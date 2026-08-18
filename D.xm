@@ -1,4 +1,4 @@
-// DD后台保活 —— 微信后台保活 + 后台掉线提醒
+// DD后台保活 —— 微信后台保活 + 后台掉线提
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -45,7 +45,6 @@ static NSString * const kDDBackgroundConfigKey            = @"DDBackgroundConfig
 static NSString * const kDDBEnableBackground     = @"enableBackground";
 static NSString * const kDDBEnableBackgroundTips = @"enableBackgroundTips";
 static NSString * const kDDBSilentMode           = @"silentMode";
-static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 
 @interface DDBackgroundConfig : NSObject
 + (instancetype)shared;
@@ -206,12 +205,13 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 }
 
 - (void)playSoundForResource:(NSString *)resource {
-    if (resource.length > 0 && !self.isSilentMode) {
-        // 提示反馈改为震动（kSystemSoundID_Vibrate = 0xfff）
+    if (resource.length == 0) return;
+    if (self.isSilentMode) {
+        // 静音模式：震动反馈
         AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-    }
-    if ([DDBackgroundConfig.shared.config objectForKey:kDDBPlaySystemSound] != nil) {
-        AudioServicesPlaySystemSound(0xfff);
+    } else {
+        // 普通模式：播放系统默认提示音
+        AudioServicesPlaySystemSound(kSystemSoundID_UserPreferredAlert);
     }
 }
 
