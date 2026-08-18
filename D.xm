@@ -102,6 +102,14 @@
 #import <objc/message.h>
 #import <WebKit/WebKit.h>
 
+// ========== MMWebViewController 类别声明 ==========
+// 【编译修复】Logos 的 %hook 块内不能声明 @property（会报 unexpected '@'），
+// 故在此用具名类别声明 webView 属性，使 self.webView 可编译。
+// 对应微信/MMWebViewController.h:478 的 webView 属性（运行时真实存在，仅编译期可见性）。
+@interface MMWebViewController (DDAdBlockWebView)
+@property(retain, nonatomic) WKWebView *webView;
+@end
+
 // ========== 插件管理入口 ==========
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
@@ -277,10 +285,6 @@ static NSString * const kDDAdBlockMiniAppKey  = @"DDAdBlock_MiniApp";
 //       (A) 请求层拦截广告端点（getappmsgad / ad.wx.com / ad.weixin.qq.com）；
 //       (B) 页面加载完成后注入 CSS + MutationObserver 隐藏/移除已存在的广告 DOM。
 %hook MMWebViewController
-
-// 【编译修复】Logos 的 %hook 宏只生成 @class MMWebViewController; 前置声明，
-// 无 webView 属性声明，故需在块内显式声明才能用 self.webView（微信/MMWebViewController.h:478）。
-@property(retain, nonatomic) WKWebView *webView;
 
 // (A) 拦截广告请求：返回 NO 取消加载
 //     证据：微信/MMWebViewController.h:771
@@ -625,7 +629,7 @@ static NSString * const kDDAdBlockMiniAppKey  = @"DDAdBlock_MiniApp";
             id mgr = [mgrClass sharedInstance];
             if ([mgr respondsToSelector:@selector(registerControllerWithTitle:version:controller:)]) {
                 [mgr registerControllerWithTitle:@"DD广告屏蔽"
-                                         version:@"1.0.8"
+                                         version:@"1.0.9"
                                       controller:@"DDAdBlockSettingsViewController"];
             }
         }
