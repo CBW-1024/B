@@ -99,6 +99,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <WebKit/WebKit.h>
 
 // ========== 插件管理入口 ==========
@@ -277,6 +278,10 @@ static NSString * const kDDAdBlockMiniAppKey  = @"DDAdBlock_MiniApp";
 //       (B) 页面加载完成后注入 CSS + MutationObserver 隐藏/移除已存在的广告 DOM。
 %hook MMWebViewController
 
+// 【编译修复】Logos 的 %hook 宏只生成 @class MMWebViewController; 前置声明，
+// 无 webView 属性声明，故需在块内显式声明才能用 self.webView（微信/MMWebViewController.h:478）。
+@property(retain, nonatomic) WKWebView *webView;
+
 // (A) 拦截广告请求：返回 NO 取消加载
 //     证据：微信/MMWebViewController.h:771
 //       - (BOOL)webView:(id)arg1 shouldStartLoadWithRequest:(id)arg2
@@ -360,12 +365,17 @@ static NSString * const kDDAdBlockMiniAppKey  = @"DDAdBlock_MiniApp";
 %hook WCFinderDataItem
 + (id)finderDataItemFromObject:(id)arg1 {
     if ([DDAdBlockConfig sharedConfig].blockFinder && arg1 != nil) {
-        // 仅当入参携带广告标识时才丢弃，避免误伤普通视频数据：
-        //  - 响应 isAd / adFlag 且判定为广告
-        //  - 携带 advertisementInfo / adInfo / FinderObjectAdInfo
-        if ([arg1 respondsToSelector:@selector(isAd)] && [arg1 isAd]) return nil;
-        if ([arg1 respondsToSelector:@selector(adFlag)] && [arg1 adFlag] != 0) return nil;
-        if ([arg1 respondsToSelector:@selector(advertisementInfo)] && [arg1 advertisementInfo] != nil) return nil;
+        // 仅当入参携带广告标识时才丢弃，避免误伤普通视频数据。
+        // 用 objc_msgSend 调用，规避编译器对 id 类型未知 selector 的检查。
+        //  - 响应 isAd 且判定为广告 → 丢弃
+        //  - adFlag 非 0 → 丢弃（广告标识）
+        //  - 携带 advertisementInfo → 丢弃
+        if ([arg1 respondsToSelector:@selector(isAd)] &&
+            ((BOOL (*)(id, SEL))objc_msgSend)(arg1, @selector(isAd))) return nil;
+        if ([arg1 respondsToSelector:@selector(adFlag)] &&
+            ((unsigned long long (*)(id, SEL))objc_msgSend)(arg1, @selector(adFlag)) != 0) return nil;
+        if ([arg1 respondsToSelector:@selector(advertisementInfo)] &&
+            ((id (*)(id, SEL))objc_msgSend)(arg1, @selector(advertisementInfo)) != nil) return nil;
     }
     return %orig;
 }
@@ -615,7 +625,7 @@ static NSString * const kDDAdBlockMiniAppKey  = @"DDAdBlock_MiniApp";
             id mgr = [mgrClass sharedInstance];
             if ([mgr respondsToSelector:@selector(registerControllerWithTitle:version:controller:)]) {
                 [mgr registerControllerWithTitle:@"DD广告屏蔽"
-                                         version:@"1.0.7"
+                                         version:@"1.0.8"
                                       controller:@"DDAdBlockSettingsViewController"];
             }
         }
