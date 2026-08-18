@@ -83,6 +83,13 @@
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
+// MMAppSceneUtil：微信场景工具类，用于取当前活跃场景的根窗口。
+// 显式声明类方法，避免编译器报 "no known class method for selector"。
+@interface MMAppSceneUtil : NSObject
++ (UIWindow *)lastActiveSceneRootWindow;
++ (UIWindow *)mainWindowScene;
+@end
+
 @interface WCTableViewManager : NSObject
 - (instancetype)initWithFrame:(struct CGRect)arg1 style:(long long)arg2;
 - (void)clearAllSection;
@@ -244,7 +251,7 @@ static NSString * const kDDBlurEnableBlur  = @"enableBlur";
         }
     }
     // 2) 微信 MMAppSceneUtil.lastActiveSceneRootWindow
-    Class sceneUtil = objc_getClass("MMAppSceneUtil");
+    id sceneUtil = objc_getClass("MMAppSceneUtil");
     if (sceneUtil && [sceneUtil respondsToSelector:@selector(lastActiveSceneRootWindow)]) {
         id w = [sceneUtil lastActiveSceneRootWindow];
         if ([w isKindOfClass:[UIWindow class]]) {
@@ -379,7 +386,7 @@ static NSString * const kDDBlurEnableBlur  = @"enableBlur";
 
 - (void)ensureTableViewMgr {
     if (_tableViewMgr) return;
-    Class mgrCls = objc_getClass("WCTableViewManager");
+    id mgrCls = objc_getClass("WCTableViewManager");
     if (!mgrCls) return;
     WCTableViewManager *mgr = [mgrCls alloc];
     _tableViewMgr = [mgr initWithFrame:[UIScreen mainScreen].bounds
@@ -408,8 +415,8 @@ static NSString * const kDDBlurEnableBlur  = @"enableBlur";
 
 // 构建设置项：开关 + 导出日志 + 清空日志
 - (void)buildTable {
-    Class cellCls = objc_getClass("WCTableViewCellManager");
-    Class secCls  = objc_getClass("WCTableViewSectionManager");
+    id cellCls = objc_getClass("WCTableViewCellManager");
+    id secCls  = objc_getClass("WCTableViewSectionManager");
     if (!cellCls || !secCls || !_tableViewMgr) {
         [[DDBlurLog shared] log:@"构建设置界面失败：微信私有类缺失 cellCls=%p secCls=%p mgr=%p",
                 cellCls, secCls, _tableViewMgr];
@@ -496,7 +503,7 @@ static NSString * const kDDBlurEnableBlur  = @"enableBlur";
         // 监听系统后台/前台通知兜底（微信 scene 生命周期下 applicationDidEnterBackground: 不可靠）
         [[DDBackgroundBlur shared] startObserving];
 
-        Class mgr = objc_getClass("WCPluginsMgr");
+        id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
             [[mgr sharedInstance] registerControllerWithTitle:@"DD后台高斯模糊"
                                                       version:@"1.0.0"
