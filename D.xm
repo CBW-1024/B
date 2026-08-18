@@ -93,10 +93,10 @@ static NSString * const kDDBlurEnableBlur  = @"enableBlur";
 @property (nonatomic, assign) BOOL blurVisible;
 + (instancetype)shared;
 
-- (void)applyBlur;
+- (void)applyBlurToWindow:(UIWindow *)window;
 - (void)removeBlur;
-- (void)handleAppDidEnterBackground;
-- (void)handleAppWillEnterForeground;
+- (void)handleAppDidEnterBackground:(UIWindow *)window;
+- (void)handleAppDidBecomeActive;
 @end
 
 @implementation DDBackgroundBlur
@@ -115,46 +115,41 @@ static NSString * const kDDBlurEnableBlur  = @"enableBlur";
     return self;
 }
 
-// 取当前前台主窗口（iOS 13+ 多场景）
-- (UIWindow *)mainWindow {
-    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            UIWindow *window = scene.windows.firstObject;
-            if (window) return window;
-        }
-    }
-    return nil;
-}
-
-// 进入后台：在窗口上盖一层高斯模糊遮罩（默认不延迟、不透明 alpha=1.0）
-- (void)handleAppDidEnterBackground {
+// 进入后台：在窗口上盖一层高斯模糊遮罩
+// window 由 hook 直接传入（微信 delegate 的 window 属性，即主窗口），
+// 对齐 WCPulse 的 [self window]
+- (void)handleAppDidEnterBackground:(UIWindow *)window {
     if (!DDBlurConfig.shared.enableBlur) return;
     if (self.blurVisible) return;
-    [self applyBlur];
+    [self applyBlurToWindow:window];
 }
 
-- (void)applyBlur {
-    UIWindow *window = [self mainWindow];
+- (void)applyBlurToWindow:(UIWindow *)window {
     if (!window) return;
 
-    // 高斯模糊层（随系统深浅色模式自适应）
-    UIBlurEffectStyle style = UIBlurEffectStyleLight;  // 浅色模式：Light（对齐 WCPulse）
-    if (window.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
-        style = UIBlurEffectStyleDark;                 // 深色模式：Dark
-    }
-    UIBlurEffect *effect = [UIBlurEffect effectWithStyle:style];
+    // 高斯模糊层：固定 UIBlurEffectStyleLight（完全对齐 WCPulse 反汇编 mov x2,#1）
+    UIBlurEffect *effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleLight];
     UIVisualEffectView *blurView = [[UIVisualEffectView alloc] initWithEffect:effect];
     blurView.frame = window.bounds;
     blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    blurView.alpha = 1.0;   // 默认不透明
+    blurView.alpha = 0.0;   // 挂载前透明（对齐 WCPulse：先 alpha=0，再淡入）
 
     self.blurView = blurView;
     self.blurVisible = YES;
     [window addSubview:blurView];
+
+    // 淡入动画（对齐 WCPulse：0.25s，delay=0 不延迟，CurveEaseOut）
+    [UIView animateWithDuration:0.25
+                          delay:0.0
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+                         blurView.alpha = 1.0;   // 淡入到不透明
+                     }
+                     completion:nil];
 }
 
-// 回到前台：移除模糊遮罩
-- (void)handleAppWillEnterForeground {
+// 回到前台：移除模糊遮罩（对齐 WCPulse 的 applicationDidBecomeActive）
+- (void)handleAppDidBecomeActive {
     if (self.blurVisible) {
         [self removeBlur];
     }
@@ -176,12 +171,16 @@ static NSString * const kDDBlurEnableBlur  = @"enableBlur";
 
 - (void)applicationDidEnterBackground:(UIApplication *)application {
     %orig;
-    [[DDBackgroundBlur shared] handleAppDidEnterBackground];
+    // 直接用 delegate 的 window 属性（即主窗口），对齐 WCPulse 的 [self window]
+    UIWindow *window = self.window;
+    if (!window) return;
+    [[DDBackgroundBlur shared] handleAppDidEnterBackground:window];
 }
 
-- (void)applicationWillEnterForeground:(UIApplication *)application {
+- (void)applicationDidBecomeActive:(UIApplication *)application {
     %orig;
-    [[DDBackgroundBlur shared] handleAppWillEnterForeground];
+    // 回到前台移除模糊层（对齐 WCPulse 的 applicationDidBecomeActive: 钩子）
+    [[DDBackgroundBlur shared] handleAppDidBecomeActive];
 }
 
 %end
