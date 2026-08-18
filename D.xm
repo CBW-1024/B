@@ -1,4 +1,4 @@
-// DD后台保活 —— 微信后台保活 + 后台掉线提
+// DD后台保活 —— 微信后台保活 + 后台掉线提醒
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -211,7 +211,7 @@ static NSString * const kDDBSilentMode           = @"silentMode";
         AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
     } else {
         // 普通模式：播放系统默认提示音
-        AudioServicesPlaySystemSound(kSystemSoundID_UserPreferredAlert);
+        AudioServicesPlaySystemSound(0x1000);
     }
 }
 
