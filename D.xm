@@ -1,24 +1,4 @@
-// DD后台保活 v1.0.0
-// 单文件 iOS 插件（Logos / Theos，arm64 + arm64e，部署 iOS 15.0+）
-//
-// 功能：提取自 PKC（dis_live1.txt 反汇编），严格对齐其 RUCrmialsmiufcq 实现：
-//   1) 后台保活（保持后台运行）
-//      - 进入后台：记录进后台时刻 + beginBackgroundTaskWithExpirationHandler
-//        申请后台任务 + 启动 25s 定时器周期续命。
-//      - 续命：backgroundTimeRemaining >= 30s 直接返回；否则播放静音占位音频
-//        （AVAudioSession Playback + MixWithOthers + 静音 caf）+ 结束旧任务
-//        并重新申请后台任务（形成续命循环）。
-//   2) 后台掉线提醒
-//      - applicationWillTerminate 时（后台被终止/掉线）：若 enableBackgroud 与
-//        enableBackgroudTips 均已配置且累计后台时长 > 0：播放 alarm 提示音 +
-//        UNUserNotificationCenter 本地通知，title 显示"X天X小时X分钟X秒"。
-//
-// 配置对齐 PKC：存于 NSUserDefaults 的 @"PKCConfig" 字典（OOXqaiiczuuvhpi 风格），
-// key：enableBackgroud / enableBackgroudTips，值为 NSNumber(0/1)，开关 on 态反映
-// key 是否存在（非 nil）。
-//
-// 设置界面 / 注册入口：参考 DD朋友圈转发 + PKC 的 MWFslyunytxupmodzgd 设置页
-// （微信原生 WCTableViewManager 系列 + WCPluginsMgr registerControllerWithTitle:）。
+// DD后台保活 —— 微信后台保活 + 后台掉线提醒
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -28,7 +8,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#pragma mark - 微信私有接口声明
+#pragma mark - 微信私有接口
 
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
@@ -45,7 +25,7 @@
 
 @interface WCTableViewSectionManager : NSObject
 + (id)defaultSection;
-+ (id)sectionInfoHeader:(NSString *)header;   // 对齐 PKC：带 section 头
++ (id)sectionInfoHeader:(NSString *)header;
 - (void)addCell:(id)arg1;
 @end
 
@@ -54,30 +34,28 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
 @end
 
-// 微信 AppDelegate，挂钩生命周期。
 @interface MicroMessengerAppDelegate : NSObject <UIApplicationDelegate>
 - (void)applicationDidEnterBackground:(UIApplication *)application;
 - (void)applicationWillEnterForeground:(UIApplication *)application;
 - (void)applicationWillTerminate:(UIApplication *)application;
 @end
 
-#pragma mark - 配置（对齐 PKC 的 OOXqaiiczuuvhpi + pkcConfig）
+#pragma mark - 配置
 
-static NSString * const kDDBPKCConfigKey    = @"PKCConfig";
-static NSString * const kDDEnableBackgroud     = @"enableBackgroud";
-static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
+static NSString * const kDDBConfigKey            = @"DDBConfig";
+static NSString * const kDDBEnableBackground     = @"enableBackground";
+static NSString * const kDDBEnableBackgroundTips = @"enableBackgroundTips";
+static NSString * const kDDBSilentMode           = @"silentMode";
+static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 
-// 对齐 PKC：+setPKCConfigForKey:value:（读 PKCConfig 字典 → mutableCopy →
-// setValue:forKey: → setPkcConfig: → 持久化回 PKCConfig）。
-// enableBackgroud / enableBackgroudTips 的读写均经 PKCConfig 字典（对齐 PKC）。
 @interface DDBConfig : NSObject
 + (instancetype)shared;
-- (NSDictionary *)pkcConfig;                                   // 读当前 pkcConfig
-- (void)setPKCConfigForKey:(NSString *)key value:(id)value;    // 写单个配置项并持久化
-- (BOOL)enableBackgroud;       // pkcConfig[@"enableBackgroud"] boolValue
-- (BOOL)enableBackgroudTips;   // pkcConfig[@"enableBackgroudTips"] boolValue
-- (BOOL)hasEnableBackgroud;    // pkcConfig[@"enableBackgroud"] 非 nil
-- (BOOL)hasEnableBackgroudTips;// pkcConfig[@"enableBackgroudTips"] 非 nil
+- (NSDictionary *)config;
+- (void)setValue:(id)value forConfigKey:(NSString *)key;
+- (BOOL)enableBackground;
+- (BOOL)enableBackgroundTips;
+- (BOOL)hasEnableBackground;
+- (BOOL)hasEnableBackgroundTips;
 @end
 
 @implementation DDBConfig
@@ -89,55 +67,56 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
     return cfg;
 }
 
-- (NSDictionary *)pkcConfig {
-    NSDictionary *cfg = [[NSUserDefaults standardUserDefaults] objectForKey:kDDBPKCConfigKey];
-    if ([cfg isKindOfClass:[NSDictionary class]]) return cfg;
-    return @{};
+// 配置存储在 NSUserDefaults 的 DDBConfig 字典中
+- (NSDictionary *)config {
+    NSDictionary *cfg = [[NSUserDefaults standardUserDefaults] objectForKey:kDDBConfigKey];
+    return [cfg isKindOfClass:[NSDictionary class]] ? cfg : @{};
 }
 
-- (void)setPKCConfigForKey:(NSString *)key value:(id)value {
-    NSMutableDictionary *cfg = [[self pkcConfig] mutableCopy];
+// 写入配置项；value 为 nil 时移除该项
+- (void)setValue:(id)value forConfigKey:(NSString *)key {
+    NSMutableDictionary *cfg = [[self config] mutableCopy];
     if (!cfg) cfg = [NSMutableDictionary dictionary];
     if (value) {
         [cfg setValue:value forKey:key];
     } else {
         [cfg removeObjectForKey:key];
     }
-    [[NSUserDefaults standardUserDefaults] setObject:cfg forKey:kDDBPKCConfigKey];
+    [[NSUserDefaults standardUserDefaults] setObject:cfg forKey:kDDBConfigKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
-- (BOOL)enableBackgroud     { return [[self.pkcConfig objectForKey:kDDEnableBackgroud] boolValue]; }
-- (BOOL)enableBackgroudTips { return [[self.pkcConfig objectForKey:kDDEnableBackgroudTips] boolValue]; }
-- (BOOL)hasEnableBackgroud     { return [self.pkcConfig objectForKey:kDDEnableBackgroud] != nil; }
-- (BOOL)hasEnableBackgroudTips { return [self.pkcConfig objectForKey:kDDEnableBackgroudTips] != nil; }
+- (BOOL)enableBackground     { return [[self.config objectForKey:kDDBEnableBackground] boolValue]; }
+- (BOOL)enableBackgroundTips { return [[self.config objectForKey:kDDBEnableBackgroundTips] boolValue]; }
+- (BOOL)hasEnableBackground     { return [self.config objectForKey:kDDBEnableBackground] != nil; }
+- (BOOL)hasEnableBackgroundTips { return [self.config objectForKey:kDDBEnableBackgroundTips] != nil; }
 
 @end
 
-#pragma mark - 后台保活 / 掉线提醒核心（对齐 RUCrmialsmiufcq）
+#pragma mark - 后台保活 / 掉线提醒
 
 @interface DDBackgroundKeeper : NSObject
-@property (nonatomic, assign) UIBackgroundTaskIdentifier bgTaskIdentifier; // ivar 0x8
-@property (nonatomic, strong) NSTimer *bgTaskTimer;                        // ivar 0x10
-@property (nonatomic, strong) AVAudioPlayer *blankPlayer;                  // ivar 0x18
-@property (nonatomic, strong) AVAudioPlayer *player;                       // ivar 0x20
-@property (nonatomic, strong) NSDate *backgroundEnteredAt;                 // ivar 0x28
-@property (nonatomic, assign) NSTimeInterval accumulatedBackgroundSeconds; // ivar 0x30
+@property (nonatomic, assign) UIBackgroundTaskIdentifier backgroundTaskIdentifier;
+@property (nonatomic, strong) NSTimer *keepAliveTimer;
+@property (nonatomic, strong) AVAudioPlayer *blankPlayer;
+@property (nonatomic, strong) AVAudioPlayer *soundPlayer;
+@property (nonatomic, strong) NSDate *backgroundEnteredAt;
+@property (nonatomic, assign) NSTimeInterval accumulatedBackgroundSeconds;
 + (instancetype)shared;
 
-- (void)enterBackgroundHandler;      // 进后台
-- (void)requestMoreTime;             // 续命
-- (void)playBlankAudio;              // 静音占位
-- (NSString *)findSystemSoundFilePathWithKeyword:(NSString *)keyword;
-- (void)playAudioForResource:(NSString *)resource;
-- (void)playAudioForPath:(NSString *)path;
+- (void)enterBackgroundHandler;
+- (void)requestMoreTime;
+- (void)playBlankAudio;
+- (NSString *)systemSoundPathForKeyword:(NSString *)keyword;
+- (void)playSoundForResource:(NSString *)resource;
+- (void)playSoundForPath:(NSString *)path;
 - (BOOL)isSilentMode;
 - (BOOL)isMicrophoneInUse;
-- (void)disbaleBackgroundHandler;    // 回前台/关闭
+- (void)disableBackgroundHandler;
 - (NSTimeInterval)totalBackgroundRuntimeSeconds;
-- (NSString *)traForSec:(NSTimeInterval)sec;
-- (void)pushMsgNotification:(NSString *)title body:(NSString *)body withTime:(NSTimeInterval)time;
-- (void)sendStopTz:(id)arg;          // 掉线提醒
+- (NSString *)timeStringForSeconds:(NSTimeInterval)seconds;
+- (void)postNotification:(NSString *)title body:(NSString *)body delay:(NSTimeInterval)delay;
+- (void)sendStopTip:(id)content;
 @end
 
 @implementation DDBackgroundKeeper
@@ -151,19 +130,15 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
 
 - (instancetype)init {
     if (self = [super init]) {
-        _bgTaskIdentifier = UIBackgroundTaskInvalid;
+        _backgroundTaskIdentifier = UIBackgroundTaskInvalid;
         _accumulatedBackgroundSeconds = 0;
     }
     return self;
 }
 
-#pragma mark 进入后台
-
-// 对齐 PKC enterBackgroundHandler：
-//   pkcConfig[@"enableBackgroud"].boolValue 为 YES 时：
-//   记录进后台时刻 → beginBackgroundTask → 25s 定时器 requestMoreTime 并立即 fire。
+// 进入后台：申请后台任务 + 25s 定时器周期续命
 - (void)enterBackgroundHandler {
-    if (!DDBConfig.shared.enableBackgroud) return;
+    if (!DDBConfig.shared.enableBackground) return;
 
     self.backgroundEnteredAt = [NSDate date];
 
@@ -172,38 +147,32 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
         beginBackgroundTaskWithExpirationHandler:^{
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
-            // 对齐 PKC：到期处理仅结束任务并复位 identifier（续命由 25s 定时器驱动）
-            UIBackgroundTaskIdentifier cur = self.bgTaskIdentifier;
-            if (cur != UIBackgroundTaskInvalid) {
-                [[UIApplication sharedApplication] endBackgroundTask:cur];
-                self.bgTaskIdentifier = UIBackgroundTaskInvalid;
+            if (self.backgroundTaskIdentifier != UIBackgroundTaskInvalid) {
+                [[UIApplication sharedApplication] endBackgroundTask:self.backgroundTaskIdentifier];
+                self.backgroundTaskIdentifier = UIBackgroundTaskInvalid;
             }
         }];
-    self.bgTaskIdentifier = task;
+    self.backgroundTaskIdentifier = task;
 
     NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:25.0
                                                       target:self
                                                     selector:@selector(requestMoreTime)
                                                     userInfo:nil
                                                      repeats:YES];
-    self.bgTaskTimer = timer;
+    self.keepAliveTimer = timer;
     [timer fire];
 }
 
-#pragma mark 续命
-
-// 对齐 PKC requestMoreTime：
-//   不读配置，直接看 backgroundTimeRemaining：>= 30 → return；否则
-//   playBlankAudio + endBackgroundTask 旧任务 + 重新 beginBackgroundTask（续命循环）。
+// 续命：剩余时间不足 30s 时播放静音音频并重新申请后台任务
 - (void)requestMoreTime {
     NSTimeInterval remaining = [UIApplication sharedApplication].backgroundTimeRemaining;
     if (remaining >= 30.0) return;
 
     [self playBlankAudio];
 
-    if (self.bgTaskIdentifier != UIBackgroundTaskInvalid) {
-        [[UIApplication sharedApplication] endBackgroundTask:self.bgTaskIdentifier];
-        self.bgTaskIdentifier = UIBackgroundTaskInvalid;
+    if (self.backgroundTaskIdentifier != UIBackgroundTaskInvalid) {
+        [[UIApplication sharedApplication] endBackgroundTask:self.backgroundTaskIdentifier];
+        self.backgroundTaskIdentifier = UIBackgroundTaskInvalid;
     }
 
     __weak typeof(self) weakSelf = self;
@@ -211,21 +180,15 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
         beginBackgroundTaskWithExpirationHandler:^{
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
-            UIBackgroundTaskIdentifier cur = self.bgTaskIdentifier;
-            if (cur != UIBackgroundTaskInvalid) {
-                [[UIApplication sharedApplication] endBackgroundTask:cur];
-                self.bgTaskIdentifier = UIBackgroundTaskInvalid;
+            if (self.backgroundTaskIdentifier != UIBackgroundTaskInvalid) {
+                [[UIApplication sharedApplication] endBackgroundTask:self.backgroundTaskIdentifier];
+                self.backgroundTaskIdentifier = UIBackgroundTaskInvalid;
             }
         }];
-    self.bgTaskIdentifier = task;
+    self.backgroundTaskIdentifier = task;
 }
 
-#pragma mark 静音占位音频
-
-// 对齐 PKC playBlankAudio：
-//   AVAudioSession setCategory:Playback withOptions:MixWithOthers(0x1) +
-//   setActive:YES + 微信主 Bundle 的 blank.caf → AVAudioPlayer → play。
-// 与 PKC 完全一致：直接复用微信自带的 blank.caf 静音占位音频（无需自造文件）。
+// 播放微信自带的 blank.caf 静音占位音频，维持后台音频会话
 - (void)playBlankAudio {
     AVAudioSession *session = [AVAudioSession sharedInstance];
     [session setCategory:AVAudioSessionCategoryPlayback
@@ -233,24 +196,17 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
                    error:nil];
     [session setActive:YES error:nil];
 
-    // 与 PKC 一致：从微信主 Bundle 取 blank.caf（微信自带该资源）
     NSString *blankPath = [[NSBundle mainBundle] pathForResource:@"blank" ofType:@"caf"];
     if (blankPath.length == 0) return;
 
     NSURL *url = [NSURL fileURLWithPath:blankPath];
     if (!self.blankPlayer) {
-        NSError *err = nil;
-        self.blankPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:&err];
+        self.blankPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:nil];
     }
     [self.blankPlayer play];
 }
 
-#pragma mark 系统提示音查找
-
-// 对齐 PKC findSystemSoundFilePathWithKeyword:：
-//   遍历 /System/Library/Audio/UISounds 子路径，文件名小写包含 "<keyword>.caf"
-//   且扩展名为 caf 的第一个文件。
-- (NSString *)findSystemSoundFilePathWithKeyword:(NSString *)keyword {
+- (NSString *)systemSoundPathForKeyword:(NSString *)keyword {
     if (keyword.length == 0) return nil;
     NSArray *subpaths = [[NSFileManager defaultManager]
         subpathsAtPath:@"/System/Library/Audio/UISounds"];
@@ -264,45 +220,36 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
     return nil;
 }
 
-#pragma mark 麦克风占用 / 静音模式
-
-// 对齐 PKC isMicrophoneInUse：WAVOIPProxy / KaraBridging 是否有 isVoipWorking。
+// 检测麦克风是否被占用（微信 VOIP 通话中不播提示音）
+// 用 objc_msgSend 调用未知类方法 isVoipWorking，避免编译期报错
 - (BOOL)isMicrophoneInUse {
-    Class wav = NSClassFromString(@"WAVOIPProxy");
-    if (wav && [wav respondsToSelector:@selector(isVoipWorking)]) {
-        return [wav isVoipWorking];
+    Class wavProxy = NSClassFromString(@"WAVOIPProxy");
+    if (wavProxy && [wavProxy respondsToSelector:@selector(isVoipWorking)]) {
+        return ((BOOL(*)(id, SEL))objc_msgSend)(wavProxy, @selector(isVoipWorking));
     }
-    Class kara = NSClassFromString(@"KaraBridging");
-    if (kara && [kara respondsToSelector:@selector(isVoipWorking)]) {
-        return [kara isVoipWorking];
+    Class karaClass = NSClassFromString(@"KaraBridging");
+    if (karaClass && [karaClass respondsToSelector:@selector(isVoipWorking)]) {
+        return ((BOOL(*)(id, SEL))objc_msgSend)(karaClass, @selector(isVoipWorking));
     }
     return NO;
 }
 
-// 对齐 PKC isSilentMode：pkcConfig[@"pkcMsgPushJY"] 非 nil。
 - (BOOL)isSilentMode {
-    return [DDBConfig.shared.pkcConfig objectForKey:@"pkcMsgPushJY"] != nil;
+    return [DDBConfig.shared.config objectForKey:kDDBSilentMode] != nil;
 }
 
-#pragma mark 播放提示音
-
-// 对齐 PKC playAudioForResource:：
-//   非静音模式时 playAudioForPath:resource；若 pkcConfig[@"pkcMsgPushZD"] 非 nil
-//   则 AudioServicesPlaySystemSound(0xfff)。
-- (void)playAudioForResource:(NSString *)resource {
+- (void)playSoundForResource:(NSString *)resource {
     if (resource.length > 0 && !self.isSilentMode) {
-        [self playAudioForPath:resource];
+        [self playSoundForPath:resource];
     }
-    if ([DDBConfig.shared.pkcConfig objectForKey:@"pkcMsgPushZD"] != nil) {
+    if ([DDBConfig.shared.config objectForKey:kDDBPlaySystemSound] != nil) {
         AudioServicesPlaySystemSound(0xfff);
     }
 }
 
-// 对齐 PKC playAudioForPath:：
-//   非麦克风占用时，用 findSystemSoundFilePathWithKeyword: 找系统 caf 播放。
-- (void)playAudioForPath:(NSString *)path {
+- (void)playSoundForPath:(NSString *)path {
     if (self.isMicrophoneInUse) return;
-    NSString *soundPath = [self findSystemSoundFilePathWithKeyword:path];
+    NSString *soundPath = [self systemSoundPathForKeyword:path];
     if (soundPath.length == 0) return;
 
     AVAudioSession *session = [AVAudioSession sharedInstance];
@@ -313,26 +260,22 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
 
     NSURL *url = [NSURL fileURLWithPath:soundPath];
     if (!url) return;
-    NSError *err = nil;
-    self.player = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:&err];
-    self.player.numberOfLoops = 0;
-    self.player.volume = 1.0;
-    [self.player prepareToPlay];
-    [self.player play];
+    self.soundPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:nil];
+    self.soundPlayer.numberOfLoops = 0;
+    self.soundPlayer.volume = 1.0;
+    [self.soundPlayer prepareToPlay];
+    [self.soundPlayer play];
 }
 
-#pragma mark 回到前台 / 关闭
-
-// 对齐 PKC disbaleBackgroundHandler：
-//   invalidate 定时器 + 清 timer + 累计 backgroundEnteredAt 差值 + 清 backgroundEnteredAt。
-- (void)disbaleBackgroundHandler {
-    if (self.bgTaskTimer) {
-        [self.bgTaskTimer invalidate];
-        self.bgTaskTimer = nil;
+// 回到前台 / 关闭保活：停定时器、结束后台任务、累计本次后台时长
+- (void)disableBackgroundHandler {
+    if (self.keepAliveTimer) {
+        [self.keepAliveTimer invalidate];
+        self.keepAliveTimer = nil;
     }
-    if (self.bgTaskIdentifier != UIBackgroundTaskInvalid) {
-        [[UIApplication sharedApplication] endBackgroundTask:self.bgTaskIdentifier];
-        self.bgTaskIdentifier = UIBackgroundTaskInvalid;
+    if (self.backgroundTaskIdentifier != UIBackgroundTaskInvalid) {
+        [[UIApplication sharedApplication] endBackgroundTask:self.backgroundTaskIdentifier];
+        self.backgroundTaskIdentifier = UIBackgroundTaskInvalid;
     }
     if (self.backgroundEnteredAt) {
         self.accumulatedBackgroundSeconds +=
@@ -349,13 +292,9 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
     return acc;
 }
 
-#pragma mark 时间格式化（对齐 PKC traForSec:）
-
-// 对齐 PKC traForSec:：
-//   sec <= 0 → @"0"；否则按 86400/3600/60 分段 append "X天/X小时/X分钟/X秒"，
-//   每段余数为 0 时不再追加该段。
-- (NSString *)traForSec:(NSTimeInterval)sec {
-    long long total = (long long)sec;
+// 把秒数格式化为 "X天X小时X分钟X秒"
+- (NSString *)timeStringForSeconds:(NSTimeInterval)seconds {
+    long long total = (long long)seconds;
     if (total <= 0) return @"0";
 
     NSMutableString *str = [NSMutableString string];
@@ -378,18 +317,14 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
     return [str copy];
 }
 
-#pragma mark 本地通知
-
-// 对齐 PKC pushMsgNotification:body:withTime:：
-//   setTitle: = 第1参，setBody: = 第2参，trigger 间隔 = withTime:，
-//   identifier = identifier_%f_%@（时间戳 + UUID）。不设置 sound（对齐 PKC）。
-- (void)pushMsgNotification:(NSString *)title body:(NSString *)body withTime:(NSTimeInterval)time {
+// 发送本地通知，delay 秒后触发
+- (void)postNotification:(NSString *)title body:(NSString *)body delay:(NSTimeInterval)delay {
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.title = title;
     content.body  = body;
 
     UNTimeIntervalNotificationTrigger *trigger =
-        [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:time repeats:NO];
+        [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:delay repeats:NO];
     NSString *identifier = [NSString stringWithFormat:@"identifier_%f_%@",
                             [[NSDate date] timeIntervalSince1970],
                             [[NSUUID UUID] UUIDString]];
@@ -399,28 +334,23 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
                                                            withCompletionHandler:nil];
 }
 
-#pragma mark 掉线提醒
+// 掉线提醒：累计后台时长 > 0 时播提示音并推送本地通知
+- (void)sendStopTip:(id)content {
+    if (!DDBConfig.shared.hasEnableBackground) return;
+    if (!DDBConfig.shared.hasEnableBackgroundTips) return;
 
-// 对齐 PKC sendStopTz:：
-//   pkcConfig[@"enableBackgroud"] 非 nil 且 pkcConfig[@"enableBackgroudTips"] 非 nil
-//   且 totalBackgroundRuntimeSeconds > 0 时：playAudioForResource:@"alarm" +
-//   stringWithFormat(传入 arg + traForSec) → pushMsgNotification(title=组合串 body=@"" withTime:1.0)。
-- (void)sendStopTz:(id)arg {
-    if (!DDBConfig.shared.hasEnableBackgroud) return;
-    if (!DDBConfig.shared.hasEnableBackgroudTips) return;
+    NSTimeInterval seconds = [self totalBackgroundRuntimeSeconds];
+    if (seconds <= 0) return;
 
-    NSTimeInterval sec = [self totalBackgroundRuntimeSeconds];
-    if (sec <= 0) return;
-
-    [self playAudioForResource:@"alarm"];
-    NSString *traStr = [self traForSec:sec];
-    NSString *msg = [NSString stringWithFormat:@"%@，%@", arg, traStr];
-    [self pushMsgNotification:msg body:@"" withTime:1.0];
+    [self playSoundForResource:@"alarm"];
+    NSString *timeText = [self timeStringForSeconds:seconds];
+    NSString *message = [NSString stringWithFormat:@"%@，%@", content, timeText];
+    [self postNotification:message body:@"" delay:1.0];
 }
 
 @end
 
-#pragma mark - 生命周期 Hook（对齐 PKC 挂钩点）
+#pragma mark - 生命周期 Hook
 
 %hook MicroMessengerAppDelegate
 
@@ -431,19 +361,19 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
 
 - (void)applicationWillEnterForeground:(UIApplication *)application {
     %orig;
-    // 对齐 PKC：回前台只停止保活并累计时长（不触发掉线提醒）
-    [[DDBackgroundKeeper shared] disbaleBackgroundHandler];
+    // 回到前台：停止保活并累计后台时长
+    [[DDBackgroundKeeper shared] disableBackgroundHandler];
 }
 
 - (void)applicationWillTerminate:(UIApplication *)application {
     %orig;
-    // 对齐 PKC：后台被终止（掉线）时触发掉线提醒，传"退出后台"文案
-    [[DDBackgroundKeeper shared] sendStopTz:@"退出后台"];
+    // 后台被终止（掉线）时触发掉线提醒
+    [[DDBackgroundKeeper shared] sendStopTip:@"退出后台"];
 }
 
 %end
 
-#pragma mark - 设置界面（参考 DD朋友圈转发）
+#pragma mark - 设置界面
 
 @interface DDBackgroundSettingsViewController : UIViewController
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
@@ -480,10 +410,7 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
     [self.view addSubview:tableView];
 }
 
-// 设置页（排版参考 DD朋友圈转发，开关语义对齐 PKC）：
-//   "保持后台运行"开关 on = enableBackgroud key 是否存在；
-//   "后台掉线提醒"开关 on = enableBackgroudTips key 是否存在，且仅当保持后台运行
-//   已配置（enableBackgroud 非 nil）时显示（对齐 PKC 的 createBackgroudTipsSwitchCell）。
+// 构建设置项："保持后台运行"开关，"后台掉线提醒"仅在保活开启时显示
 - (void)buildTable {
     Class cellCls = objc_getClass("WCTableViewCellManager");
     Class secCls  = objc_getClass("WCTableViewSectionManager");
@@ -493,36 +420,34 @@ static NSString * const kDDEnableBackgroudTips = @"enableBackgroudTips";
     DDBConfig *cfg = DDBConfig.shared;
 
     WCTableViewSectionManager *section = [secCls defaultSection];
-    [section addCell:[cellCls switchCellForSel:@selector(settingEanbleBg:)
+    [section addCell:[cellCls switchCellForSel:@selector(toggleKeepAlive:)
                                         target:self
                                          title:@"保持后台运行"
-                                            on:cfg.hasEnableBackgroud]];
-    if (cfg.hasEnableBackgroud) {
-        [section addCell:[cellCls switchCellForSel:@selector(settingEanbleBgTips:)
+                                            on:cfg.hasEnableBackground]];
+    if (cfg.hasEnableBackground) {
+        [section addCell:[cellCls switchCellForSel:@selector(toggleDisconnectTip:)
                                             target:self
                                              title:@"后台掉线提醒"
-                                                on:cfg.hasEnableBackgroudTips]];
+                                                on:cfg.hasEnableBackgroundTips]];
     }
     [self.tableViewMgr addSection:section];
 
     [self.tableViewMgr reloadTableView];
 }
 
-// 对齐 PKC settingEanbleBg:：开启写 @(1)，关闭传 nil（移除 key）+ reload；
-// 关闭时若在保活则立即停止。
-- (void)settingEanbleBg:(UISwitch *)sender {
-    [DDBConfig.shared setPKCConfigForKey:kDDEnableBackgroud
-                                   value:sender.isOn ? @(1) : nil];
+- (void)toggleKeepAlive:(UISwitch *)sender {
+    [DDBConfig.shared setValue:sender.isOn ? @(1) : nil
+                   forConfigKey:kDDBEnableBackground];
     if (!sender.isOn) {
-        [[DDBackgroundKeeper shared] disbaleBackgroundHandler];
+        // 关闭保活时立即停止后台任务
+        [[DDBackgroundKeeper shared] disableBackgroundHandler];
     }
     [self buildTable];
 }
 
-// 对齐 PKC settingEanbleBgTips:：开启写 @(1)，关闭传 nil（移除 key）+ reload。
-- (void)settingEanbleBgTips:(UISwitch *)sender {
-    [DDBConfig.shared setPKCConfigForKey:kDDEnableBackgroudTips
-                                   value:sender.isOn ? @(1) : nil];
+- (void)toggleDisconnectTip:(UISwitch *)sender {
+    [DDBConfig.shared setValue:sender.isOn ? @(1) : nil
+                   forConfigKey:kDDBEnableBackgroundTips];
     [self buildTable];
 }
 
