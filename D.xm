@@ -6,7 +6,6 @@
 #import <UserNotifications/UserNotifications.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 
 #pragma mark - 微信私有接口
 
@@ -42,13 +41,13 @@
 
 #pragma mark - 配置
 
-static NSString * const kDDBConfigKey            = @"DDBConfig";
+static NSString * const kDDBackgroundConfigKey            = @"DDBackgroundConfig";
 static NSString * const kDDBEnableBackground     = @"enableBackground";
 static NSString * const kDDBEnableBackgroundTips = @"enableBackgroundTips";
 static NSString * const kDDBSilentMode           = @"silentMode";
 static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 
-@interface DDBConfig : NSObject
+@interface DDBackgroundConfig : NSObject
 + (instancetype)shared;
 - (NSDictionary *)config;
 - (void)setValue:(id)value forConfigKey:(NSString *)key;
@@ -58,18 +57,18 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 - (BOOL)hasEnableBackgroundTips;
 @end
 
-@implementation DDBConfig
+@implementation DDBackgroundConfig
 
 + (instancetype)shared {
-    static DDBConfig *cfg = nil;
+    static DDBackgroundConfig *cfg = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ cfg = [DDBConfig new]; });
+    dispatch_once(&once, ^{ cfg = [DDBackgroundConfig new]; });
     return cfg;
 }
 
-// 配置存储在 NSUserDefaults 的 DDBConfig 字典中
+// 配置存储在 NSUserDefaults 的 DDBackgroundConfig 字典中
 - (NSDictionary *)config {
-    NSDictionary *cfg = [[NSUserDefaults standardUserDefaults] objectForKey:kDDBConfigKey];
+    NSDictionary *cfg = [[NSUserDefaults standardUserDefaults] objectForKey:kDDBackgroundConfigKey];
     return [cfg isKindOfClass:[NSDictionary class]] ? cfg : @{};
 }
 
@@ -82,7 +81,7 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
     } else {
         [cfg removeObjectForKey:key];
     }
-    [[NSUserDefaults standardUserDefaults] setObject:cfg forKey:kDDBConfigKey];
+    [[NSUserDefaults standardUserDefaults] setObject:cfg forKey:kDDBackgroundConfigKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
@@ -97,9 +96,8 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 
 @interface DDBackgroundKeeper : NSObject
 @property (nonatomic, assign) UIBackgroundTaskIdentifier backgroundTaskIdentifier;
-@property (nonatomic, strong) NSTimer *keepAliveTimer;
+@property (nonatomic, strong) NSTimer *bgTaskTimer;
 @property (nonatomic, strong) AVAudioPlayer *blankPlayer;
-@property (nonatomic, strong) AVAudioPlayer *soundPlayer;
 @property (nonatomic, strong) NSDate *backgroundEnteredAt;
 @property (nonatomic, assign) NSTimeInterval accumulatedBackgroundSeconds;
 + (instancetype)shared;
@@ -107,16 +105,13 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 - (void)enterBackgroundHandler;
 - (void)requestMoreTime;
 - (void)playBlankAudio;
-- (NSString *)systemSoundPathForKeyword:(NSString *)keyword;
 - (void)playSoundForResource:(NSString *)resource;
-- (void)playSoundForPath:(NSString *)path;
 - (BOOL)isSilentMode;
-- (BOOL)isMicrophoneInUse;
 - (void)disableBackgroundHandler;
 - (NSTimeInterval)totalBackgroundRuntimeSeconds;
 - (NSString *)timeStringForSeconds:(NSTimeInterval)seconds;
 - (void)postNotification:(NSString *)title body:(NSString *)body delay:(NSTimeInterval)delay;
-- (void)sendStopTip:(id)content;
+- (void)sendDisconnectNotification:(NSString *)prompt;
 @end
 
 @implementation DDBackgroundKeeper
@@ -138,7 +133,7 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 
 // 进入后台：申请后台任务 + 25s 定时器周期续命
 - (void)enterBackgroundHandler {
-    if (!DDBConfig.shared.enableBackground) return;
+    if (!DDBackgroundConfig.shared.enableBackground) return;
 
     self.backgroundEnteredAt = [NSDate date];
 
@@ -159,7 +154,7 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
                                                     selector:@selector(requestMoreTime)
                                                     userInfo:nil
                                                      repeats:YES];
-    self.keepAliveTimer = timer;
+    self.bgTaskTimer = timer;
     [timer fire];
 }
 
@@ -206,72 +201,25 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
     [self.blankPlayer play];
 }
 
-- (NSString *)systemSoundPathForKeyword:(NSString *)keyword {
-    if (keyword.length == 0) return nil;
-    NSArray *subpaths = [[NSFileManager defaultManager]
-        subpathsAtPath:@"/System/Library/Audio/UISounds"];
-    NSString *target = [NSString stringWithFormat:@"%@.caf", keyword].lowercaseString;
-    for (NSString *sub in subpaths) {
-        if ([sub.lowercaseString containsString:target] &&
-            [sub.pathExtension isEqualToString:@"caf"]) {
-            return [@"/System/Library/Audio/UISounds" stringByAppendingPathComponent:sub];
-        }
-    }
-    return nil;
-}
-
-// 检测麦克风是否被占用（微信 VOIP 通话中不播提示音）
-// 用 objc_msgSend 调用未知类方法 isVoipWorking，避免编译期报错
-- (BOOL)isMicrophoneInUse {
-    Class wavProxy = NSClassFromString(@"WAVOIPProxy");
-    if (wavProxy && [wavProxy respondsToSelector:@selector(isVoipWorking)]) {
-        return ((BOOL(*)(id, SEL))objc_msgSend)(wavProxy, @selector(isVoipWorking));
-    }
-    Class karaClass = NSClassFromString(@"KaraBridging");
-    if (karaClass && [karaClass respondsToSelector:@selector(isVoipWorking)]) {
-        return ((BOOL(*)(id, SEL))objc_msgSend)(karaClass, @selector(isVoipWorking));
-    }
-    return NO;
-}
-
 - (BOOL)isSilentMode {
-    return [DDBConfig.shared.config objectForKey:kDDBSilentMode] != nil;
+    return [DDBackgroundConfig.shared.config objectForKey:kDDBSilentMode] != nil;
 }
 
 - (void)playSoundForResource:(NSString *)resource {
     if (resource.length > 0 && !self.isSilentMode) {
-        [self playSoundForPath:resource];
+        // 提示反馈改为震动（kSystemSoundID_Vibrate = 0xfff）
+        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
     }
-    if ([DDBConfig.shared.config objectForKey:kDDBPlaySystemSound] != nil) {
+    if ([DDBackgroundConfig.shared.config objectForKey:kDDBPlaySystemSound] != nil) {
         AudioServicesPlaySystemSound(0xfff);
     }
 }
 
-- (void)playSoundForPath:(NSString *)path {
-    if (self.isMicrophoneInUse) return;
-    NSString *soundPath = [self systemSoundPathForKeyword:path];
-    if (soundPath.length == 0) return;
-
-    AVAudioSession *session = [AVAudioSession sharedInstance];
-    [session setCategory:AVAudioSessionCategoryPlayback
-             withOptions:AVAudioSessionCategoryOptionMixWithOthers
-                   error:nil];
-    [session setActive:YES error:nil];
-
-    NSURL *url = [NSURL fileURLWithPath:soundPath];
-    if (!url) return;
-    self.soundPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:nil];
-    self.soundPlayer.numberOfLoops = 0;
-    self.soundPlayer.volume = 1.0;
-    [self.soundPlayer prepareToPlay];
-    [self.soundPlayer play];
-}
-
 // 回到前台 / 关闭保活：停定时器、结束后台任务、累计本次后台时长
 - (void)disableBackgroundHandler {
-    if (self.keepAliveTimer) {
-        [self.keepAliveTimer invalidate];
-        self.keepAliveTimer = nil;
+    if (self.bgTaskTimer) {
+        [self.bgTaskTimer invalidate];
+        self.bgTaskTimer = nil;
     }
     if (self.backgroundTaskIdentifier != UIBackgroundTaskInvalid) {
         [[UIApplication sharedApplication] endBackgroundTask:self.backgroundTaskIdentifier];
@@ -317,11 +265,12 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
     return [str copy];
 }
 
-// 发送本地通知，delay 秒后触发
+// 发送本地通知，delay 秒后触发；带系统默认提示音
 - (void)postNotification:(NSString *)title body:(NSString *)body delay:(NSTimeInterval)delay {
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.title = title;
     content.body  = body;
+    content.sound = [UNNotificationSound defaultSound];
 
     UNTimeIntervalNotificationTrigger *trigger =
         [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:delay repeats:NO];
@@ -334,17 +283,17 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
                                                            withCompletionHandler:nil];
 }
 
-// 掉线提醒：累计后台时长 > 0 时播提示音并推送本地通知
-- (void)sendStopTip:(id)content {
-    if (!DDBConfig.shared.hasEnableBackground) return;
-    if (!DDBConfig.shared.hasEnableBackgroundTips) return;
+// 掉线提醒：累计后台时长 > 0 时震动并推送本地通知
+- (void)sendDisconnectNotification:(NSString *)prompt {
+    if (!DDBackgroundConfig.shared.hasEnableBackground) return;
+    if (!DDBackgroundConfig.shared.hasEnableBackgroundTips) return;
 
     NSTimeInterval seconds = [self totalBackgroundRuntimeSeconds];
     if (seconds <= 0) return;
 
     [self playSoundForResource:@"alarm"];
     NSString *timeText = [self timeStringForSeconds:seconds];
-    NSString *message = [NSString stringWithFormat:@"%@，%@", content, timeText];
+    NSString *message = [NSString stringWithFormat:@"%@，%@", prompt, timeText];
     [self postNotification:message body:@"" delay:1.0];
 }
 
@@ -368,7 +317,7 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 - (void)applicationWillTerminate:(UIApplication *)application {
     %orig;
     // 后台被终止（掉线）时触发掉线提醒
-    [[DDBackgroundKeeper shared] sendStopTip:@"退出后台"];
+    [[DDBackgroundKeeper shared] sendDisconnectNotification:@"退出后台"];
 }
 
 %end
@@ -417,10 +366,10 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
     if (!cellCls || !secCls || !_tableViewMgr) return;
 
     [self.tableViewMgr clearAllSection];
-    DDBConfig *cfg = DDBConfig.shared;
+    DDBackgroundConfig *cfg = DDBackgroundConfig.shared;
 
     WCTableViewSectionManager *section = [secCls defaultSection];
-    [section addCell:[cellCls switchCellForSel:@selector(toggleKeepAlive:)
+    [section addCell:[cellCls switchCellForSel:@selector(toggleBackgroundRunning:)
                                         target:self
                                          title:@"保持后台运行"
                                             on:cfg.hasEnableBackground]];
@@ -435,8 +384,8 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
     [self.tableViewMgr reloadTableView];
 }
 
-- (void)toggleKeepAlive:(UISwitch *)sender {
-    [DDBConfig.shared setValue:sender.isOn ? @(1) : nil
+- (void)toggleBackgroundRunning:(UISwitch *)sender {
+    [DDBackgroundConfig.shared setValue:sender.isOn ? @(1) : nil
                    forConfigKey:kDDBEnableBackground];
     if (!sender.isOn) {
         // 关闭保活时立即停止后台任务
@@ -446,7 +395,7 @@ static NSString * const kDDBPlaySystemSound      = @"playSystemSound";
 }
 
 - (void)toggleDisconnectTip:(UISwitch *)sender {
-    [DDBConfig.shared setValue:sender.isOn ? @(1) : nil
+    [DDBackgroundConfig.shared setValue:sender.isOn ? @(1) : nil
                    forConfigKey:kDDBEnableBackgroundTips];
     [self buildTable];
 }
