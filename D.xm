@@ -94,6 +94,23 @@
 //      证据：微信/WAAppTask.h:1279/1296/1297/1302/1303、
 //            WAAppTaskSplashADConfig.h:101/103/105、
 //            WAJSEventHandler_enableSplashAdHotStart.h:11
+//
+//  ============ CI 编译修复（v1.2.0） ============
+//  连续三轮解决了 GitHub Actions 在 MMWebViewController 块上的编译错误：
+//    1) property 'webView' cannot be found in forward class object —— 原因是
+//       MMWebViewController 仅有 @class 前置声明，编译器不认识 webView 属性。
+//    2) unexpected '@' in program —— Logos 的 %hook 块内不支持 @property 声明
+//       （@property 只能出现在 @interface 里），故不能靠声明属性来救。
+//    3) cannot find interface declaration for 'MMWebViewController' —— 想改用
+//       @interface MMWebViewController (DDAdBlockWebView) 类别来声明属性，但普通
+//       类别需要完整的类接口声明，而本文件只有 @class 前置声明，依然编译不过。
+//  正确的做法（沿用用户上传的完整头文件信息）：在文件顶部显式补齐
+//   @interface MMWebViewController : UIViewController 完整接口，声明真实存在的
+//   webView 属性（微信/MMWebViewController.h:478，类型 WKWebView<YYWebViewInterface>，
+//   编译期声明为 WKWebView* 以规避对自定义协议的依赖），于是 self.webView 点语法
+//   恢复可用，无需 KVC 绕弯。已确认该接口仅此一处定义、CI 不预定义完整形式，
+//   不会产生重复/不一致定义。
+//  webView:shouldStartLoadWithRequest:... 用参数 arg2 取请求，无需属性。
 // ---------------------------------------------------------------------------
 
 #import <UIKit/UIKit.h>
@@ -102,12 +119,18 @@
 #import <objc/message.h>
 #import <WebKit/WebKit.h>
 
-// ========== MMWebViewController 类别声明 ==========
-// 【编译修复】Logos 的 %hook 块内不能声明 @property（会报 unexpected '@'），
-// 故在此用具名类别声明 webView 属性，使 self.webView 可编译。
-// 对应微信/MMWebViewController.h:478 的 webView 属性（运行时真实存在，仅编译期可见性）。
-@interface MMWebViewController (DDAdBlockWebView)
-@property(retain, nonatomic) WKWebView *webView;
+// ========== MMWebViewController 完整接口声明 ==========
+// 来源：微信/MMWebViewController.h（classdump 生成，本文件仅有 @class 前置声明）。
+// 为保证 %hook MMWebViewController 内可用 self.webView 点语法（而非 KVC 绕弯），
+// 在此显式补齐该类接口（父类为 UIViewController；webView 属性见头文件 :478，
+// 类型 WKWebView<YYWebViewInterface>，编译期仅需 WKWebView 的方法，故声明为
+// WKWebView* 以规避对自定义协议 YYWebViewInterface 的依赖）。
+// 已确认：全头文件集合中 MMWebViewController 仅此处定义、无重复，且 CI 不预定义
+// 该类带父类的完整形式，故本声明不会造成重复/不一致定义。
+@interface MMWebViewController : UIViewController
+@property (retain, nonatomic) WKWebView *webView;
+- (BOOL)webView:(id)arg1 shouldStartLoadWithRequest:(id)arg2 navigationType:(long long)arg3 isMainFrame:(BOOL)arg4 navigationAction:(id)arg5;
+- (void)webViewDidFinishLoad:(id)arg1 navigation:(id)arg2;
 @end
 
 // ========== 插件管理入口 ==========
@@ -310,7 +333,10 @@ static NSString * const kDDAdBlockMiniAppKey  = @"DDAdBlock_MiniApp";
 - (void)webViewDidFinishLoad:(id)arg1 navigation:(id)arg2 {
     %orig;
     if (![DDAdBlockConfig sharedConfig].blockBrand) return;
-    NSURL *url = self.webView.URL;
+    // 顶部已补齐 MMWebViewController 完整接口声明，self.webView 可直接点语法访问。
+    WKWebView *wv = self.webView;
+    if (!wv) return;
+    NSURL *url = wv.URL;
     NSString *urlStr = url.absoluteString ?: @"";
     if (![urlStr containsString:@"mp.weixin.qq.com"]) return;
 
@@ -347,8 +373,8 @@ static NSString * const kDDAdBlockMiniAppKey  = @"DDAdBlock_MiniApp";
     @"}"
     @"})();";
 
-    if ([self.webView respondsToSelector:@selector(evaluateJavaScript:completionHandler:)]) {
-        [self.webView evaluateJavaScript:js completionHandler:nil];
+    if ([wv respondsToSelector:@selector(evaluateJavaScript:completionHandler:)]) {
+        [wv evaluateJavaScript:js completionHandler:nil];
     }
 }
 %end
@@ -629,7 +655,7 @@ static NSString * const kDDAdBlockMiniAppKey  = @"DDAdBlock_MiniApp";
             id mgr = [mgrClass sharedInstance];
             if ([mgr respondsToSelector:@selector(registerControllerWithTitle:version:controller:)]) {
                 [mgr registerControllerWithTitle:@"DD广告屏蔽"
-                                         version:@"1.0.9"
+                                         version:@"1.2.0"
                                       controller:@"DDAdBlockSettingsViewController"];
             }
         }
