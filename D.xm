@@ -92,10 +92,10 @@ static NSString * const kDDAddTimeEnable     = @"enableAddTime";
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
-// 默认开启（未设置时视为开启）
+// 默认关闭（未设置时视为关闭）
 - (BOOL)enableAddTime {
     NSNumber *val = [self.config objectForKey:kDDAddTimeEnable];
-    return val ? val.boolValue : YES;
+    return val ? val.boolValue : NO;
 }
 - (BOOL)hasEnableAddTime { return [self.config objectForKey:kDDAddTimeEnable] != nil; }
 
@@ -203,7 +203,7 @@ static NSString * const kDDAddTimeEnable     = @"enableAddTime";
     [sec addCell:[cellCls switchCellForSel:@selector(toggleAddTime:)
                                      target:self
                                       title:@"显示好友添加时间"
-                                         on:cfg.enableAddTime]];
+                                         on:cfg.hasEnableAddTime]];
     [self.tableViewMgr addSection:sec];
 
     [self.tableViewMgr reloadTableView];
