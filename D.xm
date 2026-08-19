@@ -88,30 +88,17 @@ static BOOL ddIsWxidCommand(NSString *text) {
     return [trimmed caseInsensitiveCompare:@"/WXID"] == NSOrderedSame;
 }
 
-// 获取当前前台活跃窗口（iOS 13+ 多场景，避免使用已废弃的 keyWindow）
+// 获取当前前台活跃窗口（多场景，替代已废弃的 keyWindow）
 static UIWindow *ddCurrentKeyWindow(void) {
     UIWindow *window = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (![scene isKindOfClass:UIWindowScene.class]) continue;
-            UIWindowScene *winScene = (UIWindowScene *)scene;
-            if (winScene.activationState != UISceneActivationStateForegroundActive) continue;
-            for (UIWindow *w in winScene.windows) {
-                if (w.isKeyWindow) { window = w; break; }
-            }
-            if (window) break;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        UIWindowScene *winScene = (UIWindowScene *)scene;
+        if (winScene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *w in winScene.windows) {
+            if (w.isKeyWindow) { window = w; break; }
         }
-        // 兜底：取前台场景第一个窗口
-        if (!window) {
-            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if ([scene isKindOfClass:UIWindowScene.class]) {
-                    UIWindowScene *winScene = (UIWindowScene *)scene;
-                    if (winScene.activationState != UISceneActivationStateForegroundActive) continue;
-                    window = winScene.windows.firstObject;
-                    if (window) break;
-                }
-            }
-        }
+        if (window) break;
     }
     return window;
 }
@@ -119,7 +106,8 @@ static UIWindow *ddCurrentKeyWindow(void) {
 // 微信原生 ActionSheet 展示，含「复制」按钮（取消按钮 WCActionSheet 自带）
 static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
     if (!message.length) message = @"未获取到 ID";
-    WCActionSheet *sheet = [[WCActionSheet alloc] initWithTitle:title];
+    Class sheetCls = objc_getClass("WCActionSheet");
+    WCActionSheet *sheet = [(WCActionSheet *)[sheetCls alloc] initWithTitle:title];
     if (!sheet) return NO;
     // 展示 ID 内容
     [sheet addCustomViewWithTitle:message fontSize:16.0 fontColor:[UIColor blackColor]
@@ -138,7 +126,8 @@ static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
 // 拦截点：命中自己发出的文本 /WXID，弹面板展示原始 ID，不发送
 - (void)AddMsg:(NSString *)usr MsgWrap:(CMessageWrap *)wrap {
     BOOL shouldSend = YES;
-    if (DDShowWxidConfig.shared.enableShowWxid && wrap && [CMessageWrap isSenderFromMsgWrap:wrap]) {
+    Class msgWrapCls = objc_getClass("CMessageWrap");
+    if (DDShowWxidConfig.shared.enableShowWxid && wrap && msgWrapCls && [msgWrapCls isSenderFromMsgWrap:wrap]) {
         if (wrap.m_uiMessageType == 1 && ddIsWxidCommand(wrap.m_nsContent)) {
             NSString *rawId = usr.length ? usr : wrap.m_nsToUsr;
             if (!rawId.length) rawId = @"未获取到 ID";
@@ -182,8 +171,9 @@ static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
 
 - (void)ensureTableViewMgr {
     if (_tableViewMgr) return;
-    _tableViewMgr = [[WCTableViewManager alloc] initWithFrame:[UIScreen mainScreen].bounds
-                                                        style:UITableViewStyleInsetGrouped];
+    Class mgrCls = objc_getClass("WCTableViewManager");
+    _tableViewMgr = [(WCTableViewManager *)[mgrCls alloc] initWithFrame:[UIScreen mainScreen].bounds
+                                                                  style:UITableViewStyleInsetGrouped];
 }
 
 - (instancetype)init {
@@ -212,11 +202,13 @@ static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
     [self.tableViewMgr clearAllSection];
     DDShowWxidConfig *cfg = DDShowWxidConfig.shared;
 
-    WCTableViewSectionManager *sec = [WCTableViewSectionManager defaultSection];
-    [sec addCell:[WCTableViewCellManager switchCellForSel:@selector(toggleShowWxid:)
-                                                   target:self
-                                                    title:@"启用指令显示ID"
-                                                       on:cfg.hasEnableShowWxid]];
+    Class secCls = objc_getClass("WCTableViewSectionManager");
+    WCTableViewSectionManager *sec = [secCls defaultSection];
+    Class cellCls = objc_getClass("WCTableViewCellManager");
+    [sec addCell:[cellCls switchCellForSel:@selector(toggleShowWxid:)
+                                    target:self
+                                     title:@"启用指令显示ID"
+                                        on:cfg.hasEnableShowWxid]];
     [sec setFooterTitle:@"聊天(联系人/群聊/公众号/服务号)发送指令:/WXID"];
     [self.tableViewMgr addSection:sec];
 
