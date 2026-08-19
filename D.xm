@@ -1,4 +1,5 @@
 // DD显示原始wxid v1.0.0 —— 联系人详情页显示原始 wxid，支持长按复制
+// 修改：改用 addRegionCellAtSection: 作为 hook 点，位置精准且时序安全，避免 viewDidLoad 塞 cell 导致闪退
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -44,12 +45,20 @@
 @interface SocialInfomationViewController : UIViewController
 @property(retain, nonatomic) CContact *m_contact;
 @property(retain, nonatomic) MMTableViewInfo *m_tableViewInfo;
+- (void)addRegionCellAtSection:(id)section;
+- (void)addSourceCellAtSection:(id)section;
+- (void)addFriendInfoSection;
+- (void)ddInsertWxidCellAtSection:(id)section;
+- (void)ddWxidCellTapped:(id)sender;
 @end
 
 #pragma mark - 配置
 
 static NSString * const kDDShowWxidConfigKey = @"DDShowWxidConfig";
 static NSString * const kDDShowWxidEnable     = @"enableShowWxid";
+
+// 关联对象 key，用于标记当前页面是否已插入 wxid cell，防止重复插入
+static char kDDShowWxidInsertedKey;
 
 @interface DDShowWxidConfig : NSObject
 + (instancetype)shared;
@@ -97,10 +106,27 @@ static NSString * const kDDShowWxidEnable     = @"enableShowWxid";
 
 %hook SocialInfomationViewController
 
-- (void)viewDidLoad {
+// 地区 cell 所在的好友信息 section 是红圈标记位置
+// 在微信添加地区 cell 之后插入 wxid cell，正好显示在"地区"下方
+- (void)addRegionCellAtSection:(id)section {
     %orig;
+    [self ddInsertWxidCellAtSection:section];
+}
 
+// 兜底：部分地区为空时 addRegionCellAtSection: 不执行，此时从来源 cell 的 section 插入
+- (void)addSourceCellAtSection:(id)section {
+    %orig;
+    [self ddInsertWxidCellAtSection:section];
+}
+
+%new
+// 往好友信息 section 插入"用户ID：原始wxid"单元格，长按右侧值可复制
+- (void)ddInsertWxidCellAtSection:(id)section {
     if (!DDShowWxidConfig.shared.enableShowWxid) return;
+
+    // 每个页面只插入一次
+    NSNumber *inserted = objc_getAssociatedObject(self, &kDDShowWxidInsertedKey);
+    if (inserted && inserted.boolValue) return;
 
     CContact *contact = self.m_contact;
     if (!contact) return;
@@ -109,20 +135,11 @@ static NSString * const kDDShowWxidEnable     = @"enableShowWxid";
     NSString *wxid = contact.userName;
     if (!wxid || wxid.length == 0) return;
 
-    MMTableViewInfo *tableInfo = self.m_tableViewInfo;
-    if (!tableInfo) return;
-    if (![tableInfo respondsToSelector:@selector(sections)]) return;
-
-    NSMutableArray *sections = tableInfo.sections;
-    if (sections.count == 0) return;
-
-    id section = sections[0];
     if (!section) return;
     Class secCls = objc_getClass("WCTableViewSectionManager");
     if (!secCls || ![section isKindOfClass:secCls]) return;
     if (![section respondsToSelector:@selector(cells)]) return;
-
-    WCTableViewSectionManager *firstSection = (WCTableViewSectionManager *)section;
+    if (![section respondsToSelector:@selector(addCell:)]) return;
 
     id cellCls = objc_getClass("WCTableViewCellManager");
     if (!cellCls) return;
@@ -134,18 +151,13 @@ static NSString * const kDDShowWxidEnable     = @"enableShowWxid";
                       canRightValueCopy:YES];
     if (!cell) return;
 
-    if ([firstSection respondsToSelector:@selector(addCell:)]) {
-        [firstSection addCell:cell];
-    }
-
-    if ([tableInfo respondsToSelector:@selector(reloadTableView)]) {
-        [tableInfo reloadTableView];
-    }
+    [section addCell:cell];
+    objc_setAssociatedObject(self, &kDDShowWxidInsertedKey, @(YES),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-%new
+// 点击回调，长按复制已由 canRightValueCopy 处理
 - (void)ddWxidCellTapped:(id)sender {
-    // 点击回调，长按复制已由 canRightValueCopy 处理
 }
 
 %end
