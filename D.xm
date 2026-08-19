@@ -204,7 +204,7 @@ static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
                                       title:@"启用指令显示ID"
                                          on:cfg.hasEnableShowWxid]];
     if ([sec respondsToSelector:@selector(setFooterTitle:)]) {
-        [sec setFooterTitle:@"聊天(联系人/群聊/公众号/服务号)发送指令:/WXID,弹窗展示原始ID"];
+        [sec setFooterTitle:@"聊天(联系人/群聊/公众号/服务号)发送指令:/WXID"];
     }
     [self.tableViewMgr addSection:sec];
 
