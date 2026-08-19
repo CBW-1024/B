@@ -26,8 +26,8 @@
 
 // 微信原生提示面板
 @interface MMTipsViewController : UIViewController
-- (id)initWithTitle:(NSString *)title message:(NSString *)message btnTitle:(NSString *)btnTitle handler:(id)handler btnTitle:(NSString *)btnTitle2 handler:(id)handler2;
-- (id)getBtnAtIndex:(unsigned int)arg1;
+- (id)initWithTitle:(NSString *)title message:(NSString *)message btnTitle:(NSString *)btnTitle handler:(id)handler;
+- (void)addButtonWithTitle:(NSString *)title handler:(id)handler;
 - (void)show;
 @end
 
@@ -90,31 +90,16 @@ static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
     if (!message.length) message = @"未获取到 ID";
     Class tipsCls = NSClassFromString(@"MMTipsViewController");
     if (!tipsCls) return NO;
-    if (![tipsCls instancesRespondToSelector:@selector(initWithTitle:message:btnTitle:handler:btnTitle:handler:)]) return NO;
+    if (![tipsCls instancesRespondToSelector:@selector(initWithTitle:message:btnTitle:handler:)]) return NO;
 
     @try {
         id tips = [[tipsCls alloc] initWithTitle:title message:message
-                                         btnTitle:@"复制" handler:^{ [UIPasteboard generalPasteboard].string = message; }
-                                         btnTitle:@"取消" handler:nil];
+                                         btnTitle:@"复制" handler:^{ [UIPasteboard generalPasteboard].string = message; }];
         if (!tips) return NO;
-        if (![tips respondsToSelector:@selector(show)]) return NO;
-
-        // 「取消」与「复制」保持一致颜色
-        if ([tips respondsToSelector:@selector(getBtnAtIndex:)]) {
-            id copyBtn = [tips getBtnAtIndex:0];
-            id cancelBtn = [tips getBtnAtIndex:1];
-            if ([copyBtn isKindOfClass:[UIButton class]] && [cancelBtn isKindOfClass:[UIButton class]]) {
-                UIColor *c = [copyBtn titleColorForState:UIControlStateNormal];
-                if (c) {
-                    [cancelBtn setTitleColor:c forState:UIControlStateNormal];
-                    [cancelBtn setTitleColor:c forState:UIControlStateHighlighted];
-                    if ([copyBtn respondsToSelector:@selector(tintColor)]) {
-                        [cancelBtn setTintColor:[copyBtn tintColor]];
-                    }
-                }
-            }
+        if ([tips respondsToSelector:@selector(addButtonWithTitle:handler:)]) {
+            [tips addButtonWithTitle:@"取消" handler:nil];
         }
-
+        if (![tips respondsToSelector:@selector(show)]) return NO;
         [tips show];
         return YES;
     } @catch (NSException *e) {
@@ -216,10 +201,10 @@ static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
     WCTableViewSectionManager *sec = [secCls defaultSection];
     [sec addCell:[cellCls switchCellForSel:@selector(toggleShowWxid:)
                                      target:self
-                                      title:@"指令显示ID"
+                                      title:@"启用指令显示ID"
                                          on:cfg.hasEnableShowWxid]];
     if ([sec respondsToSelector:@selector(setFooterTitle:)]) {
-        [sec setFooterTitle:@"聊天(联系人/群聊/公众号/服务号)发送/WXID"];
+        [sec setFooterTitle:@"聊天(联系人/群聊/公众号/服务号)发送指令:/WXID,弹窗展示原始ID"];
     }
     [self.tableViewMgr addSection:sec];
 
@@ -239,7 +224,7 @@ static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD显示WXID"
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD显示原始ID"
                                                       version:@"1.0.0"
                                                    controller:@"DDShowWxidSettingsViewController"];
         }
