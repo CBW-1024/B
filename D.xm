@@ -1,4 +1,4 @@
-// DD显示WXID —— 聊天窗口发送 /WXID 获取当前会话原始 ID
+// DD显示原始ID —— 聊天窗口发送 /WXID 获取当前会话原始 ID
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
