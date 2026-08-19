@@ -1,4 +1,4 @@
-// DD添加好友精确时间 v1.0.0 —— 联系人详情页显示好友精确添加时间
+// DD显示原始wxid v1.0.0 —— 联系人详情页显示原始 wxid，支持长按复制
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -12,71 +12,64 @@
 @end
 
 @interface WCTableViewManager : NSObject
+@property(retain, nonatomic) NSMutableArray *sections;
 - (instancetype)initWithFrame:(struct CGRect)arg1 style:(long long)arg2;
-- (void)clearAllSection;
 - (id)getTableView;
 - (void)addSection:(id)arg1;
+- (void)clearAllSection;
 - (void)reloadTableView;
 @end
 
+@interface MMTableViewInfo : WCTableViewManager
+@end
+
 @interface WCTableViewSectionManager : NSObject
+@property(retain, nonatomic) NSMutableArray *cells;
 + (id)defaultSection;
 + (id)sectionInfoHeader:(NSString *)header;
 - (void)addCell:(id)arg1;
-@property(retain, nonatomic) NSMutableArray *cells;
+- (void)insertCell:(id)arg1 At:(unsigned int)arg2;
+- (unsigned long long)getCellCount;
 @end
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
++ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4 canRightValueCopy:(_Bool)arg5;
 @end
 
 @interface CContact : NSObject
-@property(nonatomic) unsigned int m_uiAddCreateTime;
+@property(nonatomic, readonly) NSString *userName;
 @end
 
 @interface SocialInfomationViewController : UIViewController
 @property(retain, nonatomic) CContact *m_contact;
-- (void)addContactAddCreateTimeCellAtSection:(id)section;
-@end
-
-// 普通 cell 管理器
-@interface WCTableViewCellRightConfig : NSObject
-@property(copy, nonatomic) NSString *detail;
-@end
-
-@interface WCTableViewCellNormalConfig : NSObject
-@property(retain, nonatomic) WCTableViewCellRightConfig *rightConfig;
-@end
-
-@interface WCTableViewNormalCellManager : NSObject
-@property(retain, nonatomic) WCTableViewCellNormalConfig *cellConfig;
+@property(retain, nonatomic) MMTableViewInfo *m_tableViewInfo;
 @end
 
 #pragma mark - 配置
 
-static NSString * const kDDAddTimeConfigKey = @"DDAddTimeConfig";
-static NSString * const kDDAddTimeEnable     = @"enableAddTime";
+static NSString * const kDDShowWxidConfigKey = @"DDShowWxidConfig";
+static NSString * const kDDShowWxidEnable     = @"enableShowWxid";
 
-@interface DDAddTimeConfig : NSObject
+@interface DDShowWxidConfig : NSObject
 + (instancetype)shared;
 - (NSDictionary *)config;
 - (void)setValue:(id)value forConfigKey:(NSString *)key;
-- (BOOL)enableAddTime;
-- (BOOL)hasEnableAddTime;
+- (BOOL)enableShowWxid;
+- (BOOL)hasEnableShowWxid;
 @end
 
-@implementation DDAddTimeConfig
+@implementation DDShowWxidConfig
 
 + (instancetype)shared {
-    static DDAddTimeConfig *cfg = nil;
+    static DDShowWxidConfig *cfg = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ cfg = [DDAddTimeConfig new]; });
+    dispatch_once(&once, ^{ cfg = [DDShowWxidConfig new]; });
     return cfg;
 }
 
 - (NSDictionary *)config {
-    NSDictionary *cfg = [[NSUserDefaults standardUserDefaults] objectForKey:kDDAddTimeConfigKey];
+    NSDictionary *cfg = [[NSUserDefaults standardUserDefaults] objectForKey:kDDShowWxidConfigKey];
     return [cfg isKindOfClass:[NSDictionary class]] ? cfg : @{};
 }
 
@@ -88,16 +81,15 @@ static NSString * const kDDAddTimeEnable     = @"enableAddTime";
     } else {
         [cfg removeObjectForKey:key];
     }
-    [[NSUserDefaults standardUserDefaults] setObject:cfg forKey:kDDAddTimeConfigKey];
+    [[NSUserDefaults standardUserDefaults] setObject:cfg forKey:kDDShowWxidConfigKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
-// 默认关闭（未设置时视为关闭）
-- (BOOL)enableAddTime {
-    NSNumber *val = [self.config objectForKey:kDDAddTimeEnable];
+- (BOOL)enableShowWxid {
+    NSNumber *val = [self.config objectForKey:kDDShowWxidEnable];
     return val ? val.boolValue : NO;
 }
-- (BOOL)hasEnableAddTime { return [self.config objectForKey:kDDAddTimeEnable] != nil; }
+- (BOOL)hasEnableShowWxid { return [self.config objectForKey:kDDShowWxidEnable] != nil; }
 
 @end
 
@@ -105,62 +97,66 @@ static NSString * const kDDAddTimeEnable     = @"enableAddTime";
 
 %hook SocialInfomationViewController
 
-- (void)addContactAddCreateTimeCellAtSection:(id)section {
-    NSUInteger beforeCount = 0;
-    if ([section respondsToSelector:@selector(cells)]) {
-        beforeCount = ((WCTableViewSectionManager *)section).cells.count;
-    }
-
+- (void)viewDidLoad {
     %orig;
 
-    if (!DDAddTimeConfig.shared.enableAddTime) return;
+    if (!DDShowWxidConfig.shared.enableShowWxid) return;
 
     CContact *contact = self.m_contact;
     if (!contact) return;
-    if (![contact respondsToSelector:@selector(m_uiAddCreateTime)]) return;
+    if (![contact respondsToSelector:@selector(userName)]) return;
 
-    unsigned int addTime = contact.m_uiAddCreateTime;
-    if (addTime == 0) return;
+    NSString *wxid = contact.userName;
+    if (!wxid || wxid.length == 0) return;
 
-    NSDate *date = [NSDate dateWithTimeIntervalSince1970:addTime];
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"yyyy/MM/dd HH:mm:ss"];
-    NSString *timeString = [formatter stringFromDate:date];
+    MMTableViewInfo *tableInfo = self.m_tableViewInfo;
+    if (!tableInfo) return;
+    if (![tableInfo respondsToSelector:@selector(sections)]) return;
 
+    NSMutableArray *sections = tableInfo.sections;
+    if (sections.count == 0) return;
+
+    id section = sections[0];
+    if (!section) return;
+    Class secCls = objc_getClass("WCTableViewSectionManager");
+    if (!secCls || ![section isKindOfClass:secCls]) return;
     if (![section respondsToSelector:@selector(cells)]) return;
-    WCTableViewSectionManager *sec = (WCTableViewSectionManager *)section;
-    NSArray *cells = sec.cells;
-    if (cells.count == 0) return;
 
-    Class normalCls = objc_getClass("WCTableViewNormalCellManager");
-    NSUInteger startIdx = beforeCount < cells.count ? beforeCount : cells.count;
+    WCTableViewSectionManager *firstSection = (WCTableViewSectionManager *)section;
 
-    for (NSUInteger i = startIdx; i < cells.count; i++) {
-        id cell = cells[i];
-        if (!normalCls || ![cell isKindOfClass:normalCls]) continue;
-        WCTableViewNormalCellManager *normalCell = (WCTableViewNormalCellManager *)cell;
+    id cellCls = objc_getClass("WCTableViewCellManager");
+    if (!cellCls) return;
 
-        WCTableViewCellNormalConfig *cellConfig = normalCell.cellConfig;
-        if (!cellConfig) continue;
-        WCTableViewCellRightConfig *rightConfig = cellConfig.rightConfig;
-        if (!rightConfig) continue;
+    id cell = [cellCls normalCellForSel:@selector(ddWxidCellTapped:)
+                                 target:self
+                                  title:@"用户ID："
+                             rightValue:wxid
+                      canRightValueCopy:YES];
+    if (!cell) return;
 
-        NSString *detail = rightConfig.detail;
-        if (detail.length == 0) continue;
-
-        rightConfig.detail = timeString;
+    if ([firstSection respondsToSelector:@selector(addCell:)]) {
+        [firstSection addCell:cell];
     }
+
+    if ([tableInfo respondsToSelector:@selector(reloadTableView)]) {
+        [tableInfo reloadTableView];
+    }
+}
+
+%new
+- (void)ddWxidCellTapped:(id)sender {
+    // 点击回调，长按复制已由 canRightValueCopy 处理
 }
 
 %end
 
 #pragma mark - 设置界面
 
-@interface DDAddTimeSettingsViewController : UIViewController
+@interface DDShowWxidSettingsViewController : UIViewController
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
 @end
 
-@implementation DDAddTimeSettingsViewController
+@implementation DDShowWxidSettingsViewController
 
 - (void)ensureTableViewMgr {
     if (_tableViewMgr) return;
@@ -180,7 +176,7 @@ static NSString * const kDDAddTimeEnable     = @"enableAddTime";
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD添加好友精确时间";
+    self.title = @"DD显示原始wxid";
     [self ensureTableViewMgr];
     if (!_tableViewMgr) return;
     [self buildTable];
@@ -197,21 +193,21 @@ static NSString * const kDDAddTimeEnable     = @"enableAddTime";
     if (!cellCls || !secCls || !_tableViewMgr) return;
 
     [self.tableViewMgr clearAllSection];
-    DDAddTimeConfig *cfg = DDAddTimeConfig.shared;
+    DDShowWxidConfig *cfg = DDShowWxidConfig.shared;
 
     WCTableViewSectionManager *sec = [secCls defaultSection];
-    [sec addCell:[cellCls switchCellForSel:@selector(toggleAddTime:)
+    [sec addCell:[cellCls switchCellForSel:@selector(toggleShowWxid:)
                                      target:self
-                                      title:@"显示好友添加时间"
-                                         on:cfg.hasEnableAddTime]];
+                                      title:@"显示原始wxid"
+                                         on:cfg.hasEnableShowWxid]];
     [self.tableViewMgr addSection:sec];
 
     [self.tableViewMgr reloadTableView];
 }
 
-- (void)toggleAddTime:(UISwitch *)sender {
-    [DDAddTimeConfig.shared setValue:sender.isOn ? @(1) : @(0)
-                       forConfigKey:kDDAddTimeEnable];
+- (void)toggleShowWxid:(UISwitch *)sender {
+    [DDShowWxidConfig.shared setValue:sender.isOn ? @(1) : @(0)
+                       forConfigKey:kDDShowWxidEnable];
     [self buildTable];
 }
 
@@ -223,9 +219,9 @@ static NSString * const kDDAddTimeEnable     = @"enableAddTime";
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD添加好友精确时间"
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD显示原始wxid"
                                                       version:@"1.0.0"
-                                                   controller:@"DDAddTimeSettingsViewController"];
+                                                   controller:@"DDShowWxidSettingsViewController"];
         }
     }
 }
