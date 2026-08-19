@@ -26,7 +26,6 @@
 
 // 微信原生 ActionSheet（自带取消按钮，无需手动添加）
 @interface WCActionSheet : NSObject
-@property(retain, nonatomic) UIView *titleView; // 标题栏容器，其内 UILabel 承载标题文本
 - (id)initWithTitle:(NSString *)title;
 - (long long)addCustomViewWithTitle:(NSString *)title fontSize:(CGFloat)fontSize fontColor:(UIColor *)fontColor
                            WithDesc:(NSString *)desc descFontSize:(CGFloat)descFontSize descFontColor:(UIColor *)descFontColor
@@ -104,23 +103,17 @@ static UIWindow *ddCurrentKeyWindow(void) {
     return window;
 }
 
-// 微信原生 ActionSheet：原始 ID 显示在标题栏（系统字号/颜色），含「复制」按钮（取消按钮 WCActionSheet 自带）
+// 微信原生 ActionSheet：标题栏留空，标题+副标题两行承载内容，字号/颜色传 0/nil 走微信默认样式
+// 含「复制」按钮（取消按钮 WCActionSheet 自带）
 static BOOL ddShowWxidAlert(NSString *rawId) {
     if (!rawId.length) rawId = @"未获取到 ID";
-    Class sheetCls = objc_getClass("WCActionSheet");
-    WCActionSheet *sheet = [(WCActionSheet *)[sheetCls alloc] initWithTitle:rawId];
+    WCActionSheet *sheet = [(WCActionSheet *)[objc_getClass("WCActionSheet") alloc] initWithTitle:nil];
     if (!sheet) return NO;
+    [sheet addCustomViewWithTitle:@"用户ID：" fontSize:0 fontColor:nil
+                         WithDesc:rawId descFontSize:0 descFontColor:nil enable:YES];
     [sheet addButtonWithTitle:@"复制" eventAction:^{
         [UIPasteboard generalPasteboard].string = rawId;
     }];
-    // 标题栏 UILabel 重设为系统字号 + 系统动态颜色（覆盖微信默认的小字浅色）
-    for (UIView *sub in sheet.titleView.subviews) {
-        if ([sub isKindOfClass:UILabel.class]) {
-            ((UILabel *)sub).font = [UIFont systemFontOfSize:UIFont.labelFontSize];
-            ((UILabel *)sub).textColor = [UIColor labelColor];
-            break;
-        }
-    }
     UIWindow *targetWindow = ddCurrentKeyWindow();
     if (!targetWindow) return NO;
     [sheet showInView:targetWindow];
