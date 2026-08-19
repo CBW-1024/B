@@ -103,17 +103,14 @@ static UIWindow *ddCurrentKeyWindow(void) {
     return window;
 }
 
-// 微信原生 ActionSheet 展示，含「复制」按钮（取消按钮 WCActionSheet 自带）
-static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
-    if (!message.length) message = @"未获取到 ID";
+// 微信原生 ActionSheet：原始 ID 显示在标题栏，含「复制」按钮（取消按钮 WCActionSheet 自带）
+static BOOL ddShowWxidAlert(NSString *rawId) {
+    if (!rawId.length) rawId = @"未获取到 ID";
     Class sheetCls = objc_getClass("WCActionSheet");
-    WCActionSheet *sheet = [(WCActionSheet *)[sheetCls alloc] initWithTitle:title];
+    WCActionSheet *sheet = [(WCActionSheet *)[sheetCls alloc] initWithTitle:rawId];
     if (!sheet) return NO;
-    // 展示 ID 内容
-    [sheet addCustomViewWithTitle:message fontSize:16.0 fontColor:[UIColor blackColor]
-                         WithDesc:nil descFontSize:0 descFontColor:nil enable:YES];
     [sheet addButtonWithTitle:@"复制" eventAction:^{
-        [UIPasteboard generalPasteboard].string = message;
+        [UIPasteboard generalPasteboard].string = rawId;
     }];
     UIWindow *targetWindow = ddCurrentKeyWindow();
     if (!targetWindow) return NO;
@@ -131,7 +128,7 @@ static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
         if (wrap.m_uiMessageType == 1 && ddIsWxidCommand(wrap.m_nsContent)) {
             NSString *rawId = usr.length ? usr : wrap.m_nsToUsr;
             if (!rawId.length) rawId = @"未获取到 ID";
-            ddShowWxidAlert(@"原始ID", rawId);
+            ddShowWxidAlert(rawId);
             shouldSend = NO;
         }
     }
