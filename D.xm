@@ -88,6 +88,34 @@ static BOOL ddIsWxidCommand(NSString *text) {
     return [trimmed caseInsensitiveCompare:@"/WXID"] == NSOrderedSame;
 }
 
+// 获取当前前台活跃窗口（iOS 13+ 多场景，避免使用已废弃的 keyWindow）
+static UIWindow *ddCurrentKeyWindow(void) {
+    UIWindow *window = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:UIWindowScene.class]) continue;
+            UIWindowScene *winScene = (UIWindowScene *)scene;
+            if (winScene.activationState != UISceneActivationStateForegroundActive) continue;
+            for (UIWindow *w in winScene.windows) {
+                if (w.isKeyWindow) { window = w; break; }
+            }
+            if (window) break;
+        }
+        // 兜底：取前台场景第一个窗口
+        if (!window) {
+            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if ([scene isKindOfClass:UIWindowScene.class]) {
+                    UIWindowScene *winScene = (UIWindowScene *)scene;
+                    if (winScene.activationState != UISceneActivationStateForegroundActive) continue;
+                    window = winScene.windows.firstObject;
+                    if (window) break;
+                }
+            }
+        }
+    }
+    return window;
+}
+
 // 微信原生 ActionSheet 展示，含「复制」按钮（取消按钮 WCActionSheet 自带）
 static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
     if (!message.length) message = @"未获取到 ID";
@@ -109,8 +137,9 @@ static BOOL ddShowWxidAlert(NSString *title, NSString *message) {
             }];
         }
         if ([sheet respondsToSelector:@selector(showInView:)]) {
-            UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
-            [sheet showInView:keyWindow];
+            UIWindow *targetWindow = ddCurrentKeyWindow();
+            if (!targetWindow) return NO;
+            [sheet showInView:targetWindow];
             return YES;
         }
     } @catch (NSException *e) {
