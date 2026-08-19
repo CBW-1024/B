@@ -1,4 +1,4 @@
-// DD显示WXID —— 聊天窗口发送 /WXID 获取当前会话原始 ID
+// DD显示原始ID —— 聊天窗口发送 /WXID 获取当前会话原始 ID
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -184,7 +184,7 @@ static BOOL ddShowWxidAlert(NSString *rawId) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD显示WXID";
+    self.title = @"DD显示原始ID";
     [self ensureTableViewMgr];
     if (!_tableViewMgr) return;
     [self buildTable];
