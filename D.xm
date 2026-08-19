@@ -1,5 +1,5 @@
-// DD显示原始wxid v1.0.0 —— 联系人详情页显示原始 wxid，支持长按复制
-// 修改：改用 addRegionCellAtSection: 作为 hook 点，位置精准且时序安全，避免 viewDidLoad 塞 cell 导致闪退
+// DD显示原始wxid v1.0.0 —— 聊天窗口发送指令 /ID 获取当前会话原始 ID
+// 支持：单聊联系人、群聊、公众号、服务号
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -12,53 +12,27 @@
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-@interface WCTableViewManager : NSObject
-@property(retain, nonatomic) NSMutableArray *sections;
-- (instancetype)initWithFrame:(struct CGRect)arg1 style:(long long)arg2;
-- (id)getTableView;
-- (void)addSection:(id)arg1;
-- (void)clearAllSection;
-- (void)reloadTableView;
+@interface CBaseContact : NSObject
+@property(retain, nonatomic) NSString *m_nsUsrName;
 @end
 
-@interface MMTableViewInfo : WCTableViewManager
+// 所有聊天会话（单聊/群聊/公众号/服务号）的公共基类
+@interface BaseMsgContentLogicController : NSObject
+@property(retain, nonatomic) CBaseContact *m_contact;
+- (void)SendTextMessage:(NSString *)text;
 @end
 
-@interface WCTableViewSectionManager : NSObject
-@property(retain, nonatomic) NSMutableArray *cells;
-+ (id)defaultSection;
-+ (id)sectionInfoHeader:(NSString *)header;
-- (void)addCell:(id)arg1;
-- (void)insertCell:(id)arg1 At:(unsigned int)arg2;
-- (unsigned long long)getCellCount;
-@end
-
-@interface WCTableViewCellManager : NSObject
-+ (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4 canRightValueCopy:(_Bool)arg5;
-@end
-
-@interface CContact : NSObject
-@property(nonatomic, readonly) NSString *userName;
-@end
-
-@interface SocialInfomationViewController : UIViewController
-@property(retain, nonatomic) CContact *m_contact;
-@property(retain, nonatomic) MMTableViewInfo *m_tableViewInfo;
-- (void)addRegionCellAtSection:(id)section;
-- (void)addSourceCellAtSection:(id)section;
-- (void)addFriendInfoSection;
-- (void)ddInsertWxidCellAtSection:(id)section;
-- (void)ddWxidCellTapped:(id)sender;
+// 微信原生确认弹窗
+@interface WCUIAlertView : NSObject
++ (id)showAlertWithTitle:(NSString *)title message:(NSString *)message
+          cancelBtnTitle:(NSString *)cancel handler:(void (^)(id alert))cancelHandler
+                btnTitle:(NSString *)btn handler:(void (^)(id alert))btnHandler;
 @end
 
 #pragma mark - 配置
 
 static NSString * const kDDShowWxidConfigKey = @"DDShowWxidConfig";
 static NSString * const kDDShowWxidEnable     = @"enableShowWxid";
-
-// 关联对象 key，用于标记当前页面是否已插入 wxid cell，防止重复插入
-static char kDDShowWxidInsertedKey;
 
 @interface DDShowWxidConfig : NSObject
 + (instancetype)shared;
@@ -104,65 +78,78 @@ static char kDDShowWxidInsertedKey;
 
 #pragma mark - 插件主逻辑
 
-%hook SocialInfomationViewController
-
-// 地区 cell 所在的好友信息 section 是红圈标记位置
-// 在微信添加地区 cell 之后插入 wxid cell，正好显示在"地区"下方
-- (void)addRegionCellAtSection:(id)section {
-    %orig;
-    [self ddInsertWxidCellAtSection:section];
+// 判断文本是否等于 /ID（大小写不敏感）
+static BOOL ddIsIdCommand(NSString *text) {
+    if (!text || text.length == 0) return NO;
+    NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return NO;
+    if ([trimmed caseInsensitiveCompare:@"/ID"] == NSOrderedSame) return YES;
+    return NO;
 }
 
-// 兜底：部分地区为空时 addRegionCellAtSection: 不执行，此时从来源 cell 的 section 插入
-- (void)addSourceCellAtSection:(id)section {
-    %orig;
-    [self ddInsertWxidCellAtSection:section];
-}
+%hook BaseMsgContentLogicController
 
-%new
-// 往好友信息 section 插入"用户ID：原始wxid"单元格，长按右侧值可复制
-- (void)ddInsertWxidCellAtSection:(id)section {
-    if (!DDShowWxidConfig.shared.enableShowWxid) return;
+- (void)SendTextMessage:(NSString *)text {
+    // 开关关闭则正常发送
+    if (!DDShowWxidConfig.shared.enableShowWxid) {
+        %orig;
+        return;
+    }
 
-    // 每个页面只插入一次
-    NSNumber *inserted = objc_getAssociatedObject(self, &kDDShowWxidInsertedKey);
-    if (inserted && inserted.boolValue) return;
+    // 非 /ID 指令正常发送
+    if (!ddIsIdCommand(text)) {
+        %orig;
+        return;
+    }
 
-    CContact *contact = self.m_contact;
-    if (!contact) return;
-    if (![contact respondsToSelector:@selector(userName)]) return;
+    // 命中 /ID 指令：不发送，获取当前会话原始 ID 并展示
+    CBaseContact *contact = self.m_contact;
+    NSString *wxid = nil;
+    if (contact && [contact respondsToSelector:@selector(m_nsUsrName)]) {
+        wxid = contact.m_nsUsrName;
+    }
+    if (!wxid || wxid.length == 0) {
+        wxid = @"未获取到 ID";
+    }
 
-    NSString *wxid = contact.userName;
-    if (!wxid || wxid.length == 0) return;
+    // 微信原生弹窗展示原始 ID，提供「复制」「取消」两个按钮
+    Class alertCls = objc_getClass("WCUIAlertView");
+    if (!alertCls) return;
+    if (![alertCls respondsToSelector:@selector(showAlertWithTitle:message:cancelBtnTitle:handler:btnTitle:handler:)]) return;
 
-    if (!section) return;
-    Class secCls = objc_getClass("WCTableViewSectionManager");
-    if (!secCls || ![section isKindOfClass:secCls]) return;
-    if (![section respondsToSelector:@selector(cells)]) return;
-    if (![section respondsToSelector:@selector(addCell:)]) return;
-
-    id cellCls = objc_getClass("WCTableViewCellManager");
-    if (!cellCls) return;
-
-    id cell = [cellCls normalCellForSel:@selector(ddWxidCellTapped:)
-                                 target:self
-                                  title:@"用户ID："
-                             rightValue:wxid
-                      canRightValueCopy:YES];
-    if (!cell) return;
-
-    [section addCell:cell];
-    objc_setAssociatedObject(self, &kDDShowWxidInsertedKey, @(YES),
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-// 点击回调，长按复制已由 canRightValueCopy 处理
-- (void)ddWxidCellTapped:(id)sender {
+    [alertCls showAlertWithTitle:@"原始ID"
+                         message:wxid
+                  cancelBtnTitle:@"取消"
+                         handler:nil
+                        btnTitle:@"复制"
+                         handler:^(id alert) {
+        [UIPasteboard generalPasteboard].string = wxid;
+    }];
 }
 
 %end
 
 #pragma mark - 设置界面
+
+@interface WCTableViewManager : NSObject
+@property(retain, nonatomic) NSMutableArray *sections;
+- (instancetype)initWithFrame:(struct CGRect)arg1 style:(long long)arg2;
+- (id)getTableView;
+- (void)addSection:(id)arg1;
+- (void)clearAllSection;
+- (void)reloadTableView;
+@end
+
+@interface WCTableViewSectionManager : NSObject
+@property(retain, nonatomic) NSMutableArray *cells;
++ (id)defaultSection;
+- (void)addCell:(id)arg1;
+- (unsigned long long)getCellCount;
+@end
+
+@interface WCTableViewCellManager : NSObject
++ (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
+@end
 
 @interface DDShowWxidSettingsViewController : UIViewController
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
@@ -210,7 +197,7 @@ static char kDDShowWxidInsertedKey;
     WCTableViewSectionManager *sec = [secCls defaultSection];
     [sec addCell:[cellCls switchCellForSel:@selector(toggleShowWxid:)
                                      target:self
-                                      title:@"显示原始wxid"
+                                      title:@"/ID指令"
                                          on:cfg.hasEnableShowWxid]];
     [self.tableViewMgr addSection:sec];
 
