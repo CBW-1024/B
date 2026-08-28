@@ -297,26 +297,27 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
             if (pix) {
                 CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
                 if (img) {
-                    // ===== 视频填满整个 target（cover / aspect-fill），严格对齐 VCAM 0xbe74 =====
-                    // VCAM 0xbe74 反汇编（capstone 标注，已确认）：
+                    // ===== 视频完整显示、居中、不放大（contain / aspect-fit），与 VCAM 一致 =====
+                    // VCAM 0xbe74 反汇编（capstone 标注，已逐条核对）：
                     //   0xc3a0 a = (float)origW / rotExtentW
                     //   0xc3b4 b = (float)origH / rotExtentH
-                    //   0xc3d0 fcmp a,b; cset pl → scale = MAX(a,b)  ← cover，填满 target
-                    //   0xc46c tx=(tw-rotW*scale)/2; ty=(th-rotH*scale)/2
-                    // 用户图3/图4（VCAM 实际表现）确认：rotation=90 时视频**填满宽度、无黑边**，
-                    // 这正是 cover 行为。之前误判为 contain 致黑边回归，现纠正。
+                    //   0xc3d0 fcmp a,b ; 0xc3d4 cset w8, pl
+                    //   0xc3d8 tbnz w8,#0 → (a>=b 时) 取 b，否则取 a
+                    //   → scale = MIN(a,b)  ← 即 contain（完整显示、不放大、四周可能留黑边）
+                    //   （之前误读 cset pl 方向判成 MAX/cover，已纠正；这也与用户图3/图4 表现吻合）
+                    //   0xc46c tx=(origW - rotW*scale)/2 ; ty=(origH - rotH*scale)/2
                     //
                     // 实现路径：
-                    //   1) 一次性 transform：cover 缩放（MAX）+ 旋转 复合
+                    //   1) 一次性 transform：contain 缩放（MIN）+ 旋转 复合
                     //   2) 用 transform 后 extent 的 aabb 算居中平移（含 origin 修正）
                     //   3) imageByCompositingOverImage 合成到 (0,0,targetW,targetH) 纯黑画布
                     //      → 强制 composed.extent 严格等于 (0,0,targetW,targetH)
                     //   4) VCamMakeSampleBufferFromImage 用 render:toCVPixelBuffer（无 bounds）1:1 渲染
-                    //      → image (0,0) 映射到 buffer (0,0)，视频像素在画布中居中（cover 居中区域）
+                    //      → image (0,0) 映射到 buffer (0,0)，视频像素在画布中居中，四周均匀黑边
                     CGFloat targetW = targetSize.width;
                     CGFloat targetH = targetSize.height;
                     CGRect origE = img.extent;
-                    CGFloat scale = MAX(targetW / origE.size.width, targetH / origE.size.height);  // cover
+                    CGFloat scale = MIN(targetW / origE.size.width, targetH / origE.size.height);  // contain
                     // 复合 transform：scale * rotate（先缩放，再旋转）
                     CGAffineTransform tFit = CGAffineTransformMakeScale(scale, scale);
                     if (g_rotation == 90) {
