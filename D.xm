@@ -1,6 +1,6 @@
 // VCam — 微信视频/音频替换插件（Theos/Logos）
 // 视频：从相册/文件选视频，旋转居中后替换相机帧、微信视频通话帧、本地预览。
-// 音频：替换麦克风采集（AudioUnitRender）或 AVCaptureAudio 采集，源按目标格式重采样后投递。
+// 音频：替换 AVCaptureAudioDataOutput 采集（对齐 VCAM getAudioFrame，非直播路径）。
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
@@ -9,6 +9,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreImage/CoreImage.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -23,33 +24,41 @@ static CIContext    *g_ciContext    = nil;
 static AVAssetReader            *videoReader = nil;
 static AVAssetReaderTrackOutput *videoOutput = nil;
 
+// 最近一帧源画面（对齐 VCAM 0x25000+0xc78 g_lastPixelBuffer，reader 读完后冻结复用）
+static CVPixelBufferRef          g_lastVideoPixel = NULL;
+
 static AVAssetReader            *audioReader = nil;
 static AVAssetReaderTrackOutput *audioOutput = nil;
-static NSMutableData            *g_audioFIFO = nil;
 
+// 音频：整段解码进内存后按偏移切片（对齐 VCAM g_fullAudioPCM / g_audioPlayOffset）
+static NSMutableData *g_fullAudioPCM  = nil;
+static NSUInteger     g_audioPlayOffset = 0;
+static os_unfair_lock g_audioOffsetLock = OS_UNFAIR_LOCK_INIT;
+static BOOL           g_isAudioDecoding = NO;
+
+// AudioUnit 麦克风采集的目标格式（对齐 VCAM 0x25000+0xc98 保存 ASBD）
 static BOOL                         g_hasProbedASBD = NO;
 static AudioStreamBasicDescription  g_targetASBD    = {0};
 
-static int  g_sourceChannels = 2;
+static OSStatus (*orig_AudioUnitRender)(
+    AudioUnit                   inUnit,
+    AudioUnitRenderActionFlags  *ioActionFlags,
+    const AudioTimeStamp       *inTimeStamp,
+    UInt32                      inOutputBusNumber,
+    UInt32                      inNumberFrames,
+    AudioBufferList             *ioData
+) = NULL;
 
 static int  g_replaceMode       = 1;
 static BOOL g_isLoop             = YES;
 static BOOL g_isSound            = YES;
 static int  g_rotation           = 0;
 
-static BOOL g_isMirrored = NO;
+static BOOL g_isMirrored = YES;
 
 static BOOL g_videoReload = NO;
 static BOOL g_audioReload = NO;
 
-static OSStatus (*orig_AudioUnitRender)(
-    AudioUnit                  inUnit,
-    AudioUnitRenderActionFlags *ioActionFlags,
-    const AudioTimeStamp       *inTimeStamp,
-    UInt32                     inOutputBusNumber,
-    UInt32                     inNumberFrames,
-    AudioBufferList            *ioData
-) = NULL;
 
 static NSString *g_videoDir      = nil;
 static NSString *g_tempVideoPath = nil;
@@ -73,6 +82,7 @@ static void LoadSettings(void) {
     if ([d objectForKey:@"vcam_sound"])    g_isSound           = [d boolForKey:@"vcam_sound"];
     if ([d objectForKey:@"vcam_mode"])       g_replaceMode        = (int)[d integerForKey:@"vcam_mode"];
     if ([d objectForKey:@"vcam_mirror"])     g_isMirrored         = [d boolForKey:@"vcam_mirror"];
+    else                                     g_isMirrored         = YES;
 }
 
 #pragma mark - 文件路径辅助
@@ -100,104 +110,46 @@ static UIViewController *bear_getTopVC(void) {
     return vc;
 }
 
-#pragma mark - 音频格式转换（int16 源 → 目标 ASBD）
-
-static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
-                                       const AudioStreamBasicDescription *asbd,
-                                       AudioBufferList *ioData, UInt32 frames) {
-    if (!src || !asbd || !ioData || frames == 0) return;
-    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
-    BOOL nonInt  = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-    int  dstCh   = asbd->mChannelsPerFrame;
-    if (dstCh <= 0) dstCh = 1;
-    int  bits    = asbd->mBitsPerChannel;
-    if (bits < 1) bits = isFloat ? 32 : 16;
-    if (srcChannels <= 0) srcChannels = 1;
-
-    for (UInt32 i = 0; i < frames; i++) {
-        for (int c = 0; c < dstCh; c++) {
-            int16_t s = 0;
-            int idx = (srcChannels >= dstCh) ? c : 0;
-            s = src[i * srcChannels + idx];
-
-            if (isFloat) {
-                float f = s / 32768.0f;
-                if (nonInt) {
-                    float *d = (float *)ioData->mBuffers[c].mData;
-                    if (d) d[i] = f;
-                } else {
-                    float *d = (float *)ioData->mBuffers[0].mData;
-                    if (d) d[i * dstCh + c] = f;
-                }
-            } else if (bits == 32) {
-
-                int32_t v = (int32_t)s;
-                if (asbd->mFormatFlags & kAudioFormatFlagIsAlignedHigh) v = (int32_t)s << 16;
-                if (nonInt) {
-                    int32_t *d = (int32_t *)ioData->mBuffers[c].mData;
-                    if (d) d[i] = v;
-                } else {
-                    int32_t *d = (int32_t *)ioData->mBuffers[0].mData;
-                    if (d) d[i * dstCh + c] = v;
-                }
-            } else {
-
-                int16_t v = s;
-                if (nonInt) {
-                    int16_t *d = (int16_t *)ioData->mBuffers[c].mData;
-                    if (d) d[i] = v;
-                } else {
-                    int16_t *d = (int16_t *)ioData->mBuffers[0].mData;
-                    if (d) d[i * dstCh + c] = v;
-                }
-            }
-        }
-    }
-}
-
-#pragma mark - 通用：把 CIImage 渲染成新的 CMSampleBuffer（视频替换共用）
-static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
-                                                       size_t tw, size_t th, OSType pfmt,
-                                                       CMSampleBufferRef timingSrc) {
-    if (!img || tw == 0 || th == 0) return NULL;
-    NSDictionary *pbAttrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey:    @(pfmt),
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
-    CVPixelBufferRef newPixel = NULL;
-    CVPixelBufferCreate(kCFAllocatorDefault, tw, th, pfmt,
-                        (__bridge CFDictionaryRef)pbAttrs, &newPixel);
-    if (!newPixel) return NULL;
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-
-    [g_ciContext render:img toCVPixelBuffer:newPixel];
-    CGColorSpaceRelease(cs);
-
-    CMVideoFormatDescriptionRef fmtDesc = NULL;
-    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixel, &fmtDesc);
-    CMSampleBufferRef newSample = NULL;
-    if (fmtDesc) {
-        CMSampleTimingInfo timing;
-        if (CMSampleBufferGetSampleTimingInfo(timingSrc, 0, &timing) == noErr) {
-            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixel, YES,
-                                               NULL, NULL, fmtDesc, &timing, &newSample);
-        }
-        CFRelease(fmtDesc);
-    }
-    CVPixelBufferRelease(newPixel);
-    return newSample;
-}
-
 #pragma mark - MediaManager
 @interface MediaManager : NSObject
 + (void)setupVideoReaderIfNeeded;
 + (void)setupAudioReaderIfNeeded;
-+ (CIImage *)getVideoFrame:(CGSize)targetSize;
++ (CVPixelBufferRef)nextSourcePixel;
++ (CIImage *)composedImageForTarget:(CGSize)target;
++ (CIImage *)blackImageForTarget:(CGSize)target;
++ (CMSampleBufferRef)makeSampleFromImage:(CIImage *)img
+                                   width:(size_t)w height:(size_t)h
+                                  format:(OSType)pfmt
+                               timingSrc:(CMSampleBufferRef)src;
++ (CMSampleBufferRef)getVideoFrame:(CMSampleBufferRef)origSample;
++ (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample;
++ (void)decodeAudioToMemory;
 + (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length;
 + (void)cleanup;
-
-+ (CIImage *)vcam_mirrorImage:(CIImage *)img;
 @end
+
+// 恢复默认设置，并清空已选音视频文件与解码缓存
+static void ResetSettings(void) {
+    g_rotation     = 90;
+    g_isLoop       = YES;
+    g_isSound      = YES;
+    g_isMirrored   = YES;
+    g_replaceMode  = 0;
+    SaveSettings();
+
+    [MediaManager cleanup];
+
+    os_unfair_lock_lock(&g_audioOffsetLock);
+    g_fullAudioPCM    = nil;
+    g_audioPlayOffset = 0;
+    os_unfair_lock_unlock(&g_audioOffsetLock);
+
+    if (g_tempAudioPath)   [g_fileManager removeItemAtPath:g_tempAudioPath   error:nil];
+    [g_fileManager removeItemAtPath:getSandboxVideoPath() error:nil];
+
+    g_videoReload = YES;
+    g_audioReload = YES;
+}
 
 @implementation MediaManager
 + (void)setupVideoReaderIfNeeded {
@@ -209,13 +161,12 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
         AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
         videoReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
         AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+        if (g_lastVideoPixel) { CVPixelBufferRelease(g_lastVideoPixel); g_lastVideoPixel = NULL; }
         if (track) {
             NSDictionary *settings = @{
-                (id)kCVPixelBufferPixelFormatTypeKey:    @(kCVPixelFormatType_32BGRA),
-                (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
             };
             videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
-            videoOutput.alwaysCopiesSampleData = NO;
             [videoReader addOutput:videoOutput];
             [videoReader startReading];
         }
@@ -229,7 +180,6 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
     @autoreleasepool {
         if (audioReader) {
             [audioReader cancelReading]; audioReader = nil; audioOutput = nil;
-            g_audioFIFO = nil;
         }
         NSString *path = g_tempAudioPath;
         if (![g_fileManager fileExistsAtPath:path]) path = getSandboxVideoPath();
@@ -237,174 +187,270 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
         AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
         AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
         if (track) {
-            int srcCh = 2;
-            CMAudioFormatDescriptionRef desc = (__bridge CMAudioFormatDescriptionRef)track.formatDescriptions.firstObject;
-            if (desc) {
-                const AudioStreamBasicDescription *t = CMAudioFormatDescriptionGetStreamBasicDescription(desc);
-                if (t && t->mChannelsPerFrame > 0) srcCh = t->mChannelsPerFrame;
-            }
-            int outCh = srcCh;
-            if (g_hasProbedASBD && g_targetASBD.mChannelsPerFrame > 0) outCh = g_targetASBD.mChannelsPerFrame;
-            g_sourceChannels = outCh;
-
             audioReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
-            NSMutableDictionary *settings = [NSMutableDictionary dictionaryWithDictionary:@{
-                AVFormatIDKey:               @(kAudioFormatLinearPCM),
-                AVLinearPCMBitDepthKey:      @16,
-                AVLinearPCMIsFloatKey:       @NO,
-                AVLinearPCMIsBigEndianKey:   @NO,
-                AVLinearPCMIsNonInterleaved: @NO,
-                AVNumberOfChannelsKey:       @(outCh),
-            }];
-            if (g_hasProbedASBD && g_targetASBD.mSampleRate > 0) {
-                settings[AVSampleRateKey] = @(g_targetASBD.mSampleRate);
-            }
+            NSDictionary *settings = @{ AVFormatIDKey: @(kAudioFormatLinearPCM) };
             audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
             audioOutput.alwaysCopiesSampleData = NO;
             [audioReader addOutput:audioOutput];
             [audioReader startReading];
+            [self decodeAudioToMemory];
         }
     }
     g_audioReload = NO;
     [g_mediaLock unlock];
 }
 
-+ (CIImage *)vcam_mirrorImage:(CIImage *)img {
-    if (!img) return nil;
-    CGRect e = img.extent;
-    CGAffineTransform t = CGAffineTransformMakeTranslation(e.size.width, 0);
-    t = CGAffineTransformScale(t, -1, 1);
-    CIImage *m = [img imageByApplyingTransform:t];
-    CGRect me = m.extent;
-    if (me.origin.x != 0 || me.origin.y != 0)
-        m = [m imageByApplyingTransform:CGAffineTransformMakeTranslation(-me.origin.x, -me.origin.y)];
-    return m;
-}
-
-// 取一帧视频：旋转 + contain 居中 + 黑边合成，返回严格 (0,0,targetW,targetH) 的 CIImage
-+ (CIImage *)getVideoFrame:(CGSize)targetSize {
-    if (g_videoReload) [self setupVideoReaderIfNeeded];
-    [g_mediaLock lock];
-    CIImage *result = nil;
-    @autoreleasepool {
-        CMSampleBufferRef sample = [videoOutput copyNextSampleBuffer];
-        if (!sample && g_isLoop) {
-            [g_mediaLock unlock];
-            [self setupVideoReaderIfNeeded];
-            [g_mediaLock lock];
-            sample = [videoOutput copyNextSampleBuffer];
-        }
-        if (sample) {
-            CVPixelBufferRef pix = CMSampleBufferGetImageBuffer(sample);
-            if (pix) {
-                CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
-                if (img) {
-
-                    CGFloat targetW = targetSize.width;
-                    CGFloat targetH = targetSize.height;
-                    CGRect origE = img.extent;
-                    CGFloat srcW = origE.size.width;
-                    CGFloat srcH = origE.size.height;
-                    CGFloat srcX = origE.origin.x;
-                    CGFloat srcY = origE.origin.y;
-
-                    CGFloat angle = 0.0;
-                    if (g_rotation == 90)      angle = M_PI_2;
-                    else if (g_rotation == 180) angle = M_PI;
-                    else if (g_rotation == 270) angle = 3 * M_PI_2;
-                    CGFloat sa = sin(angle), ca = cos(angle);
-                    CGFloat rotW = fabs(srcW * ca) + fabs(srcH * sa);
-                    CGFloat rotH = fabs(srcW * sa) + fabs(srcH * ca);
-
-                    CGFloat scale = MIN(targetW / rotW, targetH / rotH);
-                    CGFloat fitW = rotW * scale;
-                    CGFloat fitH = rotH * scale;
-
-                    CGFloat cx0 = 0,                cy0 = 0;
-                    CGFloat cx1 = srcW * ca,        cy1 = srcW * sa;
-                    CGFloat cx2 = -srcH * sa,       cy2 = srcH * ca;
-                    CGFloat cx3 = srcW*ca - srcH*sa, cy3 = srcW*sa + srcH*ca;
-                    CGFloat minX = MIN(MIN(cx0, cx1), MIN(cx2, cx3));
-                    CGFloat minY = MIN(MIN(cy0, cy1), MIN(cy2, cy3));
-
-                    CGFloat tx = (targetW - fitW) / 2.0;
-                    CGFloat ty = (targetH - fitH) / 2.0;
-                    CGAffineTransform m = CGAffineTransformIdentity;
-                    m = CGAffineTransformTranslate(m, tx, ty);
-                    m = CGAffineTransformScale(m, scale, scale);
-                    m = CGAffineTransformTranslate(m, -minX, -minY);
-                    m = CGAffineTransformRotate(m, angle);
-                    m = CGAffineTransformTranslate(m, -srcX, -srcY);
-                    CIImage *transformed = [img imageByApplyingTransform:m];
-
-                    CIImage *cropped = [transformed imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
-
-                    CIImage *backdrop = [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]]
-                                         imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
-                    result = [cropped imageByCompositingOverImage:backdrop];
-                }
-            }
-            CFRelease(sample);
-        }
-    }
-
-    if (g_isMirrored && result) result = [self vcam_mirrorImage:result];
-    [g_mediaLock unlock];
-    return result;
-}
-
-// 从音频 reader 持续拉 PCM 字节进 FIFO，不足时循环回卷、仍不足补 0
-+ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length {
-    [g_mediaLock lock];
-    @autoreleasepool {
-        if (!g_audioFIFO) g_audioFIFO = [NSMutableData dataWithCapacity:length * 4];
-        while (g_audioFIFO.length < length) {
-            if (g_audioReload) [self setupAudioReaderIfNeeded];
-            CMSampleBufferRef sample = [audioOutput copyNextSampleBuffer];
-            if (!sample) {
-                if (g_isLoop) {
-                    [self setupAudioReaderIfNeeded];
-                    sample = [audioOutput copyNextSampleBuffer];
-                }
-                if (!sample) break;
-            }
-            if (sample) {
-                CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
+// 对齐 VCAM decodeAudioToMemory (0xab80)：把音频整段解码进内存，避免实时解码抖动
++ (void)decodeAudioToMemory {
+    if (g_isAudioDecoding) return;
+    if (!audioReader || !audioOutput) return;
+    AVAssetReader *reader = audioReader;
+    g_isAudioDecoding = YES;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableData *pcm = [NSMutableData data];
+        while (audioReader && audioOutput) {
+            @autoreleasepool {
+                CMSampleBufferRef s = [audioOutput copyNextSampleBuffer];
+                if (!s) break;
+                CMBlockBufferRef block = CMSampleBufferGetDataBuffer(s);
                 if (block) {
-                    size_t totalLen = 0;
-                    char  *dataPtr = NULL;
-                    size_t lenAtOffset = 0;
-                    OSStatus s = CMBlockBufferGetDataPointer(block, 0, &lenAtOffset, &totalLen, &dataPtr);
-                    if (s == kCMBlockBufferNoErr && totalLen > 0 && dataPtr) {
-                        [g_audioFIFO appendBytes:dataPtr length:totalLen];
+                    size_t len = 0, lenAtOffset = 0; char *ptr = NULL;
+                    if (CMBlockBufferGetDataPointer(block, 0, &lenAtOffset, &len, &ptr) == kCMBlockBufferNoErr
+                        && len > 0 && ptr) {
+                        [pcm appendBytes:ptr length:len];
                     }
                 }
-                CFRelease(sample);
+                CFRelease(s);
             }
         }
-        NSUInteger copyLen = MIN(length, g_audioFIFO.length);
-        if (copyLen > 0) {
-            memcpy(outData, g_audioFIFO.bytes, copyLen);
-            [g_audioFIFO replaceBytesInRange:NSMakeRange(0, copyLen) withBytes:NULL length:0];
+        os_unfair_lock_lock(&g_audioOffsetLock);
+        if (audioReader == reader && reader != nil) {
+            g_fullAudioPCM    = [pcm copy];
+            g_audioPlayOffset = 0;
         }
-        if (copyLen < length)
-            memset(outData + copyLen, 0, length - copyLen);
-    }
-    [g_mediaLock unlock];
+        os_unfair_lock_unlock(&g_audioOffsetLock);
+        g_isAudioDecoding = NO;
+    });
 }
 
+// 对齐 VCAM pullAudioData:length: (0xdc5c)：从内存 PCM 按偏移切片，到末尾回卷，不足补 0
++ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length {
+    if (!outData || length == 0) return;
+    if (length > 0x100000) { memset(outData, 0, length); return; }
+    os_unfair_lock_lock(&g_audioOffsetLock);
+    NSUInteger total = g_fullAudioPCM ? g_fullAudioPCM.length : 0;
+    if (total == 0) {
+        os_unfair_lock_unlock(&g_audioOffsetLock);
+        memset(outData, 0, length);
+        return;
+    }
+    const uint8_t *base = (const uint8_t *)g_fullAudioPCM.bytes;
+    NSUInteger written = 0;
+    while (written < length) {
+        if (g_audioPlayOffset >= total) {
+            if (g_isLoop) g_audioPlayOffset = 0;
+            else break;
+        }
+        NSUInteger avail = total - g_audioPlayOffset;
+        NSUInteger need  = length - written;
+        NSUInteger chunk = MIN(avail, need);
+        memcpy(outData + written, base + g_audioPlayOffset, chunk);
+        g_audioPlayOffset += chunk;
+        written += chunk;
+    }
+    os_unfair_lock_unlock(&g_audioOffsetLock);
+    if (written < length) memset(outData + written, 0, length - written);
+}
+
+// 对齐 VCAM 0xe198：从音频 reader 取一帧，套用采集帧的时序后返回（调用方负责 CFRelease）
++ (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample {
+    [g_mediaLock lock];
+    CMSampleBufferRef out = NULL;
+    @autoreleasepool {
+        if (g_audioReload) [self setupAudioReaderIfNeeded];
+        if (audioOutput) {
+            CMSampleBufferRef s = [audioOutput copyNextSampleBuffer];
+            if (!s && g_isLoop) {
+                [self setupAudioReaderIfNeeded];
+                s = [audioOutput copyNextSampleBuffer];
+            }
+            if (s) {
+                CMSampleTimingInfo timing;
+                if (origSample && CMSampleBufferGetSampleTimingInfo(origSample, 0, &timing) == noErr) {
+                    CMSampleBufferRef tmp = NULL;
+                    if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, s, 1, &timing, &tmp) == noErr && tmp) {
+                        out = tmp;
+                    }
+                }
+                if (out) CFRelease(s); else out = s;
+            }
+        }
+    }
+    [g_mediaLock unlock];
+    return out;
+}
+
+// 取下一帧源视频，reader 读完则复用上一帧（对齐 VCAM 0xc1e4 g_lastPixelBuffer），返回 +1 引用
++ (CVPixelBufferRef)nextSourcePixel {
+    if (g_videoReload) [self setupVideoReaderIfNeeded];
+    CVPixelBufferRef frame = NULL;
+
+    [g_mediaLock lock];
+    @autoreleasepool {
+        if (videoOutput) {
+            CMSampleBufferRef s = [videoOutput copyNextSampleBuffer];
+            if (s) {
+                CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(s);
+                if (pb) frame = (CVPixelBufferRef)CVPixelBufferRetain(pb);
+                CFRelease(s);
+            }
+        }
+        if (frame) {
+            if (g_lastVideoPixel) CVPixelBufferRelease(g_lastVideoPixel);
+            g_lastVideoPixel = (CVPixelBufferRef)CVPixelBufferRetain(frame);
+        } else if (g_lastVideoPixel) {
+            frame = (CVPixelBufferRef)CVPixelBufferRetain(g_lastVideoPixel);
+        }
+    }
+    [g_mediaLock unlock];
+
+    if (!frame && g_isLoop) {
+        [self setupVideoReaderIfNeeded];
+        [g_mediaLock lock];
+        @autoreleasepool {
+            if (videoOutput) {
+                CMSampleBufferRef s = [videoOutput copyNextSampleBuffer];
+                if (s) {
+                    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(s);
+                    if (pb) frame = (CVPixelBufferRef)CVPixelBufferRetain(pb);
+                    CFRelease(s);
+                }
+            }
+            if (frame) {
+                if (g_lastVideoPixel) CVPixelBufferRelease(g_lastVideoPixel);
+                g_lastVideoPixel = (CVPixelBufferRef)CVPixelBufferRetain(frame);
+            }
+        }
+        [g_mediaLock unlock];
+    }
+    return frame;
+}
+
+// 旋转 + contain 等比居中 + 黑底合成，返回 extent 严格为 (0,0,target) 的 CIImage
++ (CIImage *)composedImageForTarget:(CGSize)target {
+    CGFloat targetW = target.width, targetH = target.height;
+    if (targetW <= 0 || targetH <= 0) return nil;
+
+    CVPixelBufferRef pix = [self nextSourcePixel];
+    if (!pix) return nil;
+    CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
+    CVPixelBufferRelease(pix);
+    if (!img) return nil;
+
+    NSInteger orient = 1;
+    if      (g_rotation == 90)  orient = 6;
+    else if (g_rotation == 180) orient = 3;
+    else if (g_rotation == 270) orient = 8;
+    img = [img imageByApplyingOrientation:(CGImagePropertyOrientation)orient];
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (g_isMirrored) img = [img imageByApplyingCGOrientation:kCGImagePropertyOrientationUpMirrored];
+#pragma clang diagnostic pop
+
+    CGRect e = img.extent;
+    if (e.size.width <= 0 || e.size.height <= 0) return nil;
+
+    CGFloat scale = MIN(targetW / e.size.width, targetH / e.size.height);
+    img = [img imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+
+    CGFloat tx = (targetW - e.size.width  * scale) / 2.0;
+    CGFloat ty = (targetH - e.size.height * scale) / 2.0;
+    img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(tx, ty)];
+
+    return [img imageByCompositingOverImage:[self blackImageForTarget:target]];
+}
+
+// 全黑底图（对齐 VCAM createBlackFrame: 0xb554）
++ (CIImage *)blackImageForTarget:(CGSize)target {
+    return [[CIImage imageWithColor:[CIColor blackColor]]
+            imageByCroppingToRect:CGRectMake(0, 0, target.width, target.height)];
+}
+
+// 渲染成新的 CMSampleBuffer，沿用采集帧时序与 {Exif}/{TIFF} 附件（对齐 VCAM 0xc7c0~0xc9c0）
++ (CMSampleBufferRef)makeSampleFromImage:(CIImage *)img
+                                   width:(size_t)w height:(size_t)h
+                                  format:(OSType)pfmt
+                               timingSrc:(CMSampleBufferRef)src {
+    if (!img || w == 0 || h == 0) return NULL;
+    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pfmt,
+                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess || !pb) return NULL;
+
+    [g_ciContext render:img toCVPixelBuffer:pb
+                 bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:nil];
+
+    CMVideoFormatDescriptionRef fmtDesc = NULL;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmtDesc);
+    CMSampleBufferRef out = NULL;
+    if (fmtDesc) {
+        CMSampleTimingInfo timing;
+        timing.duration              = kCMTimeInvalid;
+        timing.presentationTimeStamp = kCMTimeInvalid;
+        timing.decodeTimeStamp       = kCMTimeInvalid;
+        if (src) CMSampleBufferGetSampleTimingInfo(src, 0, &timing);
+        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, YES,
+                                           NULL, NULL, fmtDesc, &timing, &out);
+        if (out && src) {
+            CFStringRef keys[2] = { kCGImagePropertyExifDictionary, kCGImagePropertyTIFFDictionary };
+            for (int i = 0; i < 2; i++) {
+                CFTypeRef v = CMGetAttachment(src, keys[i], NULL);
+                if (v) CMSetAttachment(out, keys[i], v, kCMAttachmentMode_ShouldPropagate);
+            }
+        }
+        CFRelease(fmtDesc);
+    }
+    CVPixelBufferRelease(pb);
+    return out;
+}
+
+// 对齐 VCAM getVideoFrame: 0xbf94：画布恒等于采集帧尺寸，旋转只作用于源画面
++ (CMSampleBufferRef)getVideoFrame:(CMSampleBufferRef)origSample {
+    if (!origSample) return NULL;
+    // 没选素材就原样透传，不输出黑帧；素材存在但取帧失败才走黑帧兜底
+    if (![g_fileManager fileExistsAtPath:getSandboxVideoPath()]) return NULL;
+    CVPixelBufferRef camPix = CMSampleBufferGetImageBuffer(origSample);
+    if (!camPix) return NULL;
+
+    CGSize target = CGSizeMake((CGFloat)CVPixelBufferGetWidth(camPix),
+                               (CGFloat)CVPixelBufferGetHeight(camPix));
+    OSType pfmt = CVPixelBufferGetPixelFormatType(camPix);
+
+    CIImage *img = [self composedImageForTarget:target];
+    if (!img) img = [self blackImageForTarget:target];
+    return [self makeSampleFromImage:img
+                               width:(size_t)target.width
+                              height:(size_t)target.height
+                              format:pfmt
+                           timingSrc:origSample];
+}
+
+// 释放视频/音频 reader
 + (void)cleanup {
     [g_mediaLock lock];
     if (videoReader) { [videoReader cancelReading]; videoReader = nil; videoOutput = nil; }
     if (audioReader) { [audioReader cancelReading]; audioReader = nil; audioOutput = nil; }
-    g_audioFIFO = nil;
-    g_hasProbedASBD = NO;
+    if (g_lastVideoPixel) { CVPixelBufferRelease(g_lastVideoPixel); g_lastVideoPixel = NULL; }
     [g_mediaLock unlock];
 }
 @end
 
-#pragma mark - AudioUnitRender Hook（音频替换）
-// 钩住麦克风采集单元的 AudioUnitRender，用替换音频覆盖输出 buffer
+#pragma mark - AudioUnitRender Hook（麦克风采集替换）
+
+// 对齐 VCAM hooked_AudioUnitRender (0x172d0)：
+//   type=='auou' 且 subtype=='rioc'/'vpio'、bus==1、scope=Output 探测 ASBD，
+//   按 ioData buffer 尺寸拉 PCM 后 memcpy，不做格式转换
 static OSStatus hooked_AudioUnitRender(
     AudioUnit                   inUnit,
     AudioUnitRenderActionFlags  *ioActionFlags,
@@ -415,36 +461,42 @@ static OSStatus hooked_AudioUnitRender(
 ) {
     OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
                                            inOutputBusNumber, inNumberFrames, ioData);
-    if (status != noErr)                     return status;
-    if (g_replaceMode == 0 || !g_isSound)  return status;
+    if (status != noErr)                    return status;
+    if (g_replaceMode == 0 || !g_isSound)   return status;
+    if (!ioData || inOutputBusNumber != 1)  return status;
 
-    AudioComponentDescription cd = {0};
     AudioComponent comp = AudioComponentInstanceGetComponent(inUnit);
-    if (comp && AudioComponentGetDescription(comp, &cd) == noErr) {
-
-        OSType sub = cd.componentSubType;
-        BOOL isMic = (sub == 'rioc') || (sub == 'vpio');
-        if (!isMic) return status;
-    }
+    if (!comp) return status;
+    AudioComponentDescription cd = {0};
+    if (AudioComponentGetDescription(comp, &cd) != noErr) return status;
+    if (cd.componentType != 'auou') return status;
+    if (cd.componentSubType != 'rioc' && cd.componentSubType != 'vpio') return status;
 
     if (!g_hasProbedASBD) {
         UInt32 propSize = sizeof(g_targetASBD);
-        AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
-                             kAudioUnitScope_Output, inOutputBusNumber,
-                             &g_targetASBD, &propSize);
-        g_hasProbedASBD = YES;
-        [MediaManager setupAudioReaderIfNeeded];
+        if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
+                                 kAudioUnitScope_Output, 1,
+                                 &g_targetASBD, &propSize) == noErr
+            && g_targetASBD.mSampleRate > 0) {
+            g_hasProbedASBD = YES;
+            [MediaManager setupAudioReaderIfNeeded];
+            [MediaManager decodeAudioToMemory];
+        }
     }
-    if (g_targetASBD.mChannelsPerFrame == 0) g_targetASBD.mChannelsPerFrame = 1;
+    if (!g_hasProbedASBD) return status;
 
-    int srcCh = g_sourceChannels ?: 2;
+    UInt32 size = ioData->mBuffers[0].mDataByteSize;
+    if (size == 0 || size > 0x100000) return status;
 
-    NSUInteger needBytes = inNumberFrames * srcCh * 2;
-    uint8_t *raw = (uint8_t *)malloc(needBytes);
-    if (!raw) return noErr;
-    [MediaManager pullAudioData:raw length:needBytes];
-    vcam_convert_int16_to_asbd((const int16_t *)raw, srcCh, &g_targetASBD, ioData, inNumberFrames);
-    free(raw);
+    uint8_t *temp = (uint8_t *)calloc(1, size);
+    if (!temp) return status;
+    [MediaManager pullAudioData:temp length:size];
+    for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
+        if (!ioData->mBuffers[i].mData) continue;
+        if (ioData->mBuffers[i].mDataByteSize != size) continue;
+        memcpy(ioData->mBuffers[i].mData, temp, size);
+    }
+    free(temp);
     return noErr;
 }
 
@@ -461,28 +513,14 @@ static OSStatus hooked_AudioUnitRender(
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      fromConnection:(AVCaptureConnection *)connection {
     if (g_replaceMode == 1) {
-        CVPixelBufferRef origPixel = CMSampleBufferGetImageBuffer(sampleBuffer);
-        if (origPixel) {
-            size_t  srcW = CVPixelBufferGetWidth(origPixel);
-            size_t  srcH = CVPixelBufferGetHeight(origPixel);
-            OSType  pfmt = CVPixelBufferGetPixelFormatType(origPixel);
-
-            size_t  tw = srcW, th = srcH;
-            if (g_rotation == 90 || g_rotation == 270) {
-                tw = srcH; th = srcW;
+        CMSampleBufferRef newSample = [MediaManager getVideoFrame:sampleBuffer];
+        if (newSample) {
+            if (_originalDelegate &&
+                [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+                [_originalDelegate captureOutput:output didOutputSampleBuffer:newSample fromConnection:connection];
             }
-            CIImage *img = [MediaManager getVideoFrame:CGSizeMake(tw, th)];
-            if (img) {
-                CMSampleBufferRef newSample = VCamMakeSampleBufferFromImage(img, tw, th, pfmt, sampleBuffer);
-                if (newSample) {
-                    if (_originalDelegate &&
-                        [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-                        [_originalDelegate captureOutput:output didOutputSampleBuffer:newSample fromConnection:connection];
-                    }
-                    CFRelease(newSample);
-                    return;
-                }
-            }
+            CFRelease(newSample);
+            return;
         }
     }
     if (_originalDelegate &&
@@ -515,64 +553,9 @@ static VCamVideoProxy *g_videoProxy = nil;
      fromConnection:(AVCaptureConnection *)connection {
     CMSampleBufferRef outBuf = sampleBuffer;
 
-    if ((g_replaceMode == 1) && g_isSound) {
-        CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
-        const AudioStreamBasicDescription *asbd = fmt ? CMAudioFormatDescriptionGetStreamBasicDescription(fmt) : NULL;
-        if (asbd && asbd->mFormatID == kAudioFormatLinearPCM) {
-            UInt32 frames = (UInt32)CMSampleBufferGetNumSamples(sampleBuffer);
-            int dstCh = asbd->mChannelsPerFrame;
-            if (dstCh <= 0) dstCh = 1;
-            int bytesPerSamp = asbd->mBitsPerChannel / 8;
-            if (bytesPerSamp < 1) bytesPerSamp = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) ? 4 : 2;
-            BOOL nonInt = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-            UInt32 totalBytes = frames * bytesPerSamp * (nonInt ? dstCh : 1);
-
-            uint8_t *data = (uint8_t *)calloc(totalBytes, 1);
-            if (data) {
-                AudioBufferList abl;
-                abl.mNumberBuffers = nonInt ? dstCh : 1;
-                for (int c = 0; c < (int)abl.mNumberBuffers; c++) {
-                    abl.mBuffers[c].mNumberChannels = nonInt ? 1 : dstCh;
-                    abl.mBuffers[c].mDataByteSize    = frames * bytesPerSamp;
-                    abl.mBuffers[c].mData            = data + (nonInt ? c * frames * bytesPerSamp : 0);
-                }
-                int srcCh = g_sourceChannels ?: 2;
-                NSUInteger need = frames * srcCh * 2;
-                uint8_t *raw = (uint8_t *)malloc(need);
-                if (raw) {
-                    [MediaManager pullAudioData:raw length:need];
-                    vcam_convert_int16_to_asbd((const int16_t *)raw, srcCh, asbd, &abl, frames);
-                    free(raw);
-
-                    CMBlockBufferRef block = NULL;
-
-                    CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, data, totalBytes,
-                                                       kCFAllocatorDefault, NULL, 0, totalBytes, 0, &block);
-                    if (block) {
-                        AudioChannelLayoutTag tag = (dstCh == 1) ? kAudioChannelLayoutTag_Mono
-                                                                : kAudioChannelLayoutTag_Stereo;
-                        AudioChannelLayout layout = {0}; layout.mChannelLayoutTag = tag;
-                        CMAudioFormatDescriptionRef newFmt = NULL;
-                        CMAudioFormatDescriptionCreate(kCFAllocatorDefault, asbd,
-                                                       sizeof(layout), &layout, 0, NULL, NULL, &newFmt);
-                        CMSampleTimingInfo timing;
-                        if (newFmt && CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timing) == noErr) {
-                            CMSampleBufferRef newS = NULL;
-
-                            CMSampleBufferCreate(kCFAllocatorDefault, block, YES, NULL, NULL,
-                                                 newFmt, frames, 1, &timing, 0, NULL, &newS);
-                            if (newS) outBuf = newS;
-                        }
-                        if (newFmt) CFRelease(newFmt);
-                        CFRelease(block);
-                    } else {
-                        free(data);
-                    }
-                } else {
-                    free(data);
-                }
-            }
-        }
+    if (g_replaceMode == 1 && g_isSound) {
+        CMSampleBufferRef rep = [MediaManager getAudioFrame:sampleBuffer];
+        if (rep) outBuf = rep;
     }
 
     if (_origDelegate &&
@@ -603,25 +586,8 @@ static VCamAudioProxy *g_audioProxy = nil;
     (void)outputTexture; (void)flipX; (void)ignoreBg;
     if (g_replaceMode == 0) { return %orig; }
 
-    CVPixelBufferRef origPixel = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (!origPixel) return %orig;
-
-    size_t  srcW = CVPixelBufferGetWidth(origPixel);
-    size_t  srcH = CVPixelBufferGetHeight(origPixel);
-    OSType  pfmt = CVPixelBufferGetPixelFormatType(origPixel);
-
-    size_t  tw = srcW, th = srcH;
-    if (g_rotation == 90 || g_rotation == 270) {
-        tw = srcH; th = srcW;
-    }
-    CIImage *img = [MediaManager getVideoFrame:CGSizeMake(tw, th)];
-    if (img) {
-        CMSampleBufferRef newSample = VCamMakeSampleBufferFromImage(img, tw, th, pfmt, sampleBuffer);
-        if (newSample) {
-
-            return (__bridge_transfer id)newSample;
-        }
-    }
+    CMSampleBufferRef newSample = [MediaManager getVideoFrame:sampleBuffer];
+    if (newSample) return (__bridge_transfer id)newSample;
     return %orig;
 }
 %end
@@ -674,8 +640,8 @@ static char kVCamOverlayTag;
             if (!ov) continue;
             CGSize sz = ov.bounds.size;
             if (sz.width <= 0 || sz.height <= 0) sz = CGSizeMake(720, 1280);
-            CIImage *img = [MediaManager getVideoFrame:sz];
-            if (!img) continue;
+            CIImage *img = [MediaManager composedImageForTarget:sz];
+            if (!img) { ov.contents = nil; continue; }
             CGImageRef cg = [g_ciContext createCGImage:img fromRect:img.extent];
             if (cg) { ov.contents = (__bridge id)cg; CGImageRelease(cg); }
         }
@@ -711,6 +677,7 @@ static char kVCamOverlayTag;
     UIButton *_btnRotate;
     UIButton *_btnEnable;
     UIButton *_btnMirror;
+    UIButton *_btnReset;
     UIView   *_contentView;
 }
 
@@ -827,7 +794,8 @@ static char kVCamOverlayTag;
     y += btnH + gap;
 
     _btnEnable = [self addGridButton:g_replaceMode == 1 ? @"替换: 开" : @"替换: 关"
-                  x:btnW + gap y:y w:btnW h:btnH action:@selector(actionRestore)];
+                  x:0 y:y w:btnW h:btnH action:@selector(actionRestore)];
+    _btnReset  = [self addGridButton:@"重置" x:btnW + gap y:y w:btnW h:btnH action:@selector(actionReset)];
     y += btnH + gap;
 
     [_panelView.heightAnchor constraintEqualToConstant:y + 56 + 16].active = YES;
@@ -839,6 +807,7 @@ static char kVCamOverlayTag;
 - (void)toggleSound  { g_isSound = !g_isSound; SaveSettings(); [self refreshGridButtons]; }
 - (void)actionRestore{ g_replaceMode = (g_replaceMode == 1) ? 0 : 1; SaveSettings(); [self refreshGridButtons]; }
 - (void)toggleMirror { g_isMirrored = !g_isMirrored; SaveSettings(); [self refreshGridButtons]; }
+- (void)actionReset  { ResetSettings(); [self refreshGridButtons]; }
 
 - (void)refreshGridButtons {
     UIFont *font = [UIFont systemFontOfSize:[UIFont systemFontSize] weight:UIFontWeightMedium];
@@ -901,8 +870,10 @@ static char kVCamOverlayTag;
         NSString *dest = getSandboxVideoPath();
         if ([g_fileManager fileExistsAtPath:dest]) [g_fileManager removeItemAtPath:dest error:nil];
         [g_fileManager copyItemAtPath:src toPath:dest error:nil];
-        g_videoReload = YES;
-        g_audioReload = YES;
+        g_replaceMode  = 1;
+        g_videoReload  = YES;
+        g_audioReload  = YES;
+        SaveSettings();
         [MediaManager setupVideoReaderIfNeeded];
         [MediaManager setupAudioReaderIfNeeded];
     } else if (hasAudio) {
@@ -969,14 +940,13 @@ static void AddTapGestureToWindow(UIWindow *win) {
 %end
 
 #pragma mark - 构造 / 析构
-// 初始化全局状态、目录、reader；钩住 AudioUnitRender 接管麦克风音频
+// 初始化全局状态、沙箱目录、音视频 reader
 %ctor {
     g_fileManager = [NSFileManager defaultManager];
     g_mediaLock   = [[NSLock alloc] init];
-    g_audioFIFO   = [NSMutableData data];
     LoadSettings();
     g_ciContext = [CIContext contextWithOptions:@{
-        kCIContextWorkingColorSpace: (__bridge id)CGColorSpaceCreateDeviceRGB(),
+        kCIContextWorkingColorSpace: [NSNull null],
     }];
     g_videoDir = [GetDocumentPath() stringByAppendingPathComponent:@"VCAM"];
     [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
