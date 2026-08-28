@@ -59,15 +59,9 @@ static AVAssetReaderTrackOutput *g_audioOutput = nil;
 // 最近一帧源画面（对齐 VCAM 0x25000+0xc78 g_lastPixelBuffer，reader 读完后冻结复用）
 static CVPixelBufferRef g_lastVideoPixel = NULL;
 
-// 取帧结果：区分「reader 暂时没货」和「reader 已读完」，只有后者才允许重建 reader
-// （对齐 VCAM 0x25000+0xa38：读完标记只由 copyNextSampleBuffer 返回 nil 置位）
-typedef NS_ENUM(NSInteger, VCMPullResult) {
-    VCMPullEmpty     = 0,   // reader 还活着但暂时没货，复用上一帧
-    VCMPullGotFrame  = 1,   // 取到新帧
-    VCMPullDrained   = 2,   // reader 已读完
-};
-// reader 是否还可能产出新帧：刚 startReading 时状态可能还停在 Unknown，
-// 只按 ==Reading 判断会把 Unknown 误判成读完，导致循环不断重建 reader
+// reader 是否还可能产出新帧：只用于整段解码的循环条件（decodeAudioToMemory）。
+// 注意：取帧路径不能拿 reader.status 判定「读完」——对齐 VCAM 0xbfe8~0xbff0，
+// 只要 copyNextSampleBuffer 返回 nil 就置 reload，由下一帧开头重建 reader。
 static BOOL vcm_readerLive(AVAssetReader *reader) {
     if (!reader) return NO;
     AVAssetReaderStatus st = reader.status;
@@ -130,11 +124,6 @@ static void vcm_loadSettings(void) {
 
 #pragma mark - 停止 reader 与重置
 // 丢弃冻结的末帧（切换素材时调用，避免新旧素材串帧）
-static void vcm_clearLastVideoFrame(void) {
-    [g_mediaLock lock];
-    if (g_lastVideoPixel) { CVPixelBufferRelease(g_lastVideoPixel); g_lastVideoPixel = NULL; }
-    [g_mediaLock unlock];
-}
 static void vcm_stopReaders(void) {
     [g_mediaLock lock];
     if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
@@ -204,6 +193,24 @@ static UIViewController *vcm_topViewController(void) {
 + (void)setupVideoReaderIfNeeded {
     [g_mediaLock lock];
     @autoreleasepool {
+        // 对齐 VCAM 0x9c5c~0x9cb4：reload 未置位、reader 存在且还没读完 → 保持现状，不重建。
+        // 缺这道门禁，每次取帧都会重建 reader，画面会永远停在第一帧。
+        if (!g_videoReload && g_videoReader &&
+            g_videoReader.status != AVAssetReaderStatusCompleted) {
+            g_videoReload = NO;
+            [g_mediaLock unlock];
+            return;
+        }
+        // 对齐 VCAM 0x9cc0~0x9d14：循环关闭 + reader 已读完 → 冻结末帧，不重建。
+        // 循环开启时这里必须放行，否则播完就再也不动。
+        if (!g_isLoop && g_videoReader &&
+            g_videoReader.status == AVAssetReaderStatusCompleted) {
+            g_videoReload = NO;
+            [g_mediaLock unlock];
+            return;
+        }
+        g_videoReload = NO;
+
         if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
         NSString *path = vcm_videoPath();
         if (![g_fileManager fileExistsAtPath:path]) { g_videoReload = NO; [g_mediaLock unlock]; return; }
@@ -227,6 +234,22 @@ static UIViewController *vcm_topViewController(void) {
 + (void)setupAudioReaderIfNeeded {
     [g_mediaLock lock];
     @autoreleasepool {
+        // 对齐 VCAM 0xa420~0xa478：reload 未置位、reader 存在且还没读完 → 不重建
+        if (!g_audioReload && g_audioReader &&
+            g_audioReader.status != AVAssetReaderStatusCompleted) {
+            g_audioReload = NO;
+            [g_mediaLock unlock];
+            return;
+        }
+        // 对齐 VCAM 0xa480~0xa520：循环关闭 + reader 已读完 → 不重建（循环开启时放行）
+        if (!g_isLoop && g_audioReader &&
+            g_audioReader.status == AVAssetReaderStatusCompleted) {
+            g_audioReload = NO;
+            [g_mediaLock unlock];
+            return;
+        }
+        g_audioReload = NO;
+
         if (g_audioReader) {
             [g_audioReader cancelReading]; g_audioReader = nil; g_audioOutput = nil;
         }
@@ -326,22 +349,14 @@ static UIViewController *vcm_topViewController(void) {
     if (g_audioReload) [self setupAudioReaderIfNeeded];
 
     CMSampleBufferRef s = NULL;
-    BOOL drained = NO;
     [g_mediaLock lock];
     @autoreleasepool {
         if (g_audioOutput) s = [g_audioOutput copyNextSampleBuffer];
-        drained = (s == NULL) && !vcm_readerLive(g_audioReader);
     }
     [g_mediaLock unlock];
 
-    if (!s && drained && g_isLoop) {
-        [self setupAudioReaderIfNeeded];
-        [g_mediaLock lock];
-        @autoreleasepool {
-            if (g_audioOutput) s = [g_audioOutput copyNextSampleBuffer];
-        }
-        [g_mediaLock unlock];
-    }
+    // 对齐 VCAM：取不到帧就置 reload，留给下一帧开头重建，理由同 nextSourcePixel
+    if (!s) g_audioReload = YES;
     if (!s) return NULL;
 
     CMSampleBufferRef out = NULL;
@@ -359,11 +374,11 @@ static UIViewController *vcm_topViewController(void) {
 // 从当前 video reader 取一帧，返回 +1 引用；取帧结果通过 outState 回传。
 // 对齐 VCAM 0xc090~0xc104：不做墙钟节流，一帧采集对应一帧源；
 // 预览由采集回调 enqueue 到 AVSampleBufferDisplayLayer，不存在两条链路叠加消费
-static CVPixelBufferRef vcm_pullVideoFrame(VCMPullResult *outState) {
+static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CVPixelBufferRef frame = NULL;
     [g_mediaLock lock];
     @autoreleasepool {
-        if (!g_videoOutput) { *outState = VCMPullDrained; [g_mediaLock unlock]; return NULL; }
+        if (!g_videoOutput) { [g_mediaLock unlock]; return NULL; }
         CMSampleBufferRef s = [g_videoOutput copyNextSampleBuffer];
         if (s) {
             CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(s);
@@ -371,9 +386,6 @@ static CVPixelBufferRef vcm_pullVideoFrame(VCMPullResult *outState) {
             CFRelease(s);
         }
     }
-    // reader 仍在读但暂时没货：不能误判成读完，否则循环会不断重建 reader
-    *outState = frame ? VCMPullGotFrame
-              : (vcm_readerLive(g_videoReader) ? VCMPullEmpty : VCMPullDrained);
     [g_mediaLock unlock];
     return frame;
 }
@@ -382,21 +394,20 @@ static CVPixelBufferRef vcm_pullVideoFrame(VCMPullResult *outState) {
 + (CVPixelBufferRef)nextSourcePixel {
     if (g_videoReload) [self setupVideoReaderIfNeeded];
 
-    VCMPullResult state = VCMPullEmpty;
-    CVPixelBufferRef frame = vcm_pullVideoFrame(&state);
-
-    // 只有真正读完才重建 reader
-    if (!frame && state == VCMPullDrained && g_isLoop) {
-        [self setupVideoReaderIfNeeded];
-        frame = vcm_pullVideoFrame(&state);
-    }
+    CVPixelBufferRef frame = vcm_pullVideoFrame();
+    // 对齐 VCAM 0xbfe8~0xbff0：取不到帧就置 reload，由下一帧开头重建 reader。
+    // 不再拿 reader.status 判定「读完」——status 何时变 Completed 没有时序保证，
+    // 依赖它会让循环永远触发不了，画面就一直冻结在末帧。
+    // 另外不在这里同帧重建：刚 startReading 的 reader 首帧必然取不到，
+    // 同帧重建会白扔一个 reader，必须留给下一帧。
+    if (!frame) g_videoReload = YES;
 
     [g_mediaLock lock];
     if (frame) {
         if (g_lastVideoPixel) CVPixelBufferRelease(g_lastVideoPixel);
         g_lastVideoPixel = (CVPixelBufferRef)CVPixelBufferRetain(frame);
     } else if (g_lastVideoPixel) {
-        // 循环开启但重建失败、或循环关闭：冻结在最后一帧，避免闪回真实摄像头
+        // 刚重建 reader 还没出图、或循环关闭：冻结在最后一帧，避免闪回真实摄像头
         frame = (CVPixelBufferRef)CVPixelBufferRetain(g_lastVideoPixel);
     }
     [g_mediaLock unlock];
@@ -936,7 +947,9 @@ static VCamAudioProxy *g_audioProxy = nil;
         NSString *dest = vcm_videoPath();
         if ([g_fileManager fileExistsAtPath:dest]) [g_fileManager removeItemAtPath:dest error:nil];
         [g_fileManager copyItemAtPath:src toPath:dest error:nil];
-        vcm_clearLastVideoFrame();   // 换新素材，丢掉旧素材冻结的末帧
+        // 停掉 reader 而不只是清冻结帧：换素材时若循环关闭、且旧 reader 已读完，
+        // setup 里的 loop 门禁会把重建挡掉，新素材就永远不生效
+        vcm_stopReaders();
         g_isReplace    = YES;
         g_videoReload  = YES;
         g_audioReload  = YES;
