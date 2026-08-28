@@ -933,7 +933,6 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 
     NSURL *url = info[UIImagePickerControllerMediaURL];
     if (url) { [self processSelectedVideoURL:url]; return; }
-    UIImage *img = info[UIImagePickerControllerOriginalImage];
 }
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker { [picker dismissViewControllerAnimated:YES completion:nil]; }
 
