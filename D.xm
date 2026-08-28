@@ -4,6 +4,7 @@
 #import <AVFAudio/AVFAudio.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <CoreImage/CoreImage.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
@@ -28,14 +29,13 @@ static AudioStreamBasicDescription  g_targetASBD    = {0};
 
 static int  g_sourceChannels = 2;
 
-static BOOL g_enableReplacement = YES;
+// 统一替换模式（对齐 VCAM 0x25000+0xc10 模式字节：0=关 1=视频 2=照片；本引擎无直播源，故无模式 3）
+static int  g_replaceMode       = 1;
 static BOOL g_isLoop             = YES;
 static BOOL g_isSound            = YES;
 static int  g_rotation           = 90;
 
 static BOOL g_isMirrored = NO;
-
-static BOOL g_enablePhotoReplacement = NO;
 
 static UIImage *g_currentPhotoImg = nil;
 
@@ -63,9 +63,8 @@ static void SaveSettings(void) {
     [d setInteger:g_rotation        forKey:@"vcam_rotation"];
     [d setBool:g_isLoop             forKey:@"vcam_loop"];
     [d setBool:g_isSound            forKey:@"vcam_sound"];
-    [d setBool:g_enableReplacement  forKey:@"vcam_enable"];
-    [d setBool:g_isMirrored         forKey:@"vcam_mirror"];             
-    [d setBool:g_enablePhotoReplacement forKey:@"vcam_photoreplace"];  
+    [d setInteger:g_replaceMode     forKey:@"vcam_mode"];   // 统一模式字节（对齐 VCAM 0x25000+0xc10）
+    [d setBool:g_isMirrored         forKey:@"vcam_mirror"];
     [d synchronize];
 }
 static void LoadSettings(void) {
@@ -74,9 +73,8 @@ static void LoadSettings(void) {
     else                                   g_rotation         = 90;
     if ([d objectForKey:@"vcam_loop"])     g_isLoop            = [d boolForKey:@"vcam_loop"];
     if ([d objectForKey:@"vcam_sound"])    g_isSound           = [d boolForKey:@"vcam_sound"];
-    if ([d objectForKey:@"vcam_enable"])   g_enableReplacement = [d boolForKey:@"vcam_enable"];
-    if ([d objectForKey:@"vcam_mirror"])         g_isMirrored         = [d boolForKey:@"vcam_mirror"];          
-    if ([d objectForKey:@"vcam_photoreplace"])    g_enablePhotoReplacement = [d boolForKey:@"vcam_photoreplace"]; 
+    if ([d objectForKey:@"vcam_mode"])       g_replaceMode        = (int)[d integerForKey:@"vcam_mode"];
+    if ([d objectForKey:@"vcam_mirror"])     g_isMirrored         = [d boolForKey:@"vcam_mirror"];
 }
 
 #pragma mark - 文件路径辅助
@@ -121,7 +119,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
     for (UInt32 i = 0; i < frames; i++) {
         for (int c = 0; c < dstCh; c++) {
             int16_t s = 0;
-            int idx = (srcChannels >= dstCh) ? c : 0;   
+            int idx = (srcChannels >= dstCh) ? c : 0;
             s = src[i * srcChannels + idx];
 
             if (isFloat) {
@@ -134,7 +132,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
                     if (d) d[i * dstCh + c] = f;
                 }
             } else if (bits == 32) {
-                
+
                 int32_t v = (int32_t)s;
                 if (asbd->mFormatFlags & kAudioFormatFlagIsAlignedHigh) v = (int32_t)s << 16;
                 if (nonInt) {
@@ -145,7 +143,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
                     if (d) d[i * dstCh + c] = v;
                 }
             } else {
-                
+
                 int16_t v = s;
                 if (nonInt) {
                     int16_t *d = (int16_t *)ioData->mBuffers[c].mData;
@@ -157,6 +155,75 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
             }
         }
     }
+}
+
+#pragma mark - 通用：把 CIImage 渲染成新的 CMSampleBuffer（视频替换共用）
+static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
+                                                       size_t tw, size_t th, OSType pfmt,
+                                                       CMSampleBufferRef timingSrc) {
+    if (!img || tw == 0 || th == 0) return NULL;
+    NSDictionary *pbAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey:    @(pfmt),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef newPixel = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, tw, th, pfmt,
+                        (__bridge CFDictionaryRef)pbAttrs, &newPixel);
+    if (!newPixel) return NULL;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    [g_ciContext render:img toCVPixelBuffer:newPixel bounds:CGRectMake(0, 0, tw, th) colorSpace:cs];
+    CGColorSpaceRelease(cs);
+
+    CMVideoFormatDescriptionRef fmtDesc = NULL;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixel, &fmtDesc);
+    CMSampleBufferRef newSample = NULL;
+    if (fmtDesc) {
+        CMSampleTimingInfo timing;
+        if (CMSampleBufferGetSampleTimingInfo(timingSrc, 0, &timing) == noErr) {
+            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixel, YES,
+                                               NULL, NULL, fmtDesc, &timing, &newSample);
+        }
+        CFRelease(fmtDesc);
+    }
+    CVPixelBufferRelease(newPixel);
+    return newSample;
+}
+
+#pragma mark - 通用：把 UIImage 编码成 JPEG CMSampleBuffer（拍照替换共用）
+static CMSampleBufferRef VCamMakeJPEGSampleBuffer(UIImage *img) {
+    if (!img) return NULL;
+    NSData *jpg = UIImageJPEGRepresentation(img, 0.9);
+    if (!jpg) jpg = UIImagePNGRepresentation(img);
+    if (!jpg) return NULL;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)jpg, NULL);
+    if (!src) return NULL;
+    CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!cg) return NULL;
+
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    CVPixelBufferRef px = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                        (__bridge CFDictionaryRef)@{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}}, &px);
+    if (!px) { CGImageRelease(cg); return NULL; }
+    CIImage *ci = [CIImage imageWithCGImage:cg];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    [g_ciContext render:ci toCVPixelBuffer:px bounds:CGRectMake(0,0,w,h) colorSpace:cs];
+    CGColorSpaceRelease(cs);
+    CGImageRelease(cg);
+
+    CMVideoFormatDescriptionRef fmt = NULL;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, px, &fmt);
+    CMSampleTimingInfo timing = {0};
+    timing.duration = CMTimeMake(1, 30);
+    timing.presentationTimeStamp = CMTimeMake(0, 30);
+    CMSampleBufferRef sbuf = NULL;
+    if (fmt) {
+        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, px, YES, NULL, NULL, fmt, &timing, &sbuf);
+        CFRelease(fmt);
+    }
+    CVPixelBufferRelease(px);
+    return sbuf;
 }
 
 #pragma mark - MediaManager
@@ -202,7 +269,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
     @autoreleasepool {
         if (audioReader) {
             [audioReader cancelReading]; audioReader = nil; audioOutput = nil;
-            g_audioFIFO = nil;   
+            g_audioFIFO = nil;
         }
         NSString *path = g_tempAudioPath;
         if (![g_fileManager fileExistsAtPath:path]) path = getSandboxVideoPath();
@@ -210,7 +277,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
         AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
         AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
         if (track) {
-            
+
             CMAudioFormatDescriptionRef desc = (__bridge CMAudioFormatDescriptionRef)track.formatDescriptions.firstObject;
             if (desc) {
                 const AudioStreamBasicDescription *t = CMAudioFormatDescriptionGetStreamBasicDescription(desc);
@@ -226,7 +293,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
                 AVLinearPCMIsBigEndianKey:   @NO,
                 AVLinearPCMIsNonInterleaved: @NO,
             }];
-            
+
             if (g_hasProbedASBD && g_targetASBD.mSampleRate > 0) {
                 settings[AVSampleRateKey] = @(g_targetASBD.mSampleRate);
             }
@@ -271,8 +338,8 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
 }
 
 + (CIImage *)getVideoFrame:(CGSize)targetSize {
-    
-    if (g_enablePhotoReplacement && g_currentPhotoImg) {
+
+    if (g_replaceMode == 2 && g_currentPhotoImg) {
         CIImage *photo = [CIImage imageWithCGImage:g_currentPhotoImg.CGImage];
         if (photo) {
             CIImage *fitted = [self vcam_fitImage:photo toSize:targetSize];
@@ -339,7 +406,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
             CFRelease(sample);
         }
     }
-    
+
     if (g_isMirrored && result) result = [self vcam_mirrorImage:result];
     [g_mediaLock unlock];
     return result;
@@ -406,13 +473,14 @@ static OSStatus hooked_AudioUnitRender(
     OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
                                            inOutputBusNumber, inNumberFrames, ioData);
     if (status != noErr)                     return status;
-    if (!g_enableReplacement || !g_isSound)  return status;
+    if (g_replaceMode == 0 || !g_isSound)  return status;
 
     AudioComponentDescription cd = {0};
     AudioComponent comp = AudioComponentInstanceGetComponent(inUnit);
     if (comp && AudioComponentGetDescription(comp, &cd) == noErr) {
+        // [FIX] 仅对麦克风采集单元（RemoteIO / VoiceProcessingIO）替换；去掉原 'auou' 死代码
         OSType sub = cd.componentSubType;
-        BOOL isMic = (sub == 'rioc') || (sub == 'vpio') || (sub == 'auou');
+        BOOL isMic = (sub == 'rioc') || (sub == 'vpio');
         if (!isMic) return status;
     }
 
@@ -422,13 +490,13 @@ static OSStatus hooked_AudioUnitRender(
                              kAudioUnitScope_Output, inOutputBusNumber,
                              &g_targetASBD, &propSize);
         g_hasProbedASBD = YES;
-        
+
         [MediaManager setupAudioReaderIfNeeded];
     }
     if (g_targetASBD.mChannelsPerFrame == 0) g_targetASBD.mChannelsPerFrame = 1;
 
     int srcCh = g_sourceChannels ?: 2;
-    
+
     NSUInteger needBytes = inNumberFrames * srcCh * 2;
     uint8_t *raw = (uint8_t *)malloc(needBytes);
     if (!raw) return noErr;
@@ -450,7 +518,7 @@ static OSStatus hooked_AudioUnitRender(
 
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      fromConnection:(AVCaptureConnection *)connection {
-    if (g_enableReplacement) {
+    if (g_replaceMode == 1) {   // 视频模式才替换实时相机视频帧
         CVPixelBufferRef origPixel = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (origPixel) {
             size_t  tw   = CVPixelBufferGetWidth(origPixel);
@@ -458,35 +526,14 @@ static OSStatus hooked_AudioUnitRender(
             OSType  pfmt = CVPixelBufferGetPixelFormatType(origPixel);
             CIImage *img = [MediaManager getVideoFrame:CGSizeMake(tw, th)];
             if (img) {
-                NSDictionary *pbAttrs = @{
-                    (id)kCVPixelBufferPixelFormatTypeKey:    @(pfmt),
-                    (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-                };
-                CVPixelBufferRef newPixel = NULL;
-                CVPixelBufferCreate(kCFAllocatorDefault, tw, th, pfmt, (__bridge CFDictionaryRef)pbAttrs, &newPixel);
-                if (newPixel) {
-                    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                    [g_ciContext render:img toCVPixelBuffer:newPixel bounds:CGRectMake(0, 0, tw, th) colorSpace:cs];
-                    CGColorSpaceRelease(cs);
-                    CMVideoFormatDescriptionRef fmtDesc = NULL;
-                    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixel, &fmtDesc);
-                    CMSampleTimingInfo timing;
-                    OSStatus timingStatus = CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timing);
-                    CMSampleBufferRef newSample = NULL;
-                    if (timingStatus == noErr) {
-                        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixel, YES,
-                                                           NULL, NULL, fmtDesc, &timing, &newSample);
+                CMSampleBufferRef newSample = VCamMakeSampleBufferFromImage(img, tw, th, pfmt, sampleBuffer);
+                if (newSample) {
+                    if (_originalDelegate &&
+                        [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+                        [_originalDelegate captureOutput:output didOutputSampleBuffer:newSample fromConnection:connection];
                     }
-                    if (fmtDesc) CFRelease(fmtDesc);
-                    CVPixelBufferRelease(newPixel);
-                    if (newSample) {
-                        if (_originalDelegate &&
-                            [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-                            [_originalDelegate captureOutput:output didOutputSampleBuffer:newSample fromConnection:connection];
-                        }
-                        CFRelease(newSample);
-                        return;
-                    }
+                    CFRelease(newSample);
+                    return;
                 }
             }
         }
@@ -521,7 +568,7 @@ static VCamVideoProxy *g_videoProxy = nil;
      fromConnection:(AVCaptureConnection *)connection {
     CMSampleBufferRef outBuf = sampleBuffer;
 
-    if (g_enableReplacement && g_isSound) {
+    if ((g_replaceMode == 1) && g_isSound) {
         CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
         const AudioStreamBasicDescription *asbd = fmt ? CMAudioFormatDescriptionGetStreamBasicDescription(fmt) : NULL;
         if (asbd && asbd->mFormatID == kAudioFormatLinearPCM) {
@@ -551,7 +598,7 @@ static VCamVideoProxy *g_videoProxy = nil;
                     free(raw);
 
                     CMBlockBufferRef block = NULL;
-                    
+
                     CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, data, totalBytes,
                                                        kCFAllocatorDefault, NULL, 0, totalBytes, 0, &block);
                     if (block) {
@@ -564,7 +611,7 @@ static VCamVideoProxy *g_videoProxy = nil;
                         CMSampleTimingInfo timing;
                         if (newFmt && CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timing) == noErr) {
                             CMSampleBufferRef newS = NULL;
-                            
+
                             CMSampleBufferCreate(kCFAllocatorDefault, block, YES, NULL, NULL,
                                                  newFmt, frames, 1, &timing, 0, NULL, &newS);
                             if (newS) outBuf = newS;
@@ -572,7 +619,7 @@ static VCamVideoProxy *g_videoProxy = nil;
                         if (newFmt) CFRelease(newFmt);
                         CFRelease(block);
                     } else {
-                        free(data);   
+                        free(data);
                     }
                 } else {
                     free(data);
@@ -598,6 +645,155 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 %end
 
+#pragma mark - [FIX] WeVisVoipEffectMgr（微信视频通话逐帧替换，严格对齐 VCAM 0x18904）
+// VCAM 真实反汇编语义（0x18904，capstone 标注）：
+//   x0=self  x1=sel  x2=sampleBuffer  x3=outputTexture(int*)  x4=flipX  x5=ignoreBg
+//   1. retval = [global@0x25000+0x800 getVideoFrame:sampleBuffer]   （selref@0x24eb8 = 'getVideoFrame:'）
+//   2. retval == nil  → 跳 0x18a40：直接 blr 原函数 IMP(0x425000+0xd80)，原 sampleBuffer/outputTexture 透传，返回原函数结果
+//   3. retval != nil  → 仅读 currentDevice/orientation 并写 0x25000+0xc10 模式字节(1..4)，
+//                       随后 0x18a20 `return retval`（即 getVideoFrame: 返回的新 CMSampleBufferRef）
+//                       —— **非 nil 路径完全不调用原函数**，替换后的 buffer 直接作为方法返回值交给微信
+//   结论（以 VCAM 为准）：用「返回值方式」替换——成功直接返回新 CMSampleBufferRef；失败(nil)才透传原函数。
+//   VCAM 的 getVideoFrame: 收 CMSampleBufferRef（作尺寸/参考）、返回新的 CMSampleBufferRef；
+//   本 hook 等价地取原帧尺寸 → 调现有 CGSize 引擎拿 CIImage → 包成新 CMSampleBufferRef 返回。
+@interface WeVisVoipEffectMgr : NSObject @end
+%hook WeVisVoipEffectMgr
+- (id)processVideoSampleBuffer:(CMSampleBufferRef)sampleBuffer
+                   outputTexture:(int *)outputTexture
+                 pixelBufferFlipX:(BOOL)flipX
+             shouldIgnoreBackground:(BOOL)ignoreBg {
+    (void)outputTexture; (void)flipX; (void)ignoreBg;   // 以 VCAM 为准：非 nil 路径不写 outputTexture、不调原函数
+    if (g_replaceMode == 0) { return %orig; }   // 关闭：对齐 VCAM 0x18a40 透传分支
+
+    CVPixelBufferRef origPixel = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!origPixel) return %orig;               // 异常帧：透传原函数
+
+    size_t  tw   = CVPixelBufferGetWidth(origPixel);
+    size_t  th   = CVPixelBufferGetHeight(origPixel);
+    OSType  pfmt = CVPixelBufferGetPixelFormatType(origPixel);
+    CIImage *img = nil;
+    if (g_replaceMode == 2 && g_currentPhotoImg) {        // 照片模式（对齐 VCAM 0xc10=2）
+        img = [MediaManager vcam_fitImage:[CIImage imageWithCGImage:g_currentPhotoImg.CGImage]
+                                    toSize:CGSizeMake(tw, th)];
+        if (g_isMirrored) img = [MediaManager vcam_mirrorImage:img];
+    } else {                                             // 视频模式（默认 1，对齐 VCAM 0xc10=1）
+        img = [MediaManager getVideoFrame:CGSizeMake(tw, th)];
+    }
+    if (img) {
+        CMSampleBufferRef newSample = VCamMakeSampleBufferFromImage(img, tw, th, pfmt, sampleBuffer);
+        if (newSample) {
+            // 以 VCAM 为准：直接返回替换后的 buffer（等价于 VCAM return getVideoFrame: 结果，不调原函数）
+            return (__bridge_transfer id)newSample;
+        }
+    }
+    return %orig;   // 取不到帧：透传原函数
+}
+%end
+
+#pragma mark - [FIX] AVCaptureSession startRunning/stopRunning（对齐 VCAM 0x187e4/0x18888，起停时重载读取器）
+%hook AVCaptureSession
+- (void)startRunning {
+    if (g_replaceMode == 1) {   // 视频模式才需要重载读取器
+        g_videoReload = YES;
+        g_audioReload = YES;
+        [MediaManager setupVideoReaderIfNeeded];
+        [MediaManager setupAudioReaderIfNeeded];
+    }
+    %orig;
+}
+- (void)stopRunning {
+    g_videoReload = YES;
+    g_audioReload = YES;
+    %orig;
+}
+%end
+
+#pragma mark - [FIX] AVCaptureVideoPreviewLayer addSublayer:（对齐 VCAM 0x18130，本地预览也显示假视频）
+static char kVCamOverlayTag;
+@interface VCamPreviewPump : NSObject
+@property (nonatomic, strong) CADisplayLink *link;
+@property (nonatomic, strong) NSHashTable   *overlays;
++ (instancetype)shared;
+- (void)addOverlay:(CALayer *)layer;
+- (void)tick;
+@end
+@implementation VCamPreviewPump
++ (instancetype)shared {
+    static VCamPreviewPump *s; static dispatch_once_t t;
+    dispatch_once(&t, ^{ s = [self new]; s.overlays = [NSHashTable weakObjectsHashTable]; });
+    return s;
+}
+- (void)addOverlay:(CALayer *)layer {
+    if (!layer) return;
+    @synchronized(self) { [self.overlays addObject:layer]; }
+    if (!self.link) {
+        self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
+        [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    }
+}
+- (void)tick {
+    if (g_replaceMode != 1) return;   // 仅视频模式泵入预览
+    @synchronized(self) {
+        for (CALayer *ov in self.overlays) {
+            if (!ov) continue;
+            CGSize sz = ov.bounds.size;
+            if (sz.width <= 0 || sz.height <= 0) sz = CGSizeMake(720, 1280);
+            CIImage *img = [MediaManager getVideoFrame:sz];
+            if (!img) continue;
+            CGImageRef cg = [g_ciContext createCGImage:img fromRect:img.extent];
+            if (cg) { ov.contents = (__bridge id)cg; CGImageRelease(cg); }
+        }
+    }
+}
+@end
+
+%hook AVCaptureVideoPreviewLayer
+- (void)addSublayer:(CALayer *)layer {
+    if (layer && objc_getAssociatedObject(layer, &kVCamOverlayTag)) { %orig; return; }
+    %orig;
+    if (g_replaceMode == 1) {
+        CALayer *ov = [CALayer layer];
+        objc_setAssociatedObject(ov, &kVCamOverlayTag, @(YES), OBJC_ASSOCIATION_RETAIN);
+        ov.frame = self.bounds;
+        ov.opacity = 1.0;
+        [self addSublayer:ov];   // 重新进入 hook 时因 tag 被识别，仅 %orig，不会递归
+        [[VCamPreviewPump shared] addOverlay:ov];
+    }
+}
+%end
+
+#pragma mark - [FIX] AVCapturePhoto 拍照文件/图像替换（对齐 VCAM 0x18fd4/0x19170）
+%hook AVCapturePhoto
+- (NSData *)fileDataRepresentation {
+    if (g_replaceMode == 2 && g_currentPhotoImg) {
+        NSData *d = UIImageJPEGRepresentation(g_currentPhotoImg, 0.9);
+        if (d) return d;
+        d = UIImagePNGRepresentation(g_currentPhotoImg);
+        if (d) return d;
+    }
+    return %orig;
+}
+- (CGImageRef)CGImageRepresentation {
+    if (g_replaceMode == 2 && g_currentPhotoImg) {
+        CGImageRef cg = g_currentPhotoImg.CGImage;
+        if (cg) return CGImageRetain(cg);   // 契约要求调用方 release（+1）
+    }
+    return %orig;
+}
+%end
+
+#pragma mark - [FIX] AVCaptureStillImageOutput 静态拍照替换（对齐 VCAM 0x192e0）
+%hook AVCaptureStillImageOutput
+- (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection
+                                   completionHandler:(void (^)(CMSampleBufferRef, NSError *))handler {
+    if (g_replaceMode == 2 && g_currentPhotoImg && handler) {
+        CMSampleBufferRef sbuf = VCamMakeJPEGSampleBuffer(g_currentPhotoImg);
+        if (sbuf) { handler(sbuf, nil); CFRelease(sbuf); return; }
+    }
+    %orig;
+}
+%end
+
 #pragma mark - LittleBearMenuVC（控制菜单界面）
 @interface LittleBearMenuVC : UIViewController
     <UIImagePickerControllerDelegate, UIDocumentPickerDelegate, UINavigationControllerDelegate>
@@ -611,7 +807,7 @@ static VCamAudioProxy *g_audioProxy = nil;
     UIButton *_btnSound;
     UIButton *_btnRotate;
     UIButton *_btnEnable;
-    UIButton *_btnMirror;   
+    UIButton *_btnMirror;
     UIView   *_contentView;
 }
 
@@ -716,25 +912,26 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)setupButtons {
     CGFloat btnW = 140, btnH = 40, gap = 8;
     CGFloat y = 28;
-    
+
     [self addGridButton:@"相册选择" x:0 y:y w:btnW h:btnH action:@selector(actionSelectAlbum)];
     [self addGridButton:@"文件选择" x:btnW + gap y:y w:btnW h:btnH action:@selector(actionSelectFile)];
     y += btnH + gap;
-    
+
     _btnRotate = [self addGridButton:[NSString stringWithFormat:@"旋转 (%d°)", g_rotation] x:0 y:y w:btnW h:btnH action:@selector(toggleRotate)];
     _btnLoop   = [self addGridButton:g_isLoop ? @"循环: 开" : @"循环: 关" x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleLoop)];
     y += btnH + gap;
-    
+
     _btnSound  = [self addGridButton:g_isSound ? @"声音: 开" : @"声音: 关" x:0 y:y w:btnW h:btnH action:@selector(toggleSound)];
     _btnMirror = [self addGridButton:g_isMirrored ? @"镜像: 开" : @"镜像: 关"
                                   x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleMirror)];
     y += btnH + gap;
-    
-    [self addGridButton:g_enablePhotoReplacement ? @"拍替: 开" : @"拍替: 关"
+
+    [self addGridButton:g_replaceMode == 2 ? @"拍替: 开" : @"拍替: 关"
                   x:0 y:y w:btnW h:btnH action:@selector(togglePhotoReplacement)];
-    _btnEnable = [self addGridButton:g_enableReplacement ? @"替换: 开" : @"替换: 关"
+    _btnEnable = [self addGridButton:g_replaceMode == 1 ? @"替换: 开" : @"替换: 关"
                   x:btnW + gap y:y w:btnW h:btnH action:@selector(actionRestore)];
     y += btnH + gap;
+
     [_panelView.heightAnchor constraintEqualToConstant:y + 56 + 16].active = YES;
 }
 
@@ -742,11 +939,9 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)toggleRotate { g_rotation = (g_rotation + 90) % 360; SaveSettings(); [self refreshGridButtons]; }
 - (void)toggleLoop   { g_isLoop = !g_isLoop; SaveSettings(); [self refreshGridButtons]; }
 - (void)toggleSound  { g_isSound = !g_isSound; SaveSettings(); [self refreshGridButtons]; }
-- (void)actionRestore{ g_enableReplacement = !g_enableReplacement; SaveSettings(); [self refreshGridButtons]; }
-
+- (void)actionRestore{ g_replaceMode = (g_replaceMode == 1) ? 0 : 1; SaveSettings(); [self refreshGridButtons]; }      // 替换(视频)开关
 - (void)toggleMirror { g_isMirrored = !g_isMirrored; SaveSettings(); [self refreshGridButtons]; }
-
-- (void)togglePhotoReplacement { g_enablePhotoReplacement = !g_enablePhotoReplacement; SaveSettings(); [self refreshGridButtons]; }
+- (void)togglePhotoReplacement { g_replaceMode = (g_replaceMode == 2) ? 0 : 2; SaveSettings(); [self refreshGridButtons]; } // 拍替(照片)开关
 
 - (void)refreshGridButtons {
     UIFont *font = [UIFont systemFontOfSize:[UIFont systemFontSize] weight:UIFontWeightMedium];
@@ -764,18 +959,19 @@ static VCamAudioProxy *g_audioProxy = nil;
     _btnSound.configuration = configSound;
     UIButtonConfiguration *configEnable = _btnEnable.configuration;
     configEnable.attributedTitle = [[NSAttributedString alloc] initWithString:
-        (g_enableReplacement ? @"替换: 开" : @"替换: 关") attributes:@{NSFontAttributeName: font}];
+        (g_replaceMode == 1 ? @"替换: 开" : @"替换: 关") attributes:@{NSFontAttributeName: font}];
     _btnEnable.configuration = configEnable;
-    
+
     UIButtonConfiguration *configMirror = _btnMirror.configuration;
     configMirror.attributedTitle = [[NSAttributedString alloc] initWithString:
         (g_isMirrored ? @"镜像: 开" : @"镜像: 关") attributes:@{NSFontAttributeName: font}];
     _btnMirror.configuration = configMirror;
+
     [self updateStatusUI];
 }
 - (void)updateStatusUI {
     NSString *vStat = [g_fileManager fileExistsAtPath:getSandboxVideoPath()] ? @"已加载" : @"未选择";
-    NSString *pStat = (g_enablePhotoReplacement && g_currentPhotoImg) ? @"已选" : @"未选";  
+    NSString *pStat = (g_replaceMode == 2 && g_currentPhotoImg) ? @"已选" : @"未选";
     _statusLbl.text = [NSString stringWithFormat:@"视频: %@  照片: %@", vStat, pStat];
 }
 - (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
@@ -784,13 +980,13 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)actionSelectAlbum {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    
+
     picker.mediaTypes = @[@"public.movie", @"public.image"];
     picker.delegate = (id)self;
     [self presentViewController:picker animated:YES completion:nil];
 }
 - (void)actionSelectFile {
-    
+
     NSArray *contentTypes = @[UTTypeMovie, UTTypeAudio, UTTypeImage];
     UIDocumentPickerViewController *picker =
         [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:contentTypes asCopy:YES];
@@ -819,7 +1015,7 @@ static VCamAudioProxy *g_audioProxy = nil;
         g_audioReload = YES;
         [MediaManager setupAudioReaderIfNeeded];
     } else {
-        
+
         NSData *data = [NSData dataWithContentsOfFile:src];
         UIImage *img = data ? [UIImage imageWithData:data] : nil;
         if (img) [self savePhoto:img];
@@ -829,7 +1025,7 @@ static VCamAudioProxy *g_audioProxy = nil;
 
 - (void)savePhoto:(UIImage *)img {
     if (!img) return;
-    
+
     if (img.imageOrientation != UIImageOrientationUp) {
         UIGraphicsBeginImageContextWithOptions(img.size, NO, img.scale);
         [img drawInRect:CGRectMake(0, 0, img.size.width, img.size.height)];
@@ -850,7 +1046,7 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)imagePickerController:(UIImagePickerController *)picker
 didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
-    
+
     NSURL *url = info[UIImagePickerControllerMediaURL];
     if (url) { [self processSelectedVideoURL:url]; return; }
     UIImage *img = info[UIImagePickerControllerOriginalImage];
@@ -915,8 +1111,8 @@ static void AddTapGestureToWindow(UIWindow *win) {
     [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
     g_tempVideoPath = [getSandboxVideoPath() copy];
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
-    g_photoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_photo.jpg"] copy];  
-    
+    g_photoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_photo.jpg"] copy];
+
     if ([g_fileManager fileExistsAtPath:g_photoPath]) {
         g_currentPhotoImg = [UIImage imageWithContentsOfFile:g_photoPath];
     }
@@ -926,6 +1122,7 @@ static void AddTapGestureToWindow(UIWindow *win) {
     }
     MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&orig_AudioUnitRender);
 }
+
 %dtor {
     [MediaManager cleanup];
     g_fileManager = nil;
