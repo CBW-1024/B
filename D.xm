@@ -297,22 +297,26 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
             if (pix) {
                 CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
                 if (img) {
-                    // ===== 视频完整显示、居中、不放大（contain / aspect-fit）=====
-                    // 之前几版（cover/contain + translate + crop + normalize）都因 CIImage extent
-                    // 原点歧义以及 render:toCVPixelBuffer:bounds: 强制缩放 image.extent 到 bounds
-                    // 导致视频被推到一侧（"一边黑边不居中"的根因）。
+                    // ===== 视频填满整个 target（cover / aspect-fill），严格对齐 VCAM 0xbe74 =====
+                    // VCAM 0xbe74 反汇编（capstone 标注，已确认）：
+                    //   0xc3a0 a = (float)origW / rotExtentW
+                    //   0xc3b4 b = (float)origH / rotExtentH
+                    //   0xc3d0 fcmp a,b; cset pl → scale = MAX(a,b)  ← cover，填满 target
+                    //   0xc46c tx=(tw-rotW*scale)/2; ty=(th-rotH*scale)/2
+                    // 用户图3/图4（VCAM 实际表现）确认：rotation=90 时视频**填满宽度、无黑边**，
+                    // 这正是 cover 行为。之前误判为 contain 致黑边回归，现纠正。
                     //
-                    // 正确方案：
-                    //   1) 一次性 transform：contain 缩放 + 旋转 复合
+                    // 实现路径：
+                    //   1) 一次性 transform：cover 缩放（MAX）+ 旋转 复合
                     //   2) 用 transform 后 extent 的 aabb 算居中平移（含 origin 修正）
                     //   3) imageByCompositingOverImage 合成到 (0,0,targetW,targetH) 纯黑画布
                     //      → 强制 composed.extent 严格等于 (0,0,targetW,targetH)
                     //   4) VCamMakeSampleBufferFromImage 用 render:toCVPixelBuffer（无 bounds）1:1 渲染
-                    //      → image (0,0) 映射到 buffer (0,0)，视频在画布中居中，四周均匀黑边
+                    //      → image (0,0) 映射到 buffer (0,0)，视频像素在画布中居中（cover 居中区域）
                     CGFloat targetW = targetSize.width;
                     CGFloat targetH = targetSize.height;
-                    CGRect origE = img.extent;  // 原始帧 extent（旋转前），contain 缩放参考
-                    CGFloat scale = MIN(targetW / origE.size.width, targetH / origE.size.height);
+                    CGRect origE = img.extent;
+                    CGFloat scale = MAX(targetW / origE.size.width, targetH / origE.size.height);  // cover
                     // 复合 transform：scale * rotate（先缩放，再旋转）
                     CGAffineTransform tFit = CGAffineTransformMakeScale(scale, scale);
                     if (g_rotation == 90) {
