@@ -321,7 +321,6 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                     //      → image (0,0) 映射到 buffer (0,0)，视频像素在画布中精确居中
                     CGFloat targetW = targetSize.width;
                     CGFloat targetH = targetSize.height;
-                    CGRect origE = img.extent;
                     // 步骤 1：先做旋转（origin 归 0，便于后续所有几何计算）
                     CGAffineTransform tRot = CGAffineTransformIdentity;
                     if (g_rotation == 90) {
