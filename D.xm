@@ -82,6 +82,21 @@ static NSString *getSandboxVideoPath(void) {
 }
 
 #pragma mark - 视图控制器查找
+static UIViewController *bear_getTopVC(void) {
+    UIWindow *key = nil;
+    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *w in scene.windows) {
+            if (w.isKeyWindow) { key = w; break; }
+        }
+        if (!key) key = scene.windows.firstObject;
+        break;
+    }
+    if (!key) return nil;
+    UIViewController *vc = key.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
 
 #pragma mark - [FIX] int16 源 → 目标 ASBD 转换
 
@@ -262,7 +277,6 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
 }
 
 + (CIImage *)getVideoFrame:(CGSize)targetSize {
-
     if (g_videoReload) [self setupVideoReaderIfNeeded];
     [g_mediaLock lock];
     CIImage *result = nil;
@@ -297,24 +311,41 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                     }
                     CGRect rotatedExtent = rotated.extent;
                     if (rotatedExtent.origin.x != 0 || rotatedExtent.origin.y != 0) {
-                        CGAffineTransform translate = CGAffineTransformMakeTranslation(-rotatedExtent.origin.x,
-                                                                                      -rotatedExtent.origin.y);
-                        rotated = [rotated imageByApplyingTransform:translate];
+                        rotated = [rotated imageByApplyingTransform:
+                            CGAffineTransformMakeTranslation(-rotatedExtent.origin.x,
+                                                            -rotatedExtent.origin.y)];
                     }
-                    // 对齐 VCAM 0xbe74：视频完整显示、不被放大（contain / aspect-fit）。
-                    // contain 缩放后居中，再把结果裁剪规范化为 (0,0,targetW,targetH)：
-                    // 否则 CIImage extent 非零原点经 VCamMakeSampleBufferFromImage 的
-                    // render:toCVPixelBuffer:bounds:(0,0,target) 会被拉伸映射到 bounds，导致偏移+黑边错乱。
-                    CGRect normalizedExtent = rotated.extent;
-                    CGFloat scale = MIN(targetSize.width / normalizedExtent.size.width,
-                                        targetSize.height / normalizedExtent.size.height);
-                    CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
-                    CGRect scaledExtent = scaled.extent;
-                    CGFloat offsetX = (targetSize.width  - scaledExtent.size.width)  / 2.0;
-                    CGFloat offsetY = (targetSize.height - scaledExtent.size.height) / 2.0;
-                    result = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(offsetX, offsetY)];
-                    // 规范化为从原点开始、尺寸=target，确保渲染到 target buffer 时真正居中留边
-                    result = [result imageByCroppingToRect:CGRectMake(0, 0, targetSize.width, targetSize.height)];
+                    // ===== 对齐 VCAM 0xbe74（capstone 标注，已逐条核对）=====
+                    // 0xc3a0 a = (float)origW / rotExtentW      (origW=原帧宽=目标宽 tw)
+                    // 0xc3b4 b = (float)origH / rotExtentH
+                    // 0xc3d0 scale = (a>=b)? a : b              → MAX（cover，填满目标）
+                    // 0xc418 scale 变换 → 0xc46c tx=(tw-rotW*scale)/2; ty=(th-rotH*scale)/2 居中
+                    // 0xc4c0 平移 → 0xc590 imageByCroppingToRect(0,0,tw,th) 裁剪到目标
+                    // 结论：VCAM 采用 cover 缩放（取较大比例填满，超出裁掉），并非 contain。
+                    // 之前用 MIN(contain) 会产生黑边且因 extent 原点问题导致偏移，属误判，现纠正回 VCAM。
+                    CGRect e = rotated.extent;
+                    CGFloat targetW = targetSize.width;
+                    CGFloat targetH = targetSize.height;
+                    CGFloat sx = targetW / e.size.width;
+                    CGFloat sy = targetH / e.size.height;
+                    CGFloat scale = (sx >= sy) ? sx : sy;          // MAX（cover）
+                    CIImage *scaled = [rotated imageByApplyingTransform:
+                        CGAffineTransformMakeScale(scale, scale)];
+                    CGRect se = scaled.extent;
+                    CGFloat tx = (targetW - se.size.width) / 2.0;
+                    CGFloat ty = (targetH - se.size.height) / 2.0;
+                    CIImage *centered = [scaled imageByApplyingTransform:
+                        CGAffineTransformMakeTranslation(tx, ty)];
+                    // 裁剪到目标尺寸（对齐 VCAM 0xc590 imageByCroppingToRect(0,0,tw,th)）
+                    CIImage *crop = [centered imageByCroppingToRect:
+                        CGRectMake(0, 0, targetW, targetH)];
+                    // 归一化 extent 原点（对齐 D.txt vcam_fitImage 末尾 normalize，
+                    // 确保 render:toCVPixelBuffer:bounds:(0,0,target) 1:1 映射不偏移）
+                    CGRect ce = crop.extent;
+                    if (ce.origin.x != 0 || ce.origin.y != 0)
+                        crop = [crop imageByApplyingTransform:
+                            CGAffineTransformMakeTranslation(-ce.origin.x, -ce.origin.y)];
+                    result = crop;
                 }
             }
             CFRelease(sample);
@@ -676,6 +707,7 @@ static char kVCamOverlayTag;
 
 @implementation LittleBearMenuVC {
     UIView   *_panelView;
+    UIView   *_blurView;
     UILabel  *_statusLbl;
     UIButton *_btnLoop;
     UIButton *_btnSound;
@@ -698,14 +730,18 @@ static char kVCamOverlayTag;
 
 #pragma mark - UI 构建
 - (void)setupBackground {
-    // 背景透明：打开菜单时不遮挡底层相机/视频画面，便于改配置后实时预览
-    self.view.backgroundColor = [UIColor clearColor];
+    // 还原为原始 D.txt 的面板背景：半透明 + 系统毛玻璃，遮住底层画面、凸显面板
+    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
+    UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+    _blurView = [[UIVisualEffectView alloc] initWithEffect:blur];
+    _blurView.frame = self.view.bounds;
+    _blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:_blurView];
 }
 - (void)setupPanel {
     _panelView = [[UIView alloc] init];
-    // 用 secondarySystemBackgroundColor（系统深灰），透明背景下天然形成边界对比，
-    // 不需要描边/阴影，看起来更干净
-    _panelView.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    // 还原为原始 D.txt 的面板背景色（系统背景色，配半透明模糊背景边界清晰）
+    _panelView.backgroundColor = [UIColor systemBackgroundColor];
     _panelView.layer.cornerRadius = 16;
     _panelView.layer.masksToBounds = YES;
     _panelView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -925,12 +961,8 @@ static void AddTapGestureToWindow(UIWindow *win) {
     static BOOL menuVisible = NO;
     if (menuVisible) return;
     menuVisible = YES;
-    UIViewController *topVC = nil;
-    for (UIWindowScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if (s.activationState == UISceneActivationStateForegroundActive) { topVC = s.windows.firstObject.rootViewController; break; }
-    }
+    UIViewController *topVC = bear_getTopVC();
     if (!topVC) { menuVisible = NO; return; }
-    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
     LittleBearMenuVC *vc = [LittleBearMenuVC new];
     vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
     vc.modalTransitionStyle   = UIModalTransitionStyleCrossDissolve;
