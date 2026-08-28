@@ -337,13 +337,12 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                                                                                       -rotatedExtent.origin.y);
                         rotated = [rotated imageByApplyingTransform:translate];
                     }
-                    // 对齐 VCAM 0xbe74：cover 缩放因子基于「旋转前原始帧尺寸」计算
-                    // （VCAM 在 0xc1e4/0xc200 取 CVPixelBufferGetWidth/Height 原始尺寸算 scale），
-                    // 旋转后再居中裁剪到 target。若用旋转后 extent 算 scale（宽高已互换），
-                    // 在 g_rotation!=0 时会把画面放大近 1.8 倍，与 VCAM 不符。
-                    CGRect srcExtent = img.extent;
-                    CGFloat scale = MAX(targetSize.width / srcExtent.size.width,
-                                        targetSize.height / srcExtent.size.height);
+                    // 对齐 VCAM 0xbe74 cover 语义：用旋转后帧尺寸算 MAX(src/target) 放大填满，再居中裁剪。
+                    // （我上一轮误改为“旋转前原始尺寸”算 scale，在 g_rotation!=0 时 rotated 图比 target 小，
+                    //   cropRect 出现负偏移导致黑边/异常放大；现回滚为标准 cover，与 VCAM 数学一致。）
+                    CGRect normalizedExtent = rotated.extent;
+                    CGFloat scale = MAX(targetSize.width / normalizedExtent.size.width,
+                                        targetSize.height / normalizedExtent.size.height);
                     CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
                     CGRect scaledExtent = scaled.extent;
                     CGFloat offsetX = (scaledExtent.size.width - targetSize.width) / 2.0;
@@ -747,7 +746,10 @@ static char kVCamOverlayTag;
     _panelView.backgroundColor = [UIColor systemBackgroundColor];
     _panelView.layer.cornerRadius = 16;
     _panelView.layer.masksToBounds = YES;
-    _panelView.translatesAutoresizingMaskIntoConstraints = NO;
+    // 透明背景下用深色描边勾勒面板边界，避免亮色视频上边界不可见
+    _panelView.layer.borderWidth = 1.5;
+    _panelView.layer.borderColor = [[UIColor separatorColor] CGColor];
+    _panelView.translatesAutoresizingMaskConstraints = NO;
     [self.view addSubview:_panelView];
     [NSLayoutConstraint activateConstraints:@[
         [_panelView.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
