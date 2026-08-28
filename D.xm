@@ -1,3 +1,6 @@
+// VCam — 微信视频/音频替换插件（Theos/Logos）
+// 视频：从相册/文件选视频，旋转居中后替换相机帧、微信视频通话帧、本地预览。
+// 音频：替换麦克风采集（AudioUnitRender）或 AVCaptureAudio 采集，源按目标格式重采样后投递。
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
@@ -29,7 +32,6 @@ static AudioStreamBasicDescription  g_targetASBD    = {0};
 
 static int  g_sourceChannels = 2;
 
-// 统一替换模式（对齐 VCAM 0x25000+0xc10 模式字节：0=关 1=视频；照片/拍替模式已移除）
 static int  g_replaceMode       = 1;
 static BOOL g_isLoop             = YES;
 static BOOL g_isSound            = YES;
@@ -59,7 +61,7 @@ static void SaveSettings(void) {
     [d setInteger:g_rotation        forKey:@"vcam_rotation"];
     [d setBool:g_isLoop             forKey:@"vcam_loop"];
     [d setBool:g_isSound            forKey:@"vcam_sound"];
-    [d setInteger:g_replaceMode     forKey:@"vcam_mode"];   // 统一模式字节（对齐 VCAM 0x25000+0xc10）
+    [d setInteger:g_replaceMode     forKey:@"vcam_mode"];
     [d setBool:g_isMirrored         forKey:@"vcam_mirror"];
     [d synchronize];
 }
@@ -98,7 +100,7 @@ static UIViewController *bear_getTopVC(void) {
     return vc;
 }
 
-#pragma mark - [FIX] int16 源 → 目标 ASBD 转换
+#pragma mark - 音频格式转换（int16 源 → 目标 ASBD）
 
 static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
                                        const AudioStreamBasicDescription *asbd,
@@ -167,10 +169,7 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                         (__bridge CFDictionaryRef)pbAttrs, &newPixel);
     if (!newPixel) return NULL;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    // 关键：使用无 bounds 参数的 render 重载，让 CIImage.extent 1:1 渲染到 pixel buffer。
-    // 之前用 bounds:(0,0,tw,th) 会让 CIContext 把 image.extent 强制缩放适配到 bounds，
-    // 即使 image.extent 是 (ox,oy,...) 也会被拉伸映射，导致视频偏移到一侧。
-    // 要求调用方保证 img.extent 严格等于 (0,0,tw,th)（getVideoFrame 配合 imageByCompositingOverImage 达成）。
+
     [g_ciContext render:img toCVPixelBuffer:newPixel];
     CGColorSpaceRelease(cs);
 
@@ -238,13 +237,15 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
         AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
         AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
         if (track) {
-
+            int srcCh = 2;
             CMAudioFormatDescriptionRef desc = (__bridge CMAudioFormatDescriptionRef)track.formatDescriptions.firstObject;
             if (desc) {
                 const AudioStreamBasicDescription *t = CMAudioFormatDescriptionGetStreamBasicDescription(desc);
-                if (t && t->mChannelsPerFrame > 0) g_sourceChannels = t->mChannelsPerFrame;
+                if (t && t->mChannelsPerFrame > 0) srcCh = t->mChannelsPerFrame;
             }
-            if (g_sourceChannels <= 0) g_sourceChannels = 2;
+            int outCh = srcCh;
+            if (g_hasProbedASBD && g_targetASBD.mChannelsPerFrame > 0) outCh = g_targetASBD.mChannelsPerFrame;
+            g_sourceChannels = outCh;
 
             audioReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
             NSMutableDictionary *settings = [NSMutableDictionary dictionaryWithDictionary:@{
@@ -253,8 +254,8 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                 AVLinearPCMIsFloatKey:       @NO,
                 AVLinearPCMIsBigEndianKey:   @NO,
                 AVLinearPCMIsNonInterleaved: @NO,
+                AVNumberOfChannelsKey:       @(outCh),
             }];
-
             if (g_hasProbedASBD && g_targetASBD.mSampleRate > 0) {
                 settings[AVSampleRateKey] = @(g_targetASBD.mSampleRate);
             }
@@ -280,6 +281,7 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
     return m;
 }
 
+// 取一帧视频：旋转 + contain 居中 + 黑边合成，返回严格 (0,0,targetW,targetH) 的 CIImage
 + (CIImage *)getVideoFrame:(CGSize)targetSize {
     if (g_videoReload) [self setupVideoReaderIfNeeded];
     [g_mediaLock lock];
@@ -297,23 +299,7 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
             if (pix) {
                 CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
                 if (img) {
-                    // ===== 视频完整显示、居中、不放大（contain / aspect-fit），与 VCAM 一致 =====
-                    // VCAM 0xbe74 反汇编（capstone 标注，已逐条核对）：
-                    //   0xc1e8/0xc200: target = CVPixelBufferGetWidth/Height（输入源视频帧尺寸）
-                    //   0xc3a0-0xc3ac: a = (float)targetW / rotated_extent.width
-                    //   0xc3b4-0xc3c0: b = (float)targetH / rotated_extent.height
-                    //   0xc3d0 fcmp a,b ; 0xc3d4 cset w8, pl
-                    //   0xc3d8 tbnz w8,#0 → (a>=b 时) 取 b，否则取 a
-                    //   → scale = MIN(a,b)  ← 即 contain（完整显示、不放大、四周可能留黑边）
-                    //   0xc46c tx=(rotW*scale - targetW)/2 ; ty=(rotH*scale - targetH)/2
-                    //
-                    // 实现路径（复合 CGAffineTransform + 强制 cropping，完全回避 extent.origin 歧义）：
-                    //   CIImage 引擎在 iOS 实机上对 imageByApplyingTransform:rotate 后的 extent.origin
-                    //   返回值不稳定（不一定是 aabb 的 min corner），导致前两版居中算法都失败。
-                    //   本版完全自己算旋转后 aabb 的 min corner，把"旋转+缩放+居中平移"合成为一个
-                    //   CGAffineTransform 矩阵，再用 imageByCroppingToRect 强制裁到
-                    //   (0,0,targetW,targetH) —— cropping 后 extent 必为裁剪矩形，origin 必为 (0,0)，
-                    //   之后 1:1 render 严格对齐输出 buffer。
+
                     CGFloat targetW = targetSize.width;
                     CGFloat targetH = targetSize.height;
                     CGRect origE = img.extent;
@@ -321,7 +307,7 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                     CGFloat srcH = origE.size.height;
                     CGFloat srcX = origE.origin.x;
                     CGFloat srcY = origE.origin.y;
-                    // 步骤 1：算出旋转角度的 sin/cos + 旋转后 aabb 尺寸
+
                     CGFloat angle = 0.0;
                     if (g_rotation == 90)      angle = M_PI_2;
                     else if (g_rotation == 180) angle = M_PI;
@@ -329,31 +315,18 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                     CGFloat sa = sin(angle), ca = cos(angle);
                     CGFloat rotW = fabs(srcW * ca) + fabs(srcH * sa);
                     CGFloat rotH = fabs(srcW * sa) + fabs(srcH * ca);
-                    // 步骤 2：contain 缩放（MIN）
+
                     CGFloat scale = MIN(targetW / rotW, targetH / rotH);
                     CGFloat fitW = rotW * scale;
                     CGFloat fitH = rotH * scale;
-                    // 步骤 3：算旋转后 aabb 的 min corner（穷举 4 角点，不依赖 CIImage extent）
-                    //    原图 4 角点（相对 srcX,srcY）: (0,0), (srcW,0), (0,srcH), (srcW,srcH)
-                    //    旋转 angle 后的 4 角点：
-                    //      (0,0)        → (0, 0)
-                    //      (srcW,0)     → (srcW*ca, srcW*sa)
-                    //      (0,srcH)     → (-srcH*sa, srcH*ca)
-                    //      (srcW,srcH)  → (srcW*ca - srcH*sa, srcW*sa + srcH*ca)
+
                     CGFloat cx0 = 0,                cy0 = 0;
                     CGFloat cx1 = srcW * ca,        cy1 = srcW * sa;
                     CGFloat cx2 = -srcH * sa,       cy2 = srcH * ca;
                     CGFloat cx3 = srcW*ca - srcH*sa, cy3 = srcW*sa + srcH*ca;
                     CGFloat minX = MIN(MIN(cx0, cx1), MIN(cx2, cx3));
                     CGFloat minY = MIN(MIN(cy0, cy1), MIN(cy2, cy3));
-                    // 步骤 4：构造复合矩阵（对原图坐标系里的点 P 作用）
-                    //    P_new = T(tx, ty) * S(scale) * T(-minX, -minY) * R(angle) * T(-srcX, -srcY) * P
-                    //    含义：
-                    //      1) T(-srcX, -srcY)  — 把原图左上角移到 (0, 0)（兼容 origin 非零）
-                    //      2) R(angle)         — 旋转
-                    //      3) T(-minX, -minY)  — 把旋转后 aabb 归零到 (0, 0)
-                    //      4) S(scale)         — 缩放
-                    //      5) T(tx, ty)        — 居中平移到画布
+
                     CGFloat tx = (targetW - fitW) / 2.0;
                     CGFloat ty = (targetH - fitH) / 2.0;
                     CGAffineTransform m = CGAffineTransformIdentity;
@@ -363,10 +336,9 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                     m = CGAffineTransformRotate(m, angle);
                     m = CGAffineTransformTranslate(m, -srcX, -srcY);
                     CIImage *transformed = [img imageByApplyingTransform:m];
-                    // 步骤 5：imageByCroppingToRect 强制 extent = (0, 0, targetW, targetH)
-                    //          CIImage 保证 cropping 后的 extent 严格等于裁剪矩形，origin 必为 (0,0)
+
                     CIImage *cropped = [transformed imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
-                    // 步骤 6：合成到 (0,0,targetW,targetH) 黑底画布（双保险：前景/背景 extent 完全相同）
+
                     CIImage *backdrop = [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]]
                                          imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
                     result = [cropped imageByCompositingOverImage:backdrop];
@@ -381,6 +353,7 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
     return result;
 }
 
+// 从音频 reader 持续拉 PCM 字节进 FIFO，不足时循环回卷、仍不足补 0
 + (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length {
     [g_mediaLock lock];
     @autoreleasepool {
@@ -431,6 +404,7 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
 @end
 
 #pragma mark - AudioUnitRender Hook（音频替换）
+// 钩住麦克风采集单元的 AudioUnitRender，用替换音频覆盖输出 buffer
 static OSStatus hooked_AudioUnitRender(
     AudioUnit                   inUnit,
     AudioUnitRenderActionFlags  *ioActionFlags,
@@ -447,7 +421,7 @@ static OSStatus hooked_AudioUnitRender(
     AudioComponentDescription cd = {0};
     AudioComponent comp = AudioComponentInstanceGetComponent(inUnit);
     if (comp && AudioComponentGetDescription(comp, &cd) == noErr) {
-        // [FIX] 仅对麦克风采集单元（RemoteIO / VoiceProcessingIO）替换；去掉原 'auou' 死代码
+
         OSType sub = cd.componentSubType;
         BOOL isMic = (sub == 'rioc') || (sub == 'vpio');
         if (!isMic) return status;
@@ -459,7 +433,6 @@ static OSStatus hooked_AudioUnitRender(
                              kAudioUnitScope_Output, inOutputBusNumber,
                              &g_targetASBD, &propSize);
         g_hasProbedASBD = YES;
-
         [MediaManager setupAudioReaderIfNeeded];
     }
     if (g_targetASBD.mChannelsPerFrame == 0) g_targetASBD.mChannelsPerFrame = 1;
@@ -487,16 +460,13 @@ static OSStatus hooked_AudioUnitRender(
 
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      fromConnection:(AVCaptureConnection *)connection {
-    if (g_replaceMode == 1) {   // 视频模式才替换实时相机视频帧
+    if (g_replaceMode == 1) {
         CVPixelBufferRef origPixel = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (origPixel) {
             size_t  srcW = CVPixelBufferGetWidth(origPixel);
             size_t  srcH = CVPixelBufferGetHeight(origPixel);
             OSType  pfmt = CVPixelBufferGetPixelFormatType(origPixel);
-            // [FIX] 竖屏视频被 AVAssetReader 读成横屏存储帧（preferredTransform 未应用），
-            //       需要 g_rotation=90/270 转正。转正后内容尺寸互换（横→竖），
-            //       因此【输出画布也必须互换】，否则竖屏内容被塞进横屏画布 → 偏移/黑边。
-            //       输出 buffer 尺寸 = 源尺寸按 rotation 互换后的值。
+
             size_t  tw = srcW, th = srcH;
             if (g_rotation == 90 || g_rotation == 270) {
                 tw = srcH; th = srcW;
@@ -531,7 +501,7 @@ static VCamVideoProxy *g_videoProxy = nil;
 }
 %end
 
-#pragma mark - [FIX] VCamAudioProxy（音频采集替换：覆盖 AVFoundation 麦克风路径）
+#pragma mark - VCamAudioProxy（AVCaptureAudio 采集替换）
 @interface VCamAudioProxy : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
@@ -622,53 +592,44 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 %end
 
-#pragma mark - [FIX] WeVisVoipEffectMgr（微信视频通话逐帧替换，严格对齐 VCAM 0x18904）
-// VCAM 真实反汇编语义（0x18904，capstone 标注）：
-//   x0=self  x1=sel  x2=sampleBuffer  x3=outputTexture(int*)  x4=flipX  x5=ignoreBg
-//   1. retval = [global@0x25000+0x800 getVideoFrame:sampleBuffer]   （selref@0x24eb8 = 'getVideoFrame:'）
-//   2. retval == nil  → 跳 0x18a40：直接 blr 原函数 IMP(0x425000+0xd80)，原 sampleBuffer/outputTexture 透传，返回原函数结果
-//   3. retval != nil  → 仅读 currentDevice/orientation 并写 0x25000+0xc10 模式字节(1..4)，
-//                       随后 0x18a20 `return retval`（即 getVideoFrame: 返回的新 CMSampleBufferRef）
-//                       —— **非 nil 路径完全不调用原函数**，替换后的 buffer 直接作为方法返回值交给微信
-//   结论（以 VCAM 为准）：用「返回值方式」替换——成功直接返回新 CMSampleBufferRef；失败(nil)才透传原函数。
-//   VCAM 的 getVideoFrame: 收 CMSampleBufferRef（作尺寸/参考）、返回新的 CMSampleBufferRef；
-//   本 hook 等价地取原帧尺寸 → 调现有 CGSize 引擎拿 CIImage → 包成新 CMSampleBufferRef 返回。
+#pragma mark - WeVisVoipEffectMgr（微信视频通话逐帧替换）
+
 @interface WeVisVoipEffectMgr : NSObject @end
 %hook WeVisVoipEffectMgr
 - (id)processVideoSampleBuffer:(CMSampleBufferRef)sampleBuffer
                    outputTexture:(int *)outputTexture
                  pixelBufferFlipX:(BOOL)flipX
              shouldIgnoreBackground:(BOOL)ignoreBg {
-    (void)outputTexture; (void)flipX; (void)ignoreBg;   // 以 VCAM 为准：非 nil 路径不写 outputTexture、不调原函数
-    if (g_replaceMode == 0) { return %orig; }   // 关闭：对齐 VCAM 0x18a40 透传分支
+    (void)outputTexture; (void)flipX; (void)ignoreBg;
+    if (g_replaceMode == 0) { return %orig; }
 
     CVPixelBufferRef origPixel = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (!origPixel) return %orig;               // 异常帧：透传原函数
+    if (!origPixel) return %orig;
 
     size_t  srcW = CVPixelBufferGetWidth(origPixel);
     size_t  srcH = CVPixelBufferGetHeight(origPixel);
     OSType  pfmt = CVPixelBufferGetPixelFormatType(origPixel);
-    // [FIX] 同 VCamVideoProxy：rotation=90/270 时输出画布尺寸互换（竖屏内容填满竖屏画布）
+
     size_t  tw = srcW, th = srcH;
     if (g_rotation == 90 || g_rotation == 270) {
         tw = srcH; th = srcW;
     }
-    CIImage *img = [MediaManager getVideoFrame:CGSizeMake(tw, th)];   // 视频模式（对齐 VCAM 0xc10=1）
+    CIImage *img = [MediaManager getVideoFrame:CGSizeMake(tw, th)];
     if (img) {
         CMSampleBufferRef newSample = VCamMakeSampleBufferFromImage(img, tw, th, pfmt, sampleBuffer);
         if (newSample) {
-            // 以 VCAM 为准：直接返回替换后的 buffer（等价于 VCAM return getVideoFrame: 结果，不调原函数）
+
             return (__bridge_transfer id)newSample;
         }
     }
-    return %orig;   // 取不到帧：透传原函数
+    return %orig;
 }
 %end
 
 #pragma mark - [FIX] AVCaptureSession startRunning/stopRunning（对齐 VCAM 0x187e4/0x18888，起停时重载读取器）
 %hook AVCaptureSession
 - (void)startRunning {
-    if (g_replaceMode == 1) {   // 视频模式才需要重载读取器
+    if (g_replaceMode == 1) {
         g_videoReload = YES;
         g_audioReload = YES;
         [MediaManager setupVideoReaderIfNeeded];
@@ -707,7 +668,7 @@ static char kVCamOverlayTag;
     }
 }
 - (void)tick {
-    if (g_replaceMode != 1) return;   // 仅视频模式泵入预览
+    if (g_replaceMode != 1) return;
     @synchronized(self) {
         for (CALayer *ov in self.overlays) {
             if (!ov) continue;
@@ -731,7 +692,7 @@ static char kVCamOverlayTag;
         objc_setAssociatedObject(ov, &kVCamOverlayTag, @(YES), OBJC_ASSOCIATION_RETAIN);
         ov.frame = self.bounds;
         ov.opacity = 1.0;
-        [self addSublayer:ov];   // 重新进入 hook 时因 tag 被识别，仅 %orig，不会递归
+        [self addSublayer:ov];
         [[VCamPreviewPump shared] addOverlay:ov];
     }
 }
@@ -766,12 +727,12 @@ static char kVCamOverlayTag;
 
 #pragma mark - UI 构建（透明背景 + 深色面板 + systemGray5 导航/按钮，透明背景下天然形成边界对比）
 - (void)setupBackground {
-    // 背景透明：打开菜单时不遮挡底层相机/视频画面，便于改配置后实时预览
+
     self.view.backgroundColor = [UIColor clearColor];
 }
 - (void)setupPanel {
     _panelView = [[UIView alloc] init];
-    // 深色面板，透明背景下天然形成边界对比，不需要描边/阴影，看起来更干净
+
     _panelView.backgroundColor = [UIColor secondarySystemBackgroundColor];
     _panelView.layer.cornerRadius = 16;
     _panelView.layer.masksToBounds = YES;
@@ -876,7 +837,7 @@ static char kVCamOverlayTag;
 - (void)toggleRotate { g_rotation = (g_rotation + 90) % 360; SaveSettings(); [self refreshGridButtons]; }
 - (void)toggleLoop   { g_isLoop = !g_isLoop; SaveSettings(); [self refreshGridButtons]; }
 - (void)toggleSound  { g_isSound = !g_isSound; SaveSettings(); [self refreshGridButtons]; }
-- (void)actionRestore{ g_replaceMode = (g_replaceMode == 1) ? 0 : 1; SaveSettings(); [self refreshGridButtons]; }      // 替换(视频)开关
+- (void)actionRestore{ g_replaceMode = (g_replaceMode == 1) ? 0 : 1; SaveSettings(); [self refreshGridButtons]; }
 - (void)toggleMirror { g_isMirrored = !g_isMirrored; SaveSettings(); [self refreshGridButtons]; }
 
 - (void)refreshGridButtons {
@@ -1008,6 +969,7 @@ static void AddTapGestureToWindow(UIWindow *win) {
 %end
 
 #pragma mark - 构造 / 析构
+// 初始化全局状态、目录、reader；钩住 AudioUnitRender 接管麦克风音频
 %ctor {
     g_fileManager = [NSFileManager defaultManager];
     g_mediaLock   = [[NSLock alloc] init];
