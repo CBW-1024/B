@@ -749,7 +749,7 @@ static char kVCamOverlayTag;
     // 透明背景下用深色描边勾勒面板边界，避免亮色视频上边界不可见
     _panelView.layer.borderWidth = 1.5;
     _panelView.layer.borderColor = [[UIColor separatorColor] CGColor];
-    _panelView.translatesAutoresizingMaskConstraints = NO;
+    _panelView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_panelView];
     [NSLayoutConstraint activateConstraints:@[
         [_panelView.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
