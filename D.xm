@@ -11,6 +11,7 @@
 #import <substrate.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#pragma mark - 全局变量
 static NSFileManager *g_fileManager = nil;
 static NSLock       *g_mediaLock    = nil;
 static CIContext    *g_ciContext    = nil;
@@ -33,7 +34,9 @@ static BOOL g_isSound            = YES;
 static int  g_rotation           = 90;
 
 static BOOL g_isMirrored = NO;
+
 static BOOL g_enablePhotoReplacement = NO;
+
 static UIImage *g_currentPhotoImg = nil;
 
 static BOOL g_videoReload = NO;
@@ -51,16 +54,18 @@ static OSStatus (*orig_AudioUnitRender)(
 static NSString *g_videoDir      = nil;
 static NSString *g_tempVideoPath = nil;
 static NSString *g_tempAudioPath = nil;
+
 static NSString *g_photoPath     = nil;
 
+#pragma mark - 配置持久化
 static void SaveSettings(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d setInteger:g_rotation        forKey:@"vcam_rotation"];
     [d setBool:g_isLoop             forKey:@"vcam_loop"];
     [d setBool:g_isSound            forKey:@"vcam_sound"];
     [d setBool:g_enableReplacement  forKey:@"vcam_enable"];
-    [d setBool:g_isMirrored         forKey:@"vcam_mirror"];
-    [d setBool:g_enablePhotoReplacement forKey:@"vcam_photoreplace"];
+    [d setBool:g_isMirrored         forKey:@"vcam_mirror"];             
+    [d setBool:g_enablePhotoReplacement forKey:@"vcam_photoreplace"];  
     [d synchronize];
 }
 static void LoadSettings(void) {
@@ -70,10 +75,11 @@ static void LoadSettings(void) {
     if ([d objectForKey:@"vcam_loop"])     g_isLoop            = [d boolForKey:@"vcam_loop"];
     if ([d objectForKey:@"vcam_sound"])    g_isSound           = [d boolForKey:@"vcam_sound"];
     if ([d objectForKey:@"vcam_enable"])   g_enableReplacement = [d boolForKey:@"vcam_enable"];
-    if ([d objectForKey:@"vcam_mirror"])         g_isMirrored         = [d boolForKey:@"vcam_mirror"];
-    if ([d objectForKey:@"vcam_photoreplace"])    g_enablePhotoReplacement = [d boolForKey:@"vcam_photoreplace"];
+    if ([d objectForKey:@"vcam_mirror"])         g_isMirrored         = [d boolForKey:@"vcam_mirror"];          
+    if ([d objectForKey:@"vcam_photoreplace"])    g_enablePhotoReplacement = [d boolForKey:@"vcam_photoreplace"]; 
 }
 
+#pragma mark - 文件路径辅助
 static NSString *GetDocumentPath(void) {
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 }
@@ -81,6 +87,7 @@ static NSString *getSandboxVideoPath(void) {
     return [g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"];
 }
 
+#pragma mark - 视图控制器查找
 static UIViewController *bear_getTopVC(void) {
     UIWindow *key = nil;
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -97,6 +104,8 @@ static UIViewController *bear_getTopVC(void) {
     return vc;
 }
 
+#pragma mark - [FIX] int16 源 → 目标 ASBD 转换
+
 static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
                                        const AudioStreamBasicDescription *asbd,
                                        AudioBufferList *ioData, UInt32 frames) {
@@ -112,7 +121,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
     for (UInt32 i = 0; i < frames; i++) {
         for (int c = 0; c < dstCh; c++) {
             int16_t s = 0;
-            int idx = (srcChannels >= dstCh) ? c : 0;
+            int idx = (srcChannels >= dstCh) ? c : 0;   
             s = src[i * srcChannels + idx];
 
             if (isFloat) {
@@ -125,6 +134,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
                     if (d) d[i * dstCh + c] = f;
                 }
             } else if (bits == 32) {
+                
                 int32_t v = (int32_t)s;
                 if (asbd->mFormatFlags & kAudioFormatFlagIsAlignedHigh) v = (int32_t)s << 16;
                 if (nonInt) {
@@ -135,6 +145,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
                     if (d) d[i * dstCh + c] = v;
                 }
             } else {
+                
                 int16_t v = s;
                 if (nonInt) {
                     int16_t *d = (int16_t *)ioData->mBuffers[c].mData;
@@ -148,13 +159,16 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
     }
 }
 
+#pragma mark - MediaManager
 @interface MediaManager : NSObject
 + (void)setupVideoReaderIfNeeded;
 + (void)setupAudioReaderIfNeeded;
 + (CIImage *)getVideoFrame:(CGSize)targetSize;
 + (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length;
 + (void)cleanup;
+
 + (CIImage *)vcam_fitImage:(CIImage *)img toSize:(CGSize)targetSize;
+
 + (CIImage *)vcam_mirrorImage:(CIImage *)img;
 @end
 
@@ -188,7 +202,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
     @autoreleasepool {
         if (audioReader) {
             [audioReader cancelReading]; audioReader = nil; audioOutput = nil;
-            g_audioFIFO = nil;
+            g_audioFIFO = nil;   
         }
         NSString *path = g_tempAudioPath;
         if (![g_fileManager fileExistsAtPath:path]) path = getSandboxVideoPath();
@@ -196,7 +210,8 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
         AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
         AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
         if (track) {
-            CMAudioFormatDescriptionRef desc = (CMAudioFormatDescriptionRef)track.formatDescriptions.firstObject;
+            
+            CMAudioFormatDescriptionRef desc = (__bridge CMAudioFormatDescriptionRef)track.formatDescriptions.firstObject;
             if (desc) {
                 const AudioStreamBasicDescription *t = CMAudioFormatDescriptionGetStreamBasicDescription(desc);
                 if (t && t->mChannelsPerFrame > 0) g_sourceChannels = t->mChannelsPerFrame;
@@ -211,6 +226,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
                 AVLinearPCMIsBigEndianKey:   @NO,
                 AVLinearPCMIsNonInterleaved: @NO,
             }];
+            
             if (g_hasProbedASBD && g_targetASBD.mSampleRate > 0) {
                 settings[AVSampleRateKey] = @(g_targetASBD.mSampleRate);
             }
@@ -255,6 +271,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
 }
 
 + (CIImage *)getVideoFrame:(CGSize)targetSize {
+    
     if (g_enablePhotoReplacement && g_currentPhotoImg) {
         CIImage *photo = [CIImage imageWithCGImage:g_currentPhotoImg.CGImage];
         if (photo) {
@@ -322,6 +339,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
             CFRelease(sample);
         }
     }
+    
     if (g_isMirrored && result) result = [self vcam_mirrorImage:result];
     [g_mediaLock unlock];
     return result;
@@ -376,6 +394,7 @@ static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
 }
 @end
 
+#pragma mark - AudioUnitRender Hook（音频替换）
 static OSStatus hooked_AudioUnitRender(
     AudioUnit                   inUnit,
     AudioUnitRenderActionFlags  *ioActionFlags,
@@ -390,9 +409,7 @@ static OSStatus hooked_AudioUnitRender(
     if (!g_enableReplacement || !g_isSound)  return status;
 
     AudioComponentDescription cd = {0};
-    UInt32 cdsize = sizeof(cd);
-    if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_ComponentDescription,
-                             kAudioUnitScope_Global, 0, &cd, &cdsize) == noErr) {
+    if (AudioComponentGetDescription((AudioComponentInstance)inUnit, &cd) == noErr) {
         OSType sub = cd.componentSubType;
         BOOL isMic = (sub == 'rioc') || (sub == 'vpio') || (sub == 'auou');
         if (!isMic) return status;
@@ -404,11 +421,13 @@ static OSStatus hooked_AudioUnitRender(
                              kAudioUnitScope_Output, inOutputBusNumber,
                              &g_targetASBD, &propSize);
         g_hasProbedASBD = YES;
+        
         [MediaManager setupAudioReaderIfNeeded];
     }
     if (g_targetASBD.mChannelsPerFrame == 0) g_targetASBD.mChannelsPerFrame = 1;
 
     int srcCh = g_sourceChannels ?: 2;
+    
     NSUInteger needBytes = inNumberFrames * srcCh * 2;
     uint8_t *raw = (uint8_t *)malloc(needBytes);
     if (!raw) return noErr;
@@ -418,6 +437,7 @@ static OSStatus hooked_AudioUnitRender(
     return noErr;
 }
 
+#pragma mark - VCamVideoProxy（视频替换）
 @interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
@@ -486,6 +506,7 @@ static VCamVideoProxy *g_videoProxy = nil;
 }
 %end
 
+#pragma mark - [FIX] VCamAudioProxy（音频采集替换：覆盖 AVFoundation 麦克风路径）
 @interface VCamAudioProxy : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
@@ -529,6 +550,7 @@ static VCamVideoProxy *g_videoProxy = nil;
                     free(raw);
 
                     CMBlockBufferRef block = NULL;
+                    
                     CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, data, totalBytes,
                                                        kCFAllocatorDefault, NULL, 0, totalBytes, 0, &block);
                     if (block) {
@@ -541,6 +563,7 @@ static VCamVideoProxy *g_videoProxy = nil;
                         CMSampleTimingInfo timing;
                         if (newFmt && CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timing) == noErr) {
                             CMSampleBufferRef newS = NULL;
+                            
                             CMSampleBufferCreate(kCFAllocatorDefault, block, YES, NULL, NULL,
                                                  newFmt, frames, 1, &timing, 0, NULL, &newS);
                             if (newS) outBuf = newS;
@@ -548,7 +571,7 @@ static VCamVideoProxy *g_videoProxy = nil;
                         if (newFmt) CFRelease(newFmt);
                         CFRelease(block);
                     } else {
-                        free(data);
+                        free(data);   
                     }
                 } else {
                     free(data);
@@ -574,6 +597,7 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 %end
 
+#pragma mark - LittleBearMenuVC（控制菜单界面）
 @interface LittleBearMenuVC : UIViewController
     <UIImagePickerControllerDelegate, UIDocumentPickerDelegate, UINavigationControllerDelegate>
 @end
@@ -586,10 +610,11 @@ static VCamAudioProxy *g_audioProxy = nil;
     UIButton *_btnSound;
     UIButton *_btnRotate;
     UIButton *_btnEnable;
-    UIButton *_btnMirror;
+    UIButton *_btnMirror;   
     UIView   *_contentView;
 }
 
+#pragma mark - 生命周期
 - (void)viewDidLoad {
     [super viewDidLoad];
     [self setupBackground];
@@ -600,6 +625,7 @@ static VCamAudioProxy *g_audioProxy = nil;
     [self updateStatusUI];
 }
 
+#pragma mark - UI 构建
 - (void)setupBackground {
     self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
     UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
@@ -689,16 +715,20 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)setupButtons {
     CGFloat btnW = 140, btnH = 40, gap = 8;
     CGFloat y = 28;
+    
     [self addGridButton:@"相册选择" x:0 y:y w:btnW h:btnH action:@selector(actionSelectAlbum)];
     [self addGridButton:@"文件选择" x:btnW + gap y:y w:btnW h:btnH action:@selector(actionSelectFile)];
     y += btnH + gap;
+    
     _btnRotate = [self addGridButton:[NSString stringWithFormat:@"旋转 (%d°)", g_rotation] x:0 y:y w:btnW h:btnH action:@selector(toggleRotate)];
     _btnLoop   = [self addGridButton:g_isLoop ? @"循环: 开" : @"循环: 关" x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleLoop)];
     y += btnH + gap;
+    
     _btnSound  = [self addGridButton:g_isSound ? @"声音: 开" : @"声音: 关" x:0 y:y w:btnW h:btnH action:@selector(toggleSound)];
     _btnMirror = [self addGridButton:g_isMirrored ? @"镜像: 开" : @"镜像: 关"
                                   x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleMirror)];
     y += btnH + gap;
+    
     [self addGridButton:g_enablePhotoReplacement ? @"拍替: 开" : @"拍替: 关"
                   x:0 y:y w:btnW h:btnH action:@selector(togglePhotoReplacement)];
     _btnEnable = [self addGridButton:g_enableReplacement ? @"替换: 开" : @"替换: 关"
@@ -707,11 +737,14 @@ static VCamAudioProxy *g_audioProxy = nil;
     [_panelView.heightAnchor constraintEqualToConstant:y + 56 + 16].active = YES;
 }
 
+#pragma mark - 按钮动作
 - (void)toggleRotate { g_rotation = (g_rotation + 90) % 360; SaveSettings(); [self refreshGridButtons]; }
 - (void)toggleLoop   { g_isLoop = !g_isLoop; SaveSettings(); [self refreshGridButtons]; }
 - (void)toggleSound  { g_isSound = !g_isSound; SaveSettings(); [self refreshGridButtons]; }
 - (void)actionRestore{ g_enableReplacement = !g_enableReplacement; SaveSettings(); [self refreshGridButtons]; }
+
 - (void)toggleMirror { g_isMirrored = !g_isMirrored; SaveSettings(); [self refreshGridButtons]; }
+
 - (void)togglePhotoReplacement { g_enablePhotoReplacement = !g_enablePhotoReplacement; SaveSettings(); [self refreshGridButtons]; }
 
 - (void)refreshGridButtons {
@@ -732,6 +765,7 @@ static VCamAudioProxy *g_audioProxy = nil;
     configEnable.attributedTitle = [[NSAttributedString alloc] initWithString:
         (g_enableReplacement ? @"替换: 开" : @"替换: 关") attributes:@{NSFontAttributeName: font}];
     _btnEnable.configuration = configEnable;
+    
     UIButtonConfiguration *configMirror = _btnMirror.configuration;
     configMirror.attributedTitle = [[NSAttributedString alloc] initWithString:
         (g_isMirrored ? @"镜像: 开" : @"镜像: 关") attributes:@{NSFontAttributeName: font}];
@@ -740,19 +774,22 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 - (void)updateStatusUI {
     NSString *vStat = [g_fileManager fileExistsAtPath:getSandboxVideoPath()] ? @"已加载" : @"未选择";
-    NSString *pStat = (g_enablePhotoReplacement && g_currentPhotoImg) ? @"已选" : @"未选";
+    NSString *pStat = (g_enablePhotoReplacement && g_currentPhotoImg) ? @"已选" : @"未选";  
     _statusLbl.text = [NSString stringWithFormat:@"视频: %@  照片: %@", vStat, pStat];
 }
 - (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
 
+#pragma mark - 文件选择
 - (void)actionSelectAlbum {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    
     picker.mediaTypes = @[@"public.movie", @"public.image"];
     picker.delegate = (id)self;
     [self presentViewController:picker animated:YES completion:nil];
 }
 - (void)actionSelectFile {
+    
     NSArray *contentTypes = @[UTTypeMovie, UTTypeAudio, UTTypeImage];
     UIDocumentPickerViewController *picker =
         [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:contentTypes asCopy:YES];
@@ -781,14 +818,17 @@ static VCamAudioProxy *g_audioProxy = nil;
         g_audioReload = YES;
         [MediaManager setupAudioReaderIfNeeded];
     } else {
+        
         NSData *data = [NSData dataWithContentsOfFile:src];
         UIImage *img = data ? [UIImage imageWithData:data] : nil;
         if (img) [self savePhoto:img];
     }
     [self refreshGridButtons];
 }
+
 - (void)savePhoto:(UIImage *)img {
     if (!img) return;
+    
     if (img.imageOrientation != UIImageOrientationUp) {
         UIGraphicsBeginImageContextWithOptions(img.size, NO, img.scale);
         [img drawInRect:CGRectMake(0, 0, img.size.width, img.size.height)];
@@ -805,9 +845,11 @@ static VCamAudioProxy *g_audioProxy = nil;
     [self refreshGridButtons];
 }
 
+#pragma mark - UIImagePickerControllerDelegate
 - (void)imagePickerController:(UIImagePickerController *)picker
 didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
+    
     NSURL *url = info[UIImagePickerControllerMediaURL];
     if (url) { [self processSelectedVideoURL:url]; return; }
     UIImage *img = info[UIImagePickerControllerOriginalImage];
@@ -815,6 +857,7 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 }
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker { [picker dismissViewControllerAnimated:YES completion:nil]; }
 
+#pragma mark - UIDocumentPickerDelegate
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     [controller dismissViewControllerAnimated:YES completion:nil];
     if (urls.count > 0) [self processSelectedVideoURL:urls.firstObject];
@@ -826,6 +869,7 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller { [controller dismissViewControllerAnimated:YES completion:nil]; }
 @end
 
+#pragma mark - UIWindow 手势触发
 static void AddTapGestureToWindow(UIWindow *win) {
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
         initWithTarget:win action:@selector(bear_tp)];
@@ -857,6 +901,7 @@ static void AddTapGestureToWindow(UIWindow *win) {
 }
 %end
 
+#pragma mark - 构造 / 析构
 %ctor {
     g_fileManager = [NSFileManager defaultManager];
     g_mediaLock   = [[NSLock alloc] init];
@@ -869,7 +914,8 @@ static void AddTapGestureToWindow(UIWindow *win) {
     [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
     g_tempVideoPath = [getSandboxVideoPath() copy];
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
-    g_photoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_photo.jpg"] copy];
+    g_photoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_photo.jpg"] copy];  
+    
     if ([g_fileManager fileExistsAtPath:g_photoPath]) {
         g_currentPhotoImg = [UIImage imageWithContentsOfFile:g_photoPath];
     }
