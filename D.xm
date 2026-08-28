@@ -307,44 +307,69 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                     //   → scale = MIN(a,b)  ← 即 contain（完整显示、不放大、四周可能留黑边）
                     //   0xc46c tx=(rotW*scale - targetW)/2 ; ty=(rotH*scale - targetH)/2
                     //
-                    // 实现路径（修正版 —— rotate-then-scale 分离两步，确保 extent 严格归零）：
-                    //   1) 先做旋转：imageByApplyingTransform:rotate(angle)
-                    //      → rotated.extent 严格 = (0, 0, rotW, rotH)，origin 必为 (0,0)
-                    //      （旧版 scale-then-rotate 复合的 extent.origin 不为 0，compositing 之后画布溢出 → 视频偏移）
-                    //   2) 再做 contain 缩放：scale = MIN(targetW/rotW, targetH/rotH)
-                    //   3) imageByApplyingTransform:scale → 缩放后 extent = (0,0,rotW*scale,rotH*scale)
-                    //   4) 居中平移 tx=(targetW-rotW*scale)/2, ty=(targetH-rotH*scale)/2
-                    //      平移后 extent = (tx, ty, rotW*scale, rotH*scale) —— 严格落在画布内
-                    //   5) imageByCompositingOverImage 合成到 (0,0,targetW,targetH) 黑底画布
-                    //      → composed.extent 严格等于目标（前景被背景完全包住，不溢出）
-                    //   6) VCamMakeSampleBufferFromImage 用 render:toCVPixelBuffer（无 bounds）1:1 渲染
-                    //      → image (0,0) 映射到 buffer (0,0)，视频像素在画布中精确居中
+                    // 实现路径（复合 CGAffineTransform + 强制 cropping，完全回避 extent.origin 歧义）：
+                    //   CIImage 引擎在 iOS 实机上对 imageByApplyingTransform:rotate 后的 extent.origin
+                    //   返回值不稳定（不一定是 aabb 的 min corner），导致前两版居中算法都失败。
+                    //   本版完全自己算旋转后 aabb 的 min corner，把"旋转+缩放+居中平移"合成为一个
+                    //   CGAffineTransform 矩阵，再用 imageByCroppingToRect 强制裁到
+                    //   (0,0,targetW,targetH) —— cropping 后 extent 必为裁剪矩形，origin 必为 (0,0)，
+                    //   之后 1:1 render 严格对齐输出 buffer。
                     CGFloat targetW = targetSize.width;
                     CGFloat targetH = targetSize.height;
-                    // 步骤 1：先做旋转（origin 归 0，便于后续所有几何计算）
-                    CGAffineTransform tRot = CGAffineTransformIdentity;
-                    if (g_rotation == 90) {
-                        tRot = CGAffineTransformMakeRotation(M_PI_2);
-                    } else if (g_rotation == 180) {
-                        tRot = CGAffineTransformMakeRotation(M_PI);
-                    } else if (g_rotation == 270) {
-                        tRot = CGAffineTransformMakeRotation(3 * M_PI_2);
-                    }
-                    CIImage *rotated = (g_rotation == 0) ? img : [img imageByApplyingTransform:tRot];
-                    CGRect rotE = rotated.extent;       // 严格 (0,0,rotW,rotH)，origin 必为 (0,0)
+                    CGRect origE = img.extent;
+                    CGFloat srcW = origE.size.width;
+                    CGFloat srcH = origE.size.height;
+                    CGFloat srcX = origE.origin.x;
+                    CGFloat srcY = origE.origin.y;
+                    // 步骤 1：算出旋转角度的 sin/cos + 旋转后 aabb 尺寸
+                    CGFloat angle = 0.0;
+                    if (g_rotation == 90)      angle = M_PI_2;
+                    else if (g_rotation == 180) angle = M_PI;
+                    else if (g_rotation == 270) angle = 3 * M_PI_2;
+                    CGFloat sa = sin(angle), ca = cos(angle);
+                    CGFloat rotW = fabs(srcW * ca) + fabs(srcH * sa);
+                    CGFloat rotH = fabs(srcW * sa) + fabs(srcH * ca);
                     // 步骤 2：contain 缩放（MIN）
-                    CGFloat scale = MIN(targetW / rotE.size.width, targetH / rotE.size.height);
-                    // 步骤 3：缩放
-                    CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
-                    CGRect sE = scaled.extent;          // 严格 (0,0,rotW*scale,rotH*scale)
-                    // 步骤 4：居中平移（正号：向右/下移，让视频进入画布中心）
-                    CGFloat tx = (targetW - sE.size.width)  / 2.0;
-                    CGFloat ty = (targetH - sE.size.height) / 2.0;
-                    CIImage *centered = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(tx, ty)];
-                    // 步骤 5：合成到 (0,0,targetW,targetH) 黑底画布（强制整体 extent 严格等于目标）
+                    CGFloat scale = MIN(targetW / rotW, targetH / rotH);
+                    CGFloat fitW = rotW * scale;
+                    CGFloat fitH = rotH * scale;
+                    // 步骤 3：算旋转后 aabb 的 min corner（穷举 4 角点，不依赖 CIImage extent）
+                    //    原图 4 角点（相对 srcX,srcY）: (0,0), (srcW,0), (0,srcH), (srcW,srcH)
+                    //    旋转 angle 后的 4 角点：
+                    //      (0,0)        → (0, 0)
+                    //      (srcW,0)     → (srcW*ca, srcW*sa)
+                    //      (0,srcH)     → (-srcH*sa, srcH*ca)
+                    //      (srcW,srcH)  → (srcW*ca - srcH*sa, srcW*sa + srcH*ca)
+                    CGFloat cx0 = 0,                cy0 = 0;
+                    CGFloat cx1 = srcW * ca,        cy1 = srcW * sa;
+                    CGFloat cx2 = -srcH * sa,       cy2 = srcH * ca;
+                    CGFloat cx3 = srcW*ca - srcH*sa, cy3 = srcW*sa + srcH*ca;
+                    CGFloat minX = MIN(MIN(cx0, cx1), MIN(cx2, cx3));
+                    CGFloat minY = MIN(MIN(cy0, cy1), MIN(cy2, cy3));
+                    // 步骤 4：构造复合矩阵（对原图坐标系里的点 P 作用）
+                    //    P_new = T(tx, ty) * S(scale) * T(-minX, -minY) * R(angle) * T(-srcX, -srcY) * P
+                    //    含义：
+                    //      1) T(-srcX, -srcY)  — 把原图左上角移到 (0, 0)（兼容 origin 非零）
+                    //      2) R(angle)         — 旋转
+                    //      3) T(-minX, -minY)  — 把旋转后 aabb 归零到 (0, 0)
+                    //      4) S(scale)         — 缩放
+                    //      5) T(tx, ty)        — 居中平移到画布
+                    CGFloat tx = (targetW - fitW) / 2.0;
+                    CGFloat ty = (targetH - fitH) / 2.0;
+                    CGAffineTransform m = CGAffineTransformIdentity;
+                    m = CGAffineTransformTranslate(m, tx, ty);
+                    m = CGAffineTransformScale(m, scale, scale);
+                    m = CGAffineTransformTranslate(m, -minX, -minY);
+                    m = CGAffineTransformRotate(m, angle);
+                    m = CGAffineTransformTranslate(m, -srcX, -srcY);
+                    CIImage *transformed = [img imageByApplyingTransform:m];
+                    // 步骤 5：imageByCroppingToRect 强制 extent = (0, 0, targetW, targetH)
+                    //          CIImage 保证 cropping 后的 extent 严格等于裁剪矩形，origin 必为 (0,0)
+                    CIImage *cropped = [transformed imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
+                    // 步骤 6：合成到 (0,0,targetW,targetH) 黑底画布（双保险：前景/背景 extent 完全相同）
                     CIImage *backdrop = [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]]
                                          imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
-                    result = [centered imageByCompositingOverImage:backdrop];
+                    result = [cropped imageByCompositingOverImage:backdrop];
                 }
             }
             CFRelease(sample);
