@@ -167,7 +167,11 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                         (__bridge CFDictionaryRef)pbAttrs, &newPixel);
     if (!newPixel) return NULL;
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    [g_ciContext render:img toCVPixelBuffer:newPixel bounds:CGRectMake(0, 0, tw, th) colorSpace:cs];
+    // 关键：使用无 bounds 参数的 render 重载，让 CIImage.extent 1:1 渲染到 pixel buffer。
+    // 之前用 bounds:(0,0,tw,th) 会让 CIContext 把 image.extent 强制缩放适配到 bounds，
+    // 即使 image.extent 是 (ox,oy,...) 也会被拉伸映射，导致视频偏移到一侧。
+    // 要求调用方保证 img.extent 严格等于 (0,0,tw,th)（getVideoFrame 配合 imageByCompositingOverImage 达成）。
+    [g_ciContext render:img toCVPixelBuffer:newPixel];
     CGColorSpaceRelease(cs);
 
     CMVideoFormatDescriptionRef fmtDesc = NULL;
@@ -293,59 +297,42 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
             if (pix) {
                 CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
                 if (img) {
-                    CIImage *rotated = img;
-                    if (g_rotation != 0) {
-                        CGRect extent = img.extent;
-                        CGAffineTransform t = CGAffineTransformIdentity;
-                        if (g_rotation == 90) {
-                            t = CGAffineTransformMakeTranslation(extent.size.height, 0);
-                            t = CGAffineTransformRotate(t, M_PI_2);
-                        } else if (g_rotation == 180) {
-                            t = CGAffineTransformMakeTranslation(extent.size.width, extent.size.height);
-                            t = CGAffineTransformRotate(t, M_PI);
-                        } else if (g_rotation == 270) {
-                            t = CGAffineTransformMakeTranslation(0, extent.size.width);
-                            t = CGAffineTransformRotate(t, 3 * M_PI_2);
-                        }
-                        rotated = [img imageByApplyingTransform:t];
-                    }
-                    CGRect rotatedExtent = rotated.extent;
-                    if (rotatedExtent.origin.x != 0 || rotatedExtent.origin.y != 0) {
-                        rotated = [rotated imageByApplyingTransform:
-                            CGAffineTransformMakeTranslation(-rotatedExtent.origin.x,
-                                                            -rotatedExtent.origin.y)];
-                    }
-                    // ===== 视频完整显示、不放大（contain / aspect-fit），对齐用户图3/图4 表现 =====
-                    // 与 D.txt 的 cover(MAX) 不同：D.txt 视频处理本身有问题，这里用 contain 让
-                    // 视频完整可见、四周均匀黑边，且严格居中。
-                    // 关键：scale=MIN → 视频缩小完整放入；居中平移(offsetX,offsetY) →
-                    // crop(0,0,target) 取目标范围内可见部分 → 再归一化 extent 原点。
-                    // 否则 CIImage 非零 origin 经 VCamMakeSampleBufferFromImage 的
-                    // render:toCVPixelBuffer:bounds:(0,0,target) 会被拉伸映射到 bounds，
-                    // 导致视频被推到一侧、单边黑边（即之前"一边黑边不居中"的 bug）。
-                    CGRect e = rotated.extent;
+                    // ===== 视频完整显示、居中、不放大（contain / aspect-fit）=====
+                    // 之前几版（cover/contain + translate + crop + normalize）都因 CIImage extent
+                    // 原点歧义以及 render:toCVPixelBuffer:bounds: 强制缩放 image.extent 到 bounds
+                    // 导致视频被推到一侧（"一边黑边不居中"的根因）。
+                    //
+                    // 正确方案：
+                    //   1) 一次性 transform：contain 缩放 + 旋转 复合
+                    //   2) 用 transform 后 extent 的 aabb 算居中平移（含 origin 修正）
+                    //   3) imageByCompositingOverImage 合成到 (0,0,targetW,targetH) 纯黑画布
+                    //      → 强制 composed.extent 严格等于 (0,0,targetW,targetH)
+                    //   4) VCamMakeSampleBufferFromImage 用 render:toCVPixelBuffer（无 bounds）1:1 渲染
+                    //      → image (0,0) 映射到 buffer (0,0)，视频在画布中居中，四周均匀黑边
                     CGFloat targetW = targetSize.width;
                     CGFloat targetH = targetSize.height;
-                    CGFloat sx = targetW / e.size.width;
-                    CGFloat sy = targetH / e.size.height;
-                    CGFloat scale = (sx <= sy) ? sx : sy;          // MIN（contain，不放大）
-                    CIImage *scaled = [rotated imageByApplyingTransform:
-                        CGAffineTransformMakeScale(scale, scale)];
-                    CGRect se = scaled.extent;
-                    // 居中：视频小图在 target 画布中水平/垂直居中
-                    CGFloat offsetX = (targetW - se.size.width)  / 2.0;
-                    CGFloat offsetY = (targetH - se.size.height) / 2.0;
-                    CIImage *centered = [scaled imageByApplyingTransform:
-                        CGAffineTransformMakeTranslation(offsetX, offsetY)];
-                    // 裁剪到目标尺寸（取居中后的可见部分，extent 落在 [0,target] 内）
-                    CIImage *crop = [centered imageByCroppingToRect:
-                        CGRectMake(0, 0, targetW, targetH)];
-                    // 归一化 extent 原点为 (0,0)，确保 render 到 target buffer 时 1:1 居中、四周均匀黑边
-                    CGRect ce = crop.extent;
-                    if (ce.origin.x != 0 || ce.origin.y != 0)
-                        crop = [crop imageByApplyingTransform:
-                            CGAffineTransformMakeTranslation(-ce.origin.x, -ce.origin.y)];
-                    result = crop;
+                    CGRect origE = img.extent;  // 原始帧 extent（旋转前），contain 缩放参考
+                    CGFloat scale = MIN(targetW / origE.size.width, targetH / origE.size.height);
+                    // 复合 transform：scale * rotate（先缩放，再旋转）
+                    CGAffineTransform tFit = CGAffineTransformMakeScale(scale, scale);
+                    if (g_rotation == 90) {
+                        tFit = CGAffineTransformRotate(tFit, M_PI_2);
+                    } else if (g_rotation == 180) {
+                        tFit = CGAffineTransformRotate(tFit, M_PI);
+                    } else if (g_rotation == 270) {
+                        tFit = CGAffineTransformRotate(tFit, 3 * M_PI_2);
+                    }
+                    CIImage *fitted = [img imageByApplyingTransform:tFit];
+                    // 旋转 + 缩放后视频的 aabb（origin 可能非 0，size 可能交换）
+                    CGRect fe = fitted.extent;
+                    CGFloat offX = (targetW - fe.size.width)  / 2.0 - fe.origin.x;
+                    CGFloat offY = (targetH - fe.size.height) / 2.0 - fe.origin.y;
+                    CIImage *centered = [fitted imageByApplyingTransform:
+                        CGAffineTransformMakeTranslation(offX, offY)];
+                    // 用 (0,0,targetW,targetH) 黑底画布合成，强制整体 extent 严格等于目标
+                    CIImage *backdrop = [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]]
+                                         imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
+                    result = [centered imageByCompositingOverImage:backdrop];
                 }
             }
             CFRelease(sample);
