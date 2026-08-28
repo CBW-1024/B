@@ -344,17 +344,12 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                     CGFloat scale = MIN(targetSize.width / normalizedExtent.size.width,
                                         targetSize.height / normalizedExtent.size.height);
                     CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+                    // contain：等比缩小后居中，不裁剪（裁剪会让图偏到一角）。
+                    // 缩放后图尺寸 ≤ target，用居中 translate 即可，多余区域天然留边，输出尺寸保持 target。
                     CGRect scaledExtent = scaled.extent;
-                    CGFloat offsetX = (scaledExtent.size.width - targetSize.width) / 2.0;
-                    CGFloat offsetY = (scaledExtent.size.height - targetSize.height) / 2.0;
-                    CGRect cropRect = CGRectMake(offsetX, offsetY, targetSize.width, targetSize.height);
-                    result = [scaled imageByCroppingToRect:cropRect];
-                    CGRect resultExtent = result.extent;
-                    if (resultExtent.origin.x != 0 || resultExtent.origin.y != 0) {
-                        CGAffineTransform translateBack = CGAffineTransformMakeTranslation(-resultExtent.origin.x,
-                                                                                           -resultExtent.origin.y);
-                        result = [result imageByApplyingTransform:translateBack];
-                    }
+                    CGFloat offsetX = (targetSize.width  - scaledExtent.size.width)  / 2.0;
+                    CGFloat offsetY = (targetSize.height - scaledExtent.size.height) / 2.0;
+                    result = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(offsetX, offsetY)];
                 }
             }
             CFRelease(sample);
@@ -774,7 +769,7 @@ static char kVCamOverlayTag;
 }
 - (void)setupNavBar {
     UIView *navBar = [[UIView alloc] init];
-    navBar.backgroundColor = [UIColor systemGray6Color];
+    navBar.backgroundColor = [UIColor systemGray5Color];
     navBar.translatesAutoresizingMaskIntoConstraints = NO;
     [_panelView addSubview:navBar];
     [NSLayoutConstraint activateConstraints:@[
@@ -898,7 +893,7 @@ static char kVCamOverlayTag;
     NSString *vStat = [g_fileManager fileExistsAtPath:getSandboxVideoPath()] ? @"已加载" : @"未选择";
     _statusLbl.text = [NSString stringWithFormat:@"视频: %@", vStat];
 }
-- (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)closeMenu { [self.view removeFromSuperview]; }
 
 #pragma mark - 文件选择
 - (void)actionSelectAlbum {
@@ -981,12 +976,19 @@ static void AddTapGestureToWindow(UIWindow *win) {
     static BOOL menuVisible = NO;
     if (menuVisible) return;
     menuVisible = YES;
-    UIViewController *topVC = bear_getTopVC();
-    if (!topVC) { menuVisible = NO; return; }
+    // 直接把菜单 view 挂到 keyWindow 上（不 present），这样面板外区域 hitTest 返回 nil 时
+    // 触摸能落到下层微信界面，实现「弹窗时仍可操作背景」
+    UIWindow *key = nil;
+    for (UIWindowScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (s.activationState == UISceneActivationStateForegroundActive) { key = s.windows.firstObject; break; }
+    }
+    if (!key) { menuVisible = NO; return; }
     LittleBearMenuVC *vc = [LittleBearMenuVC new];
-    vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
-    vc.modalTransitionStyle   = UIModalTransitionStyleCrossDissolve;
-    [topVC presentViewController:vc animated:YES completion:^{ menuVisible = NO; }];
+    [vc loadViewIfNeeded];                       // 触发 viewDidLoad（setup 面板等）
+    vc.view.frame = key.bounds;
+    vc.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [key addSubview:vc.view];
+    menuVisible = NO;
 }
 @end
 %hook UIWindow
