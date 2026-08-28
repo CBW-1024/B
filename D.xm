@@ -302,18 +302,19 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                         rotated = [rotated imageByApplyingTransform:translate];
                     }
                     // 对齐 VCAM 0xbe74：视频完整显示、不被放大（contain / aspect-fit）。
-                    // 实测对比：VCAM 画面完整可见、四周留边；D_fixed 原 MAX 会放大裁切导致主体被切。
-                    // 故用 MIN 取「不溢出 target」的等比缩放，再居中（余量处留黑边），与 VCAM 视觉一致。
+                    // contain 缩放后居中，再把结果裁剪规范化为 (0,0,targetW,targetH)：
+                    // 否则 CIImage extent 非零原点经 VCamMakeSampleBufferFromImage 的
+                    // render:toCVPixelBuffer:bounds:(0,0,target) 会被拉伸映射到 bounds，导致偏移+黑边错乱。
                     CGRect normalizedExtent = rotated.extent;
                     CGFloat scale = MIN(targetSize.width / normalizedExtent.size.width,
                                         targetSize.height / normalizedExtent.size.height);
                     CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
-                    // contain：等比缩小后居中，不裁剪（裁剪会让图偏到一角）。
-                    // 缩放后图尺寸 ≤ target，用居中 translate 即可，多余区域天然留边，输出尺寸保持 target。
                     CGRect scaledExtent = scaled.extent;
                     CGFloat offsetX = (targetSize.width  - scaledExtent.size.width)  / 2.0;
                     CGFloat offsetY = (targetSize.height - scaledExtent.size.height) / 2.0;
                     result = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(offsetX, offsetY)];
+                    // 规范化为从原点开始、尺寸=target，确保渲染到 target buffer 时真正居中留边
+                    result = [result imageByCroppingToRect:CGRectMake(0, 0, targetSize.width, targetSize.height)];
                 }
             }
             CFRelease(sample);
@@ -668,18 +669,6 @@ static char kVCamOverlayTag;
 }
 %end
 
-#pragma mark - 背景穿透 view：面板外区域将触摸事件传给下层微信界面
-@interface VCamPassthroughView : UIView
-@end
-@implementation VCamPassthroughView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    // 命中自身（透明背景）时返回 nil，让触摸穿透到下层；命中子视图（面板/按钮）正常处理
-    if (hit == self) return nil;
-    return hit;
-}
-@end
-
 #pragma mark - LittleBearMenuVC（控制菜单界面）
 @interface LittleBearMenuVC : UIViewController
     <UIImagePickerControllerDelegate, UIDocumentPickerDelegate, UINavigationControllerDelegate>
@@ -697,10 +686,6 @@ static char kVCamOverlayTag;
 }
 
 #pragma mark - 生命周期
-- (void)loadView {
-    // 用可穿透的 VCamPassthroughView 作为根 view，面板外触摸可落到下层微信界面
-    self.view = [[VCamPassthroughView alloc] initWithFrame:UIScreen.mainScreen.bounds];
-}
 - (void)viewDidLoad {
     [super viewDidLoad];
     [self setupBackground];
@@ -857,7 +842,7 @@ static char kVCamOverlayTag;
     NSString *vStat = [g_fileManager fileExistsAtPath:getSandboxVideoPath()] ? @"已加载" : @"未选择";
     _statusLbl.text = [NSString stringWithFormat:@"视频: %@", vStat];
 }
-- (void)closeMenu { [self.view removeFromSuperview]; }
+- (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
 
 #pragma mark - 文件选择
 - (void)actionSelectAlbum {
@@ -940,19 +925,16 @@ static void AddTapGestureToWindow(UIWindow *win) {
     static BOOL menuVisible = NO;
     if (menuVisible) return;
     menuVisible = YES;
-    // 直接把菜单 view 挂到 keyWindow 上（不 present），这样面板外区域 hitTest 返回 nil 时
-    // 触摸能落到下层微信界面，实现「弹窗时仍可操作背景」
-    UIWindow *key = nil;
+    UIViewController *topVC = nil;
     for (UIWindowScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if (s.activationState == UISceneActivationStateForegroundActive) { key = s.windows.firstObject; break; }
+        if (s.activationState == UISceneActivationStateForegroundActive) { topVC = s.windows.firstObject.rootViewController; break; }
     }
-    if (!key) { menuVisible = NO; return; }
+    if (!topVC) { menuVisible = NO; return; }
+    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
     LittleBearMenuVC *vc = [LittleBearMenuVC new];
-    [vc loadViewIfNeeded];                       // 触发 viewDidLoad（setup 面板等）
-    vc.view.frame = key.bounds;
-    vc.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [key addSubview:vc.view];
-    menuVisible = NO;
+    vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    vc.modalTransitionStyle   = UIModalTransitionStyleCrossDissolve;
+    [topVC presentViewController:vc animated:YES completion:^{ menuVisible = NO; }];
 }
 @end
 %hook UIWindow
