@@ -709,6 +709,18 @@ static char kVCamOverlayTag;
 }
 %end
 
+#pragma mark - 背景穿透 view：面板外区域将触摸事件传给下层微信界面
+@interface VCamPassthroughView : UIView
+@end
+@implementation VCamPassthroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    // 命中自身（透明背景）时返回 nil，让触摸穿透到下层；命中子视图（面板/按钮）正常处理
+    if (hit == self) return nil;
+    return hit;
+}
+@end
+
 #pragma mark - LittleBearMenuVC（控制菜单界面）
 @interface LittleBearMenuVC : UIViewController
     <UIImagePickerControllerDelegate, UIDocumentPickerDelegate, UINavigationControllerDelegate>
@@ -726,6 +738,10 @@ static char kVCamOverlayTag;
 }
 
 #pragma mark - 生命周期
+- (void)loadView {
+    // 用可穿透的 VCamPassthroughView 作为根 view，面板外触摸可落到下层微信界面
+    self.view = [[VCamPassthroughView alloc] initWithFrame:UIScreen.mainScreen.bounds];
+}
 - (void)viewDidLoad {
     [super viewDidLoad];
     [self setupBackground];
@@ -734,14 +750,6 @@ static char kVCamOverlayTag;
     [self setupContent];
     [self setupButtons];
     [self updateStatusUI];
-}
-
-#pragma mark - 背景穿透：面板外的触摸穿透到下层微信界面
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    // self.view 自身或非面板区域：让触摸穿透（返回 nil），这样背后的微信通话可继续操作
-    if (hit == self.view) return nil;
-    return hit;
 }
 
 #pragma mark - UI 构建
