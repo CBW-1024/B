@@ -744,7 +744,6 @@ static char kVCamOverlayTag;
 
 @implementation LittleBearMenuVC {
     UIView   *_panelView;
-    UIView   *_blurView;
     UILabel  *_statusLbl;
     UIButton *_btnLoop;
     UIButton *_btnSound;
@@ -765,18 +764,15 @@ static char kVCamOverlayTag;
     [self updateStatusUI];
 }
 
-#pragma mark - UI 构建（参考 D.txt 风格：40% 透明黑底 + UIBlurEffect 毛玻璃，panel 用 systemBackgroundColor）
+#pragma mark - UI 构建（透明背景 + 深色面板 + systemGray5 导航/按钮，透明背景下天然形成边界对比）
 - (void)setupBackground {
-    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
-    UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
-    _blurView = [[UIVisualEffectView alloc] initWithEffect:blur];
-    _blurView.frame = self.view.bounds;
-    _blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.view addSubview:_blurView];
+    // 背景透明：打开菜单时不遮挡底层相机/视频画面，便于改配置后实时预览
+    self.view.backgroundColor = [UIColor clearColor];
 }
 - (void)setupPanel {
     _panelView = [[UIView alloc] init];
-    _panelView.backgroundColor = [UIColor systemBackgroundColor];
+    // 深色面板，透明背景下天然形成边界对比，不需要描边/阴影，看起来更干净
+    _panelView.backgroundColor = [UIColor secondarySystemBackgroundColor];
     _panelView.layer.cornerRadius = 16;
     _panelView.layer.masksToBounds = YES;
     _panelView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -789,7 +785,7 @@ static char kVCamOverlayTag;
 }
 - (void)setupNavBar {
     UIView *navBar = [[UIView alloc] init];
-    navBar.backgroundColor = [UIColor systemGray6Color];
+    navBar.backgroundColor = [UIColor systemGray5Color];
     navBar.translatesAutoresizingMaskIntoConstraints = NO;
     [_panelView addSubview:navBar];
     [NSLayoutConstraint activateConstraints:@[
