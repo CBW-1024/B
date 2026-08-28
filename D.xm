@@ -490,9 +490,17 @@ static OSStatus hooked_AudioUnitRender(
     if (g_replaceMode == 1) {   // 视频模式才替换实时相机视频帧
         CVPixelBufferRef origPixel = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (origPixel) {
-            size_t  tw   = CVPixelBufferGetWidth(origPixel);
-            size_t  th   = CVPixelBufferGetHeight(origPixel);
+            size_t  srcW = CVPixelBufferGetWidth(origPixel);
+            size_t  srcH = CVPixelBufferGetHeight(origPixel);
             OSType  pfmt = CVPixelBufferGetPixelFormatType(origPixel);
+            // [FIX] 竖屏视频被 AVAssetReader 读成横屏存储帧（preferredTransform 未应用），
+            //       需要 g_rotation=90/270 转正。转正后内容尺寸互换（横→竖），
+            //       因此【输出画布也必须互换】，否则竖屏内容被塞进横屏画布 → 偏移/黑边。
+            //       输出 buffer 尺寸 = 源尺寸按 rotation 互换后的值。
+            size_t  tw = srcW, th = srcH;
+            if (g_rotation == 90 || g_rotation == 270) {
+                tw = srcH; th = srcW;
+            }
             CIImage *img = [MediaManager getVideoFrame:CGSizeMake(tw, th)];
             if (img) {
                 CMSampleBufferRef newSample = VCamMakeSampleBufferFromImage(img, tw, th, pfmt, sampleBuffer);
@@ -637,9 +645,14 @@ static VCamAudioProxy *g_audioProxy = nil;
     CVPixelBufferRef origPixel = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!origPixel) return %orig;               // 异常帧：透传原函数
 
-    size_t  tw   = CVPixelBufferGetWidth(origPixel);
-    size_t  th   = CVPixelBufferGetHeight(origPixel);
+    size_t  srcW = CVPixelBufferGetWidth(origPixel);
+    size_t  srcH = CVPixelBufferGetHeight(origPixel);
     OSType  pfmt = CVPixelBufferGetPixelFormatType(origPixel);
+    // [FIX] 同 VCamVideoProxy：rotation=90/270 时输出画布尺寸互换（竖屏内容填满竖屏画布）
+    size_t  tw = srcW, th = srcH;
+    if (g_rotation == 90 || g_rotation == 270) {
+        tw = srcH; th = srcW;
+    }
     CIImage *img = [MediaManager getVideoFrame:CGSizeMake(tw, th)];   // 视频模式（对齐 VCAM 0xc10=1）
     if (img) {
         CMSampleBufferRef newSample = VCamMakeSampleBufferFromImage(img, tw, th, pfmt, sampleBuffer);
