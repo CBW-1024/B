@@ -409,7 +409,8 @@ static OSStatus hooked_AudioUnitRender(
     if (!g_enableReplacement || !g_isSound)  return status;
 
     AudioComponentDescription cd = {0};
-    if (AudioComponentGetDescription((AudioComponentInstance)inUnit, &cd) == noErr) {
+    AudioComponent comp = AudioComponentInstanceGetComponent(inUnit);
+    if (comp && AudioComponentGetDescription(comp, &cd) == noErr) {
         OSType sub = cd.componentSubType;
         BOOL isMic = (sub == 'rioc') || (sub == 'vpio') || (sub == 'auou');
         if (!isMic) return status;
