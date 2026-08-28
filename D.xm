@@ -82,21 +82,6 @@ static NSString *getSandboxVideoPath(void) {
 }
 
 #pragma mark - 视图控制器查找
-static UIViewController *bear_getTopVC(void) {
-    UIWindow *key = nil;
-    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
-        for (UIWindow *w in scene.windows) {
-            if (w.isKeyWindow) { key = w; break; }
-        }
-        if (!key) key = scene.windows.firstObject;
-        break;
-    }
-    if (!key) return nil;
-    UIViewController *vc = key.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    return vc;
-}
 
 #pragma mark - [FIX] int16 源 → 目标 ASBD 转换
 
@@ -185,7 +170,6 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
     return newSample;
 }
 
-#pragma mark - 通用：把 UIImage 编码成 JPEG CMSampleBuffer（拍照替换共用）
 #pragma mark - MediaManager
 @interface MediaManager : NSObject
 + (void)setupVideoReaderIfNeeded;
@@ -193,8 +177,6 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
 + (CIImage *)getVideoFrame:(CGSize)targetSize;
 + (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length;
 + (void)cleanup;
-
-+ (CIImage *)vcam_fitImage:(CIImage *)img toSize:(CGSize)targetSize;
 
 + (CIImage *)vcam_mirrorImage:(CIImage *)img;
 @end
@@ -265,24 +247,6 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
     }
     g_audioReload = NO;
     [g_mediaLock unlock];
-}
-
-+ (CIImage *)vcam_fitImage:(CIImage *)img toSize:(CGSize)targetSize {
-    if (!img) return nil;
-    CGRect e = img.extent;
-    if (e.origin.x != 0 || e.origin.y != 0)
-        img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-e.origin.x, -e.origin.y)];
-    e = img.extent;
-    CGFloat scale = MAX(targetSize.width / e.size.width, targetSize.height / e.size.height);
-    CIImage *scaled = [img imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
-    CGRect se = scaled.extent;
-    CGFloat ox = (se.size.width - targetSize.width) / 2.0;
-    CGFloat oy = (se.size.height - targetSize.height) / 2.0;
-    CIImage *crop = [scaled imageByCroppingToRect:CGRectMake(ox, oy, targetSize.width, targetSize.height)];
-    CGRect ce = crop.extent;
-    if (ce.origin.x != 0 || ce.origin.y != 0)
-        crop = [crop imageByApplyingTransform:CGAffineTransformMakeTranslation(-ce.origin.x, -ce.origin.y)];
-    return crop;
 }
 
 + (CIImage *)vcam_mirrorImage:(CIImage *)img {
