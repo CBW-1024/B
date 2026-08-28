@@ -1,6 +1,7 @@
 // DD文字转语音 —— 提取自 PKC 的文字转语音(TTS)功能，单文件插件
 // 触发方式：聊天发送 /yy 文本（拦截后转语音）+ 长按输入区弹菜单输入文本
-// 音色来源：内置音色数据（琅琅音色 175，已过滤男声及指定音色；讯飞音色 6）—— 不联网、不支持本地导入
+// 音色来源：内置音色数据（琅琅音色 168，已过滤男声及指定音色；讯飞音色 6）—— 不联网、不支持本地导入
+// 例外保留：猴哥(vid=houge) 虽含"男声"描述，但为用户指定保留的特色音色
 // 语音合成：琅琅走 s.lang123.top；讯飞走 peiyin.xunfei.cn（均复用 PKC 的接口结构）
 
 #import <UIKit/UIKit.h>
@@ -218,13 +219,13 @@ static void ddTTVToast(NSString *msg) {
     });
 }
 
-// ===================== 内置音色数据（琅琅 175 + 讯飞 6） =====================
+// ===================== 内置音色数据（琅琅 168 + 讯飞 6） =====================
 // 数据来源：PKC 音色列表 ys.json；无联网刷新，仅内置静态数据
 
 // DD文字转语音 —— 内置音色数据（自动生成，勿手工编辑）
 // 数据来源：PKC 音色列表 ys.json
 // 生成时间：2026-08-29
-// 琅琅：已过滤男声 + 两批指定音色特征与音色名（详见 Docs/音色过滤记录.md），现 175 个
+// 琅琅：已过滤男声 + 三批指定音色特征与音色名（详见 Docs/音色过滤记录.md），现 168 个
 // 讯飞：仅保留图片中的 6 个
 
 static NSString * const kDDTTVLangImgPrefix = @"https://res.lang123.top/res/img/";   // 琅琅头像前缀
@@ -300,7 +301,6 @@ static NSArray<NSDictionary *> *ddTTVBuiltinLangVoices(void) {
         @{@"v": @"ten_101034", @"n": @"智莲", @"d": @"时尚甜美小姐姐、甜美女声", @"i": @"moxiaotuan_meet_24k.jpeg"},
         @{@"v": @"ten_101035", @"n": @"智依", @"d": @"通用女声、知性女声", @"i": @"mojialing_meet_24k.jpeg"},
         @{@"v": @"ten_101040", @"n": @"智川", @"d": @"四川辣妹子、四川女声", @"i": @"moxiaoman_meet_24k.jpeg"},
-        @{@"v": @"ten_101055", @"n": @"智付", @"d": @"智能收银员、支付播报,特色声音", @"i": @"molingyu_meet_24k.jpeg"},
         @{@"v": @"ten_301003", @"n": @"爱小霞", @"d": @"多情感女声", @"i": @"modaji_meet_24k.jpeg"},
         @{@"v": @"ten_301004", @"n": @"爱小玲", @"d": @"多情感女声", @"i": @"mojialing_meet_24k.jpeg"},
         @{@"v": @"ten_301009", @"n": @"爱小芸", @"d": @"阅读女声、婉约女声", @"i": @"moyuji_meet_24k.jpeg"},
@@ -312,7 +312,6 @@ static NSArray<NSDictionary *> *ddTTVBuiltinLangVoices(void) {
         @{@"v": @"ten_301021", @"n": @"爱小茹", @"d": @"阅读女声", @"i": @"moyuqingt1_meet_24k.jpeg"},
         @{@"v": @"ten_301022", @"n": @"爱小蓉", @"d": @"多情感女声、舒缓女声", @"i": @"mojialing_meet_24k.jpeg"},
         @{@"v": @"ten_301023", @"n": @"爱小燕", @"d": @"客服女声", @"i": @"moyuji_meet_24k.jpeg"},
-        @{@"v": @"ten_301024", @"n": @"爱小莲", @"d": @"知心姐姐", @"i": @"monihong_meet_24k.png"},
         @{@"v": @"ten_301026", @"n": @"爱小雪", @"d": @"亲切姐姐", @"i": @"modaji_meet_24k.jpeg"},
         @{@"v": @"ten_301027", @"n": @"爱小媛", @"d": @"多情感女声、大方女声", @"i": @"moxiaoqiaonv_meet_24k.jpeg"},
         @{@"v": @"ten_301028", @"n": @"爱小娴", @"d": @"通用女声", @"i": @"moxiaoqiaonv_meet_24k.jpeg"},
@@ -353,8 +352,6 @@ static NSArray<NSDictionary *> *ddTTVBuiltinLangVoices(void) {
         @{@"v": @"momengyao_meet_24k", @"n": @"魔梦瑶", @"d": @"温柔甜美，自然动听、直播|游戏", @"i": @"momengyao_meet_24k.png"},
         @{@"v": @"moyuyao_meet_24k", @"n": @"魔雨瑶", @"d": @"温柔甜美，自然动听、影视|情感", @"i": @"moyuyao_meet_24k.jpeg"},
         @{@"v": @"moxiaoman_meet_24k", @"n": @"魔小蛮", @"d": @"精灵可爱，自然动听、美食|资讯", @"i": @"moxiaoman_meet_24k.jpeg"},
-        @{@"v": @"molingyu_meet_24k", @"n": @"魔凌玉", @"d": @"活泼阳光，魅力四射 、资讯|影视", @"i": @"molingyu_meet_24k.jpeg"},
-        @{@"v": @"moshuihan_meet_24k", @"n": @"魔水寒", @"d": @"精灵古怪，自然动听、影视|动漫", @"i": @"moshuihan_meet_24k.png"},
         @{@"v": @"modaji_meet_24k", @"n": @"魔妲己", @"d": @"魅惑妲己，娇软动听、娱乐|影视", @"i": @"modaji_meet_24k.jpeg"},
         @{@"v": @"molaojie_meet_24k", @"n": @"魔莎莎", @"d": @"自然随和，甜美吆喝、美食|资讯", @"i": @"molaojie_meet_24k.png"},
         @{@"v": @"moyuji_meet_24k", @"n": @"魔娱姬", @"d": @"亲切悦耳，青春阳光、资讯|影视", @"i": @"moyuji_meet_24k.jpeg"},
@@ -377,7 +374,6 @@ static NSArray<NSDictionary *> *ddTTVBuiltinLangVoices(void) {
         @{@"v": @"mozhongling_meet_24k", @"n": @"魔钟灵", @"d": @"青春少女，可爱甜美、资讯|情感", @"i": @"mozhongling_meet_24k.jpeg"},
         @{@"v": @"moyuxia_meet_24k", @"n": @"魔羽霞", @"d": @"美妙悦耳，清脆欢快、资讯|影视", @"i": @"moyuxia_meet_24k.png"},
         @{@"v": @"linger_meet_24k", @"n": @"魔小环", @"d": @"可爱清新，清脆欢快", @"i": @"linger_meet_24k.png"},
-        @{@"v": @"mopeiqi_meet_24k", @"n": @"魔佩奇", @"d": @"可爱清新，清脆欢快、影视|游戏", @"i": @"mopeiqi_meet_24k.jpeg"},
         @{@"v": @"xiaomansha_meet_24k", @"n": @"小蔓莎", @"d": @"温柔甜美，温暖治愈、资讯|影视", @"i": @"xiaomansha_meet_24k.jpeg"},
         @{@"v": @"moduidui_meet_24k", @"n": @"魔怼怼", @"d": @"怼人御姐，真实自然、娱乐|影视", @"i": @"moduidui_meet_24k.png"},
         @{@"v": @"xiaoyan_meet_24k", @"n": @"小妍", @"d": @"亲切温和，自然流畅、影视|情感", @"i": @"xiaoyan_meet_24k.png"},
@@ -392,11 +388,8 @@ static NSArray<NSDictionary *> *ddTTVBuiltinLangVoices(void) {
         @{@"v": @"momeixuan_meet_24k", @"n": @"魔梅萱", @"d": @"可爱清新，清脆欢快、影视|情感", @"i": @"momeixuan_meet_24k.png"},
         @{@"v": @"lin_meet_24k", @"n": @"魔晓萱", @"d": @"温柔柔软，纯净轻快、资讯|影视", @"i": @"lin_meet_24k.png"},
         @{@"v": @"chuyaping_meet_24k", @"n": @"魔灵儿", @"d": @"节奏明快，自然动听、直播", @"i": @"chuyaping_meet_24k.png"},
-        @{@"v": @"chunchun_meet_24k", @"n": @"春春", @"d": @"亲切温和，自然流畅、资讯|情感", @"i": @"chunchun_meet_24k.png"},
         @{@"v": @"lili_meet_24k", @"n": @"丽丽", @"d": @"亲切温和，自然流畅、资讯|情感", @"i": @"lili_meet_24k.png"},
-        @{@"v": @"mojiaxin_meet_24k", @"n": @"魔家欣", @"d": @"真实自然，朗朗动听、资讯|影视", @"i": @"mojiaxin_meet_24k.png"},
         @{@"v": @"jiuweihu_meet_24k", @"n": @"九尾狐", @"d": @"魅惑妲己，娇软动听、影视|游戏", @"i": @"jiuweihu_meet_24k.png"},
-        @{@"v": @"shujun_meet_24k", @"n": @"淑君", @"d": @"亲切温和，自然流畅、情感", @"i": @"shujun_meet_24k.png"},
         @{@"v": @"mowutong_meet_24k", @"n": @"魔舞桐", @"d": @"元气少女，悦耳动听 、资讯|影视", @"i": @"mowutong_meet_24k.jpeg"},
         @{@"v": @"qiqi_meet_24k", @"n": @"魔嫣然", @"d": @"亲切温和，自然流畅、资讯|游戏", @"i": @"qiqi_meet_24k.png"},
         @{@"v": @"lingling_meet_24k", @"n": @"玲玲", @"d": @"亲切温和，自然流畅、资讯|情感", @"i": @"lingling_meet_24k.png"},
@@ -407,6 +400,7 @@ static NSArray<NSDictionary *> *ddTTVBuiltinLangVoices(void) {
         @{@"v": @"cissy_meet_24k", @"n": @"小娜", @"d": @"自然淳朴、资讯|情感", @"i": @"cissy_meet_24k.png"},
         @{@"v": @"azure_wuu-CN-XiaotongNeural", @"n": @"晓彤", @"d": @"上海话、阅读、解说温柔女声", @"i": @"azure_wuu-CN-XiaotongNeural.png"},
         @{@"v": @"azure_yue-CN-XiaoMinNeural", @"n": @"晓敏", @"d": @"粤语年轻女声、宣传、广告、客服", @"i": @"azure_yue-CN-XiaoMinNeural.png"},
+        @{@"v": @"houge", @"n": @"猴哥", @"d": @"热门/特色声音，搞笑、配音、男声", @"i": @"houge.png"},
     ];
 }
 
