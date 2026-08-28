@@ -299,42 +299,50 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                 if (img) {
                     // ===== 视频完整显示、居中、不放大（contain / aspect-fit），与 VCAM 一致 =====
                     // VCAM 0xbe74 反汇编（capstone 标注，已逐条核对）：
-                    //   0xc3a0 a = (float)origW / rotExtentW
-                    //   0xc3b4 b = (float)origH / rotExtentH
+                    //   0xc1e8/0xc200: target = CVPixelBufferGetWidth/Height（输入源视频帧尺寸）
+                    //   0xc3a0-0xc3ac: a = (float)targetW / rotated_extent.width
+                    //   0xc3b4-0xc3c0: b = (float)targetH / rotated_extent.height
                     //   0xc3d0 fcmp a,b ; 0xc3d4 cset w8, pl
                     //   0xc3d8 tbnz w8,#0 → (a>=b 时) 取 b，否则取 a
                     //   → scale = MIN(a,b)  ← 即 contain（完整显示、不放大、四周可能留黑边）
-                    //   （之前误读 cset pl 方向判成 MAX/cover，已纠正；这也与用户图3/图4 表现吻合）
-                    //   0xc46c tx=(origW - rotW*scale)/2 ; ty=(origH - rotH*scale)/2
+                    //   0xc46c tx=(rotW*scale - targetW)/2 ; ty=(rotH*scale - targetH)/2
                     //
-                    // 实现路径：
-                    //   1) 一次性 transform：contain 缩放（MIN）+ 旋转 复合
-                    //   2) 用 transform 后 extent 的 aabb 算居中平移（含 origin 修正）
-                    //   3) imageByCompositingOverImage 合成到 (0,0,targetW,targetH) 纯黑画布
-                    //      → 强制 composed.extent 严格等于 (0,0,targetW,targetH)
-                    //   4) VCamMakeSampleBufferFromImage 用 render:toCVPixelBuffer（无 bounds）1:1 渲染
-                    //      → image (0,0) 映射到 buffer (0,0)，视频像素在画布中居中，四周均匀黑边
+                    // 实现路径（修正版 —— rotate-then-scale 分离两步，确保 extent 严格归零）：
+                    //   1) 先做旋转：imageByApplyingTransform:rotate(angle)
+                    //      → rotated.extent 严格 = (0, 0, rotW, rotH)，origin 必为 (0,0)
+                    //      （旧版 scale-then-rotate 复合的 extent.origin 不为 0，compositing 之后画布溢出 → 视频偏移）
+                    //   2) 再做 contain 缩放：scale = MIN(targetW/rotW, targetH/rotH)
+                    //   3) imageByApplyingTransform:scale → 缩放后 extent = (0,0,rotW*scale,rotH*scale)
+                    //   4) 居中平移 tx=(targetW-rotW*scale)/2, ty=(targetH-rotH*scale)/2
+                    //      平移后 extent = (tx, ty, rotW*scale, rotH*scale) —— 严格落在画布内
+                    //   5) imageByCompositingOverImage 合成到 (0,0,targetW,targetH) 黑底画布
+                    //      → composed.extent 严格等于目标（前景被背景完全包住，不溢出）
+                    //   6) VCamMakeSampleBufferFromImage 用 render:toCVPixelBuffer（无 bounds）1:1 渲染
+                    //      → image (0,0) 映射到 buffer (0,0)，视频像素在画布中精确居中
                     CGFloat targetW = targetSize.width;
                     CGFloat targetH = targetSize.height;
                     CGRect origE = img.extent;
-                    CGFloat scale = MIN(targetW / origE.size.width, targetH / origE.size.height);  // contain
-                    // 复合 transform：scale * rotate（先缩放，再旋转）
-                    CGAffineTransform tFit = CGAffineTransformMakeScale(scale, scale);
+                    // 步骤 1：先做旋转（origin 归 0，便于后续所有几何计算）
+                    CGAffineTransform tRot = CGAffineTransformIdentity;
                     if (g_rotation == 90) {
-                        tFit = CGAffineTransformRotate(tFit, M_PI_2);
+                        tRot = CGAffineTransformMakeRotation(M_PI_2);
                     } else if (g_rotation == 180) {
-                        tFit = CGAffineTransformRotate(tFit, M_PI);
+                        tRot = CGAffineTransformMakeRotation(M_PI);
                     } else if (g_rotation == 270) {
-                        tFit = CGAffineTransformRotate(tFit, 3 * M_PI_2);
+                        tRot = CGAffineTransformMakeRotation(3 * M_PI_2);
                     }
-                    CIImage *fitted = [img imageByApplyingTransform:tFit];
-                    // 旋转 + 缩放后视频的 aabb（origin 可能非 0，size 可能交换）
-                    CGRect fe = fitted.extent;
-                    CGFloat offX = (targetW - fe.size.width)  / 2.0 - fe.origin.x;
-                    CGFloat offY = (targetH - fe.size.height) / 2.0 - fe.origin.y;
-                    CIImage *centered = [fitted imageByApplyingTransform:
-                        CGAffineTransformMakeTranslation(offX, offY)];
-                    // 用 (0,0,targetW,targetH) 黑底画布合成，强制整体 extent 严格等于目标
+                    CIImage *rotated = (g_rotation == 0) ? img : [img imageByApplyingTransform:tRot];
+                    CGRect rotE = rotated.extent;       // 严格 (0,0,rotW,rotH)，origin 必为 (0,0)
+                    // 步骤 2：contain 缩放（MIN）
+                    CGFloat scale = MIN(targetW / rotE.size.width, targetH / rotE.size.height);
+                    // 步骤 3：缩放
+                    CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+                    CGRect sE = scaled.extent;          // 严格 (0,0,rotW*scale,rotH*scale)
+                    // 步骤 4：居中平移（正号：向右/下移，让视频进入画布中心）
+                    CGFloat tx = (targetW - sE.size.width)  / 2.0;
+                    CGFloat ty = (targetH - sE.size.height) / 2.0;
+                    CIImage *centered = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(tx, ty)];
+                    // 步骤 5：合成到 (0,0,targetW,targetH) 黑底画布（强制整体 extent 严格等于目标）
                     CIImage *backdrop = [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]]
                                          imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
                     result = [centered imageByCompositingOverImage:backdrop];
@@ -699,6 +707,7 @@ static char kVCamOverlayTag;
 
 @implementation LittleBearMenuVC {
     UIView   *_panelView;
+    UIView   *_blurView;
     UILabel  *_statusLbl;
     UIButton *_btnLoop;
     UIButton *_btnSound;
@@ -719,16 +728,18 @@ static char kVCamOverlayTag;
     [self updateStatusUI];
 }
 
-#pragma mark - UI 构建
+#pragma mark - UI 构建（参考 D.txt 风格：40% 透明黑底 + UIBlurEffect 毛玻璃，panel 用 systemBackgroundColor）
 - (void)setupBackground {
-    // 背景透明：打开菜单时不遮挡底层相机/视频画面，便于改配置后实时预览
-    self.view.backgroundColor = [UIColor clearColor];
+    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
+    UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+    _blurView = [[UIVisualEffectView alloc] initWithEffect:blur];
+    _blurView.frame = self.view.bounds;
+    _blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:_blurView];
 }
 - (void)setupPanel {
     _panelView = [[UIView alloc] init];
-    // 用 secondarySystemBackgroundColor（系统深灰），透明背景下天然形成边界对比，
-    // 不需要描边/阴影，看起来更干净
-    _panelView.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    _panelView.backgroundColor = [UIColor systemBackgroundColor];
     _panelView.layer.cornerRadius = 16;
     _panelView.layer.masksToBounds = YES;
     _panelView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -741,7 +752,7 @@ static char kVCamOverlayTag;
 }
 - (void)setupNavBar {
     UIView *navBar = [[UIView alloc] init];
-    navBar.backgroundColor = [UIColor systemGray5Color];
+    navBar.backgroundColor = [UIColor systemGray6Color];
     navBar.translatesAutoresizingMaskIntoConstraints = NO;
     [_panelView addSubview:navBar];
     [NSLayoutConstraint activateConstraints:@[
