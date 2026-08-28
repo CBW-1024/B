@@ -1,18 +1,31 @@
-// VCam — 微信视频/音频替换插件（Theos/Logos）
-// 视频：从相册/文件选视频，旋转居中后替换相机帧、微信视频通话帧、本地预览。
-// 音频：替换 AVCaptureAudioDataOutput 采集（对齐 VCAM getAudioFrame，非直播路径）。
+// VCam — 微信相机/麦克风替换插件（Theos / Logos）
 //
-// 章节顺序：
-//   配置开关 → 沙箱路径 → 运行时状态 → 路径/配置存取 → 停止与重置 → 工具
-//   → VCamMediaManager（取帧、旋转居中、渲染成帧）
-//   → AudioUnitRender hook（麦克风采集替换）
-//   → AVCapture / WeVisVoip hook（视频、音频、预览、会话起停）
-//   → VCamMenuVC（控制面板）→ UIWindow 手势 → ctor / dtor
+// 做的事：把微信拿到的相机画面和麦克风声音，换成用户选的本地视频/音频。
+// 触发方式：任意窗口上双指双击，弹出控制面板。
+//
+// 替换分四条链路，按微信内部实际走的通道分别拦截：
+//   1. AVCaptureVideoDataOutput   → 拍摄、录像的采集回调
+//   2. WeVisVoipEffectMgr         → 视频通话的逐帧处理
+//   3. AVCaptureAudioDataOutput   → 拍摄、录像的音频采集回调
+//   4. AudioUnitRender            → 视频通话的麦克风采集（裸 PCM）
+//
+// 前三条投递 CMSampleBuffer，第四条是裸 PCM 字节流，所以音频有两套实现：
+// AVCapture 链路按帧走，AudioUnit 链路把整段素材预解码成 PCM 后按偏移切片。
+//
+// 画面流向：素材 → AVAssetReader 取帧 → 旋转/镜像/等比居中 → CIContext 渲染到
+// 与采集帧同尺寸同像素格式的 CVPixelBuffer → 套用采集帧时序 → 新的 CMSampleBuffer。
+// 本地预览另开一层 AVSampleBufferDisplayLayer 叠在 AVCaptureVideoPreviewLayer 上。
 //
 // 命名约定：
-//   g_xxx    模块级变量      vcm_xxx()  文件内 C 函数
-//   VCamXxx  自定义类        hooked_/g_orig 被替换 / 原实现
+//   g_xxx    模块级变量     vcm_xxx()  文件内 C 函数
+//   VCamXxx  自定义类       hooked_/g_orig 替换实现 / 原实现
 //   开关三处同名：g_isXxx（状态）/ _btnXxx（按钮）/ toggleXxx（动作）
+//
+// 两条硬约束，改动时务必遵守：
+//   · 帧构建和音频拉取都跑在实时线程上，任何一步都可能抛 ObjC 异常，必须就地拦住，
+//     否则异常会沿采集栈上抛把宿主 App 崩掉。拦住后熔断，退回真实摄像头/麦克风。
+//   · g_mediaLock 是 NSLock，不可重入；持有它的函数内部不得再调用任何会加锁的函数。
+//     有 return 的 @try 必须用 @finally 解锁——@try/@catch 里的 return 不执行块后语句。
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
@@ -30,14 +43,16 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
 
-#pragma mark - 配置开关（统一 g_isXxx + _btnXxx + toggleXxx 三处同名）
+#pragma mark - 配置开关
 static BOOL g_isReplace  = YES;     // YES=替换画面，NO=透传真实摄像头
 static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
 static BOOL g_isSound    = YES;     // 是否替换麦克风采集
 static BOOL g_isMirrored = YES;     // 是否对源画面左右镜像
 static int  g_rotation   = 90;      // 0 / 90 / 180 / 270（非开关，循环取值）
 
-#pragma mark - reader 重载标记
+#pragma mark - reader 重建标记
+// 置位后由下一帧开头重建对应 reader。不在取帧失败的同帧重建：
+// 刚 startReading 的 reader 首帧必然取不到，同帧重建只会白扔一个 reader。
 static BOOL g_videoReload = NO;
 static BOOL g_audioReload = NO;
 
@@ -56,47 +71,72 @@ static AVAssetReaderTrackOutput *g_videoOutput = nil;
 static AVAssetReader            *g_audioReader = nil;
 static AVAssetReaderTrackOutput *g_audioOutput = nil;
 
-// 最近一帧源画面（对齐 VCAM 0x25000+0xc78 g_lastPixelBuffer，reader 读完后冻结复用）
+// 最近一帧源画面。reader 读完后冻结复用，避免画面闪回真实摄像头。
 static CVPixelBufferRef g_lastVideoPixel = NULL;
 
-// reader 是否还可能产出新帧：只用于整段解码的循环条件（decodeAudioToMemory）。
-// 注意：取帧路径不能拿 reader.status 判定「读完」——对齐 VCAM 0xbfe8~0xbff0，
-// 只要 copyNextSampleBuffer 返回 nil 就置 reload，由下一帧开头重建 reader。
-static BOOL vcm_readerLive(AVAssetReader *reader) {
-    if (!reader) return NO;
-    AVAssetReaderStatus st = reader.status;
-    return st != AVAssetReaderStatusCompleted &&
-           st != AVAssetReaderStatusFailed    &&
-           st != AVAssetReaderStatusCancelled;
-}
+#pragma mark - 预览显示层
+static AVSampleBufferDisplayLayer *g_displayLayer     = nil;
+static CADisplayLink              *g_displayLink      = nil;
+static AVCaptureVideoOrientation   g_videoOrientation = AVCaptureVideoOrientationPortrait;
 
-#pragma mark - 预览显示层（对齐 VCAM 0x18218 addSublayer: / 0x18410 vcam_step:）
-static AVSampleBufferDisplayLayer *g_displayLayer      = nil;
-static CADisplayLink              *g_displayLink       = nil;
-static AVCaptureVideoOrientation   g_videoOrientation  = AVCaptureVideoOrientationPortrait;
-
-#pragma mark - 音频解码缓存（对齐 VCAM g_fullAudioPCM / g_audioPlayOffset）
+#pragma mark - 音频解码缓存
+// AudioUnit 链路用的整段 PCM：解码一次，之后按 g_audioPlayOffset 切片播出。
 static NSData        *g_fullAudioPCM    = nil;
 static NSUInteger     g_audioPlayOffset = 0;
 static os_unfair_lock g_audioOffsetLock = OS_UNFAIR_LOCK_INIT;
 static BOOL           g_isAudioDecoding = NO;
 
-#pragma mark - AudioUnit 采集状态（对齐 VCAM 0x25000+0xc98 保存 ASBD）
+#pragma mark - AudioUnit 采集状态
 static BOOL                        g_hasProbedASBD = NO;
 static AudioStreamBasicDescription g_targetASBD    = {0};
+// 由 AVCaptureSession 的 startRunning / stopRunning 维护。
+// 麦克风替换要在它置位后才生效：会话之外的 AudioUnitRender 调用（Voip 预初始化、
+// 系统音效单元等）不该被拿去探测格式或登记成麦克风单元。
+static BOOL g_sessionRunning = NO;
 
-// 音频熔断（对齐 VCAM 0x25000+0xcd9）：任一音频环节抛过异常就置位，
-// 置位后 AudioUnit 链路不再替换、pullAudioData 输出静音、getAudioFrame 返回 NULL 透传真实麦。
-// 理由：音频渲染跑在实时线程上，异常不拦会沿 AudioUnit 调用栈上抛，最坏直接崩掉宿主 App。
-// 只在重新选素材时复位（对齐 VCAM 0x14804）。
+// 按麦克风 ASBD 反推解码输出格式。
+// AudioUnit 链路是把 PCM 裸字节直接 memcpy 进麦克风 buffer，格式必须逐位对齐，
+// 否则素材与麦克风的采样率/位深不一致时会变调、播放速度也不对。
+// 只给 AudioUnit 链路用：AVCapture 链路可能先于 ASBD 探测建好 reader，
+// 那时 g_targetASBD 还是全 0，用它会解出空数据。
+static NSDictionary *vcm_asbdOutputSettings(const AudioStreamBasicDescription *asbd) {
+    UInt32 flags            = asbd ? asbd->mFormatFlags : 0;
+    BOOL   isFloat          = (flags & kAudioFormatFlagIsFloat)         != 0;
+    BOOL   isBigEndian      = (flags & kAudioFormatFlagIsBigEndian)     != 0;
+    BOOL   isNonInterleaved = (flags & kAudioFormatFlagIsNonInterleaved)!= 0;
+    double sampleRate       = (asbd && asbd->mSampleRate       > 0) ? asbd->mSampleRate       : 48000.0;
+    UInt32 channels         = (asbd && asbd->mChannelsPerFrame > 0) ? asbd->mChannelsPerFrame : 1;
+    UInt32 bitDepth         = (asbd && asbd->mBitsPerChannel   > 0) ? asbd->mBitsPerChannel   : 16;
+    return @{
+        AVFormatIDKey:               @(kAudioFormatLinearPCM),
+        AVSampleRateKey:             @(sampleRate),
+        AVNumberOfChannelsKey:       @(channels),
+        AVLinearPCMBitDepthKey:      @(bitDepth),
+        AVLinearPCMIsFloatKey:       @(isFloat),
+        AVLinearPCMIsNonInterleaved: @(isNonInterleaved),
+        AVLinearPCMIsBigEndianKey:   @(isBigEndian),
+    };
+}
+
+// 音频熔断：任一音频环节抛过异常就置位，之后不再替换，退回真实麦克风。
+// 只在重新选素材或恢复默认时复位，否则一次异常会让替换永久失效。
 static BOOL g_audioFailed = NO;
-// 已识别的麦克风 AudioUnit 缓存（对齐 VCAM 0x425db0 g_micAudioUnits[32] + 0x425dac 锁），
-// 命中即跳过 AudioComponentInstanceGetComponent / AudioComponentGetDescription 探测
+
+// 视频熔断：视频链路任一环节抛过异常就置位。
+// 与音频侧的差别：视频熔断会连带关掉 g_isReplace，整个退回真实摄像头——
+// 视频是主功能，链路炸了就没有继续替换的意义。
+// 音频侧只有麦克风采集那一处会连带关总开关（见 hooked_AudioUnitRender），
+// 其余只熔断自己。这个不对称是刻意的。
+static BOOL g_videoFailed = NO;
+
+#pragma mark - 麦克风单元识别
+// 已识别的麦克风 AudioUnit 缓存，命中即跳过 AudioComponent 探测。
+// 探测要走两次跨进程调用，而 AudioUnitRender 每 10~20ms 就来一次。
 #define VCM_MIC_UNIT_MAX 32
 static AudioUnit g_micAudioUnits[VCM_MIC_UNIT_MAX] = {0};
 static os_unfair_lock g_micUnitsLock = OS_UNFAIR_LOCK_INIT;
 
-// 判定并登记麦克风单元：type=='auou' 且 subType ∈ {'rioc','vpio'}（对齐 VCAM 0x1729c~0x1748c）
+// 判定并登记麦克风单元：componentType=='auou' 且 subType 属于 {'rioc','vpio'}
 static BOOL vcm_isMicUnit(AudioUnit unit) {
     if (!unit) return NO;
 
@@ -174,7 +214,19 @@ static void vcm_stopReaders(void) {
     if (g_lastVideoPixel) { CVPixelBufferRelease(g_lastVideoPixel); g_lastVideoPixel = NULL; }
     [g_mediaLock unlock];
 }
-// 恢复默认设置，并清空已选音视频文件与解码缓存
+// 换素材 / 会话重启时让两条链路都从头来过。
+// 关键是清 g_hasProbedASBD：不清的话麦克风链路会认为格式已探测完，
+// 既不会重新探测新会话的 ASBD 也不会重新解码，新素材的音频永远进不了麦克风。
+static void vcm_reloadReaders(void) {
+    g_videoReload   = YES;
+    g_audioReload   = YES;
+    g_hasProbedASBD = NO;
+    os_unfair_lock_lock(&g_audioOffsetLock);
+    g_fullAudioPCM    = nil;
+    g_audioPlayOffset = 0;
+    os_unfair_lock_unlock(&g_audioOffsetLock);
+}
+// 恢复默认设置，清空已选素材与解码缓存，并复位熔断
 static void vcm_resetSettings(void) {
     g_isReplace   = NO;
     g_isLoop      = YES;
@@ -184,19 +236,13 @@ static void vcm_resetSettings(void) {
     vcm_saveSettings();
 
     vcm_stopReaders();
-
-    os_unfair_lock_lock(&g_audioOffsetLock);
-    g_fullAudioPCM    = nil;
-    g_audioPlayOffset = 0;
-    os_unfair_lock_unlock(&g_audioOffsetLock);
+    vcm_reloadReaders();
 
     if (g_tempAudioPath) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
     [g_fileManager removeItemAtPath:vcm_videoPath() error:nil];
 
-    // 对齐 VCAM 0x14804：重选素材/恢复默认都复位熔断，否则一次异常会让声音替换永久失效
-    g_audioFailed  = NO;
-    g_videoReload  = YES;
-    g_audioReload  = YES;
+    g_audioFailed = NO;
+    g_videoFailed = NO;
 }
 
 #pragma mark - 视图控制器查找
@@ -237,63 +283,55 @@ static UIViewController *vcm_topViewController(void) {
 @implementation VCamMediaManager
 + (void)setupVideoReaderIfNeeded {
     [g_mediaLock lock];
-    @autoreleasepool {
-        // 对齐 VCAM 0x9c5c~0x9cb4：reload 未置位、reader 存在且还没读完 → 保持现状，不重建。
-        // 缺这道门禁，每次取帧都会重建 reader，画面会永远停在第一帧。
-        if (!g_videoReload && g_videoReader &&
-            g_videoReader.status != AVAssetReaderStatusCompleted) {
+    // 建 reader 的过程整体受保护，异常即熔断并关掉总开关——
+    // 否则每帧都会重试重建、每帧重复抛异常。
+    @try {
+        @autoreleasepool {
+            // 没标重建且 reader 还没读完 → 保持现状。缺这道门禁，
+            // 每次取帧都会重建 reader，画面会永远停在第一帧。
+            if (!g_videoReload && g_videoReader &&
+                g_videoReader.status != AVAssetReaderStatusCompleted) return;
+            // 循环关闭 + reader 已读完 → 冻结末帧，不重建。
+            // 循环开启时这里必须放行，否则播完就再也不动。
+            if (!g_isLoop && g_videoReader &&
+                g_videoReader.status == AVAssetReaderStatusCompleted) return;
             g_videoReload = NO;
-            [g_mediaLock unlock];
-            return;
-        }
-        // 对齐 VCAM 0x9cc0~0x9d14：循环关闭 + reader 已读完 → 冻结末帧，不重建。
-        // 循环开启时这里必须放行，否则播完就再也不动。
-        if (!g_isLoop && g_videoReader &&
-            g_videoReader.status == AVAssetReaderStatusCompleted) {
-            g_videoReload = NO;
-            [g_mediaLock unlock];
-            return;
-        }
-        g_videoReload = NO;
 
-        if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
-        NSString *path = vcm_videoPath();
-        if (![g_fileManager fileExistsAtPath:path]) { g_videoReload = NO; [g_mediaLock unlock]; return; }
-        AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
-        g_videoReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
-        AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
-        // 这里不清末帧，否则循环重建 reader 失败时会闪黑帧
-        if (track) {
-            NSDictionary *settings = @{
-                (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-            };
-            g_videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
-            [g_videoReader addOutput:g_videoOutput];
-            [g_videoReader startReading];
+            if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
+            NSString *path = vcm_videoPath();
+            if (![g_fileManager fileExistsAtPath:path]) return;
+            AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
+            g_videoReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
+            AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+            // 这里不清冻结的末帧，否则循环重建 reader 失败时会闪黑帧
+            if (track) {
+                NSDictionary *settings = @{
+                    (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                };
+                g_videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
+                [g_videoReader addOutput:g_videoOutput];
+                [g_videoReader startReading];
+            }
         }
+    } @catch (NSException *e) {
+        g_videoFailed = YES;
+        g_isReplace   = NO;
+    } @finally {
+        // 必须是 @finally：@try/@catch 里的 return 不会执行块后语句，
+        // unlock 写在块后会漏解锁，NSLock 又不可重入，下一帧直接卡死
+        g_videoReload = NO;
+        [g_mediaLock unlock];
     }
-    g_videoReload = NO;
-    [g_mediaLock unlock];
 }
 
 + (void)setupAudioReaderIfNeeded {
     [g_mediaLock lock];
-    // 对齐 VCAM 0xa9e8：整个建 reader 的过程受保护，异常即熔断，
-    // 否则每次取不到帧都会重试重建、每帧重复抛异常
     @try {
         @autoreleasepool {
-            // 对齐 VCAM 0xa420~0xa478：reload 未置位、reader 存在且还没读完 → 不重建
             if (!g_audioReload && g_audioReader &&
-                g_audioReader.status != AVAssetReaderStatusCompleted) {
-                g_audioReload = NO;
-                return;
-            }
-            // 对齐 VCAM 0xa480~0xa520：循环关闭 + reader 已读完 → 不重建（循环开启时放行）
+                g_audioReader.status != AVAssetReaderStatusCompleted) return;
             if (!g_isLoop && g_audioReader &&
-                g_audioReader.status == AVAssetReaderStatusCompleted) {
-                g_audioReload = NO;
-                return;
-            }
+                g_audioReader.status == AVAssetReaderStatusCompleted) return;
             g_audioReload = NO;
 
             if (g_audioReader) {
@@ -301,7 +339,7 @@ static UIViewController *vcm_topViewController(void) {
             }
             NSString *path = g_tempAudioPath;
             if (![g_fileManager fileExistsAtPath:path]) path = vcm_videoPath();
-            if (![g_fileManager fileExistsAtPath:path]) { g_audioReload = NO; return; }
+            if (![g_fileManager fileExistsAtPath:path]) return;
             AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
             AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
             if (track) {
@@ -313,67 +351,90 @@ static UIViewController *vcm_topViewController(void) {
                 [g_audioReader startReading];
             }
         }
-        // 内存 PCM 只服务 AudioUnit 链路（pullAudioData:）：探测到 ASBD 说明该链路活着，此时才预解码；
-        // 否则把 output 留给 AVCaptureAudio 链路（getAudioFrame:）独占，两边同时抽会互相抢 buffer。
-        // 素材是通话途中才换的，也必须走这里补一次解码，否则 pullAudioData: 会一直播旧 PCM
+        // 内存 PCM 只服务 AudioUnit 链路：探测到 ASBD 说明那条链路活着，此时才值得预解码。
+        // 通话途中换素材也要走这里补一次，否则会一直播旧 PCM。
         if (g_hasProbedASBD) [self decodeAudioToMemory];
     } @catch (NSException *e) {
         g_audioFailed = YES;
+    } @finally {
+        // 同 setupVideoReaderIfNeeded：早期 return 也要保证解锁
+        g_audioReload = NO;
+        [g_mediaLock unlock];
     }
-    g_audioReload = NO;
-    [g_mediaLock unlock];
 }
 
-// 对齐 VCAM decodeAudioToMemory (0xaa60)：把音频整段解码进内存，避免实时解码抖动
-// 注意：可能从 setupAudioReaderIfNeeded 内部（持锁）被调用，此处不得再加 g_mediaLock
+// 把音频整段解码进内存，避免实时解码抖动。异步执行，调用方不等待。
+// 注意：可能从 setupAudioReaderIfNeeded 内部（持锁）被调用，此处不得再加 g_mediaLock。
 + (void)decodeAudioToMemory {
+    if (!g_hasProbedASBD)   return;
     if (g_audioFailed)      return;
     if (g_isAudioDecoding)  return;
-    // 启动时捕获 reader/output 到本地，全程只排空这一组，避免中途换素材后把新 reader 也抽干
-    AVAssetReader            *reader = g_audioReader;
-    AVAssetReaderTrackOutput *output = g_audioOutput;
-    if (!reader || !output) return;
     g_isAudioDecoding = YES;
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    // HIGH 队列：解码越早完成，首帧音频越早接上
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        NSMutableData *pcm = nil;
         @try {
-            NSMutableData *pcm = [NSMutableData data];
-            while (vcm_readerLive(reader)) {
-                @autoreleasepool {
-                    CMSampleBufferRef s = [output copyNextSampleBuffer];
-                    if (!s) break;
-                    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(s);
-                    if (block) {
-                        size_t len = 0, lenAtOffset = 0; char *ptr = NULL;
-                        if (CMBlockBufferGetDataPointer(block, 0, &lenAtOffset, &len, &ptr) == kCMBlockBufferNoErr
-                            && len > 0 && ptr) {
-                            [pcm appendBytes:ptr length:len];
+            @autoreleasepool {
+                // 自建一套 reader，全程不碰 g_audioReader / g_audioOutput。
+                // 那组要留给 AVCapture 链路独占，两边同时抽同一个 output 会互相抢 buffer。
+                NSString *path = g_tempAudioPath;
+                if (![g_fileManager fileExistsAtPath:path]) path = vcm_videoPath();
+                if ([g_fileManager fileExistsAtPath:path]) {
+                    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
+                    AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+                    if (track) {
+                        NSError *err = nil;
+                        AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
+                        if (reader && !err) {
+                            AVAssetReaderTrackOutput *output = [[AVAssetReaderTrackOutput alloc]
+                                initWithTrack:track
+                               outputSettings:vcm_asbdOutputSettings(&g_targetASBD)];
+                            output.alwaysCopiesSampleData = NO;
+                            if ([reader canAddOutput:output]) [reader addOutput:output];
+                            [reader startReading];
+                            pcm = [NSMutableData data];
+                            while (reader.status == AVAssetReaderStatusReading) {
+                                @autoreleasepool {
+                                    CMSampleBufferRef s = [output copyNextSampleBuffer];
+                                    if (!s) break;
+                                    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(s);
+                                    if (block) {
+                                        size_t len = 0, lenAtOffset = 0; char *ptr = NULL;
+                                        if (CMBlockBufferGetDataPointer(block, 0, &lenAtOffset, &len, &ptr)
+                                            == kCMBlockBufferNoErr && len > 0 && ptr) {
+                                            [pcm appendBytes:ptr length:len];
+                                        }
+                                    }
+                                    CFRelease(s);
+                                }
+                            }
+                            // 异常跳出时 reader 可能还在 Reading，收掉别占着解码器
+                            if (reader.status == AVAssetReaderStatusReading) [reader cancelReading];
                         }
                     }
-                    CFRelease(s);
                 }
             }
-            // 先在锁外生成快照，锁内只做赋值，避免持锁期间抛异常把 g_audioOffsetLock 锁死
-            NSData *snapshot = [pcm copy];
-            os_unfair_lock_lock(&g_audioOffsetLock);
-            if (g_audioReader == reader && reader != nil) {
+            // 先在锁外生成快照，锁内只做赋值，避免持锁期间抛异常把 g_audioOffsetLock 锁死。
+            // 非空才覆盖：解码失败时留着旧 PCM 继续循环，比直接静音更不容易被察觉
+            NSData *snapshot = (pcm && pcm.length > 0) ? [pcm copy] : nil;
+            if (snapshot) {
+                os_unfair_lock_lock(&g_audioOffsetLock);
                 g_fullAudioPCM    = snapshot;
                 g_audioPlayOffset = 0;
+                os_unfair_lock_unlock(&g_audioOffsetLock);
             }
-            os_unfair_lock_unlock(&g_audioOffsetLock);
         } @catch (NSException *e) {
             g_audioFailed = YES;
         } @finally {
             g_isAudioDecoding = NO;
         }
-        // 解码期间换了素材：刚才那次会被身份校验丢弃，补解码一次，否则新音频永远进不了内存
-        if (!g_audioFailed && g_audioReader != reader) [self decodeAudioToMemory];
     });
 }
 
-// 对齐 VCAM pullAudioData:length: (0xdc5c)：从内存 PCM 按偏移切片，到末尾回卷，不足补 0
+// 从内存 PCM 按偏移切片，到末尾回卷，不足补 0
 + (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length {
     if (!outData || length == 0) return;
-    // 对齐 VCAM 0xdbe8：熔断后直接输出静音
+    // 熔断后直接输出静音；超大请求多半是参数异常，同样静音处理
     if (g_audioFailed || length > 0x100000) { memset(outData, 0, length); return; }
     os_unfair_lock_lock(&g_audioOffsetLock);
     NSUInteger total = g_fullAudioPCM ? g_fullAudioPCM.length : 0;
@@ -400,17 +461,16 @@ static UIViewController *vcm_topViewController(void) {
     if (written < length) memset(outData + written, 0, length - written);
 }
 
-// 对齐 VCAM 0xe198：从音频 reader 取一帧，套用采集帧的时序后返回（调用方负责 CFRelease）
-// setupAudioReaderIfNeeded 内部同样会加 g_mediaLock，而 NSLock 不可重入，
-// 因此所有重建动作都必须在锁外完成
+// 从音频 reader 取一帧，套用采集帧的时序后返回（调用方负责 CFRelease）。
+// setupAudioReaderIfNeeded 内部也会加 g_mediaLock，而 NSLock 不可重入，
+// 因此重建动作必须在加锁之前完成。
 + (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample {
-    // 对齐 VCAM 0xe208：熔断后返回 NULL → 调用方透传真实麦克风
+    // 熔断后返回 NULL → 调用方透传真实麦克风
     if (g_audioFailed) return NULL;
     if (g_audioReload) [self setupAudioReaderIfNeeded];
 
     CMSampleBufferRef s = NULL;
     [g_mediaLock lock];
-    // 对齐 VCAM 0xe334：抽帧异常即熔断，@finally 保证锁一定释放（NSLock 不可重入）
     @try {
         @autoreleasepool {
             if (g_audioOutput) s = [g_audioOutput copyNextSampleBuffer];
@@ -422,14 +482,14 @@ static UIViewController *vcm_topViewController(void) {
     }
     if (g_audioFailed) return NULL;
 
-    // 对齐 VCAM：取不到帧就置 reload，留给下一帧开头重建，理由同 nextSourcePixel
+    // 取不到帧就标重建，留给下一帧开头处理
     if (!s) g_audioReload = YES;
     if (!s) return NULL;
 
     CMSampleBufferRef out = NULL;
-    // 对齐 VCAM 0xe424：改时序异常同样熔断，并退回透传真实麦
     @try {
-        CMSampleTimingInfo timing;
+        // 先用 kCMTimingInfoInvalid 兜底，原帧时序取不到时不至于拿栈上的垃圾值构造输出帧
+        CMSampleTimingInfo timing = kCMTimingInfoInvalid;
         if (origSample && CMSampleBufferGetSampleTimingInfo(origSample, 0, &timing) == noErr) {
             CMSampleBufferRef tmp = NULL;
             if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, s, 1, &timing, &tmp) == noErr && tmp) {
@@ -445,35 +505,41 @@ static UIViewController *vcm_topViewController(void) {
     return out;
 }
 
-// 从当前 video reader 取一帧，返回 +1 引用；取帧结果通过 outState 回传。
-// 对齐 VCAM 0xc090~0xc104：不做墙钟节流，一帧采集对应一帧源；
-// 预览由采集回调 enqueue 到 AVSampleBufferDisplayLayer，不存在两条链路叠加消费
+// 从当前 video reader 取一帧，返回 +1 引用。
+// 不做墙钟节流：一帧采集对应一帧源。预览由采集回调 enqueue 到显示层，
+// 不存在两条链路叠加消费同一批帧的问题。
 static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CVPixelBufferRef frame = NULL;
     [g_mediaLock lock];
-    @autoreleasepool {
-        if (!g_videoOutput) { [g_mediaLock unlock]; return NULL; }
-        CMSampleBufferRef s = [g_videoOutput copyNextSampleBuffer];
-        if (s) {
-            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(s);
-            if (pb) frame = (CVPixelBufferRef)CVPixelBufferRetain(pb);
-            CFRelease(s);
+    @try {
+        @autoreleasepool {
+            if (!g_videoOutput) return NULL;
+            CMSampleBufferRef s = [g_videoOutput copyNextSampleBuffer];
+            if (s) {
+                CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(s);
+                if (pb) frame = (CVPixelBufferRef)CVPixelBufferRetain(pb);
+                CFRelease(s);
+            }
         }
+    } @catch (NSException *e) {
+        g_videoFailed = YES;
+        g_isReplace   = NO;
+    } @finally {
+        [g_mediaLock unlock];
     }
-    [g_mediaLock unlock];
     return frame;
 }
 
 // 取下一帧源视频：读完时按 g_isLoop 决定回卷重播还是冻结末帧，返回 +1 引用
 + (CVPixelBufferRef)nextSourcePixel {
+    // 熔断后不再取帧，交给调用方透传真实摄像头
+    if (g_videoFailed) return NULL;
     if (g_videoReload) [self setupVideoReaderIfNeeded];
 
     CVPixelBufferRef frame = vcm_pullVideoFrame();
-    // 对齐 VCAM 0xbfe8~0xbff0：取不到帧就置 reload，由下一帧开头重建 reader。
-    // 不再拿 reader.status 判定「读完」——status 何时变 Completed 没有时序保证，
-    // 依赖它会让循环永远触发不了，画面就一直冻结在末帧。
-    // 另外不在这里同帧重建：刚 startReading 的 reader 首帧必然取不到，
-    // 同帧重建会白扔一个 reader，必须留给下一帧。
+    // 取不到帧就标重建，由下一帧开头处理。不拿 reader.status 判定「读完」——
+    // status 何时变成 Completed 没有时序保证，依赖它会让循环永远触发不了，
+    // 画面就一直冻结在末帧。
     if (!frame) g_videoReload = YES;
 
     [g_mediaLock lock];
@@ -488,7 +554,7 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     return frame;
 }
 
-// 旋转 + contain 等比居中 + 黑底合成，返回 extent 严格为 (0,0,target) 的 CIImage
+// 旋转 + 等比居中 + 黑底合成，返回 extent 严格为 (0,0,target) 的 CIImage
 + (CIImage *)composedImageForTarget:(CGSize)target {
     CGFloat targetW = target.width, targetH = target.height;
     if (targetW <= 0 || targetH <= 0) return nil;
@@ -523,13 +589,12 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     return [img imageByCompositingOverImage:[self blackImageForTarget:target]];
 }
 
-// 全黑底图（对齐 VCAM createBlackFrame: 0xb554）
 + (CIImage *)blackImageForTarget:(CGSize)target {
     return [[CIImage imageWithColor:[CIColor blackColor]]
             imageByCroppingToRect:CGRectMake(0, 0, target.width, target.height)];
 }
 
-// 渲染成新的 CMSampleBuffer，沿用采集帧时序与 {Exif}/{TIFF} 附件（对齐 VCAM 0xc7c0~0xc9c0）
+// 渲染成新的 CMSampleBuffer，沿用采集帧的时序与 {Exif}/{TIFF} 附件
 + (CMSampleBufferRef)makeSampleFromImage:(CIImage *)img
                                    width:(size_t)w height:(size_t)h
                                   format:(OSType)pfmt
@@ -567,9 +632,12 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     return out;
 }
 
-// 对齐 VCAM getVideoFrame: 0xbf94：画布恒等于采集帧尺寸，旋转只作用于源画面
+// 画布恒等于采集帧尺寸，旋转只作用于源画面
 + (CMSampleBufferRef)getVideoFrame:(CMSampleBufferRef)origSample {
     if (!origSample) return NULL;
+    // 熔断后直接返回 NULL，让调用方透传真实摄像头。
+    // 不能走下面的黑帧兜底——那会让画面变成全黑而不是退回真实摄像头
+    if (g_videoFailed) return NULL;
     // 没选素材就原样透传，不输出黑帧；素材存在但取帧失败才走黑帧兜底
     if (![g_fileManager fileExistsAtPath:vcm_videoPath()]) return NULL;
     CVPixelBufferRef camPix = CMSampleBufferGetImageBuffer(origSample);
@@ -579,24 +647,35 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
                                (CGFloat)CVPixelBufferGetHeight(camPix));
     OSType pfmt = CVPixelBufferGetPixelFormatType(camPix);
 
-    CIImage *img = [self composedImageForTarget:target];
-    if (!img) img = [self blackImageForTarget:target];
-    return [self makeSampleFromImage:img
-                               width:(size_t)target.width
-                              height:(size_t)target.height
-                              format:pfmt
-                           timingSrc:origSample];
+    CMSampleBufferRef out = NULL;
+    // 合成或渲染抛异常即熔断并关掉替换。帧构建跑在采集回调线程上，
+    // 异常不拦会沿采集调用栈上抛，最坏直接崩掉宿主 App
+    @try {
+        @autoreleasepool {
+            CIImage *img = [self composedImageForTarget:target];
+            if (!img) img = [self blackImageForTarget:target];
+            out = [self makeSampleFromImage:img
+                                      width:(size_t)target.width
+                                     height:(size_t)target.height
+                                     format:pfmt
+                                  timingSrc:origSample];
+        }
+    } @catch (NSException *e) {
+        g_videoFailed = YES;
+        g_isReplace   = NO;
+        if (out) { CFRelease(out); out = NULL; }
+    }
+    return out;
 }
 
-// 释放视频/音频 reader
 + (void)cleanup { vcm_stopReaders(); }
 @end
 
 #pragma mark - AudioUnitRender Hook（麦克风采集替换）
 
-// 对齐 VCAM hooked_AudioUnitRender (0x172d0)：
-//   type=='auou' 且 subtype=='rioc'/'vpio'、bus==1、scope=Output 探测 ASBD，
-//   按 ioData buffer 尺寸拉 PCM 后 memcpy，不做格式转换
+// 麦克风采集走的是裸 PCM：先按 type=='auou' 且 subtype 属于 {'rioc','vpio'}、
+// bus==1、scope=Output 探测一次目标 ASBD，之后按 ioData 的 buffer 尺寸拉 PCM 再 memcpy。
+// 全程不做格式转换——解码时已经按 ASBD 对齐好了。
 static OSStatus hooked_AudioUnitRender(
     AudioUnit                   inUnit,
     AudioUnitRenderActionFlags  *ioActionFlags,
@@ -608,9 +687,11 @@ static OSStatus hooked_AudioUnitRender(
     OSStatus status = g_origAudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
                                            inOutputBusNumber, inNumberFrames, ioData);
     if (status != noErr)                    return status;
+    // 会话没在跑时一律不碰原样
+    if (!g_sessionRunning)                  return status;
     if (!g_isReplace || !g_isSound)         return status;
     if (!ioData || inOutputBusNumber != 1)  return status;
-    // 对齐 VCAM 0x1759c：熔断后本链路彻底不替换，避免每帧重复抛异常
+    // 熔断后本链路彻底不替换，避免每帧重复抛异常
     if (g_audioFailed)                      return status;
     if (!vcm_isMicUnit(inUnit))             return status;
 
@@ -621,11 +702,12 @@ static OSStatus hooked_AudioUnitRender(
                                  &g_targetASBD, &propSize) == noErr
             && g_targetASBD.mSampleRate > 0) {
             g_hasProbedASBD = YES;
-            // 对齐 VCAM 0x17534：探测到 ASBD 只触发整段解码（decodeAudioToMemory 自带
-            // g_hasProbedASBD 门禁）。这里不再重建 reader，避免和 AVCapture 链路抢 output。
+            // 探测到 ASBD 只触发整段解码，不重建 reader——
+            // 那会和 AVCapture 链路抢同一组 output
             @try {
                 [VCamMediaManager decodeAudioToMemory];
             } @catch (NSException *e) {
+                // 只熔断、不清 g_isReplace：探测阶段出问题还没污染输出，不必关画面
                 g_audioFailed = YES;
             }
         }
@@ -645,14 +727,17 @@ static OSStatus hooked_AudioUnitRender(
             memcpy(ioData->mBuffers[i].mData, temp, size);
         }
     } @catch (NSException *e) {
-        // 对齐 VCAM 0x177e8：异常即熔断。宁可静音也不把异常抛到实时音频线程上
+        // 这里是唯一一处「音频熔断连带关画面」的地方，其余音频环节只熔断自己。
+        // 麦克风已经把素材数据写进 buffer 了再失败，输出就是半真半假的杂音，
+        // 不如整个退回去。
         g_audioFailed = YES;
+        g_isReplace   = NO;
     }
     free(temp);
     return noErr;
 }
 
-#pragma mark - VCamVideoProxy（视频替换）
+#pragma mark - VCamVideoProxy（相机采集替换）
 @interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
@@ -662,26 +747,25 @@ static OSStatus hooked_AudioUnitRender(
 }
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue { _originalDelegate = delegate; }
 
-// 对齐 VCAM 0x1aae0：采集回调里取帧 → 塞进显示层 → 再转发给原 delegate
+// 采集回调里取替换帧 → 塞进预览显示层 → 再转发给原 delegate
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      fromConnection:(AVCaptureConnection *)connection {
-    // 对齐 VCAM 0x1ab8c~0x1aba0：g_videoOrientation = [connection videoOrientation]
     g_videoOrientation = connection.videoOrientation;
 
     CMSampleBufferRef newSample = NULL;
     if (g_isReplace) {
         @try {
             newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
-            // 对齐 VCAM 0x1abe8~0x1ac48：newSample && 显示层 && isReadyForMoreMediaData
-            // → flush（丢掉未显示的旧帧，保证低延迟）→ enqueueSampleBuffer:
+            // 有替换帧且显示层就绪 → flush 丢掉未显示的旧帧保证低延迟 → 入队
             if (newSample && g_displayLayer && g_displayLayer.isReadyForMoreMediaData) {
                 [g_displayLayer flush];
                 [g_displayLayer enqueueSampleBuffer:newSample];
             }
         } @catch (NSException *e) {
-            // 对齐 VCAM 0x1ac90~0x1ac9c：解码异常就直接关掉替换，避免每帧抛异常
-            newSample    = NULL;
-            g_isReplace  = NO;
+            // 熔断 + 关掉替换，避免每帧重复抛异常
+            newSample     = NULL;
+            g_videoFailed = YES;
+            g_isReplace   = NO;
         }
     }
 
@@ -704,7 +788,7 @@ static VCamVideoProxy *g_videoProxy = nil;
 }
 %end
 
-#pragma mark - VCamAudioProxy（AVCaptureAudio 采集替换）
+#pragma mark - VCamAudioProxy（AVCapture 音频采集替换）
 @interface VCamAudioProxy : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
@@ -719,7 +803,7 @@ static VCamVideoProxy *g_videoProxy = nil;
     CMSampleBufferRef outBuf = sampleBuffer;
 
     if (g_isReplace && g_isSound && !g_audioFailed) {
-        // 对齐 VCAM 0x1ae40：异常即熔断，避免采集线程每帧抛异常
+        // 异常即熔断，避免采集线程每帧抛异常
         @try {
             CMSampleBufferRef rep = [VCamMediaManager getAudioFrame:sampleBuffer];
             if (rep) outBuf = rep;
@@ -763,38 +847,39 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 %end
 
-#pragma mark - AVCaptureSession（会话起停时重载 reader，对齐 VCAM 0x187e4 / 0x18888）
+#pragma mark - AVCaptureSession（会话起停）
 %hook AVCaptureSession
 - (void)startRunning {
+    g_sessionRunning = YES;
+    // 新会话的麦克风格式可能是另一套（采样率/位深随通话类型变），
+    // 不把旧的 g_targetASBD 清掉就会沿用上一通的格式去解码
+    vcm_reloadReaders();
     if (g_isReplace) {
-        g_videoReload = YES;
-        g_audioReload = YES;
         [VCamMediaManager setupVideoReaderIfNeeded];
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
     %orig;
 }
 - (void)stopRunning {
-    g_videoReload = YES;
-    g_audioReload = YES;
+    // 这里只清标志、不 reload。stopRunning 后链路可能还在收尾取帧，
+    // 这时候清 reader 会打断它；内存 PCM 留着，等下次 startRunning 再清
+    g_sessionRunning = NO;
     %orig;
 }
 %end
 
-#pragma mark - AVCaptureVideoPreviewLayer（叠加 AVSampleBufferDisplayLayer，对齐 VCAM 0x18218）
-// VCAM 的预览叠加层是 AVSampleBufferDisplayLayer（全局 0x25c10，类引用 0x25848 已确认），
-// 不是普通 CALayer + contents：帧由采集回调 enqueue 进去，节奏由素材自身的 PTS 决定
+#pragma mark - AVCaptureVideoPreviewLayer（叠加预览显示层）
+// 预览叠加层用 AVSampleBufferDisplayLayer 而不是普通 CALayer：
+// 帧由采集回调 enqueue 进去，播放节奏由素材自身的 PTS 决定
 %hook AVCaptureVideoPreviewLayer
 - (void)addSublayer:(CALayer *)layer {
     %orig;
 
     // displayLink 只建一次，target 就是当前 preview layer
-    // （对齐 VCAM 0x18270~0x182f8：displayLinkWithTarget:selector: → addToRunLoop:forMode:）
     if (!g_displayLink) {
         g_displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(vcm_step:)];
         [g_displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
     }
-    // 对齐 VCAM 0x18308~0x18390：containsObject 判重 → alloc/init → insertSublayer:above:
     if (![[self sublayers] containsObject:g_displayLayer]) {
         g_displayLayer = [[AVSampleBufferDisplayLayer alloc] init];
         [self insertSublayer:g_displayLayer above:layer];
@@ -802,13 +887,13 @@ static VCamAudioProxy *g_audioProxy = nil;
     }
 }
 
-// 对齐 VCAM vcam_step: (0x18410)：只同步 opacity / videoGravity / frame / transform，
-// 不在这里取帧（VCAM 那句 getVideoFrame:nil 是死代码，getVideoFrame: 对 nil 直接 return NULL）
+// 每帧同步显示层的可见性、填充模式、位置和旋转。不在这里取帧——
+// 取帧由采集回调驱动，这里只负责把显示层跟采集层的状态对齐
 %new
 - (void)vcm_step:(CADisplayLink *)link {
     if (!g_displayLayer) return;
 
-    // 对齐 VCAM 0x184ac~0x18560：素材不存在就把显示层透明掉，露出真实摄像头
+    // 素材不存在或不替换时把显示层透明掉，露出真实摄像头
     BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()];
     [g_displayLayer setOpacity:(show ? 1.0f : 0.0f)];
     if (!show) return;
@@ -816,9 +901,8 @@ static VCamAudioProxy *g_audioProxy = nil;
     [g_displayLayer setVideoGravity:[self videoGravity]];
     [g_displayLayer setFrame:self.bounds];
 
-    // 对齐 VCAM 0x18600~0x1874c：AVSampleBufferDisplayLayer 不会像 AVCaptureVideoPreviewLayer
-    // 那样自动跟随连接方向，必须按 videoOrientation 手动补偿
-    // （常量 0x1c998 = +π/2，0x1c9a0 = -π/2）
+    // AVSampleBufferDisplayLayer 不会像 AVCaptureVideoPreviewLayer 那样
+    // 自动跟随连接方向，必须按 videoOrientation 手动补偿
     switch (g_videoOrientation) {
         case AVCaptureVideoOrientationLandscapeRight:
             g_displayLayer.transform = CATransform3DMakeRotation(M_PI_2, 0, 0, 1);
@@ -861,14 +945,12 @@ static VCamAudioProxy *g_audioProxy = nil;
     [self updateStatusUI];
 }
 
-#pragma mark - UI 构建（透明背景 + 深色面板 + systemGray5 导航/按钮，透明背景下天然形成边界对比）
+#pragma mark - UI 构建（透明背景 + 深色面板，透明背景下天然形成边界对比）
 - (void)setupBackground {
-
     self.view.backgroundColor = [UIColor clearColor];
 }
 - (void)setupPanel {
     _panelView = [[UIView alloc] init];
-
     _panelView.backgroundColor = [UIColor secondarySystemBackgroundColor];
     _panelView.layer.cornerRadius = 16;
     _panelView.layer.masksToBounds = YES;
@@ -1008,13 +1090,11 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)actionSelectAlbum {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-
     picker.mediaTypes = @[@"public.movie"];
     picker.delegate = (id)self;
     [self presentViewController:picker animated:YES completion:nil];
 }
 - (void)actionSelectFile {
-
     NSArray *contentTypes = @[UTTypeMovie, UTTypeAudio];
     UIDocumentPickerViewController *picker =
         [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:contentTypes asCopy:YES];
@@ -1029,8 +1109,14 @@ static VCamAudioProxy *g_audioProxy = nil;
     AVAsset *asset  = [AVAsset assetWithURL:url];
     BOOL hasVideo = [[asset tracksWithMediaType:AVMediaTypeVideo] count] > 0;
     BOOL hasAudio  = [[asset tracksWithMediaType:AVMediaTypeAudio] count] > 0;
-    // 对齐 VCAM 0x14804：换素材即复位熔断
+    // 换素材即复位熔断，否则一次异常会让替换永久失效
     g_audioFailed = NO;
+    g_videoFailed = NO;
+    // 走 reloadReaders 把 ASBD 和内存 PCM 一起清掉。少清 g_hasProbedASBD 这一步，
+    // AudioUnit 链路会一直以为格式已探测完，既不重新探测也不重新解码，
+    // 新素材的音频在通话中永远不生效。
+    // （清掉后下一帧 AudioUnitRender 会重新探测并触发解码，不会造成永久失效）
+    vcm_reloadReaders();
     if (hasVideo) {
         NSString *dest = vcm_videoPath();
         if ([g_fileManager fileExistsAtPath:dest]) [g_fileManager removeItemAtPath:dest error:nil];
@@ -1038,16 +1124,13 @@ static VCamAudioProxy *g_audioProxy = nil;
         // 停掉 reader 而不只是清冻结帧：换素材时若循环关闭、且旧 reader 已读完，
         // setup 里的 loop 门禁会把重建挡掉，新素材就永远不生效
         vcm_stopReaders();
-        g_isReplace    = YES;
-        g_videoReload  = YES;
-        g_audioReload  = YES;
+        g_isReplace = YES;
         vcm_saveSettings();
         [VCamMediaManager setupVideoReaderIfNeeded];
         [VCamMediaManager setupAudioReaderIfNeeded];
     } else if (hasAudio) {
         if ([g_fileManager fileExistsAtPath:g_tempAudioPath]) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
         [g_fileManager copyItemAtPath:src toPath:g_tempAudioPath error:nil];
-        g_audioReload = YES;
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
     [self refreshGridButtons];
