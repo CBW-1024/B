@@ -33,7 +33,7 @@ static int  g_sourceChannels = 2;
 static int  g_replaceMode       = 1;
 static BOOL g_isLoop             = YES;
 static BOOL g_isSound            = YES;
-static int  g_rotation           = 90;
+static int  g_rotation           = 0;
 
 static BOOL g_isMirrored = NO;
 
@@ -337,11 +337,11 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                                                                                       -rotatedExtent.origin.y);
                         rotated = [rotated imageByApplyingTransform:translate];
                     }
-                    // 对齐 VCAM 0xbe74 cover 语义：用旋转后帧尺寸算 MAX(src/target) 放大填满，再居中裁剪。
-                    // （我上一轮误改为“旋转前原始尺寸”算 scale，在 g_rotation!=0 时 rotated 图比 target 小，
-                    //   cropRect 出现负偏移导致黑边/异常放大；现回滚为标准 cover，与 VCAM 数学一致。）
+                    // 对齐 VCAM 0xbe74：视频完整显示、不被放大（contain / aspect-fit）。
+                    // 实测对比：VCAM 画面完整可见、四周留边；D_fixed 原 MAX 会放大裁切导致主体被切。
+                    // 故用 MIN 取「不溢出 target」的等比缩放，再居中（余量处留黑边），与 VCAM 视觉一致。
                     CGRect normalizedExtent = rotated.extent;
-                    CGFloat scale = MAX(targetSize.width / normalizedExtent.size.width,
+                    CGFloat scale = MIN(targetSize.width / normalizedExtent.size.width,
                                         targetSize.height / normalizedExtent.size.height);
                     CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
                     CGRect scaledExtent = scaled.extent;
@@ -736,6 +736,14 @@ static char kVCamOverlayTag;
     [self updateStatusUI];
 }
 
+#pragma mark - 背景穿透：面板外的触摸穿透到下层微信界面
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    // self.view 自身或非面板区域：让触摸穿透（返回 nil），这样背后的微信通话可继续操作
+    if (hit == self.view) return nil;
+    return hit;
+}
+
 #pragma mark - UI 构建
 - (void)setupBackground {
     // 背景透明：打开菜单时不遮挡底层相机/视频画面，便于改配置后实时预览
@@ -743,12 +751,11 @@ static char kVCamOverlayTag;
 }
 - (void)setupPanel {
     _panelView = [[UIView alloc] init];
-    _panelView.backgroundColor = [UIColor systemBackgroundColor];
+    // 用 secondarySystemBackgroundColor（系统深灰），透明背景下天然形成边界对比，
+    // 不需要描边/阴影，看起来更干净
+    _panelView.backgroundColor = [UIColor secondarySystemBackgroundColor];
     _panelView.layer.cornerRadius = 16;
     _panelView.layer.masksToBounds = YES;
-    // 透明背景下用深色描边勾勒面板边界，避免亮色视频上边界不可见
-    _panelView.layer.borderWidth = 1.5;
-    _panelView.layer.borderColor = [[UIColor separatorColor] CGColor];
     _panelView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_panelView];
     [NSLayoutConstraint activateConstraints:@[
