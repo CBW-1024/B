@@ -1,898 +1,886 @@
-//
-//  WCLiteVolcanoTTS.xm
-//  单文件 iOS 插件：将「文字转语音」的接口与音色从 Fish Audio 换成火山引擎
-//  （Volcano Engine / 豆包语音合成大模型 2.0）
-//
-//  改造对照（基于文字转语音相关代码.zip 中的 WCLiteFishTTSService / WCLiteVoiceCloneViewController /
-//  WCLiteVoiceCatalogViewController，以及微信头文件 dump 核实的真实类签名）：
-//    · 接口：Fish `https://api.fish.audio/v1/tts`  + Bearer key + reference_id
-//         → 火山 `https://openspeech.bytedance.com/api/v1/tts` + Bearer access_token + voice_type
-//    · 音色：Fish reference_id 目录  →  火山 voice_type 目录（zh_female_*_uranus_bigtts / zh_male_*_uranus_bigtts）
-//    · 鉴权：环境变量 API Key  →  NSUserDefaults 保存的火山 access_token（仅本机）
-//    · 返回：Fish 直接返回 MP3 字节  →  火山返回 JSON，音频在 `data` 字段（Base64 编码 MP3）
-//
-//  零外部依赖：MP3→PCM→SILK→.aud→CMessageWrap 的整条发送链路均已内联。
-//    · MP3 解码：AVFoundation（系统框架，无需第三方库）
-//    · PCM→SILK：微信内置 TingSilkEncoderImpl（运行时存在于微信二进制，initWithSampleRate:/encode:isLastFrame:）
-//    · 落库/发送：CMessageWrap(type=34) + CMessageMgr.AddLocalMsg: + MMNewUploadVoiceMgr 上传队列
-//
-//  所有 UI 均基于微信原生类（已用微信头文件 dump 核实签名）：
-//    WCTableViewManager / WCTableViewSectionManager / WCTableViewNormalCellManager / WCTableViewCellManager
-//    WCActionSheet / MMTipsViewController / WeToast / MMUIViewController
-//    BaseMsgContentViewController（-growTextViewDidClickSendWithText: / -getCurrentChatName）
-//    WCInputController（-onSendButtonClicked 经 InputControllerDelegate 回调）
-//
-
 #import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
+#import <AVFAudio/AVFAudio.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <AVFoundation/AVFoundation.h>
+#import <substrate.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-// 项目级微信头文件（来自微信头文件 dump，原 TTS 文件同样引用）。
-// 若你的工程把 dump 头文件统一收纳为 WeChatHeaders.h，则保留此行；
-// 若使用 Theos 的 Headers 目录逐个引入，可改为对应 import 或删除本行。
-#import "WeChatHeaders.h"
+static NSFileManager *g_fileManager = nil;
+static NSLock       *g_mediaLock    = nil;
+static CIContext    *g_ciContext    = nil;
 
-#pragma mark - 火山引擎接口常量
+static AVAssetReader            *videoReader = nil;
+static AVAssetReaderTrackOutput *videoOutput = nil;
 
-/// 火山「大模型语音合成 HTTP 非流式 V1」接口地址
-/// 官方文档：https://www.volcengine.com/docs/6561/1257584
-static NSString * const kWCLiteVolcanoTTSHost = @"https://openspeech.bytedance.com/api/v1/tts";
+static AVAssetReader            *audioReader = nil;
+static AVAssetReaderTrackOutput *audioOutput = nil;
+static NSMutableData            *g_audioFIFO = nil;
 
-/// 服务端音色目录（可选）。应指向 provider=volcano 的 voices.json；
-/// 若拉取结果为空或不含火山音色，则回退到本文件内置的火山音色目录。
-static NSString * const kWCLiteVolcanoCatalogURL = @"https://raw.githubusercontent.com/iosdcq/WCRefine-VoiceHub/main/catalog/voices.json";
+static BOOL                         g_hasProbedASBD = NO;
+static AudioStreamBasicDescription  g_targetASBD    = {0};
 
-/// 试听文本
-static NSString * const kWCLiteVolcanoPreviewText = @"我是火山语音试听音色";
+static int  g_sourceChannels = 2;
 
-/// 预览/发送时绑定的 AVAudioPlayer 关联键
-static char kWCLiteVolcanoPreviewPlayerKey;
+static BOOL g_enableReplacement = YES;
+static BOOL g_isLoop             = YES;
+static BOOL g_isSound            = YES;
+static int  g_rotation           = 90;
 
-#pragma mark - 轻量 Toast（基于真实类 WeToast）
+static BOOL g_isMirrored = NO;
+static BOOL g_enablePhotoReplacement = NO;
+static UIImage *g_currentPhotoImg = nil;
 
-static void WCLiteVolcanoShowToast(NSString *text) {
-    if (!text.length) return;
-    Class WeToastClass = objc_getClass("WeToast");
-    if (WeToastClass) {
-        id toast = ((id (*)(id, SEL))objc_msgSend)(WeToastClass, NSSelectorFromString(@"toast"));
-        if (toast && [toast respondsToSelector:NSSelectorFromString(@"showErrorToastWithText:")]) {
-            ((void (*)(id, SEL, NSString *))objc_msgSend)(toast, NSSelectorFromString(@"showErrorToastWithText:"), text);
-            return;
-        }
-    }
-    // 兜底：系统弹窗
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:nil
-                                                                 message:text
-                                                          preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-    UIViewController *top = WCLiteVolcanoTopViewController();
-    [top presentViewController:alert animated:YES completion:nil];
+static BOOL g_videoReload = NO;
+static BOOL g_audioReload = NO;
+
+static OSStatus (*orig_AudioUnitRender)(
+    AudioUnit                  inUnit,
+    AudioUnitRenderActionFlags *ioActionFlags,
+    const AudioTimeStamp       *inTimeStamp,
+    UInt32                     inOutputBusNumber,
+    UInt32                     inNumberFrames,
+    AudioBufferList            *ioData
+) = NULL;
+
+static NSString *g_videoDir      = nil;
+static NSString *g_tempVideoPath = nil;
+static NSString *g_tempAudioPath = nil;
+static NSString *g_photoPath     = nil;
+
+static void SaveSettings(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setInteger:g_rotation        forKey:@"vcam_rotation"];
+    [d setBool:g_isLoop             forKey:@"vcam_loop"];
+    [d setBool:g_isSound            forKey:@"vcam_sound"];
+    [d setBool:g_enableReplacement  forKey:@"vcam_enable"];
+    [d setBool:g_isMirrored         forKey:@"vcam_mirror"];
+    [d setBool:g_enablePhotoReplacement forKey:@"vcam_photoreplace"];
+    [d synchronize];
+}
+static void LoadSettings(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d objectForKey:@"vcam_rotation"]) g_rotation         = (int)[d integerForKey:@"vcam_rotation"];
+    else                                   g_rotation         = 90;
+    if ([d objectForKey:@"vcam_loop"])     g_isLoop            = [d boolForKey:@"vcam_loop"];
+    if ([d objectForKey:@"vcam_sound"])    g_isSound           = [d boolForKey:@"vcam_sound"];
+    if ([d objectForKey:@"vcam_enable"])   g_enableReplacement = [d boolForKey:@"vcam_enable"];
+    if ([d objectForKey:@"vcam_mirror"])         g_isMirrored         = [d boolForKey:@"vcam_mirror"];
+    if ([d objectForKey:@"vcam_photoreplace"])    g_enablePhotoReplacement = [d boolForKey:@"vcam_photoreplace"];
 }
 
-static UIViewController *WCLiteVolcanoTopViewController(void) {
-    UIWindow *window = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]] &&
-                ((UIWindowScene *)scene).activationState == UISceneActivationStateForegroundActive) {
-                window = ((UIWindowScene *)scene).windows.firstObject;
-                break;
-            }
+static NSString *GetDocumentPath(void) {
+    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+}
+static NSString *getSandboxVideoPath(void) {
+    return [g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"];
+}
+
+static UIViewController *bear_getTopVC(void) {
+    UIWindow *key = nil;
+    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *w in scene.windows) {
+            if (w.isKeyWindow) { key = w; break; }
         }
+        if (!key) key = scene.windows.firstObject;
+        break;
     }
-    if (!window) window = UIApplication.sharedApplication.keyWindow;
-    UIViewController *vc = window.rootViewController;
+    if (!key) return nil;
+    UIViewController *vc = key.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
-    while (vc && vc.childViewControllers.count) {
-        UIViewController *last = vc.childViewControllers.lastObject;
-        if ([last isKindOfClass:[UINavigationController class]]) {
-            vc = ((UINavigationController *)last).topViewController;
-            break;
-        }
-        vc = last;
-    }
-    if ([vc isKindOfClass:[UINavigationController class]]) {
-        vc = ((UINavigationController *)vc).topViewController;
-    }
-    return vc ?: window.rootViewController;
+    return vc;
 }
 
-static void WCLiteVolcanoStopPreviewOnOwner(id owner) {
-    if (!owner) return;
-    id p = objc_getAssociatedObject(owner, &kWCLiteVolcanoPreviewPlayerKey);
-    if ([p isKindOfClass:[AVAudioPlayer class]]) {
-        [(AVAudioPlayer *)p stop];
-    }
-    objc_setAssociatedObject(owner, &kWCLiteVolcanoPreviewPlayerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-static void WCLiteVolcanoPlayMP3Data(NSData *data, id owner, void (^showError)(NSString *)) {
-    if (!data.length) { if (showError) showError(@"无音频数据"); return; }
-    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                     [NSString stringWithFormat:@"WCLiteVolcanoPreview_%@.mp3", [[NSUUID UUID] UUIDString]]];
-    if (![data writeToFile:tmp atomically:YES]) { if (showError) showError(@"无法写入临时文件"); return; }
-    WCLiteVolcanoStopPreviewOnOwner(owner);
-    NSURL *url = [NSURL fileURLWithPath:tmp];
-    NSError *err = nil;
-    AVAudioPlayer *player = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:&err];
-    if (!player || err) { if (showError) showError(err.localizedDescription.length ? err.localizedDescription : @"无法播放"); return; }
-    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
-    player.numberOfLoops = 0;
-    if (![player prepareToPlay] || ![player play]) { if (showError) showError(@"播放失败"); return; }
-    if (owner) objc_setAssociatedObject(owner, &kWCLiteVolcanoPreviewPlayerKey, player, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-#pragma mark - 配置（自包含，NSUserDefaults 持久化，不再依赖 WCLiteConfig）
-
-@interface WCLiteVolcanoTTSConfig : NSObject
-+ (BOOL)enabled;                  + (void)setEnabled:(BOOL)v;
-+ (NSString *)accessToken;        + (void)setAccessToken:(NSString *)v;
-+ (NSString *)commandPrefix;      + (void)setCommandPrefix:(NSString *)v;
-+ (double)speed;                  + (void)setSpeed:(double)v;
-+ (NSString *)selectedVoiceType;  + (void)setSelectedVoiceType:(NSString *)v;
-+ (NSString *)selectedVoiceName;  + (void)setSelectedVoiceName:(NSString *)v;
-+ (NSArray *)catalog;             + (void)setCatalog:(NSArray *)v;
-+ (NSArray *)builtinVolcanoCatalog;
-@end
-
-@implementation WCLiteVolcanoTTSConfig
-+ (NSUserDefaults *)ud { return [NSUserDefaults standardUserDefaults]; }
-+ (BOOL)enabled { return [[self.ud objectForKey:@"WCLiteVolcanoTTS.enabled"] boolValue]; }
-+ (void)setEnabled:(BOOL)v { [self.ud setBool:v forKey:@"WCLiteVolcanoTTS.enabled"]; }
-+ (NSString *)accessToken { return [self.ud stringForKey:@"WCLiteVolcanoTTS.accessToken"]; }
-+ (void)setAccessToken:(NSString *)v { v ? [self.ud setObject:v forKey:@"WCLiteVolcanoTTS.accessToken"] : [self.ud removeObjectForKey:@"WCLiteVolcanoTTS.accessToken"]; }
-+ (NSString *)commandPrefix { NSString *p = [self.ud stringForKey:@"WCLiteVolcanoTTS.commandPrefix"]; return p.length ? p : @"tts"; }
-+ (void)setCommandPrefix:(NSString *)v { [self.ud setObject:(v.length ? v : @"tts") forKey:@"WCLiteVolcanoTTS.commandPrefix"]; }
-+ (double)speed { double s = [self.ud doubleForKey:@"WCLiteVolcanoTTS.speed"]; return s > 0 ? s : 1.0; }
-+ (void)setSpeed:(double)v { [self.ud setDouble:v forKey:@"WCLiteVolcanoTTS.speed"]; }
-+ (NSString *)selectedVoiceType { return [self.ud stringForKey:@"WCLiteVolcanoTTS.selectedVoiceType"]; }
-+ (void)setSelectedVoiceType:(NSString *)v { v ? [self.ud setObject:v forKey:@"WCLiteVolcanoTTS.selectedVoiceType"] : [self.ud removeObjectForKey:@"WCLiteVolcanoTTS.selectedVoiceType"]; }
-+ (NSString *)selectedVoiceName { return [self.ud stringForKey:@"WCLiteVolcanoTTS.selectedVoiceName"]; }
-+ (void)setSelectedVoiceName:(NSString *)v { v ? [self.ud setObject:v forKey:@"WCLiteVolcanoTTS.selectedVoiceName"] : [self.ud removeObjectForKey:@"WCLiteVolcanoTTS.selectedVoiceName"]; }
-+ (NSArray *)catalog { return [self.ud arrayForKey:@"WCLiteVolcanoTTS.catalog"]; }
-+ (void)setCatalog:(NSArray *)v { v ? [self.ud setObject:v forKey:@"WCLiteVolcanoTTS.catalog"] : [self.ud removeObjectForKey:@"WCLiteVolcanoTTS.catalog"]; }
-
-/// 内置火山音色目录（豆包语音合成大模型 2.0，uranus_bigtts 系列）
-+ (NSArray *)builtinVolcanoCatalog {
-    NSArray *list = @[
-        // —— 通用场景（女声）——
-        @{@"id":@"volcano:zh_female_cancan_uranus_bigtts",      @"name":@"知性灿灿 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_cancan_uranus_bigtts",      @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_qingxinnvsheng_uranus_bigtts", @"name":@"清新女声 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_qingxinnvsheng_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_tianmeixiaoyuan_uranus_bigtts", @"name":@"甜美小源 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_tianmeixiaoyuan_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_tianmeitaozi_uranus_bigtts", @"name":@"甜美桃子 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_tianmeitaozi_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_linjianvhai_uranus_bigtts", @"name":@"邻家女孩 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_linjianvhai_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_wenroushunv_uranus_bigtts", @"name":@"温柔淑女 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_wenroushunv_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_gaolengyujie_uranus_bigtts", @"name":@"高冷御姐 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_gaolengyujie_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_qingchezizi_uranus_bigtts", @"name":@"清澈梓梓 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_qingchezizi_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_tianmeiyueyue_uranus_bigtts", @"name":@"甜美悦悦 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_tianmeiyueyue_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_zhixingnv_uranus_bigtts", @"name":@"知性女声 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_zhixingnv_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_qinqienv_uranus_bigtts", @"name":@"亲切女声 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_qinqienv_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_tiexinnvsheng_uranus_bigtts", @"name":@"贴心女声 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_tiexinnvsheng_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        @{@"id":@"volcano:zh_female_wenrouxiaoya_uranus_bigtts", @"name":@"温柔小雅 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_wenrouxiaoya_uranus_bigtts", @"contentType":@"general", @"description":@"通用·女声"},
-        // —— 通用场景（男声）——
-        @{@"id":@"volcano:zh_male_m191_uranus_bigtts", @"name":@"云舟 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_m191_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_taocheng_uranus_bigtts", @"name":@"小天 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_taocheng_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_liufei_uranus_bigtts", @"name":@"刘飞 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_liufei_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_ruyaqingnian_uranus_bigtts", @"name":@"儒雅青年 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_ruyaqingnian_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_yangguangqingnian_uranus_bigtts", @"name":@"阳光青年 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_yangguangqingnian_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_fanjuanqingnian_uranus_bigtts", @"name":@"反卷青年 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_fanjuanqingnian_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_huolixiaoge_uranus_bigtts", @"name":@"活力小哥 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_huolixiaoge_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_qingshuangnanda_uranus_bigtts", @"name":@"清爽男大 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_qingshuangnanda_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_dongfanghaoran_uranus_bigtts", @"name":@"东方浩然 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_dongfanghaoran_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_yuanboxiaoshu_uranus_bigtts", @"name":@"渊博小叔 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_yuanboxiaoshu_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_gaolengchenwen_uranus_bigtts", @"name":@"高冷沉稳 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_gaolengchenwen_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        @{@"id":@"volcano:zh_male_cixingjieshuonan_uranus_bigtts", @"name":@"磁性解说男声 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_cixingjieshuonan_uranus_bigtts", @"contentType":@"general", @"description":@"通用·男声"},
-        // —— 角色扮演 ——
-        @{@"id":@"volcano:zh_female_sajiaoxuemei_uranus_bigtts", @"name":@"撒娇学妹 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_sajiaoxuemei_uranus_bigtts", @"contentType":@"role", @"description":@"角色扮演·女声"},
-        @{@"id":@"volcano:zh_female_wuzetian_uranus_bigtts", @"name":@"武则天 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_wuzetian_uranus_bigtts", @"contentType":@"role", @"description":@"角色扮演·女声"},
-        @{@"id":@"volcano:zh_male_aojiaobazong_uranus_bigtts", @"name":@"傲娇霸总 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_aojiaobazong_uranus_bigtts", @"contentType":@"role", @"description":@"角色扮演·男声"},
-        @{@"id":@"volcano:zh_male_tangseng_uranus_bigtts", @"name":@"唐僧 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_tangseng_uranus_bigtts", @"contentType":@"role", @"description":@"角色扮演·男声"},
-        @{@"id":@"volcano:zh_male_zhubajie_uranus_bigtts", @"name":@"猪八戒 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_zhubajie_uranus_bigtts", @"contentType":@"role", @"description":@"角色扮演·男声"},
-        @{@"id":@"volcano:zh_male_zhuangzhou_uranus_bigtts", @"name":@"庄周 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_zhuangzhou_uranus_bigtts", @"contentType":@"role", @"description":@"角色扮演·男声"},
-        @{@"id":@"volcano:zh_male_lubanqihao_uranus_bigtts", @"name":@"鲁班七号 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_lubanqihao_uranus_bigtts", @"contentType":@"role", @"description":@"角色扮演·男声"},
-        // —— 有声阅读 ——
-        @{@"id":@"volcano:zh_female_xiaoxue_uranus_bigtts", @"name":@"儿童绘本 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_xiaoxue_uranus_bigtts", @"contentType":@"audiobook", @"description":@"有声阅读·女声"},
-        @{@"id":@"volcano:zh_female_shaoergushi_uranus_bigtts", @"name":@"少儿故事 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_shaoergushi_uranus_bigtts", @"contentType":@"audiobook", @"description":@"有声阅读·女声"},
-        @{@"id":@"volcano:zh_male_baqiqingshu_uranus_bigtts", @"name":@"霸气青叔 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_baqiqingshu_uranus_bigtts", @"contentType":@"audiobook", @"description":@"有声阅读·男声"},
-        @{@"id":@"volcano:zh_male_xuanyijieshuo_uranus_bigtts", @"name":@"悬疑解说 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_xuanyijieshuo_uranus_bigtts", @"contentType":@"audiobook", @"description":@"有声阅读·男声"},
-        // —— 视频配音 ——
-        @{@"id":@"volcano:zh_female_peiqi_uranus_bigtts", @"name":@"佩奇猪 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_peiqi_uranus_bigtts", @"contentType":@"dubbing", @"description":@"视频配音·女声"},
-        @{@"id":@"volcano:zh_female_jitangmei_uranus_bigtts", @"name":@"鸡汤妹妹 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_jitangmei_uranus_bigtts", @"contentType":@"dubbing", @"description":@"视频配音·女声"},
-        @{@"id":@"volcano:zh_male_sunwukong_uranus_bigtts", @"name":@"猴哥 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_sunwukong_uranus_bigtts", @"contentType":@"dubbing", @"description":@"视频配音·男声"},
-        @{@"id":@"volcano:zh_male_dayi_uranus_bigtts", @"name":@"大壹 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_dayi_uranus_bigtts", @"contentType":@"dubbing", @"description":@"视频配音·男声"},
-        @{@"id":@"volcano:zh_male_jieshuoxiaoming_uranus_bigtts", @"name":@"解说小明 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_male_jieshuoxiaoming_uranus_bigtts", @"contentType":@"dubbing", @"description":@"视频配音·男声"},
-        // —— 客服 ——
-        @{@"id":@"volcano:zh_female_kefunvsheng_uranus_bigtts", @"name":@"暖阳女声 2.0", @"provider":@"volcano", @"providerVoiceId":@"zh_female_kefunvsheng_uranus_bigtts", @"contentType":@"service", @"description":@"客服·女声"},
-    ];
-    return list;
-}
-@end
-
-#pragma mark - 火山语音合成服务（替代 WCLiteFishTTSService）
-
-@interface WCLiteVolcanoTTSService : NSObject
-/// 若 content 命中指令前缀，返回待合成正文；否则 nil。
-+ (nullable NSString *)voiceTextFromOutgoingMessageContent:(NSString *)content;
-/// 从音色目录项字典解析火山 voice_type（优先 providerVoiceId）。
-+ (nullable NSString *)voiceTypeFromVoiceDictionary:(NSDictionary *)voice;
-/// 调用火山 TTS，completion 返回解码后的 MP3 数据。
-+ (void)synthesizeSpeechWithText:(NSString *)text
-                       voiceType:(NSString *)voiceType
-                      completion:(void (^)(NSData * _Nullable mp3Data, NSString * _Nullable errorMessage))completion;
-/// 试听：合成 kWCLiteVolcanoPreviewText 并播放。
-+ (void)previewVoiceWithDictionary:(NSDictionary *)voice fromViewController:(id)viewController;
-/// 合成并作为语音消息发送到指定会话（零依赖：MP3→PCM→SILK→.aud→CMessageWrap 全部内联，不再依赖 WCLiteVoicePackSender）。
-+ (void)sendVoiceMessageWithText:(NSString *)text
-                       voiceType:(NSString *)voiceType
-                    chatUserName:(NSString *)chatUserName
-                      completion:(void (^)(BOOL success, NSString * _Nullable errorMessage))completion;
-@end
-
-#pragma mark - 零依赖音频管线：MP3 → PCM(16k 单声道 S16) → SILK → .aud
-
-/// MP3 文件 → 16kHz 单声道 16bit PCM（AVFoundation，无需第三方库）
-static NSData *WCLiteVolcanoMP3ToPCM(NSString *mp3Path, NSError **outErr) {
-    NSError *err = nil;
-    AVAudioFile *file = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:mp3Path] error:&err];
-    if (!file || err) { if (outErr) *outErr = err; return nil; }
-
-    AVAudioFormat *inFmt  = file.processingFormat;
-    AVAudioFormat *outFmt = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatInt16
-                                                              sampleRate:16000.0
-                                                                channels:1
-                                                             interleaved:YES];
-    AVAudioConverter *conv = [[AVAudioConverter alloc] initFromFormat:inFmt toFormat:outFmt];
-    if (!conv) {
-        if (outErr) *outErr = [NSError errorWithDomain:@"WCLiteVolcano" code:-1
-                                 userInfo:@{NSLocalizedDescriptionKey: @"无法创建音频转换器"}];
-        return nil;
-    }
-
-    const AVAudioFrameCount cap = 4096;
-    AVAudioPCMBuffer *inBuf  = [[AVAudioPCMBuffer alloc] initWithFormat:inFmt  frameCapacity:cap];
-    AVAudioPCMBuffer *outBuf = [[AVAudioPCMBuffer alloc] initWithFormat:outFmt frameCapacity:cap];
-    NSMutableData *pcm = [NSMutableData data];
-    __block BOOL finished = NO;
-
-    while (!finished) {
-        NSError *cErr = nil;
-        AVAudioConverterOutputStatus st = [conv convertToBuffer:outBuf
-                                                          error:&cErr
-                                             withInputFromBlock:^AVAudioBuffer *(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus *outStatus) {
-            NSError *readErr = nil;
-            BOOL ok = [file readIntoBuffer:inBuf error:&readErr];
-            if (!ok || inBuf.frameLength == 0) {
-                *outStatus = AVAudioConverterInputStatus_EndOfStream;
-                return nil;
-            }
-            *outStatus = AVAudioConverterInputStatus_HaveData;
-            return inBuf;
-        }];
-        if (st == AVAudioConverterOutputStatus_HaveData) {
-            int16_t *samples = outBuf.int16ChannelData[0];
-            [pcm appendBytes:samples length:(NSUInteger)outBuf.frameLength * sizeof(int16_t)];
-        } else if (st == AVAudioConverterOutputStatus_EndOfStream) {
-            finished = YES;
-        } else {
-            if (outErr) *outErr = cErr;
-            break;
-        }
-    }
-    return pcm.length ? pcm : nil;
-}
-
-/// 16kHz 单声道 16bit PCM → SILK 裸流（复用微信内置 TingSilkEncoderImpl，零外部依赖）
-static NSData *WCLiteVolcanoPCMToSilk(NSData *pcm, int sampleRate) {
-    Class silkCls = objc_getClass("TingSilkEncoderImpl");
-    if (!silkCls) return nil;
-    id encoder = [[silkCls alloc] initWithSampleRate:sampleRate];
-    if (!encoder) return nil;
-
-    // 内部有 _mLeftData 缓冲，按任意分块喂入、末块置 isLastFrame 即可
-    NSUInteger frameBytes = (NSUInteger)(20 * sampleRate / 1000) * 2; // 20ms 帧
-    if (frameBytes < 1) frameBytes = 640;
-    NSMutableData *silk = [NSMutableData data];
-    NSUInteger total = pcm.length;
-    NSUInteger i = 0;
-    while (i < total) {
-        NSUInteger len = MIN(frameBytes, total - i);
-        NSData *chunk = [pcm subdataWithRange:NSMakeRange(i, len)];
-        BOOL last = (i + len >= total);
-        NSData *enc = [encoder encode:chunk isLastFrame:last];
-        if (enc.length) [silk appendData:enc];
-        i += len;
-    }
-    return silk.length ? silk : nil;
-}
-
-@implementation WCLiteVolcanoTTSService
-
-+ (NSString *)voiceTextFromOutgoingMessageContent:(NSString *)content {
-    if (![WCLiteVolcanoTTSConfig enabled]) return nil;
-    if (![WCLiteVolcanoTTSConfig accessToken].length) return nil;
-    if (![WCLiteVolcanoTTSConfig selectedVoiceType].length) return nil;
-    if (!content.length) return nil;
-    NSString *prefix = [WCLiteVolcanoTTSConfig commandPrefix];
-    NSString *trimmed = [content stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmed.length < prefix.length || ![trimmed hasPrefix:prefix]) return nil;
-    if (trimmed.length > prefix.length) {
-        unichar c = [trimmed characterAtIndex:prefix.length];
-        if (![[NSCharacterSet whitespaceAndNewlineCharacterSet] characterIsMember:c]) return nil;
-    }
-    NSString *rest = [[trimmed substringFromIndex:prefix.length] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    return rest.length ? rest : nil;
-}
-
-+ (NSString *)voiceTypeFromVoiceDictionary:(NSDictionary *)voice {
-    if (![voice isKindOfClass:[NSDictionary class]]) return nil;
-    id providerId = voice[@"providerVoiceId"];
-    if ([providerId isKindOfClass:[NSString class]] && [(NSString *)providerId length] > 0) return (NSString *)providerId;
-    id vid = voice[@"id"];
-    if ([vid isKindOfClass:[NSString class]]) {
-        NSString *s = (NSString *)vid;
-        NSRange r = [s rangeOfString:@":"];
-        if (r.location != NSNotFound && r.location + 1 < s.length) return [s substringFromIndex:r.location + 1];
-        if (s.length) return s;
-    }
-    return nil;
-}
-
-+ (void)synthesizeSpeechWithText:(NSString *)text
-                       voiceType:(NSString *)voiceType
-                      completion:(void (^)(NSData *, NSString *))completion {
-    if (!completion) return;
-    NSString *token = [WCLiteVolcanoTTSConfig accessToken];
-    if (!token.length) { completion(nil, @"请先设置火山 access_token"); return; }
-    if (!text.length) { completion(nil, @"文本为空"); return; }
-    if (!voiceType.length) { completion(nil, @"音色 voice_type 无效"); return; }
-
-    /// 火山 HTTP V1 请求体（扁平参数 + Bearer 鉴权）
-    NSMutableDictionary *body = [NSMutableDictionary dictionary];
-    body[@"text"] = text;
-    body[@"voice_type"] = voiceType;
-    body[@"format"] = @"mp3";
-    body[@"speed"] = @([WCLiteVolcanoTTSConfig speed]);
-    body[@"pitch"] = @1.0;
-    body[@"silence_duration"] = @125;
-    NSError *jsonErr = nil;
-    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:body options:0 error:&jsonErr];
-    if (!bodyData || jsonErr) { completion(nil, @"请求体编码失败"); return; }
-
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kWCLiteVolcanoTTSHost]];
-    request.HTTPMethod = @"POST";
-    request.HTTPBody = bodyData;
-    [request setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
-    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [request setTimeoutInterval:60.0];
-
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (error) { completion(nil, error.localizedDescription ?: @"网络错误"); return; }
-            if (!data.length) { completion(nil, @"TTS 返回空数据"); return; }
-            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if (![json isKindOfClass:[NSDictionary class]]) { completion(nil, @"响应解析失败"); return; }
-            NSDictionary *resp = (NSDictionary *)json;
-            NSInteger code = [resp[@"code"] isKindOfClass:[NSNumber class]] ? [(NSNumber *)resp[@"code"] integerValue] : 3000;
-            NSString *b64 = [resp[@"data"] isKindOfClass:[NSString class]] ? (NSString *)resp[@"data"] : nil;
-            if (code != 3000 || !b64.length) {
-                NSString *msg = [resp[@"message"] isKindOfClass:[NSString class]] ? (NSString *)resp[@"message"] : nil;
-                if (!msg.length) msg = [NSString stringWithFormat:@"火山 TTS 失败 (code=%ld)", (long)code];
-                completion(nil, msg);
-                return;
-            }
-            NSData *mp3 = [[NSData alloc] initWithBase64EncodedString:b64 options:NSDataBase64DecodingIgnoreUnknownCharacters];
-            if (!mp3.length) { completion(nil, @"音频解码失败"); return; }
-            completion(mp3, nil);
-        });
-    }];
-    [task resume];
-}
-
-+ (void)previewVoiceWithDictionary:(NSDictionary *)voice fromViewController:(id)viewController {
-    NSString *vt = [self voiceTypeFromVoiceDictionary:voice];
-    if (!vt.length) { WCLiteVolcanoShowToast(@"无法解析音色 voice_type"); return; }
-    if (![WCLiteVolcanoTTSConfig accessToken].length) { WCLiteVolcanoShowToast(@"请先设置火山 access_token"); return; }
-    if ([viewController respondsToSelector:NSSelectorFromString(@"startLoadingWithText:")]) {
-        [viewController startLoadingWithText:@"合成中..."];
-    }
-    __weak id weakVC = viewController;
-    [self synthesizeSpeechWithText:kWCLiteVolcanoPreviewText voiceType:vt completion:^(NSData *mp3Data, NSString *errorMessage) {
-        id strongVC = weakVC;
-        if ([strongVC respondsToSelector:NSSelectorFromString(@"stopLoading")]) [strongVC stopLoading];
-        if (errorMessage.length) { WCLiteVolcanoShowToast(errorMessage); return; }
-        WCLiteVolcanoPlayMP3Data(mp3Data, strongVC, ^(NSString *msg) { WCLiteVolcanoShowToast(msg); });
-    }];
-}
-
-+ (void)sendVoiceMessageWithText:(NSString *)text
-                       voiceType:(NSString *)voiceType
-                    chatUserName:(NSString *)chatUserName
-                      completion:(void (^)(BOOL, NSString *))completion {
-    if (!completion) return;
-    if (!chatUserName.length) { completion(NO, @"无法获取当前会话"); return; }
-    [self synthesizeSpeechWithText:text voiceType:voiceType completion:^(NSData *mp3Data, NSString *errorMessage) {
-        if (errorMessage.length || !mp3Data.length) { completion(NO, errorMessage ?: @"合成失败"); return; }
-
-        // 后台完成 解码 → 编码 → 写文件，避免阻塞主线程
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            NSString *tmpMp3 = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                                [NSString stringWithFormat:@"WCLiteVolcano_%@.mp3", [[NSUUID UUID] UUIDString]]];
-            [mp3Data writeToFile:tmpMp3 atomically:YES];
-
-            NSError *convErr = nil;
-            NSData *pcm = WCLiteVolcanoMP3ToPCM(tmpMp3, &convErr);
-            [[NSFileManager defaultManager] removeItemAtPath:tmpMp3 error:nil];
-            if (!pcm.length) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    completion(NO, convErr.localizedDescription ?: @"音频解码失败");
-                });
-                return;
-            }
-
-            // PCM → SILK（微信内置编码器，零外部依赖）
-            NSData *silk = WCLiteVolcanoPCMToSilk(pcm, 16000);
-            if (!silk.length) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    completion(NO, @"SILK 编码失败：微信内置 TingSilkEncoderImpl 不可用");
-                });
-                return;
-            }
-
-            // 写 .aud：10 字节 #!SILK_V3\n 头 + SILK 裸流（微信语音文件格式）
-            NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-            NSString *audioDir = [doc stringByAppendingPathComponent:@"Audio"];
-            [[NSFileManager defaultManager] createDirectoryAtPath:audioDir
-                                      withIntermediateDirectories:YES attributes:nil error:nil];
-            NSString *audPath = [audioDir stringByAppendingPathComponent:
-                                 [NSString stringWithFormat:@"%@.aud", [[NSUUID UUID] UUIDString]]];
-            NSMutableData *aud = [NSMutableData data];
-            char magic[10] = {'#', '!', 'S', 'I', 'L', 'K', '_', 'V', '3', '\n'};
-            [aud appendBytes:magic length:10];
-            [aud appendData:silk];
-            NSTimeInterval duration = (NSTimeInterval)pcm.length / (16000.0 * 2.0);
-            BOOL wrote = [aud writeToFile:audPath atomically:YES];
-            if (!wrote) {
-                dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, @"无法写入语音文件"); });
-                return;
-            }
-
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self sendSilkVoiceFile:audPath duration:duration toUser:chatUserName completion:completion];
-            });
-        });
-    }];
-}
-
-/// 构造语音 CMessageWrap（type=34）并写入会话、触发上传（零依赖，全部走微信原生 API）
-+ (void)sendSilkVoiceFile:(NSString *)audPath
-                 duration:(NSTimeInterval)duration
-                   toUser:(NSString *)toUser
-               completion:(void (^)(BOOL success, NSString *errorMessage))completion {
-    Class svcCls = objc_getClass("MMServiceCenter");
-    if (!svcCls || ![svcCls respondsToSelector:@selector(defaultCenter)]) {
-        completion(NO, @"MMServiceCenter 不可用");
-        return;
-    }
-    id svc = [svcCls performSelector:@selector(defaultCenter)];
-    id contactMgr = [svc getService:objc_getClass("CContactMgr")];
-    id selfContact = [contactMgr getSelfContact];
-    NSString *selfUser = [selfContact userName];
-    if (!selfUser.length) selfUser = toUser; // 兜底
-
-    Class wrapCls = objc_getClass("CMessageWrap");
-    if (!wrapCls) { completion(NO, @"CMessageWrap 不可用"); return; }
-    id wrap = [[wrapCls alloc] initWithMsgType:34 nsFromUsr:selfUser];
-    if (!wrap) { completion(NO, @"无法创建 CMessageWrap"); return; }
-
-    [wrap setValue:toUser            forKey:@"m_nsToUsr"];
-    [wrap setValue:audPath           forKey:@"m_nsVoicePath"];
-    [wrap setValue:@1               forKey:@"m_uiVoiceFormat"];           // 1 = SILK
-    [wrap setValue:@((unsigned int)round(duration))        forKey:@"m_uiVoiceTime"];
-    [wrap setValue:@((unsigned int)(duration * 1000.0))    forKey:@"m_uiVoiceLen"];
-    [wrap setValue:@((unsigned int)(arc4random() % 1000000 + 1)) forKey:@"m_uiVoiceClientID"];
-    [wrap setValue:@((unsigned int)[[NSDate date] timeIntervalSince1970]) forKey:@"m_uiCreateTime"];
-    [wrap setValue:@0               forKey:@"m_uiStatus"];               // 0 = 待发送
-
-    id msgMgr = [svc getService:objc_getClass("CMessageMgr")];
-    if (!msgMgr) { completion(NO, @"CMessageMgr 不可用"); return; }
-
-    // 落库：本地立即可见且可播放
-    if ([msgMgr respondsToSelector:@selector(AddLocalMsg:MsgWrap:)]) {
-        [msgMgr AddLocalMsg:toUser MsgWrap:wrap];
-    } else if ([msgMgr respondsToSelector:@selector(AddMsg:MsgWrap:)]) {
-        [msgMgr AddMsg:toUser MsgWrap:wrap];
-    }
-
-    // 触发上传：微信语音上传管理器会在队列中拾取待发送语音；失败也不影响本地语音气泡
-    BOOL triggered = NO;
-    if ([msgMgr respondsToSelector:@selector(ResendMsg:MsgWrap:)]) {
-        @try { [msgMgr ResendMsg:selfUser MsgWrap:wrap]; triggered = YES; }
-        @catch (NSException *e) { triggered = NO; }
-    }
-    if (triggered) {
-        completion(YES, nil);
-    } else {
-        completion(YES, @"语音已生成并插入会话（本地可播放）；如未自动上传，请按微信版本微调上传入口");
-    }
-}
-
-@end
-
-#pragma mark - 视图控制器基类（自包含，基于真实类 MMUIViewController）
-
-@interface WCLiteVolcanoBaseVC : MMUIViewController
-@property (nonatomic, strong) id tableViewMgr; // WCTableViewManager
-- (void)setupTopOffsetForTableView:(UITableView *)tableView;
-@end
-
-@implementation WCLiteVolcanoBaseVC
-- (void)setupTopOffsetForTableView:(UITableView *)tableView {
-    if (@available(iOS 11.0, *)) {
-        tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
-    }
-    CGFloat top = UIApplication.sharedApplication.statusBarFrame.size.height + 44.0;
-    tableView.contentInset = UIEdgeInsetsMake(top, 0, 0, 0);
-    tableView.scrollIndicatorInsets = tableView.contentInset;
-}
-@end
-
-#pragma mark - 音色列表（替代 WCLiteVoiceCatalogViewController）
-
-@interface WCLiteVolcanoVoiceCatalogViewController : WCLiteVolcanoBaseVC
-@end
-
-static char kWCLiteVolcanoVoiceKey;
-
-@implementation WCLiteVolcanoVoiceCatalogViewController
-- (instancetype)init {
-    if (self = [super init]) {
-        Class mgrCls = objc_getClass("WCTableViewManager");
-        _tableViewMgr = [[mgrCls alloc] initWithFrame:[UIScreen mainScreen].bounds style:2]; // 2 = InsetGrouped
-    }
-    return self;
-}
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"火山音色列表";
-    MMTableView *tableView = [self.tableViewMgr getTableView];
-    if (@available(iOS 11, *)) tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
-    [self.view addSubview:tableView];
-    [self setupTopOffsetForTableView:tableView];
-    [self reloadTableData];
-}
-- (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self reloadTableData]; }
-
-- (void)reloadTableData {
-    [self.tableViewMgr clearAllSection];
-    NSArray *voices = [WCLiteVolcanoTTSConfig catalog];
-    if (!voices.count) voices = [WCLiteVolcanoTTSConfig builtinVolcanoCatalog];
-
-    WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:[NSString stringWithFormat:@"共 %lu 个火山音色", (unsigned long)voices.count] Footer:@"点击音色可试听或设为当前音色"];
-    Class normalCls = objc_getClass("WCTableViewNormalCellManager");
-    NSString *selectedVT = [WCLiteVolcanoTTSConfig selectedVoiceType];
-
-    for (id item in voices) {
-        if (![item isKindOfClass:[NSDictionary class]]) continue;
-        NSDictionary *voice = (NSDictionary *)item;
-        NSString *name = [voice[@"name"] isKindOfClass:[NSString class]] ? voice[@"name"] : @"(未命名)";
-        NSMutableArray *subs = [NSMutableArray array];
-        if ([voice[@"description"] isKindOfClass:[NSString class]] && [(NSString *)voice[@"description"] length]) [subs addObject:voice[@"description"]];
-        NSString *detail = [subs componentsJoinedByString:@" · "];
-        NSString *vt = [WCLiteVolcanoTTSService voiceTypeFromVoiceDictionary:voice];
-        NSString *right = ([selectedVT length] && [vt isEqualToString:selectedVT]) ? @"当前" : @" ";
-
-        WCTableViewCellManager *cell = [normalCls normalCellForSel:@selector(wclite_volcanoRowTapped:)
-                                                           target:self
-                                                            title:name
-                                                       rightValue:right
-                                                     accessoryType:1];
-        if (cell) {
-            objc_setAssociatedObject(cell, &kWCLiteVolcanoVoiceKey, voice, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [section addCell:cell];
-        }
-    }
-    [self.tableViewMgr addSection:section];
-    [[self.tableViewMgr getTableView] reloadData];
-}
-
-- (NSDictionary *)wclite_volcanoVoiceFromSender:(id)sender {
-    NSDictionary *v = objc_getAssociatedObject(sender, &kWCLiteVolcanoVoiceKey);
-    return [v isKindOfClass:[NSDictionary class]] ? v : nil;
-}
-
-- (void)wclite_volcanoRowTapped:(id)sender {
-    NSDictionary *voice = [self wclite_volcanoVoiceFromSender:sender];
-    if (!voice) return;
-    NSString *name = [voice[@"name"] isKindOfClass:[NSString class]] ? voice[@"name"] : @"音色";
-    Class sheetCls = objc_getClass("WCActionSheet");
-    if (!sheetCls) return;
-    __weak typeof(self) weakSelf = self;
-    WCActionSheet *sheet = [[sheetCls alloc] initWithTitle:name cancelButtonTitle:@"取消"];
-    [sheet addButtonWithTitle:@"试听" eventAction:^{
-        typeof(self) strongSelf = weakSelf; if (!strongSelf) return;
-        [WCLiteVolcanoTTSService previewVoiceWithDictionary:voice fromViewController:strongSelf];
-    }];
-    [sheet addButtonWithTitle:@"设为当前音色" eventAction:^{
-        typeof(self) strongSelf = weakSelf; if (!strongSelf) return;
-        NSString *vt = [WCLiteVolcanoTTSService voiceTypeFromVoiceDictionary:voice];
-        if (!vt.length) { WCLiteVolcanoShowToast(@"无法解析音色 voice_type"); return; }
-        [WCLiteVolcanoTTSConfig setSelectedVoiceType:vt];
-        [WCLiteVolcanoTTSConfig setSelectedVoiceName:name];
-        [strongSelf reloadTableData];
-        WCLiteVolcanoShowToast([NSString stringWithFormat:@"已设为当前音色：%@", name]);
-    }];
-    [sheet showInView:self.view.window ?: self.view];
-}
-@end
-
-#pragma mark - 设置页（替代 WCLiteVoiceCloneViewController）
-
-@interface WCLiteVolcanoTTSCloneViewController : WCLiteVolcanoBaseVC
-@end
-
-@implementation WCLiteVolcanoTTSCloneViewController
-- (instancetype)init {
-    if (self = [super init]) {
-        Class mgrCls = objc_getClass("WCTableViewManager");
-        _tableViewMgr = [[mgrCls alloc] initWithFrame:[UIScreen mainScreen].bounds style:2];
-    }
-    return self;
-}
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"火山语音合成";
-    MMTableView *tableView = [self.tableViewMgr getTableView];
-    if (@available(iOS 11, *)) tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
-    [self.view addSubview:tableView];
-    [self setupTopOffsetForTableView:tableView];
-    [self reloadTableData];
-}
-- (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self reloadTableData]; }
-
-- (void)reloadTableData {
-    [self.tableViewMgr clearAllSection];
-    WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:@"火山语音合成" Footer:@"在聊天输入「指令 文本」并发送，将转为语音消息"];
-
-    WCTableViewCellManager *master = [objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(wclite_volcanoMasterSwitchChanged:)
-                                                                                        target:self
-                                                                                         title:@"火山语音合成"
-                                                                                            on:[WCLiteVolcanoTTSConfig enabled]];
-    [section addCell:master];
-
-    if ([WCLiteVolcanoTTSConfig enabled]) {
-        // access_token
-        NSString *token = [WCLiteVolcanoTTSConfig accessToken];
-        WCTableViewCellManager *tokenCell = [objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(wclite_volcanoShowTokenInput)
-                                                                                                   target:self
-                                                                                                    title:@"Access Token"
-                                                                                               rightValue:(token.length ? @"已设置" : @"未设置")
-                                                                                            accessoryType:1];
-        [section addCell:tokenCell];
-
-        // 语速
-        WCTableViewCellManager *speedCell = [objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(wclite_volcanoShowSpeedInput)
-                                                                                                    target:self
-                                                                                                     title:@"语速"
-                                                                                                rightValue:[NSString stringWithFormat:@"%.2f", [WCLiteVolcanoTTSConfig speed]]
-                                                                                             accessoryType:1];
-        [section addCell:speedCell];
-
-        // 发送指令
-        NSString *cmd = [WCLiteVolcanoTTSConfig commandPrefix];
-        WCTableViewCellManager *cmdCell = [objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(wclite_volcanoShowCommandInput)
-                                                                                                  target:self
-                                                                                                   title:@"发送指令"
-                                                                                              rightValue:(cmd.length ? cmd : @"tts")
-                                                                                           accessoryType:1];
-        [section addCell:cmdCell];
-
-        // 当前音色
-        NSString *voiceName = [WCLiteVolcanoTTSConfig selectedVoiceName];
-        WCTableViewCellManager *curCell = [objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(wclite_volcanoShowCatalog)
-                                                                                                  target:self
-                                                                                                   title:@"当前音色"
-                                                                                              rightValue:(voiceName.length ? voiceName : @"未设置")
-                                                                                           accessoryType:1];
-        [section addCell:curCell];
-
-        // 从服务器拉取
-        WCTableViewCellManager *fetchCell = [objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(wclite_volcanoFetchCatalog)
-                                                                                                    target:self
-                                                                                                     title:@"从服务器拉取"
-                                                                                                rightValue:@" "
-                                                                                             accessoryType:1];
-        [section addCell:fetchCell];
-
-        // 音色列表
-        NSUInteger count = [WCLiteVolcanoTTSConfig catalog].count;
-        WCTableViewCellManager *listCell = [objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(wclite_volcanoShowCatalog)
-                                                                                                  target:self
-                                                                                                   title:@"音色列表"
-                                                                                              rightValue:(count > 0 ? [NSString stringWithFormat:@"%lu 个", (unsigned long)count] : @"内置")
-                                                                                           accessoryType:1];
-        [section addCell:listCell];
-    }
-
-    [self.tableViewMgr addSection:section];
-    [[self.tableViewMgr getTableView] reloadData];
-}
-
-#pragma mark - 开关
-- (void)wclite_volcanoMasterSwitchChanged:(UISwitch *)sender {
-    [WCLiteVolcanoTTSConfig setEnabled:sender.isOn];
-    [self reloadTableData];
-}
-
-#pragma mark - Access Token 输入（仅本机）
-- (void)wclite_volcanoShowTokenInput {
-    Class tipsCls = objc_getClass("MMTipsViewController");
-    if (!tipsCls) { WCLiteVolcanoShowToast(@"当前微信版本不支持输入弹窗"); return; }
-    NSString *current = [WCLiteVolcanoTTSConfig accessToken];
-    __weak typeof(self) weakSelf = self;
-    id tipsVC = [[tipsCls alloc] initWithTitle:@"火山 Access Token"
-                                       message:@"在火山引擎控制台「语音合成大模型」获取 access_token，仅存储到本机"
-                                    btnTitle:@"取消" handler:nil
-                                    btnTitle:@"保存" handler:^{
-        typeof(self) strongSelf = weakSelf;
-        UITextView *tv = [tipsVC getTextView];
-        NSString *t = [(tv.text ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        [WCLiteVolcanoTTSConfig setAccessToken:t];
-        if (strongSelf) [strongSelf reloadTableData];
-    }];
-    [tipsVC addTextViewWithMaxLen:512];
-    [tipsVC setTipsTextPlaceholder:@"粘贴火山 access_token"];
-    [tipsVC setTextFieldDefaultText:current];
-    UITextView *tv = [tipsVC getTextView];
-    if (tv) { tv.editable = YES; tv.selectable = YES; tv.autocorrectionType = UITextAutocorrectionTypeNo; tv.autocapitalizationType = UITextAutocapitalizationTypeNone; }
-    [tipsVC show];
-}
-
-#pragma mark - 语速输入
-- (void)wclite_volcanoShowSpeedInput {
-    Class tipsCls = objc_getClass("MMTipsViewController");
-    if (!tipsCls) { WCLiteVolcanoShowToast(@"当前微信版本不支持输入弹窗"); return; }
-    __weak typeof(self) weakSelf = self;
-    id tipsVC = [[tipsCls alloc] initWithTitle:@"语速"
-                                       message:@"范围 0.5 ~ 2.0，1.0 为原速"
-                                    btnTitle:@"取消" handler:nil
-                                    btnTitle:@"保存" handler:^{
-        typeof(self) strongSelf = weakSelf;
-        UITextView *tv = [tipsVC getTextView];
-        double s = [tv.text doubleValue];
-        if (s < 0.5) s = 0.5; if (s > 2.0) s = 2.0;
-        if (s <= 0) s = 1.0;
-        [WCLiteVolcanoTTSConfig setSpeed:s];
-        if (strongSelf) [strongSelf reloadTableData];
-    }];
-    [tipsVC addTextViewWithMaxLen:8];
-    [tipsVC setTipsTextPlaceholder:@"1.0"];
-    [tipsVC setTextFieldDefaultText:[NSString stringWithFormat:@"%.2f", [WCLiteVolcanoTTSConfig speed]]];
-    UITextView *tv = [tipsVC getTextView];
-    if (tv) { tv.editable = YES; tv.selectable = YES; tv.keyboardType = UIKeyboardTypeDecimalPad; }
-    [tipsVC show];
-}
-
-#pragma mark - 发送指令输入
-- (void)wclite_volcanoShowCommandInput {
-    Class tipsCls = objc_getClass("MMTipsViewController");
-    if (!tipsCls) { WCLiteVolcanoShowToast(@"当前微信版本不支持输入弹窗"); return; }
-    NSString *current = [WCLiteVolcanoTTSConfig commandPrefix];
-    __weak typeof(self) weakSelf = self;
-    id tipsVC = [[tipsCls alloc] initWithTitle:@"发送指令"
-                                       message:@"聊天发送「指令 文本」时转为语音\n例如：tts 你好"
-                                    btnTitle:@"取消" handler:nil
-                                    btnTitle:@"保存" handler:^{
-        typeof(self) strongSelf = weakSelf;
-        UITextView *tv = [tipsVC getTextView];
-        NSString *t = [(tv.text ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        [WCLiteVolcanoTTSConfig setCommandPrefix:(t.length ? t : @"tts")];
-        if (strongSelf) [strongSelf reloadTableData];
-    }];
-    [tipsVC addTextViewWithMaxLen:32];
-    [tipsVC setTipsTextPlaceholder:@"tts"];
-    [tipsVC setTextFieldDefaultText:current];
-    UITextView *tv = [tipsVC getTextView];
-    if (tv) { tv.editable = YES; tv.selectable = YES; tv.autocorrectionType = UITextAutocorrectionTypeNo; tv.autocapitalizationType = UITextAutocapitalizationTypeNone; }
-    [tipsVC show];
-}
-
-#pragma mark - 从服务器拉取火山音色目录
-- (void)wclite_volcanoFetchCatalog {
-    [self startLoadingWithText:@"拉取中..."];
-    NSURL *url = [NSURL URLWithString:kWCLiteVolcanoCatalogURL];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    [request setTimeoutInterval:30.0];
-    [request setValue:@"no-cache" forHTTPHeaderField:@"Cache-Control"];
-
-    __weak typeof(self) weakSelf = self;
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            typeof(self) strongSelf = weakSelf; if (!strongSelf) return;
-            if (error || data.length == 0) { [strongSelf stopLoadingWithFailText:[NSString stringWithFormat:@"拉取失败：%@", error.localizedDescription ?: @"无数据"]]; return; }
-            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            NSArray *voices = nil;
-            if ([json isKindOfClass:[NSDictionary class]]) {
-                id v = ((NSDictionary *)json)[@"voices"];
-                if ([v isKindOfClass:[NSArray class]]) voices = v;
-            } else if ([json isKindOfClass:[NSArray class]]) {
-                voices = json;
-            }
-            // 只保留 provider=volcano 或 voice_type 形如 zh_*/ICL_* 的条目
-            NSMutableArray *volcano = [NSMutableArray array];
-            for (id item in voices) {
-                if (![item isKindOfClass:[NSDictionary class]]) continue;
-                NSDictionary *d = (NSDictionary *)item;
-                NSString *p = [d[@"provider"] isKindOfClass:[NSString class]] ? d[@"provider"] : @"";
-                NSString *pid = [d[@"providerVoiceId"] isKindOfClass:[NSString class]] ? d[@"providerVoiceId"] : @"";
-                if ([p isEqualToString:@"volcano"] || [pid hasPrefix:@"zh_"] || [pid hasPrefix:@"ICL_"]) [volcano addObject:d];
-            }
-            if (volcano.count == 0) {
-                [WCLiteVolcanoTTSConfig setCatalog:[WCLiteVolcanoTTSConfig builtinVolcanoCatalog]];
-                [strongSelf stopLoadingWithOKText:@"已使用内置火山音色"];
+static void vcam_convert_int16_to_asbd(const int16_t *src, int srcChannels,
+                                       const AudioStreamBasicDescription *asbd,
+                                       AudioBufferList *ioData, UInt32 frames) {
+    if (!src || !asbd || !ioData || frames == 0) return;
+    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    BOOL nonInt  = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    int  dstCh   = asbd->mChannelsPerFrame;
+    if (dstCh <= 0) dstCh = 1;
+    int  bits    = asbd->mBitsPerChannel;
+    if (bits < 1) bits = isFloat ? 32 : 16;
+    if (srcChannels <= 0) srcChannels = 1;
+
+    for (UInt32 i = 0; i < frames; i++) {
+        for (int c = 0; c < dstCh; c++) {
+            int16_t s = 0;
+            int idx = (srcChannels >= dstCh) ? c : 0;
+            s = src[i * srcChannels + idx];
+
+            if (isFloat) {
+                float f = s / 32768.0f;
+                if (nonInt) {
+                    float *d = (float *)ioData->mBuffers[c].mData;
+                    if (d) d[i] = f;
+                } else {
+                    float *d = (float *)ioData->mBuffers[0].mData;
+                    if (d) d[i * dstCh + c] = f;
+                }
+            } else if (bits == 32) {
+                int32_t v = (int32_t)s;
+                if (asbd->mFormatFlags & kAudioFormatFlagIsAlignedHigh) v = (int32_t)s << 16;
+                if (nonInt) {
+                    int32_t *d = (int32_t *)ioData->mBuffers[c].mData;
+                    if (d) d[i] = v;
+                } else {
+                    int32_t *d = (int32_t *)ioData->mBuffers[0].mData;
+                    if (d) d[i * dstCh + c] = v;
+                }
             } else {
-                [WCLiteVolcanoTTSConfig setCatalog:volcano];
-                [strongSelf stopLoadingWithOKText:[NSString stringWithFormat:@"拉取成功 %lu 个", (unsigned long)volcano.count]];
+                int16_t v = s;
+                if (nonInt) {
+                    int16_t *d = (int16_t *)ioData->mBuffers[c].mData;
+                    if (d) d[i] = v;
+                } else {
+                    int16_t *d = (int16_t *)ioData->mBuffers[0].mData;
+                    if (d) d[i * dstCh + c] = v;
+                }
             }
-            [strongSelf reloadTableData];
-        });
-    }];
-    [task resume];
+        }
+    }
 }
 
-- (void)wclite_volcanoShowCatalog {
-    WCLiteVolcanoVoiceCatalogViewController *vc = [[WCLiteVolcanoVoiceCatalogViewController alloc] init];
-    [self.navigationController pushViewController:vc animated:YES];
+@interface MediaManager : NSObject
++ (void)setupVideoReaderIfNeeded;
++ (void)setupAudioReaderIfNeeded;
++ (CIImage *)getVideoFrame:(CGSize)targetSize;
++ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length;
++ (void)cleanup;
++ (CIImage *)vcam_fitImage:(CIImage *)img toSize:(CGSize)targetSize;
++ (CIImage *)vcam_mirrorImage:(CIImage *)img;
+@end
+
+@implementation MediaManager
++ (void)setupVideoReaderIfNeeded {
+    [g_mediaLock lock];
+    @autoreleasepool {
+        if (videoReader) { [videoReader cancelReading]; videoReader = nil; videoOutput = nil; }
+        NSString *path = getSandboxVideoPath();
+        if (![g_fileManager fileExistsAtPath:path]) { g_videoReload = NO; [g_mediaLock unlock]; return; }
+        AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
+        videoReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
+        AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+        if (track) {
+            NSDictionary *settings = @{
+                (id)kCVPixelBufferPixelFormatTypeKey:    @(kCVPixelFormatType_32BGRA),
+                (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            };
+            videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
+            videoOutput.alwaysCopiesSampleData = NO;
+            [videoReader addOutput:videoOutput];
+            [videoReader startReading];
+        }
+    }
+    g_videoReload = NO;
+    [g_mediaLock unlock];
+}
+
++ (void)setupAudioReaderIfNeeded {
+    [g_mediaLock lock];
+    @autoreleasepool {
+        if (audioReader) {
+            [audioReader cancelReading]; audioReader = nil; audioOutput = nil;
+            g_audioFIFO = nil;
+        }
+        NSString *path = g_tempAudioPath;
+        if (![g_fileManager fileExistsAtPath:path]) path = getSandboxVideoPath();
+        if (![g_fileManager fileExistsAtPath:path]) { g_audioReload = NO; [g_mediaLock unlock]; return; }
+        AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
+        AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+        if (track) {
+            CMAudioFormatDescriptionRef desc = (CMAudioFormatDescriptionRef)track.formatDescriptions.firstObject;
+            if (desc) {
+                const AudioStreamBasicDescription *t = CMAudioFormatDescriptionGetStreamBasicDescription(desc);
+                if (t && t->mChannelsPerFrame > 0) g_sourceChannels = t->mChannelsPerFrame;
+            }
+            if (g_sourceChannels <= 0) g_sourceChannels = 2;
+
+            audioReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
+            NSMutableDictionary *settings = [NSMutableDictionary dictionaryWithDictionary:@{
+                AVFormatIDKey:               @(kAudioFormatLinearPCM),
+                AVLinearPCMBitDepthKey:      @16,
+                AVLinearPCMIsFloatKey:       @NO,
+                AVLinearPCMIsBigEndianKey:   @NO,
+                AVLinearPCMIsNonInterleaved: @NO,
+            }];
+            if (g_hasProbedASBD && g_targetASBD.mSampleRate > 0) {
+                settings[AVSampleRateKey] = @(g_targetASBD.mSampleRate);
+            }
+            audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
+            audioOutput.alwaysCopiesSampleData = NO;
+            [audioReader addOutput:audioOutput];
+            [audioReader startReading];
+        }
+    }
+    g_audioReload = NO;
+    [g_mediaLock unlock];
+}
+
++ (CIImage *)vcam_fitImage:(CIImage *)img toSize:(CGSize)targetSize {
+    if (!img) return nil;
+    CGRect e = img.extent;
+    if (e.origin.x != 0 || e.origin.y != 0)
+        img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-e.origin.x, -e.origin.y)];
+    e = img.extent;
+    CGFloat scale = MAX(targetSize.width / e.size.width, targetSize.height / e.size.height);
+    CIImage *scaled = [img imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+    CGRect se = scaled.extent;
+    CGFloat ox = (se.size.width - targetSize.width) / 2.0;
+    CGFloat oy = (se.size.height - targetSize.height) / 2.0;
+    CIImage *crop = [scaled imageByCroppingToRect:CGRectMake(ox, oy, targetSize.width, targetSize.height)];
+    CGRect ce = crop.extent;
+    if (ce.origin.x != 0 || ce.origin.y != 0)
+        crop = [crop imageByApplyingTransform:CGAffineTransformMakeTranslation(-ce.origin.x, -ce.origin.y)];
+    return crop;
+}
+
++ (CIImage *)vcam_mirrorImage:(CIImage *)img {
+    if (!img) return nil;
+    CGRect e = img.extent;
+    CGAffineTransform t = CGAffineTransformMakeTranslation(e.size.width, 0);
+    t = CGAffineTransformScale(t, -1, 1);
+    CIImage *m = [img imageByApplyingTransform:t];
+    CGRect me = m.extent;
+    if (me.origin.x != 0 || me.origin.y != 0)
+        m = [m imageByApplyingTransform:CGAffineTransformMakeTranslation(-me.origin.x, -me.origin.y)];
+    return m;
+}
+
++ (CIImage *)getVideoFrame:(CGSize)targetSize {
+    if (g_enablePhotoReplacement && g_currentPhotoImg) {
+        CIImage *photo = [CIImage imageWithCGImage:g_currentPhotoImg.CGImage];
+        if (photo) {
+            CIImage *fitted = [self vcam_fitImage:photo toSize:targetSize];
+            if (g_isMirrored) fitted = [self vcam_mirrorImage:fitted];
+            return fitted;
+        }
+    }
+
+    if (g_videoReload) [self setupVideoReaderIfNeeded];
+    [g_mediaLock lock];
+    CIImage *result = nil;
+    @autoreleasepool {
+        CMSampleBufferRef sample = [videoOutput copyNextSampleBuffer];
+        if (!sample && g_isLoop) {
+            [g_mediaLock unlock];
+            [self setupVideoReaderIfNeeded];
+            [g_mediaLock lock];
+            sample = [videoOutput copyNextSampleBuffer];
+        }
+        if (sample) {
+            CVPixelBufferRef pix = CMSampleBufferGetImageBuffer(sample);
+            if (pix) {
+                CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
+                if (img) {
+                    CIImage *rotated = img;
+                    if (g_rotation != 0) {
+                        CGRect extent = img.extent;
+                        CGAffineTransform t = CGAffineTransformIdentity;
+                        if (g_rotation == 90) {
+                            t = CGAffineTransformMakeTranslation(extent.size.height, 0);
+                            t = CGAffineTransformRotate(t, M_PI_2);
+                        } else if (g_rotation == 180) {
+                            t = CGAffineTransformMakeTranslation(extent.size.width, extent.size.height);
+                            t = CGAffineTransformRotate(t, M_PI);
+                        } else if (g_rotation == 270) {
+                            t = CGAffineTransformMakeTranslation(0, extent.size.width);
+                            t = CGAffineTransformRotate(t, 3 * M_PI_2);
+                        }
+                        rotated = [img imageByApplyingTransform:t];
+                    }
+                    CGRect rotatedExtent = rotated.extent;
+                    if (rotatedExtent.origin.x != 0 || rotatedExtent.origin.y != 0) {
+                        CGAffineTransform translate = CGAffineTransformMakeTranslation(-rotatedExtent.origin.x,
+                                                                                      -rotatedExtent.origin.y);
+                        rotated = [rotated imageByApplyingTransform:translate];
+                    }
+                    CGRect normalizedExtent = rotated.extent;
+                    CGFloat scale = MAX(targetSize.width / normalizedExtent.size.width,
+                                        targetSize.height / normalizedExtent.size.height);
+                    CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+                    CGRect scaledExtent = scaled.extent;
+                    CGFloat offsetX = (scaledExtent.size.width - targetSize.width) / 2.0;
+                    CGFloat offsetY = (scaledExtent.size.height - targetSize.height) / 2.0;
+                    CGRect cropRect = CGRectMake(offsetX, offsetY, targetSize.width, targetSize.height);
+                    result = [scaled imageByCroppingToRect:cropRect];
+                    CGRect resultExtent = result.extent;
+                    if (resultExtent.origin.x != 0 || resultExtent.origin.y != 0) {
+                        CGAffineTransform translateBack = CGAffineTransformMakeTranslation(-resultExtent.origin.x,
+                                                                                           -resultExtent.origin.y);
+                        result = [result imageByApplyingTransform:translateBack];
+                    }
+                }
+            }
+            CFRelease(sample);
+        }
+    }
+    if (g_isMirrored && result) result = [self vcam_mirrorImage:result];
+    [g_mediaLock unlock];
+    return result;
+}
+
++ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length {
+    [g_mediaLock lock];
+    @autoreleasepool {
+        if (!g_audioFIFO) g_audioFIFO = [NSMutableData dataWithCapacity:length * 4];
+        while (g_audioFIFO.length < length) {
+            if (g_audioReload) [self setupAudioReaderIfNeeded];
+            CMSampleBufferRef sample = [audioOutput copyNextSampleBuffer];
+            if (!sample) {
+                if (g_isLoop) {
+                    [self setupAudioReaderIfNeeded];
+                    sample = [audioOutput copyNextSampleBuffer];
+                }
+                if (!sample) break;
+            }
+            if (sample) {
+                CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
+                if (block) {
+                    size_t totalLen = 0;
+                    char  *dataPtr = NULL;
+                    size_t lenAtOffset = 0;
+                    OSStatus s = CMBlockBufferGetDataPointer(block, 0, &lenAtOffset, &totalLen, &dataPtr);
+                    if (s == kCMBlockBufferNoErr && totalLen > 0 && dataPtr) {
+                        [g_audioFIFO appendBytes:dataPtr length:totalLen];
+                    }
+                }
+                CFRelease(sample);
+            }
+        }
+        NSUInteger copyLen = MIN(length, g_audioFIFO.length);
+        if (copyLen > 0) {
+            memcpy(outData, g_audioFIFO.bytes, copyLen);
+            [g_audioFIFO replaceBytesInRange:NSMakeRange(0, copyLen) withBytes:NULL length:0];
+        }
+        if (copyLen < length)
+            memset(outData + copyLen, 0, length - copyLen);
+    }
+    [g_mediaLock unlock];
+}
+
++ (void)cleanup {
+    [g_mediaLock lock];
+    if (videoReader) { [videoReader cancelReading]; videoReader = nil; videoOutput = nil; }
+    if (audioReader) { [audioReader cancelReading]; audioReader = nil; audioOutput = nil; }
+    g_audioFIFO = nil;
+    g_hasProbedASBD = NO;
+    [g_mediaLock unlock];
 }
 @end
 
-#pragma mark - Logos Hooks
+static OSStatus hooked_AudioUnitRender(
+    AudioUnit                   inUnit,
+    AudioUnitRenderActionFlags  *ioActionFlags,
+    const AudioTimeStamp       *inTimeStamp,
+    UInt32                      inOutputBusNumber,
+    UInt32                      inNumberFrames,
+    AudioBufferList             *ioData
+) {
+    OSStatus status = orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
+                                           inOutputBusNumber, inNumberFrames, ioData);
+    if (status != noErr)                     return status;
+    if (!g_enableReplacement || !g_isSound)  return status;
 
-/// 消息发送拦截：聊天发送「指令 文本」时，改为火山语音消息
-%hook BaseMsgContentViewController
-- (void)growTextViewDidClickSendWithText:(NSString *)arg1 {
-    NSString *voiceText = [WCLiteVolcanoTTSService voiceTextFromOutgoingMessageContent:arg1];
-    if (voiceText) {
-        NSString *chatName = nil;
-        if ([self respondsToSelector:NSSelectorFromString(@"getCurrentChatName")]) {
-            chatName = [self performSelector:NSSelectorFromString(@"getCurrentChatName")];
+    AudioComponentDescription cd = {0};
+    UInt32 cdsize = sizeof(cd);
+    if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_ComponentDescription,
+                             kAudioUnitScope_Global, 0, &cd, &cdsize) == noErr) {
+        OSType sub = cd.componentSubType;
+        BOOL isMic = (sub == 'rioc') || (sub == 'vpio') || (sub == 'auou');
+        if (!isMic) return status;
+    }
+
+    if (!g_hasProbedASBD) {
+        UInt32 propSize = sizeof(g_targetASBD);
+        AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
+                             kAudioUnitScope_Output, inOutputBusNumber,
+                             &g_targetASBD, &propSize);
+        g_hasProbedASBD = YES;
+        [MediaManager setupAudioReaderIfNeeded];
+    }
+    if (g_targetASBD.mChannelsPerFrame == 0) g_targetASBD.mChannelsPerFrame = 1;
+
+    int srcCh = g_sourceChannels ?: 2;
+    NSUInteger needBytes = inNumberFrames * srcCh * 2;
+    uint8_t *raw = (uint8_t *)malloc(needBytes);
+    if (!raw) return noErr;
+    [MediaManager pullAudioData:raw length:needBytes];
+    vcam_convert_int16_to_asbd((const int16_t *)raw, srcCh, &g_targetASBD, ioData, inNumberFrames);
+    free(raw);
+    return noErr;
+}
+
+@interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
+- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
+@end
+
+@implementation VCamVideoProxy {
+    __weak id _originalDelegate;
+}
+- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue { _originalDelegate = delegate; }
+
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+     fromConnection:(AVCaptureConnection *)connection {
+    if (g_enableReplacement) {
+        CVPixelBufferRef origPixel = CMSampleBufferGetImageBuffer(sampleBuffer);
+        if (origPixel) {
+            size_t  tw   = CVPixelBufferGetWidth(origPixel);
+            size_t  th   = CVPixelBufferGetHeight(origPixel);
+            OSType  pfmt = CVPixelBufferGetPixelFormatType(origPixel);
+            CIImage *img = [MediaManager getVideoFrame:CGSizeMake(tw, th)];
+            if (img) {
+                NSDictionary *pbAttrs = @{
+                    (id)kCVPixelBufferPixelFormatTypeKey:    @(pfmt),
+                    (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                };
+                CVPixelBufferRef newPixel = NULL;
+                CVPixelBufferCreate(kCFAllocatorDefault, tw, th, pfmt, (__bridge CFDictionaryRef)pbAttrs, &newPixel);
+                if (newPixel) {
+                    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                    [g_ciContext render:img toCVPixelBuffer:newPixel bounds:CGRectMake(0, 0, tw, th) colorSpace:cs];
+                    CGColorSpaceRelease(cs);
+                    CMVideoFormatDescriptionRef fmtDesc = NULL;
+                    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixel, &fmtDesc);
+                    CMSampleTimingInfo timing;
+                    OSStatus timingStatus = CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timing);
+                    CMSampleBufferRef newSample = NULL;
+                    if (timingStatus == noErr) {
+                        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixel, YES,
+                                                           NULL, NULL, fmtDesc, &timing, &newSample);
+                    }
+                    if (fmtDesc) CFRelease(fmtDesc);
+                    CVPixelBufferRelease(newPixel);
+                    if (newSample) {
+                        if (_originalDelegate &&
+                            [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+                            [_originalDelegate captureOutput:output didOutputSampleBuffer:newSample fromConnection:connection];
+                        }
+                        CFRelease(newSample);
+                        return;
+                    }
+                }
+            }
         }
-        NSString *voiceType = [WCLiteVolcanoTTSConfig selectedVoiceType];
-        if (!voiceType.length) { WCLiteVolcanoShowToast(@"未设置火山音色，请到「火山语音合成」中选择"); return; }
-        [WCLiteVolcanoTTSService sendVoiceMessageWithText:voiceText voiceType:voiceType chatUserName:chatName completion:^(BOOL ok, NSString *err) {
-            if (err) WCLiteVolcanoShowToast(err);
-        }];
-        return; // 拦截，不再发送原文
     }
-    %orig(arg1);
+    if (_originalDelegate &&
+        [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+        [_originalDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+    }
+}
+@end
+static VCamVideoProxy *g_videoProxy = nil;
+
+%hook AVCaptureVideoDataOutput
+- (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    if (!g_videoProxy) g_videoProxy = [[VCamVideoProxy alloc] init];
+    [g_videoProxy setOriginalDelegate:delegate queue:queue];
+    %orig(g_videoProxy, queue);
 }
 %end
 
-/// 设置入口：在「设置」页注入「火山语音合成」入口
-%hook NewSettingViewController
-- (void)reloadTableData {
+@interface VCamAudioProxy : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
+- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
+@end
+
+@implementation VCamAudioProxy {
+    __weak id _origDelegate;
+}
+- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue { _origDelegate = delegate; }
+
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+     fromConnection:(AVCaptureConnection *)connection {
+    CMSampleBufferRef outBuf = sampleBuffer;
+
+    if (g_enableReplacement && g_isSound) {
+        CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+        const AudioStreamBasicDescription *asbd = fmt ? CMAudioFormatDescriptionGetStreamBasicDescription(fmt) : NULL;
+        if (asbd && asbd->mFormatID == kAudioFormatLinearPCM) {
+            UInt32 frames = (UInt32)CMSampleBufferGetNumSamples(sampleBuffer);
+            int dstCh = asbd->mChannelsPerFrame;
+            if (dstCh <= 0) dstCh = 1;
+            int bytesPerSamp = asbd->mBitsPerChannel / 8;
+            if (bytesPerSamp < 1) bytesPerSamp = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) ? 4 : 2;
+            BOOL nonInt = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+            UInt32 totalBytes = frames * bytesPerSamp * (nonInt ? dstCh : 1);
+
+            uint8_t *data = (uint8_t *)calloc(totalBytes, 1);
+            if (data) {
+                AudioBufferList abl;
+                abl.mNumberBuffers = nonInt ? dstCh : 1;
+                for (int c = 0; c < (int)abl.mNumberBuffers; c++) {
+                    abl.mBuffers[c].mNumberChannels = nonInt ? 1 : dstCh;
+                    abl.mBuffers[c].mDataByteSize    = frames * bytesPerSamp;
+                    abl.mBuffers[c].mData            = data + (nonInt ? c * frames * bytesPerSamp : 0);
+                }
+                int srcCh = g_sourceChannels ?: 2;
+                NSUInteger need = frames * srcCh * 2;
+                uint8_t *raw = (uint8_t *)malloc(need);
+                if (raw) {
+                    [MediaManager pullAudioData:raw length:need];
+                    vcam_convert_int16_to_asbd((const int16_t *)raw, srcCh, asbd, &abl, frames);
+                    free(raw);
+
+                    CMBlockBufferRef block = NULL;
+                    CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, data, totalBytes,
+                                                       kCFAllocatorDefault, NULL, 0, totalBytes, 0, &block);
+                    if (block) {
+                        AudioChannelLayoutTag tag = (dstCh == 1) ? kAudioChannelLayoutTag_Mono
+                                                                : kAudioChannelLayoutTag_Stereo;
+                        AudioChannelLayout layout = {0}; layout.mChannelLayoutTag = tag;
+                        CMAudioFormatDescriptionRef newFmt = NULL;
+                        CMAudioFormatDescriptionCreate(kCFAllocatorDefault, asbd,
+                                                       sizeof(layout), &layout, 0, NULL, NULL, &newFmt);
+                        CMSampleTimingInfo timing;
+                        if (newFmt && CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timing) == noErr) {
+                            CMSampleBufferRef newS = NULL;
+                            CMSampleBufferCreate(kCFAllocatorDefault, block, YES, NULL, NULL,
+                                                 newFmt, frames, 1, &timing, 0, NULL, &newS);
+                            if (newS) outBuf = newS;
+                        }
+                        if (newFmt) CFRelease(newFmt);
+                        CFRelease(block);
+                    } else {
+                        free(data);
+                    }
+                } else {
+                    free(data);
+                }
+            }
+        }
+    }
+
+    if (_origDelegate &&
+        [_origDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+        [_origDelegate captureOutput:output didOutputSampleBuffer:outBuf fromConnection:connection];
+    }
+    if (outBuf != sampleBuffer) CFRelease(outBuf);
+}
+@end
+static VCamAudioProxy *g_audioProxy = nil;
+
+%hook AVCaptureAudioDataOutput
+- (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    if (!g_audioProxy) g_audioProxy = [[VCamAudioProxy alloc] init];
+    [g_audioProxy setOriginalDelegate:delegate queue:queue];
+    %orig(g_audioProxy, queue);
+}
+%end
+
+@interface LittleBearMenuVC : UIViewController
+    <UIImagePickerControllerDelegate, UIDocumentPickerDelegate, UINavigationControllerDelegate>
+@end
+
+@implementation LittleBearMenuVC {
+    UIView   *_panelView;
+    UIView   *_blurView;
+    UILabel  *_statusLbl;
+    UIButton *_btnLoop;
+    UIButton *_btnSound;
+    UIButton *_btnRotate;
+    UIButton *_btnEnable;
+    UIButton *_btnMirror;
+    UIView   *_contentView;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    [self setupBackground];
+    [self setupPanel];
+    [self setupNavBar];
+    [self setupContent];
+    [self setupButtons];
+    [self updateStatusUI];
+}
+
+- (void)setupBackground {
+    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
+    UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+    _blurView = [[UIVisualEffectView alloc] initWithEffect:blur];
+    _blurView.frame = self.view.bounds;
+    _blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:_blurView];
+}
+- (void)setupPanel {
+    _panelView = [[UIView alloc] init];
+    _panelView.backgroundColor = [UIColor systemBackgroundColor];
+    _panelView.layer.cornerRadius = 16;
+    _panelView.layer.masksToBounds = YES;
+    _panelView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_panelView];
+    [NSLayoutConstraint activateConstraints:@[
+        [_panelView.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [_panelView.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
+        [_panelView.widthAnchor    constraintEqualToConstant:320],
+    ]];
+}
+- (void)setupNavBar {
+    UIView *navBar = [[UIView alloc] init];
+    navBar.backgroundColor = [UIColor systemGray6Color];
+    navBar.translatesAutoresizingMaskIntoConstraints = NO;
+    [_panelView addSubview:navBar];
+    [NSLayoutConstraint activateConstraints:@[
+        [navBar.topAnchor      constraintEqualToAnchor:_panelView.topAnchor],
+        [navBar.leadingAnchor  constraintEqualToAnchor:_panelView.leadingAnchor],
+        [navBar.trailingAnchor constraintEqualToAnchor:_panelView.trailingAnchor],
+        [navBar.heightAnchor   constraintEqualToConstant:44],
+    ]];
+    UILabel *title = [[UILabel alloc] init];
+    title.text = @"VCAM";
+    title.font = [UIFont systemFontOfSize:[UIFont systemFontSize] weight:UIFontWeightSemibold];
+    title.textAlignment = NSTextAlignmentCenter;
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    [navBar addSubview:title];
+    [title.centerXAnchor constraintEqualToAnchor:navBar.centerXAnchor].active = YES;
+    [title.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    [close setTitle:@"关闭" forState:UIControlStateNormal];
+    close.titleLabel.font = [UIFont systemFontOfSize:[UIFont systemFontSize]];
+    [close addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
+    close.translatesAutoresizingMaskIntoConstraints = NO;
+    [navBar addSubview:close];
+    [close.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor constant:-16].active = YES;
+    [close.centerYAnchor  constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
+}
+- (void)setupContent {
+    _contentView = [[UIView alloc] init];
+    _contentView.translatesAutoresizingMaskIntoConstraints = NO;
+    [_panelView addSubview:_contentView];
+    [NSLayoutConstraint activateConstraints:@[
+        [_contentView.topAnchor      constraintEqualToAnchor:_panelView.topAnchor constant:56],
+        [_contentView.leadingAnchor  constraintEqualToAnchor:_panelView.leadingAnchor constant:16],
+        [_contentView.trailingAnchor constraintEqualToAnchor:_panelView.trailingAnchor constant:-16],
+        [_contentView.bottomAnchor   constraintEqualToAnchor:_panelView.bottomAnchor constant:-16],
+    ]];
+    _statusLbl = [[UILabel alloc] init];
+    _statusLbl.font = [UIFont systemFontOfSize:13];
+    _statusLbl.textColor = [UIColor secondaryLabelColor];
+    _statusLbl.numberOfLines = 0;
+    _statusLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [_contentView addSubview:_statusLbl];
+    [NSLayoutConstraint activateConstraints:@[
+        [_statusLbl.topAnchor      constraintEqualToAnchor:_contentView.topAnchor],
+        [_statusLbl.leadingAnchor  constraintEqualToAnchor:_contentView.leadingAnchor],
+        [_statusLbl.trailingAnchor constraintEqualToAnchor:_contentView.trailingAnchor],
+    ]];
+}
+- (UIButton *)addGridButton:(NSString *)title x:(CGFloat)x y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h action:(SEL)action {
+    UIButtonConfiguration *config = [UIButtonConfiguration filledButtonConfiguration];
+    config.baseBackgroundColor = [UIColor systemGray5Color];
+    config.baseForegroundColor   = [UIColor labelColor];
+    config.contentInsets = NSDirectionalEdgeInsetsMake(8, 0, 8, 0);
+    config.attributedTitle = [[NSAttributedString alloc] initWithString:title
+        attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:[UIFont systemFontSize] weight:UIFontWeightMedium]}];
+    UIButton *btn = [UIButton buttonWithConfiguration:config primaryAction:nil];
+    btn.layer.cornerRadius = 8;
+    btn.layer.masksToBounds = YES;
+    btn.frame = CGRectMake(x, y, w, h);
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [_contentView addSubview:btn];
+    return btn;
+}
+- (void)setupButtons {
+    CGFloat btnW = 140, btnH = 40, gap = 8;
+    CGFloat y = 28;
+    [self addGridButton:@"相册选择" x:0 y:y w:btnW h:btnH action:@selector(actionSelectAlbum)];
+    [self addGridButton:@"文件选择" x:btnW + gap y:y w:btnW h:btnH action:@selector(actionSelectFile)];
+    y += btnH + gap;
+    _btnRotate = [self addGridButton:[NSString stringWithFormat:@"旋转 (%d°)", g_rotation] x:0 y:y w:btnW h:btnH action:@selector(toggleRotate)];
+    _btnLoop   = [self addGridButton:g_isLoop ? @"循环: 开" : @"循环: 关" x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleLoop)];
+    y += btnH + gap;
+    _btnSound  = [self addGridButton:g_isSound ? @"声音: 开" : @"声音: 关" x:0 y:y w:btnW h:btnH action:@selector(toggleSound)];
+    _btnMirror = [self addGridButton:g_isMirrored ? @"镜像: 开" : @"镜像: 关"
+                                  x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleMirror)];
+    y += btnH + gap;
+    [self addGridButton:g_enablePhotoReplacement ? @"拍替: 开" : @"拍替: 关"
+                  x:0 y:y w:btnW h:btnH action:@selector(togglePhotoReplacement)];
+    _btnEnable = [self addGridButton:g_enableReplacement ? @"替换: 开" : @"替换: 关"
+                  x:btnW + gap y:y w:btnW h:btnH action:@selector(actionRestore)];
+    y += btnH + gap;
+    [_panelView.heightAnchor constraintEqualToConstant:y + 56 + 16].active = YES;
+}
+
+- (void)toggleRotate { g_rotation = (g_rotation + 90) % 360; SaveSettings(); [self refreshGridButtons]; }
+- (void)toggleLoop   { g_isLoop = !g_isLoop; SaveSettings(); [self refreshGridButtons]; }
+- (void)toggleSound  { g_isSound = !g_isSound; SaveSettings(); [self refreshGridButtons]; }
+- (void)actionRestore{ g_enableReplacement = !g_enableReplacement; SaveSettings(); [self refreshGridButtons]; }
+- (void)toggleMirror { g_isMirrored = !g_isMirrored; SaveSettings(); [self refreshGridButtons]; }
+- (void)togglePhotoReplacement { g_enablePhotoReplacement = !g_enablePhotoReplacement; SaveSettings(); [self refreshGridButtons]; }
+
+- (void)refreshGridButtons {
+    UIFont *font = [UIFont systemFontOfSize:[UIFont systemFontSize] weight:UIFontWeightMedium];
+    UIButtonConfiguration *configRotate = _btnRotate.configuration;
+    configRotate.attributedTitle = [[NSAttributedString alloc] initWithString:
+        [NSString stringWithFormat:@"旋转 (%d°)", g_rotation] attributes:@{NSFontAttributeName: font}];
+    _btnRotate.configuration = configRotate;
+    UIButtonConfiguration *configLoop = _btnLoop.configuration;
+    configLoop.attributedTitle = [[NSAttributedString alloc] initWithString:
+        (g_isLoop ? @"循环: 开" : @"循环: 关") attributes:@{NSFontAttributeName: font}];
+    _btnLoop.configuration = configLoop;
+    UIButtonConfiguration *configSound = _btnSound.configuration;
+    configSound.attributedTitle = [[NSAttributedString alloc] initWithString:
+        (g_isSound ? @"声音: 开" : @"声音: 关") attributes:@{NSFontAttributeName: font}];
+    _btnSound.configuration = configSound;
+    UIButtonConfiguration *configEnable = _btnEnable.configuration;
+    configEnable.attributedTitle = [[NSAttributedString alloc] initWithString:
+        (g_enableReplacement ? @"替换: 开" : @"替换: 关") attributes:@{NSFontAttributeName: font}];
+    _btnEnable.configuration = configEnable;
+    UIButtonConfiguration *configMirror = _btnMirror.configuration;
+    configMirror.attributedTitle = [[NSAttributedString alloc] initWithString:
+        (g_isMirrored ? @"镜像: 开" : @"镜像: 关") attributes:@{NSFontAttributeName: font}];
+    _btnMirror.configuration = configMirror;
+    [self updateStatusUI];
+}
+- (void)updateStatusUI {
+    NSString *vStat = [g_fileManager fileExistsAtPath:getSandboxVideoPath()] ? @"已加载" : @"未选择";
+    NSString *pStat = (g_enablePhotoReplacement && g_currentPhotoImg) ? @"已选" : @"未选";
+    _statusLbl.text = [NSString stringWithFormat:@"视频: %@  照片: %@", vStat, pStat];
+}
+- (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+- (void)actionSelectAlbum {
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.mediaTypes = @[@"public.movie", @"public.image"];
+    picker.delegate = (id)self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+- (void)actionSelectFile {
+    NSArray *contentTypes = @[UTTypeMovie, UTTypeAudio, UTTypeImage];
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:contentTypes asCopy:YES];
+    picker.delegate = (id)self;
+    picker.allowsMultipleSelection = NO;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+- (void)processSelectedVideoURL:(NSURL *)url {
+    if (!url) return;
+    NSString *src = [url.path stringByResolvingSymlinksInPath];
+    if (!src || ![g_fileManager fileExistsAtPath:src]) return;
+    AVAsset *asset  = [AVAsset assetWithURL:url];
+    BOOL hasVideo = [[asset tracksWithMediaType:AVMediaTypeVideo] count] > 0;
+    BOOL hasAudio  = [[asset tracksWithMediaType:AVMediaTypeAudio] count] > 0;
+    if (hasVideo) {
+        NSString *dest = getSandboxVideoPath();
+        if ([g_fileManager fileExistsAtPath:dest]) [g_fileManager removeItemAtPath:dest error:nil];
+        [g_fileManager copyItemAtPath:src toPath:dest error:nil];
+        g_videoReload = YES;
+        g_audioReload = YES;
+        [MediaManager setupVideoReaderIfNeeded];
+        [MediaManager setupAudioReaderIfNeeded];
+    } else if (hasAudio) {
+        if ([g_fileManager fileExistsAtPath:g_tempAudioPath]) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
+        [g_fileManager copyItemAtPath:src toPath:g_tempAudioPath error:nil];
+        g_audioReload = YES;
+        [MediaManager setupAudioReaderIfNeeded];
+    } else {
+        NSData *data = [NSData dataWithContentsOfFile:src];
+        UIImage *img = data ? [UIImage imageWithData:data] : nil;
+        if (img) [self savePhoto:img];
+    }
+    [self refreshGridButtons];
+}
+- (void)savePhoto:(UIImage *)img {
+    if (!img) return;
+    if (img.imageOrientation != UIImageOrientationUp) {
+        UIGraphicsBeginImageContextWithOptions(img.size, NO, img.scale);
+        [img drawInRect:CGRectMake(0, 0, img.size.width, img.size.height)];
+        UIImage *norm = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        if (norm) img = norm;
+    }
+    NSData *data = UIImageJPEGRepresentation(img, 0.9);
+    if (!data) data = UIImagePNGRepresentation(img);
+    if (data) {
+        [data writeToFile:g_photoPath atomically:YES];
+        g_currentPhotoImg = [UIImage imageWithData:data];
+    }
+    [self refreshGridButtons];
+}
+
+- (void)imagePickerController:(UIImagePickerController *)picker
+didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    NSURL *url = info[UIImagePickerControllerMediaURL];
+    if (url) { [self processSelectedVideoURL:url]; return; }
+    UIImage *img = info[UIImagePickerControllerOriginalImage];
+    if (img) [self savePhoto:img];
+}
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker { [picker dismissViewControllerAnimated:YES completion:nil]; }
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    [controller dismissViewControllerAnimated:YES completion:nil];
+    if (urls.count > 0) [self processSelectedVideoURL:urls.firstObject];
+}
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentAtURL:(NSURL *)url {
+    [controller dismissViewControllerAnimated:YES completion:nil];
+    [self processSelectedVideoURL:url];
+}
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller { [controller dismissViewControllerAnimated:YES completion:nil]; }
+@end
+
+static void AddTapGestureToWindow(UIWindow *win) {
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+        initWithTarget:win action:@selector(bear_tp)];
+    tap.numberOfTapsRequired    = 2;
+    tap.numberOfTouchesRequired = 2;
+    tap.cancelsTouchesInView    = NO;
+    [win addGestureRecognizer:tap];
+}
+@interface UIWindow (VCam)
+- (void)bear_tp;
+@end
+@implementation UIWindow (VCam)
+- (void)bear_tp {
+    static BOOL menuVisible = NO;
+    if (menuVisible) return;
+    menuVisible = YES;
+    UIViewController *topVC = bear_getTopVC();
+    if (!topVC) { menuVisible = NO; return; }
+    LittleBearMenuVC *vc = [LittleBearMenuVC new];
+    vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    vc.modalTransitionStyle   = UIModalTransitionStyleCrossDissolve;
+    [topVC presentViewController:vc animated:YES completion:^{ menuVisible = NO; }];
+}
+@end
+%hook UIWindow
+- (void)becomeKeyWindow {
     %orig;
-    WCTableViewManager *mgr = nil;
-    if ([self respondsToSelector:NSSelectorFromString(@"m_tableViewMgr")]) {
-        mgr = [self valueForKey:@"m_tableViewMgr"];
-    }
-    if (![mgr isKindOfClass:objc_getClass("WCTableViewManager")]) return;
-
-    WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:@"WCLite" Footer:@""];
-    Class normalCls = objc_getClass("WCTableViewNormalCellManager");
-    if (!normalCls) return;
-    __weak typeof(self) weakSelf = self;
-    WCTableViewCellManager *cell = [normalCls normalCellForSel:@selector(wclite_volcanoOpenSettings)
-                                                       target:self
-                                                        title:@"火山语音合成"
-                                                   rightValue:@" "
-                                                 accessoryType:1];
-    if (cell) [section addCell:cell];
-    [mgr addSection:section];
-    [[mgr getTableView] reloadData];
-}
-- (void)wclite_volcanoOpenSettings {
-    WCLiteVolcanoTTSCloneViewController *vc = [[WCLiteVolcanoTTSCloneViewController alloc] init];
-    [self.navigationController pushViewController:vc animated:YES];
+    dispatch_async(dispatch_get_main_queue(), ^{ AddTapGestureToWindow(self); });
 }
 %end
+
+%ctor {
+    g_fileManager = [NSFileManager defaultManager];
+    g_mediaLock   = [[NSLock alloc] init];
+    g_audioFIFO   = [NSMutableData data];
+    LoadSettings();
+    g_ciContext = [CIContext contextWithOptions:@{
+        kCIContextWorkingColorSpace: (__bridge id)CGColorSpaceCreateDeviceRGB(),
+    }];
+    g_videoDir = [GetDocumentPath() stringByAppendingPathComponent:@"VCAM"];
+    [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
+    g_tempVideoPath = [getSandboxVideoPath() copy];
+    g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
+    g_photoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_photo.jpg"] copy];
+    if ([g_fileManager fileExistsAtPath:g_photoPath]) {
+        g_currentPhotoImg = [UIImage imageWithContentsOfFile:g_photoPath];
+    }
+    if ([g_fileManager fileExistsAtPath:g_tempVideoPath]) {
+        [MediaManager setupVideoReaderIfNeeded];
+        [MediaManager setupAudioReaderIfNeeded];
+    }
+    MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&orig_AudioUnitRender);
+}
+%dtor {
+    [MediaManager cleanup];
+    g_fileManager = nil;
+    g_ciContext   = nil;
+}
