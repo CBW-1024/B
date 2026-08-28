@@ -56,12 +56,8 @@
 
 static NSString * const kDDTTVConfigKey = @"DDTextToVoiceConfig";
 static NSString * const kDDTTVEnable      = @"enableTextToVoice";      // 1.启用文字转语音
-static NSString * const kDDTTVCurrentVoice = @"currentVoiceID";         // 3.当前音色(琅琅音色→音色ID)
-static NSString * const kDDTTVRefreshVoices = @"refreshVoices";         // 4.刷新音色列表(一次性动作)
 static NSString * const kDDTTVBgEnable     = @"enableBackgroundMusic";  // 5.启用背景音
 static NSString * const kDDTTVBgFilePath   = @"bgFilePath";             // 6.导入背景音(文件路径)
-static NSString * const kDDTTVBgSet        = @"bgSet";                  // 7.设置背景音(一次性动作)
-static NSString * const kDDTTVCleanCache   = @"cleanCache";             // 8.清理缓存(一次性动作)
 
 static NSString * const kDDTTVVoiceIDDefault = @"voiceIDDefault";       // 当前音色ID(vid)
 
@@ -1118,6 +1114,31 @@ static id ddTTVJSON(NSData *data) {
 // GetPayState?token=&t=  →  task/Submit (taskText = base64(speak XML))  →  轮询 task/GetDetail  →  下载 data.audioUrl
 static NSString * const kDDTTVLangBase = @"https://s.lang123.top/proxy/api";
 
+// 轮询琅琅任务结果（每 2 秒一次，最多 30 次）—— 用递归函数而非递归 block，避免 ARC retain cycle
+static void ddTTVLangPoll(NSString *token, NSString *taskId, NSInteger retry,
+                          void (^completion)(NSData *audioData, NSError *error)) {
+    long long t = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
+    NSString *detailURL = [NSString stringWithFormat:@"%@/task/GetDetail?token=%@&t=%lld&taskId=%@",
+                           kDDTTVLangBase, token, t, taskId];
+    ddTTVGet(detailURL, ^(NSData *data, NSError *error) {
+        if (error || !data.length) { if (completion) completion(nil, error ?: ddTTVError(@"查询任务失败")); return; }
+        id json = ddTTVJSON(data);
+        NSString *audioUrl = [[json objectForKey:@"data"] objectForKey:@"audioUrl"];
+        if (audioUrl.length) {
+            ddTTVGet(audioUrl, ^(NSData *audio, NSError *e) {
+                if (completion) completion((e || !audio.length) ? nil : audio,
+                                           e ?: (audio.length ? nil : ddTTVError(@"音频下载失败")));
+            });
+            return;
+        }
+        if (retry + 1 >= 30) { if (completion) completion(nil, ddTTVError(@"琅琅合成超时")); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            ddTTVLangPoll(token, taskId, retry + 1, completion);
+        });
+    });
+}
+
 static void ddTTVLangSynth(NSString *text, NSString *vid, double speed, double volume,
                            void (^completion)(NSData *audioData, NSError *error)) {
     NSString *token = [DDTextToVoiceConfig.shared stringForKey:kDDTTVLangToken];
@@ -1155,28 +1176,7 @@ static void ddTTVLangSynth(NSString *text, NSString *vid, double speed, double v
             NSString *taskId = [dObj objectForKey:@"taskId"] ?: [j2 objectForKey:@"taskId"];
             if (!taskId) { if (completion) completion(nil, ddTTVError(@"未取到 taskId")); return; }
 
-            __block NSInteger retry = 0;
-            __block void (^poll)(void) = ^{
-                long long t2 = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
-                NSString *detailURL = [NSString stringWithFormat:@"%@/task/GetDetail?token=%@&t=%lld&taskId=%@",
-                                       kDDTTVLangBase, token, t2, taskId];
-                ddTTVGet(detailURL, ^(NSData *d3, NSError *e3) {
-                    if (e3 || !d3.length) { if (completion) completion(nil, e3 ?: ddTTVError(@"查询任务失败")); return; }
-                    id j3 = ddTTVJSON(d3);
-                    NSString *audioUrl = [[j3 objectForKey:@"data"] objectForKey:@"audioUrl"];
-                    if (audioUrl.length) {
-                        ddTTVGet(audioUrl, ^(NSData *audio, NSError *e4) {
-                            if (completion) completion((e4 || !audio.length) ? nil : audio,
-                                                       e4 ?: (audio.length ? nil : ddTTVError(@"音频下载失败")));
-                        });
-                        return;
-                    }
-                    if (++retry >= 30) { if (completion) completion(nil, ddTTVError(@"琅琅合成超时")); return; }
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), poll);
-                });
-            };
-            poll();
+            ddTTVLangPoll(token, taskId, 0, completion);
         });
     });
 }
@@ -1399,7 +1399,7 @@ static void ddTTVShowInputMenu(NSString *toUser) {
     BOOL shouldSend = YES;
     DDTextToVoiceConfig *cfg = DDTextToVoiceConfig.shared;
     Class msgWrapCls = objc_getClass("CMessageWrap");
-    if (cfg.boolForKey:kDDTTVEnable && wrap && msgWrapCls && [msgWrapCls isSenderFromMsgWrap:wrap]) {
+    if ([cfg boolForKey:kDDTTVEnable] && wrap && msgWrapCls && [msgWrapCls isSenderFromMsgWrap:wrap]) {
         if (wrap.m_uiMessageType == 1 && wrap.m_nsContent.length) {
             NSString *content = [wrap.m_nsContent stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
             // /yy 文本 → 转语音并发送
@@ -1527,7 +1527,7 @@ static void ddTTVEnsureLongPress(UIView *view) {
     [sec1 addCell:[cellCls switchCellForSel:@selector(toggleEnable:)
                                      target:self
                                       title:@"1. 启用文字转语音"
-                                         on:cfg.boolForKey:kDDTTVEnable]];
+                                         on:[cfg boolForKey:kDDTTVEnable]]];
     [sec1 addCell:[cellCls normalCellForSel:@selector(setVoice:)
                                      target:self
                                       title:[NSString stringWithFormat:@"2. 设置音色(%@)", ddTTVCurrentVoiceName()]]];
@@ -1542,7 +1542,7 @@ static void ddTTVEnsureLongPress(UIView *view) {
     [sec2 addCell:[cellCls switchCellForSel:@selector(toggleBg:)
                                      target:self
                                       title:@"4. 启用背景音"
-                                         on:cfg.boolForKey:kDDTTVBgEnable]];
+                                         on:[cfg boolForKey:kDDTTVBgEnable]]];
     [sec2 addCell:[cellCls normalCellForSel:@selector(importBg:)
                                      target:self
                                       title:@"5. 导入背景音"]];
