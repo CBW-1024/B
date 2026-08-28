@@ -337,9 +337,13 @@ static CMSampleBufferRef VCamMakeSampleBufferFromImage(CIImage *img,
                                                                                       -rotatedExtent.origin.y);
                         rotated = [rotated imageByApplyingTransform:translate];
                     }
-                    CGRect normalizedExtent = rotated.extent;
-                    CGFloat scale = MAX(targetSize.width / normalizedExtent.size.width,
-                                        targetSize.height / normalizedExtent.size.height);
+                    // 对齐 VCAM 0xbe74：cover 缩放因子基于「旋转前原始帧尺寸」计算
+                    // （VCAM 在 0xc1e4/0xc200 取 CVPixelBufferGetWidth/Height 原始尺寸算 scale），
+                    // 旋转后再居中裁剪到 target。若用旋转后 extent 算 scale（宽高已互换），
+                    // 在 g_rotation!=0 时会把画面放大近 1.8 倍，与 VCAM 不符。
+                    CGRect srcExtent = img.extent;
+                    CGFloat scale = MAX(targetSize.width / srcExtent.size.width,
+                                        targetSize.height / srcExtent.size.height);
                     CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
                     CGRect scaledExtent = scaled.extent;
                     CGFloat offsetX = (scaledExtent.size.width - targetSize.width) / 2.0;
@@ -713,7 +717,6 @@ static char kVCamOverlayTag;
 
 @implementation LittleBearMenuVC {
     UIView   *_panelView;
-    UIView   *_blurView;
     UILabel  *_statusLbl;
     UIButton *_btnLoop;
     UIButton *_btnSound;
@@ -736,12 +739,8 @@ static char kVCamOverlayTag;
 
 #pragma mark - UI 构建
 - (void)setupBackground {
-    self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
-    UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
-    _blurView = [[UIVisualEffectView alloc] initWithEffect:blur];
-    _blurView.frame = self.view.bounds;
-    _blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.view addSubview:_blurView];
+    // 背景透明：打开菜单时不遮挡底层相机/视频画面，便于改配置后实时预览
+    self.view.backgroundColor = [UIColor clearColor];
 }
 - (void)setupPanel {
     _panelView = [[UIView alloc] init];
