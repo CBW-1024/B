@@ -1,9 +1,9 @@
-// VCAM — 微信相机/麦克风虚拟替换插件（Theos / Logos）
+// VCAM — 相机/麦克风虚拟替换插件（Theos / Logos）
 //
-// 将微信的相机画面与麦克风声音，替换为用户导入的本地视频/音频素材。
+// 将软件的相机画面与麦克风声音，替换为用户导入的本地视频/音频素材。
 // 双指双击任意窗口弹出控制面板，导入素材并开关各项替换。
 //
-// 按微信内部采集通道分四条链路拦截：
+// 按软件内部采集通道分四条链路拦截：
 //   · AVCaptureVideoDataOutput  拍摄/录像的画面采集回调
 //   · WeVisVoipEffectMgr        视频通话的逐帧处理
 //   · AVCaptureAudioDataOutput  拍摄/录像的音频采集回调
@@ -594,7 +594,7 @@ static OSStatus hooked_AudioUnitRender(
                                            inOutputBusNumber, inNumberFrames, ioData);
     if (status != noErr)                    return status;
     if (!g_isReplace || !g_isSound)         return status;
-    // 麦克风渲染落在 bus 1 才替换；本机微信麦克风渲染即 bus 1，保留此检查。
+    // 麦克风渲染落在 bus 1 才替换；本机WX麦克风渲染即 bus 1，保留此检查。
     if (!ioData || inOutputBusNumber != 1)  return status;
 
     if (!g_hasProbedASBD) {
