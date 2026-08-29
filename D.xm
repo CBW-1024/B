@@ -1,7 +1,7 @@
 // VCam — 微信相机/麦克风替换插件（Theos / Logos）
 //
 // 做的事：把微信拿到的相机画面和麦克风声音，换成用户选的本地视频/音频。
-// 触发方式：悬浮按钮（DD）点击切换面板，双指双击切换按钮显隐。
+// 触发方式：任意窗口上双指双击，弹出控制面板。
 //
 // 替换分四条链路，按微信内部实际走的通道分别拦截：
 //   1. AVCaptureVideoDataOutput   → 拍摄、录像的采集回调
@@ -154,8 +154,13 @@ static BOOL vcm_isMicUnit(AudioUnit unit) {
     AudioComponentDescription cd = {0};
     if (AudioComponentGetDescription(comp, &cd) != noErr) return NO;
     if (cd.componentType != (OSType)'auou') return NO;
-    if (cd.componentSubType != (OSType)'rioc' &&
-        cd.componentSubType != (OSType)'vpio') return NO;
+    // 认麦克风单元：rioc / vpio 是微信 VoIP 用的两类，命中即登记。
+    // 但微信在 iPhone 与 iPad 模式下的音频图子类型可能不同，某些 iOS 版本还会把
+    // 麦克风单元的子类型报成别的；这里只要是 auou（音频 I/O 单元）就视为采集单元，
+    // 真正的「是否该替换」改由 hooked_AudioUnitRender 里
+    // 「原始渲染成功 + ioData 非空」兜底，避免漏掉 iPhone 上的麦克风渲染。
+    // （speaker 输出单元同样属于 auou，但 app 不会去 pull 它的 bus 来读麦克风，
+    //  即便误中，也只在本端听到替换音，不会崩、也不会影响上行麦克风替换。）
 
     os_unfair_lock_lock(&g_micUnitsLock);
     for (int i = 0; i < VCM_MIC_UNIT_MAX; i++) {
@@ -245,27 +250,20 @@ static void vcm_resetSettings(void) {
     g_videoFailed = NO;
 }
 
-#pragma mark - 视图控制器查找（增强版）
+#pragma mark - 视图控制器查找
 static UIViewController *vcm_topViewController(void) {
-    UIWindow *keyWindow = nil;
+    UIWindow *key = nil;
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (scene.activationState != UISceneActivationStateForegroundActive) continue;
         for (UIWindow *w in scene.windows) {
-            if (w.isKeyWindow) { keyWindow = w; break; }
+            if (w.isKeyWindow) { key = w; break; }
         }
-        if (!keyWindow) {
-            for (UIWindow *w in scene.windows) {
-                if (!w.hidden) { keyWindow = w; break; }
-            }
-        }
-        if (keyWindow) break;
+        if (!key) key = scene.windows.firstObject;
+        break;
     }
-    if (!keyWindow) return nil;
-    
-    UIViewController *vc = keyWindow.rootViewController;
-    while (vc.presentedViewController) {
-        vc = vc.presentedViewController;
-    }
+    if (!key) return nil;
+    UIViewController *vc = key.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
 
@@ -680,9 +678,19 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 
 #pragma mark - AudioUnitRender Hook（麦克风采集替换）
 
-// 麦克风采集走的是裸 PCM：先按 type=='auou' 且 subtype 属于 {'rioc','vpio'}、
-// bus==1、scope=Output 探测一次目标 ASBD，之后按 ioData 的 buffer 尺寸拉 PCM 再 memcpy。
-// 全程不做格式转换——解码时已经按 ASBD 对齐好了。
+// 麦克风采集走的是裸 PCM：先按当前渲染总线号探测一次目标 ASBD，
+// 之后按 ioData 的 buffer 尺寸拉 PCM 再 memcpy。全程不做格式转换——解码时按 ASBD 对齐好了。
+//
+// 修复依据（反汇编工作版 dylib 的 _hooked_AudioUnitRender @0x994c）：
+//   实测门控链为 _g_enableReplacement → ioData!=0 → inOutputBusNumber==1 →
+//   _g_isSound → _g_hasProbedASBD → (VerifyCard)。
+//   工作版里【没有】g_sessionRunning、也【没有】vcm_isMicUnit 这两道门控。
+//   源码版多加了这两道，正是 iPhone 失效的根因：
+//     · g_sessionRunning 把麦克风替换绑死在 AVCaptureSession 在线，
+//       语音/视频通话不跑相机会话 → 该标志为 NO → 整条 return；
+//     · vcm_isMicUnit 的子类型白名单 {rioc,vpio} 在 iPhone 上对不上 → 漏掉麦克风单元 → return。
+//   故删除这两道源码版独有的门控（保留 dylib 原有的 bus==1 / ioData / g_isReplace / g_isSound），
+//   iPhone 与 iPad 行为即与工作版一致。
 static OSStatus hooked_AudioUnitRender(
     AudioUnit                   inUnit,
     AudioUnitRenderActionFlags  *ioActionFlags,
@@ -694,18 +702,22 @@ static OSStatus hooked_AudioUnitRender(
     OSStatus status = g_origAudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
                                            inOutputBusNumber, inNumberFrames, ioData);
     if (status != noErr)                    return status;
-    // 会话没在跑时一律不碰原样
-    if (!g_sessionRunning)                  return status;
     if (!g_isReplace || !g_isSound)         return status;
+    // 与工作版 dylib 一致：麦克风渲染落在 bus 1 才替换（dylib @0x99c4 `subs w8,#1`）。
+    // 工作版 dylib 也卡 bus==1 且 iPhone 正常，说明本机微信麦克风渲染即 bus 1，
+    // 因此 bus 检查并非 iPhone 失效的原因，保留即可。
     if (!ioData || inOutputBusNumber != 1)  return status;
     // 熔断后本链路彻底不替换，避免每帧重复抛异常
     if (g_audioFailed)                      return status;
-    if (!vcm_isMicUnit(inUnit))             return status;
+    // （已删除源码版独有的 g_sessionRunning / vcm_isMicUnit 门控）
 
     if (!g_hasProbedASBD) {
         UInt32 propSize = sizeof(g_targetASBD);
+        // 与工作版 dylib 一致：用当前渲染总线号探测 StreamFormat。
+        // 经上方 bus==1 门控后此处 inOutputBusNumber 恒为 1，
+        // 等价于 dylib 里写死的 bus 1（@0x99f4 `mov w3,#1`）。
         if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
-                                 kAudioUnitScope_Output, 1,
+                                 kAudioUnitScope_Output, inOutputBusNumber,
                                  &g_targetASBD, &propSize) == noErr
             && g_targetASBD.mSampleRate > 0) {
             g_hasProbedASBD = YES;
@@ -927,7 +939,6 @@ static VCamAudioProxy *g_audioProxy = nil;
 #pragma mark - VCamMenuVC（控制菜单界面）
 @interface VCamMenuVC : UIViewController
     <UIImagePickerControllerDelegate, UIDocumentPickerDelegate, UINavigationControllerDelegate>
-@property (nonatomic, copy) void (^dismissBlock)(void);
 @end
 
 @implementation VCamMenuVC {
@@ -1092,13 +1103,7 @@ static VCamAudioProxy *g_audioProxy = nil;
     NSString *vStat = [g_fileManager fileExistsAtPath:vcm_videoPath()] ? @"已加载" : @"未选择";
     _statusLabel.text = [NSString stringWithFormat:@"视频: %@", vStat];
 }
-- (void)closeMenu {
-    [self dismissViewControllerAnimated:YES completion:^{
-        if (self.dismissBlock) {
-            self.dismissBlock();
-        }
-    }];
-}
+- (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
 
 #pragma mark - 文件选择
 - (void)actionSelectAlbum {
@@ -1172,97 +1177,40 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller { [controller dismissViewControllerAnimated:YES completion:nil]; }
 @end
 
-#pragma mark - 全局悬浮按钮与手势控制
-static UIWindow *g_floatWindow = nil;
-static BOOL     g_menuVisible   = NO;
-static UIViewController *g_menuVC = nil;
-
-static void vcm_presentMenu(void) {
-    if (g_menuVisible) return;
+#pragma mark - UIWindow 手势触发
+static void vcm_installTapGesture(UIWindow *win) {
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+        initWithTarget:win action:@selector(vcm_presentMenu)];
+    tap.numberOfTapsRequired    = 2;
+    tap.numberOfTouchesRequired = 2;
+    tap.cancelsTouchesInView    = NO;
+    [win addGestureRecognizer:tap];
+}
+@interface UIWindow (VCam)
+- (void)vcm_presentMenu;
+@end
+@implementation UIWindow (VCam)
+- (void)vcm_presentMenu {
+    static BOOL menuVisible = NO;
+    if (menuVisible) return;
+    menuVisible = YES;
     UIViewController *topVC = vcm_topViewController();
-    if (!topVC) return;
-    VCamMenuVC *vc = [[VCamMenuVC alloc] init];
+    if (!topVC) { menuVisible = NO; return; }
+    VCamMenuVC *vc = [VCamMenuVC new];
     vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
-    vc.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
-    vc.dismissBlock = ^{
-        g_menuVisible = NO;
-        g_menuVC = nil;
-    };
-    g_menuVisible = YES;
-    g_menuVC = vc;
-    [topVC presentViewController:vc animated:YES completion:nil];
+    vc.modalTransitionStyle   = UIModalTransitionStyleCrossDissolve;
+    [topVC presentViewController:vc animated:YES completion:^{ menuVisible = NO; }];
 }
-
+@end
 %hook UIWindow
-
-%new
-- (void)vcm_floatButtonTapped {
-    if (g_menuVisible) {
-        if (g_menuVC && [g_menuVC respondsToSelector:@selector(closeMenu)]) {
-            [(VCamMenuVC *)g_menuVC closeMenu];
-        }
-    } else {
-        vcm_presentMenu();
-    }
-}
-
-%new
-- (void)vcm_handleDoubleDoubleTap {
-    if (g_menuVisible) return;
-    if (g_floatWindow) {
-        g_floatWindow.hidden = !g_floatWindow.hidden;
-    }
-}
-
 - (void)becomeKeyWindow {
     %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            CGFloat size = 25; // 按钮大小改为 25
-            UIWindow *floatWindow = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, size, size)];
-            floatWindow.windowLevel = UIWindowLevelStatusBar + 1;
-            floatWindow.backgroundColor = [UIColor clearColor];
-            floatWindow.userInteractionEnabled = YES;
-            floatWindow.clipsToBounds = NO;
-            floatWindow.layer.cornerRadius = size / 2.0;
-            floatWindow.layer.masksToBounds = YES;
-
-            UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-            btn.frame = floatWindow.bounds;
-            btn.backgroundColor = [UIColor systemGray5Color];
-            [btn setTitle:@"DD" forState:UIControlStateNormal]; // 图标改为 DD
-            btn.titleLabel.font = [UIFont systemFontOfSize:14]; // 适配小尺寸
-            btn.layer.cornerRadius = size / 2.0;
-            btn.clipsToBounds = YES;
-            [btn addTarget:self action:@selector(vcm_floatButtonTapped) forControlEvents:UIControlEventTouchUpInside];
-
-            [floatWindow addSubview:btn];
-
-            CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
-            CGFloat screenHeight = [UIScreen mainScreen].bounds.size.height;
-            CGFloat padding = 20;
-            floatWindow.frame = CGRectMake(screenWidth - size - padding,
-                                           (screenHeight - size) / 2.0,
-                                           size, size);
-            floatWindow.hidden = YES; // 默认隐藏
-            g_floatWindow = floatWindow;
-        });
-
-        static BOOL gestureInstalled = NO;
-        if (!gestureInstalled) {
-            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(vcm_handleDoubleDoubleTap)];
-            tap.numberOfTapsRequired = 2;
-            tap.numberOfTouchesRequired = 2;
-            tap.cancelsTouchesInView = NO;
-            [self addGestureRecognizer:tap];
-            gestureInstalled = YES;
-        }
-    });
+    dispatch_async(dispatch_get_main_queue(), ^{ vcm_installTapGesture(self); });
 }
 %end
 
 #pragma mark - 构造 / 析构
+// 初始化全局状态、沙箱目录、音视频 reader
 %ctor {
     g_fileManager = [NSFileManager defaultManager];
     g_mediaLock   = [[NSLock alloc] init];
