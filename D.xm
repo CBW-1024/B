@@ -26,7 +26,7 @@
 //   ③ 调用 0x159556c() 辅助判定 —— 这是对齐的核心，见下。返回 1 →
 //      CFString @0x1f8fe88 = @"com.tencent.xin"；返回 0 → orig 真实 bid。
 //
-// ▸ 辅助函数 0x159556c 的真实机制（已逐 selector 解析，非"会话态"）：
+// ▸ 辅助函数 0x159556c 的真实机制（已逐指令反汇编，2026-08-29 全量核实，非"会话态"）：
 //       A  = objc_msgSend(classref@0x2073670=NSThread,
 //                         @selector(callStackReturnAddresses)@0x205e818)
 //            → [NSThread callStackReturnAddresses]   (NSArray<NSNumber*>，栈返回地址)
@@ -34,31 +34,36 @@
 //       if (B <= 2)  → return 0  (栈太浅，不伪装)
 //       C  = objc_msgSend(A, @selector(objectAtIndexedSubscript:)@0x204a6c8, 2)  → 栈帧2地址
 //       D  = objc_msgSend(C, @selector(unsignedLongLongValue)@0x204b530)         → 地址转 u64
-//       再取 classref@0x20734c0 配置类的 stringWithUTF8String:@0x204d530 结果，
-//       与 [NSBundle mainBundle].bundlePath(@0x205c990) 做
-//       length@0x204a398 / hasPrefix:@0x204a380 字符串前缀匹配，最终定 0 或 1。
-//   ⇒ WCR 用【调用栈返回地址 + 主包 bundlePath 字符串前缀匹配】判定是否处于
-//     "需要伪装的调用上下文"。默认（不命中）返回真实 bid；命中时返回 com.tencent.xin。
+//       dladdr(D, &info) 解析该地址所属镜像路径 info.dli_fname（等价 0x1ca58d4 内部调用）
+//       cfg = objc_msgSend(classref@0x20734c0=NSString,                          (经 dyld bind 确认=NSString)
+//                          @selector(stringWithUTF8String:)@0x204d530,
+//                          info.dli_fname)   → NSString(调用者镜像路径)
+//       if ([cfg length]@0x204a398 == 0) → return 0
+//       return [cfg hasPrefix:[NSBundle mainBundle].bundlePath@0x205c990]@0x204a380  → 0 或 1
+//   ⇒ WCR 用【调用栈返回地址经 dladdr 取镜像路径 + 与主包 bundlePath 前缀匹配】判定。
+//     命中（调用者镜像位于主程序包目录内）→ 返回 com.tencent.xin；否则 → 真实 bid。
+//     关键点：info.dli_fname 是【调用者镜像路径】，并非"运行时/远端下发的配置串"——
+//     本机二进制即可完整还原，无需任何运行时假设。
 //
 //   这解释了 WCR 为什么"完美"：它【不是全局伪装、也不是手动会话态标志】，而是
-//   【默认真实 bid，仅当调用栈命中登录/鉴权深层路径才伪装】。推送令牌注册发生在
-//   登录前的浅栈调用里 → 读到真实 bid → APNs 按真实 bid(com.tencent.qy.xin) 派发；
-//   登录/长连接(Mars)鉴权在深层调用栈里 → 命中 → 伪装成官方 bid → 过服务端校验。
+//   【默认真实 bid，仅当调用栈命中登录/鉴权深层路径才伪装】。推送令牌注册通常发生在
+//   登录前的浅栈调用里（含框架/Swift 镜像），dladdr 取到的镜像路径不在主包目录 →
+//   读到真实 bid → APNs 按真实 bid(com.tencent.qy.xin) 派发；登录/长连接(Mars)鉴权
+//   在深层调用栈里（主程序可执行镜像）→ hasPrefix 命中 → 伪装成官方 bid → 过服务端校验。
 //
 // ── 本实现的 1:1 对齐策略 ──────────────────────────────────────────────────
-// 机制逐条对齐 WCR：① 开关 + ② 主包判定 + ③ 调用栈判定；【默认真实 bid，
-// 仅"主包 + 调用者位于主程序镜像"才伪装】。多开装包 bid 非 com.tencent.xin
-// （如 com.tencent.qy.xin）时，微信服务端在 登录 / 长连接(Mars)鉴权 时按官方
-// bid 校验 app 身份 → 非官方直接被拒；故登录/鉴权链须伪装成 com.tencent.xin，
+// 机制逐条对齐 WCR：① 开关 + ② 主包判定 + ③ 调用栈(镜像路径)判定；【默认真实 bid，
+// 仅"主包 + 调用者镜像位于主程序包目录内(hasPrefix bundlePath)"才伪装】。多开装包 bid
+// 非 com.tencent.xin（如 com.tencent.qy.xin）时，微信服务端在 登录 / 长连接(Mars)鉴权
+// 时按官方 bid 校验 app 身份 → 非官方直接被拒；故登录/鉴权链须伪装成 com.tencent.xin，
 // 其余（含推送注册，通常由框架发起）一律真实 bid。
 //
-// ③ 调用栈判定的 1:1 还原说明：WCR 的 0x159556c 取 [NSThread callStackReturnAddresses]
-// 的 A[2]（即 bundleIdentifier 的调用点返回地址），将该地址经配置类 NSString 化后
-// 与主包路径做 hasPrefix:/length 匹配。配置串来自 WCR 运行时/远端、本机静态不可见，
-// 故以「调用者镜像 == 主程序 executablePath」精确近似：只命中"主程序镜像内"的调用
-// （登录/鉴权多在此），天然排除"框架镜像"调用（推送/SDK 多在此）→ 推送拿真实 bid、
-// APNs 不丢，比"关键词匹配"更贴近 WCR 的"调用者镜像"语义。
-// 若实测某次登录未命中（登录链恰好不在主程序镜像），把该场景的 backtrace 给我再放宽。
+// ③ 调用栈判定已与 WCR 0x159556c 逐字节对齐，无近似：
+//   · dladdr(pc) 取调用者镜像路径（WCR 经 0x1ca58d4 内部解析 dli_fname）；
+//   · [NSString stringWithUTF8String:dli_fname] 转 NSString（0x20734c0 经 dyld bind 确认=NSString）；
+//   · 与 [NSBundle mainBundle].bundlePath 做 hasPrefix: 比对（sel@0x204a380，WCR 原样）。
+//   此前误记"配置串来自运行时/远端、本机不可见"——实为调用者镜像路径，可由 dladdr 在
+//   本机完整还原，故 NC 此处与 WCR 行为完全一致，无残留偏差。
 // ============================================================================
 
 // 官方微信 bundle id（伪装目标）
@@ -74,28 +79,25 @@
 // 调试时临时置 NO 即等同 WCR 该字节清零。
 static BOOL g_wcBidEnabled = NO;
 
-#pragma mark - 调用栈判定：对齐 WCR 0x159556c 的调用者镜像分析
+#pragma mark - 调用栈判定：1:1 对齐 WCR 0x159556c
 
-/// 对齐 WCR 辅助函数 0x159556c：用调用栈判定当前 bundleIdentifier 的调用者
-/// 是否位于【主程序可执行文件镜像】内。
-///
-/// WCR 机制：取 [NSThread callStackReturnAddresses] 的 A[2]（bundleIdentifier 的
-/// 调用点返回地址），将该地址经配置类 NSString 化后与主包路径做前缀匹配。
-/// 本实现以 dladdr 取该返回地址所属镜像路径，与目标主程序 executablePath 精确比较，
-/// 语义等价且更严格：只命中"主程序镜像内"的调用（登录/鉴权多在此），
-/// 排除"框架镜像"调用（推送/SDK 多在此）→ 推送天然拿到真实 bid，APNs 不丢。
-///
-/// 与 WCR 的偏差（已尽量收窄）：WCR 实际比较的配置串来自运行时/远端、本机不可见，
-/// 故以 executablePath 近似。其余（取 A[2]、count<=2 早退）均与 WCR 逐条一致。
+/// 1:1 对齐 WCR 辅助函数 0x159556c（逐指令反汇编核实，2026-08-29）：
+///   A = [NSThread callStackReturnAddresses]                  ; NSThread@0x2073670, sel@0x205e818
+///   if (A.count <= 2) return NO                              ; subs #2 ; b.hi
+///   D = [A[2] unsignedLongLongValue]                         ; sel@0x204b530
+///   dladdr(D, &info) → info.dli_fname（调用者镜像路径）       ; 等价 0x1ca58d4
+///   cfg = [NSString stringWithUTF8String:info.dli_fname]      ; NSString@bind, sel@0x204d530
+///   return [cfg hasPrefix:[NSBundle mainBundle].bundlePath]   ; sel@0x204a380 / bundlePath@0x205c990
 static BOOL wc_callerInMainBundle(void) {
     NSArray<NSNumber *> *addrs = [NSThread callStackReturnAddresses];
-    if (addrs.count <= 2) return NO;                         // 对齐 WCR: B<=2 → 不伪装
-    uintptr_t pc = addrs[2].unsignedLongLongValue;            // 对齐 WCR: C = A[2]
+    if (addrs.count <= 2) return NO;                        // 对齐 WCR: B<=2 → 不伪装
+    uintptr_t pc = addrs[2].unsignedLongLongValue;           // 对齐 WCR: D = A[2].unsignedLongLongValue
     Dl_info info;
+    // 对齐 WCR 0x1ca58d4：解析返回地址所属镜像路径（等价于 dladdr）
     if (dladdr((void *)pc, &info) == 0 || info.dli_fname == NULL) return NO;
-    NSString *callerImage = [NSString stringWithUTF8String:info.dli_fname];
-    // 对齐 WCR 的"主包路径前缀匹配"：用主程序可执行文件路径精确判定调用者镜像。
-    return [callerImage isEqualToString:[NSBundle mainBundle].executablePath];
+    NSString *callerImage = [NSString stringWithUTF8String:info.dli_fname];  // 对齐 WCR: [NSString stringWithUTF8String:dli_fname]
+    NSString *bundlePath = [NSBundle mainBundle].bundlePath;                 // 对齐 WCR: mainBundle.bundlePath
+    return [callerImage hasPrefix:bundlePath];              // 对齐 WCR: [cfg hasPrefix:bundlePath]
 }
 
 #pragma mark - 1:1 对齐 WCR 的 bundleIdentifier 三层门控
@@ -103,9 +105,9 @@ static BOOL wc_callerInMainBundle(void) {
 // WCR replacement IMP @0x1582ec0 逐条对应：
 //   ① g_wcBidEnabled == NO             → 返回真实 bid            (对齐 @0x2203560 开关)
 //   ② self != 主包                     → 返回真实 bid            (对齐 self==mainBundle 判定)
-//   ③ wc_callerInMainBundle() == YES   → 返回 @"com.tencent.xin" (对齐 0x159556c 调用者镜像判定)
+//   ③ wc_callerInMainBundle() == YES   → 返回 @"com.tencent.xin" (对齐 0x159556c：调用者镜像位于主包目录内)
 //   其余                               → 返回真实 bid
-// 即【默认真实、调用者位于主程序镜像才伪装】，与 WCR 行为同构。
+// 即【默认真实、仅"主包 + 调用者镜像位于主程序包目录(hasPrefix bundlePath)"才伪装】，与 WCR 行为同构。
 %hook NSBundle
 
 - (NSString *)bundleIdentifier {
@@ -123,7 +125,7 @@ static BOOL wc_callerInMainBundle(void) {
     if (self != [NSBundle mainBundle]) {
         return real;
     }
-    // ③ 调用者位于主程序镜像（登录/鉴权多在此）→ 伪装成官方 bid，过服务端校验
+    // ③ 调用者镜像位于主程序包目录内（登录/鉴权多在此）→ 伪装成官方 bid，过服务端校验
     if (wc_callerInMainBundle()) {
         return WC_OFFICIAL_BID;
     }
