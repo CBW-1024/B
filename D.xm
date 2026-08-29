@@ -1,7 +1,7 @@
 // VCam — 微信相机/麦克风替换插件（Theos / Logos）
 //
 // 做的事：把微信拿到的相机画面和麦克风声音，换成用户选的本地视频/音频。
-// 触发方式：悬浮按钮（🔘）点击切换面板，双指双击切换按钮显隐。
+// 触发方式：悬浮按钮（DD）点击切换面板，双指双击切换按钮显隐。
 //
 // 替换分四条链路，按微信内部实际走的通道分别拦截：
 //   1. AVCaptureVideoDataOutput   → 拍摄、录像的采集回调
@@ -245,20 +245,27 @@ static void vcm_resetSettings(void) {
     g_videoFailed = NO;
 }
 
-#pragma mark - 视图控制器查找
+#pragma mark - 视图控制器查找（增强版）
 static UIViewController *vcm_topViewController(void) {
-    UIWindow *key = nil;
+    UIWindow *keyWindow = nil;
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (scene.activationState != UISceneActivationStateForegroundActive) continue;
         for (UIWindow *w in scene.windows) {
-            if (w.isKeyWindow) { key = w; break; }
+            if (w.isKeyWindow) { keyWindow = w; break; }
         }
-        if (!key) key = scene.windows.firstObject;
-        break;
+        if (!keyWindow) {
+            for (UIWindow *w in scene.windows) {
+                if (!w.hidden) { keyWindow = w; break; }
+            }
+        }
+        if (keyWindow) break;
     }
-    if (!key) return nil;
-    UIViewController *vc = key.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
+    if (!keyWindow) return nil;
+    
+    UIViewController *vc = keyWindow.rootViewController;
+    while (vc.presentedViewController) {
+        vc = vc.presentedViewController;
+    }
     return vc;
 }
 
@@ -1166,9 +1173,9 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 @end
 
 #pragma mark - 全局悬浮按钮与手势控制
-static UIWindow *g_floatWindow = nil;      // 悬浮窗口
-static BOOL     g_menuVisible   = NO;      // 面板是否可见
-static UIViewController *g_menuVC = nil;   // 面板控制器（用于关闭）
+static UIWindow *g_floatWindow = nil;
+static BOOL     g_menuVisible   = NO;
+static UIViewController *g_menuVC = nil;
 
 static void vcm_presentMenu(void) {
     if (g_menuVisible) return;
@@ -1188,7 +1195,6 @@ static void vcm_presentMenu(void) {
 
 %hook UIWindow
 
-// 点击悬浮按钮 → 切换面板（打开/关闭）
 %new
 - (void)vcm_floatButtonTapped {
     if (g_menuVisible) {
@@ -1200,7 +1206,6 @@ static void vcm_presentMenu(void) {
     }
 }
 
-// 双指双击 → 切换悬浮按钮显示/隐藏（面板打开时忽略）
 %new
 - (void)vcm_handleDoubleDoubleTap {
     if (g_menuVisible) return;
@@ -1214,7 +1219,7 @@ static void vcm_presentMenu(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
-            CGFloat size = 50;
+            CGFloat size = 25; // 按钮大小改为 25
             UIWindow *floatWindow = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, size, size)];
             floatWindow.windowLevel = UIWindowLevelStatusBar + 1;
             floatWindow.backgroundColor = [UIColor clearColor];
@@ -1226,26 +1231,24 @@ static void vcm_presentMenu(void) {
             UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
             btn.frame = floatWindow.bounds;
             btn.backgroundColor = [UIColor systemGray5Color];
-            [btn setTitle:@"🔘" forState:UIControlStateNormal];
-            btn.titleLabel.font = [UIFont systemFontOfSize:28];
+            [btn setTitle:@"DD" forState:UIControlStateNormal]; // 图标改为 DD
+            btn.titleLabel.font = [UIFont systemFontOfSize:14]; // 适配小尺寸
             btn.layer.cornerRadius = size / 2.0;
             btn.clipsToBounds = YES;
             [btn addTarget:self action:@selector(vcm_floatButtonTapped) forControlEvents:UIControlEventTouchUpInside];
 
             [floatWindow addSubview:btn];
 
-            // 固定右侧中间
             CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
             CGFloat screenHeight = [UIScreen mainScreen].bounds.size.height;
             CGFloat padding = 20;
             floatWindow.frame = CGRectMake(screenWidth - size - padding,
                                            (screenHeight - size) / 2.0,
                                            size, size);
-            floatWindow.hidden = NO;
+            floatWindow.hidden = YES; // 默认隐藏
             g_floatWindow = floatWindow;
         });
 
-        // 安装双指双击手势（只添加一次到当前窗口）
         static BOOL gestureInstalled = NO;
         if (!gestureInstalled) {
             UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(vcm_handleDoubleDoubleTap)];
