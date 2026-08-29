@@ -89,11 +89,6 @@ static BOOL           g_isAudioDecoding = NO;
 #pragma mark - AudioUnit 采集状态
 static BOOL                        g_hasProbedASBD = NO;
 static AudioStreamBasicDescription g_targetASBD    = {0};
-// 由 AVCaptureSession 的 startRunning / stopRunning 维护。
-// 麦克风替换要在它置位后才生效：会话之外的 AudioUnitRender 调用（Voip 预初始化、
-// 系统音效单元等）不该被拿去探测格式或登记成麦克风单元。
-static BOOL g_sessionRunning = NO;
-
 // 按麦克风 ASBD 反推解码输出格式。
 // AudioUnit 链路是把 PCM 裸字节直接 memcpy 进麦克风 buffer，格式必须逐位对齐，
 // 否则素材与麦克风的采样率/位深不一致时会变调、播放速度也不对。
@@ -129,49 +124,6 @@ static BOOL g_audioFailed = NO;
 // 其余只熔断自己。这个不对称是刻意的。
 static BOOL g_videoFailed = NO;
 
-#pragma mark - 麦克风单元识别
-// 已识别的麦克风 AudioUnit 缓存，命中即跳过 AudioComponent 探测。
-// 探测要走两次跨进程调用，而 AudioUnitRender 每 10~20ms 就来一次。
-#define VCM_MIC_UNIT_MAX 32
-static AudioUnit g_micAudioUnits[VCM_MIC_UNIT_MAX] = {0};
-static os_unfair_lock g_micUnitsLock = OS_UNFAIR_LOCK_INIT;
-
-// 判定并登记麦克风单元：componentType=='auou' 且 subType 属于 {'rioc','vpio'}
-static BOOL vcm_isMicUnit(AudioUnit unit) {
-    if (!unit) return NO;
-
-    os_unfair_lock_lock(&g_micUnitsLock);
-    for (int i = 0; i < VCM_MIC_UNIT_MAX; i++) {
-        if (g_micAudioUnits[i] == unit) {
-            os_unfair_lock_unlock(&g_micUnitsLock);
-            return YES;
-        }
-    }
-    os_unfair_lock_unlock(&g_micUnitsLock);
-
-    AudioComponent comp = AudioComponentInstanceGetComponent(unit);
-    if (!comp) return NO;
-    AudioComponentDescription cd = {0};
-    if (AudioComponentGetDescription(comp, &cd) != noErr) return NO;
-    if (cd.componentType != (OSType)'auou') return NO;
-    // 认麦克风单元：rioc / vpio 是微信 VoIP 用的两类，命中即登记。
-    // 但微信在 iPhone 与 iPad 模式下的音频图子类型可能不同，某些 iOS 版本还会把
-    // 麦克风单元的子类型报成别的；这里只要是 auou（音频 I/O 单元）就视为采集单元，
-    // 真正的「是否该替换」改由 hooked_AudioUnitRender 里
-    // 「原始渲染成功 + ioData 非空」兜底，避免漏掉 iPhone 上的麦克风渲染。
-    // （speaker 输出单元同样属于 auou，但 app 不会去 pull 它的 bus 来读麦克风，
-    //  即便误中，也只在本端听到替换音，不会崩、也不会影响上行麦克风替换。）
-
-    os_unfair_lock_lock(&g_micUnitsLock);
-    for (int i = 0; i < VCM_MIC_UNIT_MAX; i++) {
-        if (g_micAudioUnits[i] == 0 || g_micAudioUnits[i] == unit) {
-            g_micAudioUnits[i] = unit;
-            break;
-        }
-    }
-    os_unfair_lock_unlock(&g_micUnitsLock);
-    return YES;
-}
 static OSStatus (*g_origAudioUnitRender)(
     AudioUnit                   inUnit,
     AudioUnitRenderActionFlags  *ioActionFlags,
@@ -684,13 +636,8 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 // 修复依据（反汇编工作版 dylib 的 _hooked_AudioUnitRender @0x994c）：
 //   实测门控链为 _g_enableReplacement → ioData!=0 → inOutputBusNumber==1 →
 //   _g_isSound → _g_hasProbedASBD → (VerifyCard)。
-//   工作版里【没有】g_sessionRunning、也【没有】vcm_isMicUnit 这两道门控。
-//   源码版多加了这两道，正是 iPhone 失效的根因：
-//     · g_sessionRunning 把麦克风替换绑死在 AVCaptureSession 在线，
-//       语音/视频通话不跑相机会话 → 该标志为 NO → 整条 return；
-//     · vcm_isMicUnit 的子类型白名单 {rioc,vpio} 在 iPhone 上对不上 → 漏掉麦克风单元 → return。
-//   故删除这两道源码版独有的门控（保留 dylib 原有的 bus==1 / ioData / g_isReplace / g_isSound），
-//   iPhone 与 iPad 行为即与工作版一致。
+//   源码版曾多加了这两道门控（g_sessionRunning / vcm_isMicUnit），
+//   为 iPhone 失效根因，现已整段移除，此处门控链即上方反汇编所示、与 dylib 完全一致。
 static OSStatus hooked_AudioUnitRender(
     AudioUnit                   inUnit,
     AudioUnitRenderActionFlags  *ioActionFlags,
@@ -709,7 +656,6 @@ static OSStatus hooked_AudioUnitRender(
     if (!ioData || inOutputBusNumber != 1)  return status;
     // 熔断后本链路彻底不替换，避免每帧重复抛异常
     if (g_audioFailed)                      return status;
-    // （已删除源码版独有的 g_sessionRunning / vcm_isMicUnit 门控）
 
     if (!g_hasProbedASBD) {
         UInt32 propSize = sizeof(g_targetASBD);
@@ -869,7 +815,6 @@ static VCamAudioProxy *g_audioProxy = nil;
 #pragma mark - AVCaptureSession（会话起停）
 %hook AVCaptureSession
 - (void)startRunning {
-    g_sessionRunning = YES;
     // 新会话的麦克风格式可能是另一套（采样率/位深随通话类型变），
     // 不把旧的 g_targetASBD 清掉就会沿用上一通的格式去解码
     vcm_reloadReaders();
@@ -882,7 +827,6 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)stopRunning {
     // 这里只清标志、不 reload。stopRunning 后链路可能还在收尾取帧，
     // 这时候清 reader 会打断它；内存 PCM 留着，等下次 startRunning 再清
-    g_sessionRunning = NO;
     %orig;
 }
 %end
