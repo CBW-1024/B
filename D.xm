@@ -1,13 +1,16 @@
 // DD文字转语音 —— 提取自 PKC 的文字转语音(TTS)功能，单文件插件
-// 触发方式：聊天发送 /yy 文本（拦截后转语音）+ 长按输入区弹菜单输入文本
+// 触发方式：聊天发送 /yy 文本（拦截后转语音）+ 长按文字消息菜单"转语音"
 // 音色来源：内置音色数据（琅琅音色 168，已过滤男声及指定音色；讯飞音色 6）—— 不联网、不支持本地导入
 // 例外保留：猴哥(vid=houge) 虽含"男声"描述，但为用户指定保留的特色音色
 // 语音合成：琅琅走 s.lang123.top；讯飞走 peiyin.xunfei.cn（均复用 PKC 的接口结构）
+// 语音发送：合成结果为 mp3，须经内置 SILK codec 转成 silk 才能作为微信语音消息发出
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
+#import "SKP_Silk_SDK_API.h"
 
 // ===================== 微信私有接口 =====================
 
@@ -66,9 +69,11 @@ static NSString * const kDDTTVVoiceIDDefault = @"voiceIDDefault";       // 当�
 static NSString * const kDDTTVSpeed    = @"speed";
 static NSString * const kDDTTVVolume   = @"volume";
 
-// 音色列表动态拉取(复用 PKC 数据源)
 static NSString * const kDDTTVLangToken  = @"langToken";    // 琅琅音色 token
-static NSString * const kDDTTVXFUid      = @"xfUid";        // 讯飞配音 uid
+
+// 已被用户删除的音色ID（逗号分隔）。删除后音色从列表永久消失，
+// 只有清除插件配置或重装插件才会重新出现（源码里的内置数据始终保留）
+static NSString * const kDDTTVDeletedVoices = @"deletedVoices";
 
 @interface DDTextToVoiceConfig : NSObject
 + (instancetype)shared;
@@ -190,6 +195,14 @@ static UIWindow *ddTTVCurrentKeyWindow(void) {
         if (window) break;
     }
     return window;
+}
+
+// 找到一个可用来 present 的最顶层 VC（穿透已 present 的弹窗）
+static void ddTTVPresentVC(UIViewController *vc) {
+    if (!vc) return;
+    UIViewController *top = ddTTVCurrentKeyWindow().rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    [top presentViewController:vc animated:YES completion:nil];
 }
 
 // Toast 提示
@@ -419,6 +432,22 @@ static NSArray<NSDictionary *> *ddTTVBuiltinXFVoices(void) {
 static NSString * const kDDTTVTypeLang = @"琅琅";   // 琅琅音色
 static NSString * const kDDTTVTypeXF   = @"讯飞";   // 讯飞音色
 
+// 已被删除的音色ID集合
+static NSSet<NSString *> *ddTTVDeletedVoiceIDs(void) {
+    NSString *s = [DDTextToVoiceConfig.shared stringForKey:kDDTTVDeletedVoices];
+    if (!s.length) return [NSSet set];
+    return [NSSet setWithArray:[s componentsSeparatedByString:@","]];
+}
+
+// 删除音色：写入已删除集合后音色即从列表消失（不可恢复）
+static void ddTTVDeleteVoice(NSString *voiceID) {
+    if (!voiceID.length) return;
+    NSMutableSet<NSString *> *set = [ddTTVDeletedVoiceIDs() mutableCopy];
+    [set addObject:voiceID];
+    [DDTextToVoiceConfig.shared setValue:[[set allObjects] componentsJoinedByString:@","]
+                           forConfigKey:kDDTTVDeletedVoices];
+}
+
 // 头像地址还原：数据文件里存的是短路径，运行时拼前缀
 static NSString *ddTTVVoiceImageURL(NSString *img) {
     if (!img.length) return @"";
@@ -429,6 +458,7 @@ static NSString *ddTTVVoiceImageURL(NSString *img) {
 
 // 归一化：兼容内置数据(v/n/d/i) 与联网数据(vid/name/desc/img)
 static NSArray<NSDictionary *> *ddTTVNormalizeVoices(NSArray<NSDictionary *> *raw, NSString *type) {
+    NSSet<NSString *> *deleted = ddTTVDeletedVoiceIDs();
     NSMutableArray *out = [NSMutableArray arrayWithCapacity:raw.count];
     for (NSDictionary *r in raw) {
         NSString *vid  = r[@"v"]    ?: r[@"vid"]  ?: @"";
@@ -436,6 +466,7 @@ static NSArray<NSDictionary *> *ddTTVNormalizeVoices(NSArray<NSDictionary *> *ra
         NSString *desc = r[@"d"]    ?: r[@"desc"] ?: @"";
         NSString *img  = r[@"i"]    ?: r[@"img"]  ?: @"";
         if (!vid.length || !name.length) continue;
+        if ([deleted containsObject:vid]) continue;   // 已被用户删除
         [out addObject:@{@"id": vid, @"name": name, @"desc": desc,
                          @"img": ddTTVVoiceImageURL(img), @"type": type}];
     }
@@ -644,7 +675,8 @@ static void ddTTVXFSynth(NSString *text, NSString *vid, double speed, double vol
             if (!sign.length) sign = [[j2 objectForKey:@"data"] objectForKey:@"sign"];
             if (!sign.length) { if (completion) completion(nil, ddTTVError(@"讯飞未返回 sign")); return; }
 
-            NSString *uid = [DDTextToVoiceConfig.shared stringForKey:kDDTTVXFUid] ?: @"";
+            // 讯飞链路 uid 恒为空（与 PKC 一致），无需用户配置
+            NSString *uid = @"";
             NSString *ts  = [NSString stringWithFormat:@"%lld", (long long)([[NSDate date] timeIntervalSince1970] * 1000)];
             int vol = (int)lround(volume * 20.0);        // 默认 1.0 → 20（与 PKC 默认一致）
             int spd = (int)lround((speed - 1.0) * 10.0); // 默认 1.0 → 0
@@ -667,6 +699,68 @@ static void ddTTVSynthesizeWithVoice(NSString *text, NSString *voiceID, double s
     NSString *type = v[@"type"] ?: kDDTTVTypeLang;   // 查不到时按琅琅处理
     if ([type isEqualToString:kDDTTVTypeXF]) ddTTVXFSynth(text, voiceID, speed, volume, completion);
     else                                     ddTTVLangSynth(text, voiceID, speed, volume, completion);
+}
+
+// ===================== 音色头像 / 试听 =====================
+
+// 试听播放器（全局单例，播放新试听前先停掉旧的）
+static AVAudioPlayer *gDDTTVPreviewPlayer = nil;
+static void ddTTVStopPreview(void) { [gDDTTVPreviewPlayer stop]; gDDTTVPreviewPlayer = nil; }
+
+// 异步加载音色头像：先查磁盘缓存(IconDir)，没有再联网下载并落盘
+static void ddTTVLoadVoiceIcon(NSString *imgURL, NSString *vid, void (^setImage)(UIImage *img)) {
+    if (!setImage) return;
+    if (!imgURL.length) { setImage(nil); return; }
+    NSString *ext = [imgURL pathExtension].length ? [imgURL pathExtension] : @"png";
+    NSString *cache = [[ddTTVIconDir() stringByAppendingPathComponent:vid] stringByAppendingPathExtension:ext];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:cache]) {
+        UIImage *img = [UIImage imageWithContentsOfFile:cache];
+        if (img) { setImage(img); return; }
+    }
+    ddTTVGet(imgURL, ^(NSData *data, NSError *e) {
+        if (data.length) {
+            [data writeToFile:cache atomically:YES];
+            UIImage *img = [UIImage imageWithData:data];
+            if (img) dispatch_async(dispatch_get_main_queue(), ^{ setImage(img); });
+        }
+    });
+}
+
+// 试听：优先播缓存(PreviewDir/<vid>.mp3)，否则用合成接口产出一段短时示例并缓存
+// 注意：走的是与发送相同的合成链路（琅琅需 Token），因此试听依赖当前音色平台可用
+static void ddTTVPreviewVoice(NSDictionary *voice, void (^done)(BOOL ok, NSString *err)) {
+    if (!voice) { if (done) done(NO, @"音色无效"); return; }
+    NSString *vid = voice[@"id"];
+    if (!vid.length) { if (done) done(NO, @"音色无效"); return; }
+    NSString *cache = [[ddTTVPreviewDir() stringByAppendingPathComponent:vid] stringByAppendingPathExtension:@"mp3"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:cache]) {
+        NSError *e = nil;
+        AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:cache] error:&e];
+        if (p) {
+            ddTTVStopPreview();
+            gDDTTVPreviewPlayer = p; p.numberOfLoops = 0; [p play];
+            if (done) done(YES, nil);
+            return;
+        }
+    }
+    NSString *demo = @"你好，这是音色试听。";
+    ddTTVSynthesizeWithVoice(demo, vid, 1.0, 1.0, ^(NSData *audio, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (err || !audio.length) { if (done) done(NO, err.localizedDescription ?: @"试听失败"); return; }
+            [audio writeToFile:cache atomically:YES];
+            NSError *e = nil;
+            AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithData:audio error:&e];
+            if (p) {
+                ddTTVStopPreview();
+                gDDTTVPreviewPlayer = p; p.numberOfLoops = 0; [p play];
+                if (done) done(YES, nil);
+            } else {
+                if (done) done(NO, @"试听播放失败");
+            }
+        });
+    });
 }
 
 // ===================== 背景音 =====================
@@ -714,12 +808,150 @@ static void ddTTVCleanCache(void) {
     ddTTVToast(@"缓存已清理");
 }
 
+// ===================== MP3 → SILK 转码 =====================
+// 微信语音消息只接受 silk 编码（文件头 "#!SILK_V3" + 每帧 [2字节长度][负载]），
+// 直接把 mp3 塞进 m_dtVoice 会导致微信解析失败、消息发不出去。
+// 转码链路：mp3 → PCM(16bit/单声道/24kHz) → silk，与 PKC 的 pkcMp3:silkPath: 一致。
+
+#define DDTTV_SILK_SAMPLE_RATE   24000
+#define DDTTV_SILK_FRAME_MS      20
+#define DDTTV_SILK_MAX_FRAME_BYTES 250
+
+// PCM(16bit 单声道) → silk 数据
+static NSData *ddTTVPCMToSilk(const int16_t *pcm, NSUInteger totalSamples, int sampleRate, int *outDurationMs) {
+    if (!pcm || totalSamples == 0) return nil;
+
+    SKP_int32 encSizeBytes = 0;
+    if (SKP_Silk_SDK_Get_Encoder_Size(&encSizeBytes) != 0 || encSizeBytes <= 0) return nil;
+
+    void *psEnc = malloc((size_t)encSizeBytes);
+    if (!psEnc) return nil;
+    memset(psEnc, 0, (size_t)encSizeBytes);
+
+    SKP_int encStatus = 0;
+    if (SKP_Silk_SDK_InitEncoder(psEnc, &encStatus) != 0) { free(psEnc); return nil; }
+
+    SKP_SILK_SDK_EncControlStruct encControl;
+    memset(&encControl, 0, sizeof(encControl));
+    encControl.API_sampleRate        = sampleRate;
+    encControl.maxInternalSampleRate = DDTTV_SILK_SAMPLE_RATE;
+    encControl.packetSize            = (sampleRate * DDTTV_SILK_FRAME_MS) / 1000;
+    encControl.packetLossPercentage  = 0;
+    encControl.useInBandFEC          = 0;
+    encControl.useDTX                = 0;
+    encControl.complexity            = 2;
+    encControl.bitRate               = 0;   // 0 = 由 maxInternalSampleRate 自动决定
+
+    NSUInteger frameSize = (NSUInteger)encControl.packetSize;
+    if (frameSize == 0) { free(psEnc); return nil; }
+
+    SKP_int16 *frameBuf = (SKP_int16 *)calloc(frameSize, sizeof(SKP_int16));
+    if (!frameBuf) { free(psEnc); return nil; }
+
+    NSMutableData *out = [NSMutableData data];
+    const char header[] = "#!SILK_V3";
+    [out appendBytes:header length:strlen(header)];
+
+    SKP_uint8 payload[DDTTV_SILK_MAX_FRAME_BYTES];
+    NSUInteger offset = 0;
+    NSUInteger frames = 0;
+
+    while (offset < totalSamples) {
+        NSUInteger n = MIN(frameSize, totalSamples - offset);
+        memset(frameBuf, 0, frameSize * sizeof(SKP_int16));
+        memcpy(frameBuf, pcm + offset, n * sizeof(SKP_int16));
+
+        SKP_int16 nBytes = 0;
+        SKP_int ret = SKP_Silk_SDK_Encode(psEnc, &encControl, frameBuf, (SKP_int16)frameSize, payload, &nBytes);
+        if (ret != 0) break;
+        if (nBytes > 0) {
+            // iOS 为小端，长度直接按 2 字节写入即为 silk 要求的 LE 顺序
+            int16_t lenLE = (int16_t)nBytes;
+            [out appendBytes:&lenLE length:sizeof(lenLE)];
+            [out appendBytes:payload length:(NSUInteger)nBytes];
+            frames++;
+        }
+        offset += n;
+    }
+
+    free(frameBuf);
+    free(psEnc);
+
+    if (outDurationMs) *outDurationMs = (int)(frames * DDTTV_SILK_FRAME_MS);
+    return (frames > 0) ? out : nil;
+}
+
+// 用 ExtAudioFile 把 mp3 解码成 PCM(16bit/单声道/目标采样率)
+static NSData *ddTTVDecodeMP3ToPCM(NSData *mp3Data, int targetSampleRate) {
+    if (!mp3Data.length) return nil;
+    NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"ddttv_%ld.mp3", (long)time(NULL)]];
+    if (![mp3Data writeToFile:tmpPath atomically:YES]) return nil;
+
+    NSURL *url = [NSURL fileURLWithPath:tmpPath];
+    ExtAudioFileRef audioFile = NULL;
+    if (ExtAudioFileOpenURL((__bridge CFURLRef)url, &audioFile) != noErr) {
+        [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+        return nil;
+    }
+
+    AudioStreamBasicDescription clientFormat;
+    memset(&clientFormat, 0, sizeof(clientFormat));
+    clientFormat.mSampleRate       = (Float64)targetSampleRate;
+    clientFormat.mFormatID         = kAudioFormatLinearPCM;
+    clientFormat.mFormatFlags      = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    clientFormat.mChannelsPerFrame = 1;
+    clientFormat.mBitsPerChannel   = 16;
+    clientFormat.mFramesPerPacket  = 1;
+    clientFormat.mBytesPerFrame    = 2;
+    clientFormat.mBytesPerPacket   = 2;
+
+    if (ExtAudioFileSetProperty(audioFile, kExtAudioFileProperty_ClientDataFormat,
+                                sizeof(clientFormat), &clientFormat) != noErr) {
+        ExtAudioFileDispose(audioFile);
+        [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+        return nil;
+    }
+
+    NSMutableData *pcm = [NSMutableData data];
+    const NSUInteger chunkFrames = 4096;
+    int16_t *buffer = (int16_t *)malloc(chunkFrames * sizeof(int16_t));
+    if (buffer) {
+        AudioBufferList bufferList;
+        memset(&bufferList, 0, sizeof(bufferList));
+        bufferList.mNumberBuffers = 1;
+        bufferList.mBuffers[0].mNumberChannels = 1;
+        bufferList.mBuffers[0].mData = buffer;
+
+        while (1) {
+            UInt32 frames = (UInt32)chunkFrames;
+            bufferList.mBuffers[0].mDataByteSize = (UInt32)(chunkFrames * sizeof(int16_t));
+            if (ExtAudioFileRead(audioFile, &frames, &bufferList) != noErr || frames == 0) break;
+            [pcm appendBytes:buffer length:(NSUInteger)frames * sizeof(int16_t)];
+        }
+        free(buffer);
+    }
+
+    ExtAudioFileDispose(audioFile);
+    [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+    return pcm.length ? pcm : nil;
+}
+
+// mp3 数据 → silk 数据（微信语音消息可直接发送的格式）
+static NSData *ddTTVMp3ToSilk(NSData *mp3Data, int *outDurationMs) {
+    NSData *pcm = ddTTVDecodeMP3ToPCM(mp3Data, DDTTV_SILK_SAMPLE_RATE);
+    if (!pcm.length) return nil;
+    return ddTTVPCMToSilk((const int16_t *)pcm.bytes, pcm.length / sizeof(int16_t),
+                          DDTTV_SILK_SAMPLE_RATE, outDurationMs);
+}
+
 // ===================== 语音消息发送 =====================
 
 // 构造语音消息并发送（msgType 34 = 语音消息；silk 数据通过 m_dtVoice 设置）
 // 注：完整语音发送依赖微信 CDN 上传链路，此处用 CMessageMgr AddMsg 走微信统一出口。
-static BOOL ddTTVSendVoiceMessage(NSData *audioData, NSString *toUser) {
-    if (!audioData.length || !toUser.length) return NO;
+// silkData 必须是 silk 编码数据（见 ddTTVMp3ToSilk），durationMs 为语音时长
+static BOOL ddTTVSendVoiceMessage(NSData *silkData, NSString *toUser, int durationMs) {
+    if (!silkData.length || !toUser.length) return NO;
     Class msgWrapCls = objc_getClass("CMessageWrap");
     Class msgMgrCls  = objc_getClass("CMessageMgr");
     if (!msgWrapCls || !msgMgrCls) return NO;
@@ -727,11 +959,11 @@ static BOOL ddTTVSendVoiceMessage(NSData *audioData, NSString *toUser) {
     CMessageWrap *wrap = [msgWrapCls initWithMsgType:34 nsFromUsr:nil];
     if (!wrap) return NO;
     wrap.m_nsToUsr = toUser;
-    wrap.m_uiVoiceFormat = 4;      // silk 格式
+    wrap.m_uiVoiceFormat = 4;      // 4 = silk 编码
     wrap.m_uiVoiceEndFlag = 1;
     wrap.m_uiCreateTime = (unsigned int)time(NULL);
-    wrap.m_uiVoiceTime = 3000;     // 3 秒占位
-    wrap.m_dtVoice = audioData;
+    wrap.m_uiVoiceTime = (unsigned int)(durationMs > 0 ? durationMs : 1000);  // 毫秒
+    wrap.m_dtVoice = silkData;
 
     id mgr = [[msgMgrCls alloc] init];
     if (!mgr) return NO;
@@ -752,26 +984,40 @@ static void ddTTVConvertAndSend(NSString *text, NSString *toUser) {
     ddTTVToast(@"正在合成语音…");
 
     ddTTVSynthesizeWithVoice(text, voiceID, cfg.speed, cfg.volume, ^(NSData *audioData, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (error || !audioData.length) {
+        if (error || !audioData.length) {
+            dispatch_async(dispatch_get_main_queue(), ^{
                 ddTTVToast(error ? [NSString stringWithFormat:@"合成失败：%@", error.localizedDescription] : @"合成失败");
-                return;
-            }
-            // 落盘到缓存目录
-            NSString *fileName = [NSString stringWithFormat:@"ttv_%ld.mp3", (long)time(NULL)];
-            NSString *filePath = [ddTTVAudioDir() stringByAppendingPathComponent:fileName];
-            [audioData writeToFile:filePath atomically:YES];
+            });
+            return;
+        }
+        // mp3 落盘
+        NSString *baseName = [NSString stringWithFormat:@"ttv_%ld", (long)time(NULL)];
+        NSString *mp3Path = [[ddTTVAudioDir() stringByAppendingPathComponent:baseName]
+                             stringByAppendingPathExtension:@"mp3"];
+        [audioData writeToFile:mp3Path atomically:YES];
 
-            // 背景音
-            ddTTVPlayBackgroundMusic();
-
-            if (toUser.length) {
-                // 发送语音消息
-                BOOL ok = ddTTVSendVoiceMessage(audioData, toUser);
-                ddTTVToast(ok ? @"语音已发送" : @"语音已保存(发送失败)");
-            } else {
-                ddTTVToast([NSString stringWithFormat:@"语音已保存：%@", fileName]);
+        // mp3 → silk：CPU 密集，放后台线程，避免卡住 UI
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            int durationMs = 0;
+            NSData *silk = ddTTVMp3ToSilk(audioData, &durationMs);
+            if (silk.length) {
+                NSString *silkPath = [[ddTTVAudioDir() stringByAppendingPathComponent:baseName]
+                                      stringByAppendingPathExtension:@"silk"];
+                [silk writeToFile:silkPath atomically:YES];
             }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!silk.length) {
+                    ddTTVToast(@"silk 转码失败，已保存 mp3");
+                    return;
+                }
+                ddTTVPlayBackgroundMusic();
+                if (toUser.length) {
+                    BOOL ok = ddTTVSendVoiceMessage(silk, toUser, durationMs);
+                    ddTTVToast(ok ? @"语音已发送" : @"语音已保存(发送失败)");
+                } else {
+                    ddTTVToast([NSString stringWithFormat:@"语音已保存：%@.silk", baseName]);
+                }
+            });
         });
     });
 }
@@ -904,7 +1150,9 @@ static void ddTTVEnsureLongPress(UIView *view) {
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3;
 @end
 
-@interface DDTextToVoiceSettingsViewController : UIViewController
+@class DDTTVVoiceListViewController;
+
+@interface DDTextToVoiceSettingsViewController : UIViewController <UIDocumentPickerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
 @end
 
@@ -983,11 +1231,7 @@ static void ddTTVEnsureLongPress(UIView *view) {
                                      target:self
                                       title:[NSString stringWithFormat:@"7. 琅琅 Token：%@",
                                              [self dd_masked:[cfg stringForKey:kDDTTVLangToken]]]]];
-    [sec4 addCell:[cellCls normalCellForSel:@selector(setXFUid:)
-                                     target:self
-                                      title:[NSString stringWithFormat:@"8. 讯飞 UID：%@",
-                                             [cfg stringForKey:kDDTTVXFUid] ?: @"未设置"]]];
-    [sec4 setFooterTitle:@"琅琅音色需填 Token"];
+    [sec4 setFooterTitle:@"琅琅音色需填 Token（讯飞无需配置）"];
     [self.tableViewMgr addSection:sec4];
 
     [self.tableViewMgr reloadTableView];
@@ -999,47 +1243,23 @@ static void ddTTVEnsureLongPress(UIView *view) {
     [self buildTable];
 }
 
-// 2. 设置音色（琅琅音色 / 讯飞音色）
+// 2. 设置音色：用 UITableView 展示（带头像/试听/左滑删除）
 - (void)setVoice:(id)sender {
-    UIWindow *win = ddTTVCurrentKeyWindow();
-    if (!win) return;
-    Class sheetCls = objc_getClass("WCActionSheet");
-
-    // 先选分类（琅琅音色 / 讯飞音色）
-    NSArray *lang = ddTTVLangVoices();
-    NSArray *xf   = ddTTVXFVoices();
-    WCActionSheet *catSheet = [(WCActionSheet *)[sheetCls alloc] initWithTitle:@"选择音色分类"];
-    if (!catSheet) return;
-    [catSheet addButtonWithTitle:[NSString stringWithFormat:@"琅琅音色 (%lu)", (unsigned long)lang.count]
-                     eventAction:^{ [self showVoiceList:lang title:@"琅琅音色"]; }];
-    [catSheet addButtonWithTitle:[NSString stringWithFormat:@"讯飞音色 (%lu)", (unsigned long)xf.count]
-                     eventAction:^{ [self showVoiceList:xf title:@"讯飞音色"]; }];
-    [catSheet showInView:win];
-}
-
-// 展示某一分类的音色列表
-- (void)showVoiceList:(NSArray<NSDictionary *> *)voices title:(NSString *)title {
-    if (!voices.count) { ddTTVToast(@"暂无音色，请先刷新音色列表"); return; }
-    UIWindow *win = ddTTVCurrentKeyWindow();
-    if (!win) return;
-    Class sheetCls = objc_getClass("WCActionSheet");
-    WCActionSheet *sheet = [(WCActionSheet *)[sheetCls alloc]
-        initWithTitle:[NSString stringWithFormat:@"%@ (%lu)", title, (unsigned long)voices.count]];
-    if (!sheet) return;
-    DDTextToVoiceConfig *cfg = DDTextToVoiceConfig.shared;
-    NSString *cur = ddTTVCurrentVoiceID();
-    for (NSDictionary *v in voices) {
-        NSString *mark = [v[@"id"] isEqualToString:cur] ? @"✓ " : @"";
-        NSString *desc = v[@"desc"];
-        NSString *btnTitle = desc.length ? [NSString stringWithFormat:@"%@%@  %@", mark, v[@"name"], desc]
-                                         : [NSString stringWithFormat:@"%@%@", mark, v[@"name"]];
-        [sheet addButtonWithTitle:btnTitle eventAction:^{
-            [cfg setValue:v[@"id"] forConfigKey:kDDTTVVoiceIDDefault];
-            ddTTVToast([NSString stringWithFormat:@"已设置音色：%@", v[@"name"]]);
-            [self buildTable];
-        }];
-    }
-    [sheet showInView:win];
+    DDTTVVoiceListViewController *vc = [[DDTTVVoiceListViewController alloc] init];
+    vc.groups  = ddTTVVoiceGroups();
+    vc.sections = @[kDDTTVTypeLang, kDDTTVTypeXF];
+    vc.onSelect = ^(NSString *vid, NSString *name) {
+        [DDTextToVoiceConfig.shared setValue:vid forConfigKey:kDDTTVVoiceIDDefault];
+        ddTTVToast([NSString stringWithFormat:@"已设置音色：%@", name]);
+        [self buildTable];
+    };
+    vc.onDeleted = ^{ [self buildTable]; };
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    vc.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"完成"
+                                         style:UIBarButtonItemStyleDone
+                                       handler:^(__unused id a) { [nav dismissViewControllerAnimated:YES completion:nil]; }];
+    ddTTVPresentVC(nav);
 }
 
 // Token 脱敏显示
@@ -1052,11 +1272,6 @@ static void ddTTVEnsureLongPress(UIView *view) {
 // 7. 琅琅 Token
 - (void)setLangToken:(id)sender {
     [self dd_editConfig:kDDTTVLangToken title:@"琅琅 Token" placeholder:@"在 lang123.top 个人中心获取" secure:YES];
-}
-
-// 8. 讯飞 UID
-- (void)setXFUid:(id)sender {
-    [self dd_editConfig:kDDTTVXFUid title:@"讯飞 UID" placeholder:@"可留空" secure:NO];
 }
 
 // 通用配置编辑弹窗
@@ -1091,15 +1306,38 @@ static void ddTTVEnsureLongPress(UIView *view) {
 }
 
 // 4. 导入背景音
+// 4. 导入背景音：从「文件」App 选择音频文件（UIDocumentPickerViewController）
 - (void)importBg:(id)sender {
-    UIWindow *win = ddTTVCurrentKeyWindow();
-    UIViewController *vc = win.rootViewController;
-    if (!vc) return;
-    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = @[@"public.movie"]; // 视频选背景音(实际用音频需真机适配)
-    [vc presentViewController:picker animated:YES completion:nil];
-    ddTTVToast(@"请在文件App中放入背景音，或从视频提取(需进一步适配)");
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.audio"]
+                                                               inMode:UIDocumentPickerModeImport];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    ddTTVPresentVC(picker);
+}
+
+// UIDocumentPickerDelegate：把选中的音频拷进 BgDir 并设为当前背景音
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    for (NSURL *url in urls) {
+        if (![url startAccessingSecurityScopedResource]) continue;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *name = [url lastPathComponent];
+        NSString *dest = [ddTTVBgDir() stringByAppendingPathComponent:name];
+        [fm removeItemAtPath:dest error:nil];
+        BOOL ok = [fm copyItemAtPath:url.path toPath:dest error:nil];
+        [url stopAccessingSecurityScopedResource];
+        if (ok) {
+            [DDTextToVoiceConfig.shared setValue:dest forConfigKey:kDDTTVBgFilePath];
+            ddTTVToast([NSString stringWithFormat:@"已导入背景音：%@", name]);
+        } else {
+            ddTTVToast(@"背景音导入失败");
+        }
+        break;
+    }
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    // 用户取消，无需处理
 }
 
 // 5. 设置背景音
@@ -1126,6 +1364,211 @@ static void ddTTVEnsureLongPress(UIView *view) {
 }
 
 @end
+
+// ===================== 音色列表（图标 / 试听 / 删除） =====================
+
+@interface DDTTVVoiceCell : UITableViewCell
+@property (nonatomic, strong) UIImageView *iconView;
+@property (nonatomic, strong) UILabel *nameLabel;
+@property (nonatomic, strong) UILabel *descLabel;
+@property (nonatomic, strong) UIButton *previewBtn;
+@property (nonatomic, copy)   NSDictionary *voice;
+@property (nonatomic, copy)   void (^onPreview)(NSDictionary *voice);
+- (void)configure:(NSDictionary *)voice selected:(BOOL)sel;
+@end
+
+@implementation DDTTVVoiceCell
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
+    if (self = [super initWithStyle:style reuseIdentifier:reuseIdentifier]) {
+        _iconView = [[UIImageView alloc] initWithFrame:CGRectMake(12, 11, 44, 44)];
+        _iconView.layer.cornerRadius = 22; _iconView.clipsToBounds = YES;
+        _iconView.backgroundColor = [UIColor colorWithWhite:0.9 alpha:1];
+        _iconView.contentMode = UIViewContentModeScaleAspectFill;
+        [self.contentView addSubview:_iconView];
+
+        _nameLabel = [[UILabel alloc] initWithFrame:CGRectMake(68, 10, 180, 20)];
+        _nameLabel.font = [UIFont boldSystemFontOfSize:16];
+        [self.contentView addSubview:_nameLabel];
+
+        _descLabel = [[UILabel alloc] initWithFrame:CGRectMake(68, 32, 200, 26)];
+        _descLabel.font = [UIFont systemFontOfSize:12];
+        _descLabel.textColor = [UIColor grayColor];
+        _descLabel.numberOfLines = 2;
+        [self.contentView addSubview:_descLabel];
+
+        _previewBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        _previewBtn.frame = CGRectMake(0, 0, 56, 32);
+        [_previewBtn setTitle:@"▶ 试听" forState:UIControlStateNormal];
+        _previewBtn.titleLabel.font = [UIFont systemFontOfSize:13];
+        [_previewBtn addTarget:self action:@selector(ddTTVPreviewTapped) forControlEvents:UIControlEventTouchUpInside];
+        self.accessoryView = _previewBtn;
+    }
+    return self;
+}
+
+- (void)ddTTVPreviewTapped {
+    if (_onPreview) _onPreview(_voice);
+}
+
+- (void)configure:(NSDictionary *)voice selected:(BOOL)sel {
+    _voice = voice;
+    // accessoryView 已被「试听」按钮占用，勾选用文字前缀+蓝色高亮表达（accessoryType 与 accessoryView 互斥）
+    NSString *name = voice[@"name"] ?: @"";
+    _nameLabel.text = sel ? [NSString stringWithFormat:@"✓ %@", name] : name;
+    _nameLabel.textColor = sel ? [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1]
+                               : [UIColor blackColor];
+    _descLabel.text = voice[@"desc"] ?: @"";
+    _iconView.image = nil;
+    __weak typeof(self) w = self;
+    ddTTVLoadVoiceIcon(voice[@"img"], voice[@"id"], ^(UIImage *img) {
+        if (w && img) w.iconView.image = img;
+    });
+}
+
+@end
+
+@interface DDTTVVoiceListViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, copy)   NSArray<NSString *> *sections;   // 分类名（琅琅/讯飞）
+@property (nonatomic, copy)   NSDictionary<NSString *, NSArray<NSDictionary *> *> *groups;
+@property (nonatomic, copy)   void (^onSelect)(NSString *vid, NSString *name);
+@property (nonatomic, copy)   void (^onDeleted)(void);
+@end
+
+@implementation DDTTVVoiceListViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"选择音色";
+    self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
+    self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    [self.tableView registerClass:[DDTTVVoiceCell class] forCellReuseIdentifier:@"vcell"];
+    [self.view addSubview:self.tableView];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return (NSInteger)self.sections.count;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return (NSInteger)[self.groups[self.sections[section]] count];
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    NSString *name = self.sections[section];
+    return [NSString stringWithFormat:@"%@ (%lu)", name, (unsigned long)[self.groups[name] count]];
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    return 66;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    DDTTVVoiceCell *cell = [tableView dequeueReusableCellWithIdentifier:@"vcell" forIndexPath:indexPath];
+    NSDictionary *voice = self.groups[self.sections[indexPath.section]][indexPath.row];
+    BOOL sel = [voice[@"id"] isEqualToString:ddTTVCurrentVoiceID()];
+    [cell configure:voice selected:sel];
+    __weak typeof(self) w = self;
+    cell.onPreview = ^(NSDictionary *v) {
+        ddTTVToast(@"试听中…");
+        ddTTVPreviewVoice(v, ^(BOOL ok, NSString *err) {
+            if (!ok) ddTTVToast(err ?: @"试听失败");
+        });
+        (void)w;
+    };
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSDictionary *voice = self.groups[self.sections[indexPath.section]][indexPath.row];
+    if (self.onSelect) self.onSelect(voice[@"id"], voice[@"name"]);
+    [tableView reloadSections:[NSIndexSet indexSetWithIndex:indexPath.section] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+// 左滑删除：删除后该音色从列表永久消失（不可恢复）
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSDictionary *voice = self.groups[self.sections[indexPath.section]][indexPath.row];
+    __weak typeof(self) w = self;
+    UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
+                                                                       title:@"删除"
+                                                                     handler:^(__unused UIContextualAction *a, __unused UIView *v, void (^done)(BOOL)) {
+        ddTTVDeleteVoice(voice[@"id"]);
+        [tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationAutomatic];
+        if (w.onDeleted) w.onDeleted();
+        done(YES);
+    }];
+    return [UISwipeActionsConfiguration configurationWithActions:@[del]];
+}
+
+@end
+
+// ===================== 长按消息菜单：转语音 =====================
+// 参考 PKC：在微信消息气泡长按菜单追加「转语音」，把该条文字消息合成为语音并发送。
+// 实现要点（不同微信版本私有方法名可能略有差异，以下为通用写法）：
+//   1. hook MMMenuController setMenuItems: 给菜单追加 UIMenuItem(转语音)
+//   2. hook MMMenuController setTargetView: 时，沿 responder 链尝试取出被长按消息的 CMessageWrap
+//   3. hook BaseMessageCellView canPerformAction: 让菜单项可点，并实现 ddTTVTransToVoice:
+
+static __strong CMessageWrap *ddTTVLongPressedWrap = nil;
+
+@interface MMMenuController : NSObject
+- (void)setMenuItems:(NSArray *)items;
+- (void)setTargetView:(UIView *)view;
+@end
+
+@interface BaseMessageCellView : UIView
+@end
+
+%hook MMMenuController
+- (void)setMenuItems:(NSArray *)items {
+    NSMutableArray *arr = [items mutableCopy] ?: [NSMutableArray array];
+    BOOL has = NO;
+    for (UIMenuItem *it in arr) {
+        if ([it isKindOfClass:[UIMenuItem class]] && [it.title isEqualToString:@"转语音"]) { has = YES; break; }
+    }
+    if (!has) {
+        [arr addObject:[[UIMenuItem alloc] initWithTitle:@"转语音" action:@selector(ddTTVTransToVoice:)]];
+    }
+    %orig(arr);
+}
+- (void)setTargetView:(UIView *)view {
+    %orig;
+    ddTTVLongPressedWrap = nil;
+    UIView *v = view;
+    while (v) {
+        CMessageWrap *w = nil;
+        if ([v respondsToSelector:@selector(messageWrap)])     { @try { w = [v messageWrap]; }     @catch (id e) { w = nil; } }
+        if (!w && [v respondsToSelector:@selector(m_messageWrap)]) { @try { w = [v m_messageWrap]; } @catch (id e) { w = nil; } }
+        if (w) { ddTTVLongPressedWrap = w; break; }
+        v = v.superview ?: (UIView *)[v nextResponder];
+        if (!v) break;
+    }
+}
+%end
+
+%hook BaseMessageCellView
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(ddTTVTransToVoice:)) return YES;
+    return %orig;
+}
+- (void)ddTTVTransToVoice:(id)sender {
+    CMessageWrap *wrap = ddTTVLongPressedWrap;
+    if (!wrap) { ddTTVToast(@"未获取到消息内容"); return; }
+    if (wrap.m_uiMessageType == 1 && wrap.m_nsContent.length) {
+        // 会话对方：发出消息取 m_nsToUsr，收到消息取 m_nsFromUsr（均为对方账号）
+        BOOL isSender = [objc_getClass("CMessageWrap") isSenderFromMsgWrap:wrap];
+        NSString *toUser = (isSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr) ?: wrap.m_nsToUsr ?: @"";
+        ddTTVConvertAndSend(wrap.m_nsContent, toUser);
+    } else {
+        ddTTVToast(@"仅支持文字消息转语音");
+    }
+}
+%end
 
 // ===================== 注册入口 =====================
 
