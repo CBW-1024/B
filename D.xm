@@ -1,1098 +1,169 @@
-// VCAM — 相机/麦克风虚拟替换插件（Theos / Logos）
-//
-// 将软件的相机画面与麦克风声音，替换为用户导入的本地视频/音频素材。
-// 双指双击任意窗口弹出控制面板，导入素材并开关各项替换。
-//
-// 按软件内部采集通道分四条链路拦截：
-//   · AVCaptureVideoDataOutput  拍摄/录像的画面采集回调
-//   · WeVisVoipEffectMgr        视频通话的逐帧处理
-//   · AVCaptureAudioDataOutput  拍摄/录像的音频采集回调
-//   · AudioUnitRender           视频通话的麦克风采集（裸 PCM）
-//
-// 前三条投递 CMSampleBuffer，第四条是裸 PCM 字节流，故音频有两套实现：
-//   AVCapture 链路按帧取用，AudioUnit 链路把整段素材预解码成 PCM 后按偏移切片播出。
-//
-// 画面流向：素材 → AVAssetReader 取帧 → 旋转/镜像/等比居中 →
-// CIContext 渲染到与采集帧同尺寸同格式的 CVPixelBuffer → 套用采集帧时序 → 新的 CMSampleBuffer。
-//
-// 容错约定：帧构建与音频拉取均跑在实时线程，任一步抛异常仅本帧降级
-// （返回 NULL / 透传真实音视频 / 静音填充），下帧自动重试；不置全局标志、不关总开关。
-// g_mediaLock 为不可重入 NSLock，持锁函数内部不得再调用任何会加锁的函数；
-// 含 return 的 @try 必须用 @finally 解锁，否则异常路径会漏解锁后卡死。
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <AVFoundation/AVFoundation.h>
-#import <AVFAudio/AVFAudio.h>
-#import <CoreMedia/CoreMedia.h>
-#import <CoreVideo/CoreVideo.h>
-#import <CoreImage/CoreImage.h>
-#import <CoreGraphics/CoreGraphics.h>
-#import <QuartzCore/QuartzCore.h>
-#import <ImageIO/ImageIO.h>
-#import <AudioToolbox/AudioToolbox.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
-#import <substrate.h>
-#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
-#import <os/lock.h>
+#import <UIKit/UIKit.h>
+#import <dlfcn.h>
 
-#pragma mark - 配置开关
-static BOOL g_isReplace  = YES;     // YES=替换画面，NO=透传真实摄像头
-static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
-static BOOL g_isSound    = YES;     // 是否替换麦克风采集
-static BOOL g_isMirrored = YES;     // 是否对源画面左右镜像
-static int  g_rotation   = 90;      // 0 / 90 / 180 / 270（非开关，循环取值）
+// ============================================================================
+// NC — 微信反检测 / 多开保活层
+//
+// 1:1 对齐 WCRefine 的 -[NSBundle bundleIdentifier] hook（2026-08-29 逐指令反汇编核实）
+// ────────────────────────────────────────────────────────────────────────────
+// WCRefine 确实 hook 了 -[NSBundle bundleIdentifier]，证据链（铁证，全部来自本机二进制）：
+//
+// ▸ hook 注册（构造函数 @0x15826f4，封装自 MSHookMessageEx）：
+//       adrp x0, 0x1daa000 ; +0x764 → "NSBundle"
+//       bl   0x1ca5afc     ; objc_getClass("NSBundle")
+//       ldr  x1, [x8,#0x3b0] ; @selector(bundleIdentifier)  (selref 0x20533b0)
+//       adrp x2, 0x1582000 ; +0xec0  → replacement IMP = 0x1582ec0
+//       adrp x3, 0x2203000 ; +0x458  → &orig @ 0x2203458
+//       bl   0x1ca5328     ; MSHookMessageEx(NSBundle, bundleIdentifier, repl, &orig)
+//
+// ▸ replacement IMP @0x1582ec0 的三层门控（与下列 NC 实现逐条对应）：
+//   ① 全局开关字节 @0x2203560 (bit0)：为 0 → 直接走 orig 返回【真实 bid】。
+//      该字节初始为 0，由 FaceRecogFlashHandler initPipeline 置 1（dealloc 置 0），
+//      故"启动/推送注册"阶段读到真实 bid（APNs 正常），initPipeline 后才进入伪装态。
+//   ② self==[NSBundle mainBundle] 判定（classref@0x2073560=NSBundle +
+//      @selector(mainBundle)@0x204a800 比较）：非主包 → 返回【真实 bid】
+//   ③ 调用 0x159556c() 辅助判定 —— 这是对齐的核心，见下。返回 1 →
+//      CFString @0x1f8fe88 = @"com.tencent.xin"；返回 0 → orig 真实 bid。
+//
+// ▸ 辅助函数 0x159556c 的真实机制（已逐 selector 解析，非"会话态"）：
+//       A  = objc_msgSend(classref@0x2073670=NSThread,
+//                         @selector(callStackReturnAddresses)@0x205e818)
+//            → [NSThread callStackReturnAddresses]   (NSArray<NSNumber*>，栈返回地址)
+//       B  = objc_msgSend(A, @selector(count)@0x204a340)
+//       if (B <= 2)  → return 0  (栈太浅，不伪装)
+//       C  = objc_msgSend(A, @selector(objectAtIndexedSubscript:)@0x204a6c8, 2)  → 栈帧2地址
+//       D  = objc_msgSend(C, @selector(unsignedLongLongValue)@0x204b530)         → 地址转 u64
+//       再取 classref@0x20734c0 配置类的 stringWithUTF8String:@0x204d530 结果，
+//       与 [NSBundle mainBundle].bundlePath(@0x205c990) 做
+//       length@0x204a398 / hasPrefix:@0x204a380 字符串前缀匹配，最终定 0 或 1。
+//   ⇒ WCR 用【调用栈返回地址 + 主包 bundlePath 字符串前缀匹配】判定是否处于
+//     "需要伪装的调用上下文"。默认（不命中）返回真实 bid；命中时返回 com.tencent.xin。
+//
+//   这解释了 WCR 为什么"完美"：它【不是全局伪装、也不是手动会话态标志】，而是
+//   【默认真实 bid，仅当调用栈命中登录/鉴权深层路径才伪装】。推送令牌注册发生在
+//   登录前的浅栈调用里 → 读到真实 bid → APNs 按真实 bid(com.tencent.qy.xin) 派发；
+//   登录/长连接(Mars)鉴权在深层调用栈里 → 命中 → 伪装成官方 bid → 过服务端校验。
+//
+// ── 本实现的 1:1 对齐策略 ──────────────────────────────────────────────────
+// 机制逐条对齐 WCR：① 开关 + ② 主包判定 + ③ 调用栈判定；【默认真实 bid，
+// 仅"主包 + 调用者位于主程序镜像"才伪装】。多开装包 bid 非 com.tencent.xin
+// （如 com.tencent.qy.xin）时，微信服务端在 登录 / 长连接(Mars)鉴权 时按官方
+// bid 校验 app 身份 → 非官方直接被拒；故登录/鉴权链须伪装成 com.tencent.xin，
+// 其余（含推送注册，通常由框架发起）一律真实 bid。
+//
+// ③ 调用栈判定的 1:1 还原说明：WCR 的 0x159556c 取 [NSThread callStackReturnAddresses]
+// 的 A[2]（即 bundleIdentifier 的调用点返回地址），将该地址经配置类 NSString 化后
+// 与主包路径做 hasPrefix:/length 匹配。配置串来自 WCR 运行时/远端、本机静态不可见，
+// 故以「调用者镜像 == 主程序 executablePath」精确近似：只命中"主程序镜像内"的调用
+// （登录/鉴权多在此），天然排除"框架镜像"调用（推送/SDK 多在此）→ 推送拿真实 bid、
+// APNs 不丢，比"关键词匹配"更贴近 WCR 的"调用者镜像"语义。
+// 若实测某次登录未命中（登录链恰好不在主程序镜像），把该场景的 backtrace 给我再放宽。
+// ============================================================================
 
-#pragma mark - reader 重建标记
-// 置位后由下一帧开头重建对应 reader；不在取帧失败的同帧重建（刚 startReading 的 reader 首帧必取不到）。
-static BOOL g_videoReload = NO;
-static BOOL g_audioReload = NO;
+// 官方微信 bundle id（伪装目标）
+#define WC_OFFICIAL_BID @"com.tencent.xin"
 
-#pragma mark - 沙箱路径
-static NSString *g_videoDir      = nil;
-static NSString *g_tempVideoPath = nil;
-static NSString *g_tempAudioPath = nil;
+// 总开关：对齐 WCR 全局字节 @0x2203560。
+// 关键时序（已逐指令核实）：该字节【初始为 0】（bid 不伪装）→
+//   FaceRecogFlashHandler initPipeline 运行时置 1（启用伪装）→
+//   FaceRecogFlashHandler dealloc 时置 0（关闭伪装）。
+// 故默认 NO（与 @0x2203560 初始 0 一致）：app 启动、推送令牌注册发生在
+// initPipeline 之前 → 读到真实 bid → APNs 正常；initPipeline 跑完后登录/鉴权
+// 读到的才是官方 bid。切勿默认 YES——否则启动即全局伪装会搞挂推送。
+// 调试时临时置 NO 即等同 WCR 该字节清零。
+static BOOL g_wcBidEnabled = NO;
 
-#pragma mark - 运行时状态
-static NSFileManager *g_fileManager = nil;
-static NSLock        *g_mediaLock   = nil;
-static CIContext     *g_ciContext   = nil;
+#pragma mark - 调用栈判定：对齐 WCR 0x159556c 的调用者镜像分析
 
-static AVAssetReader            *g_videoReader = nil;
-static AVAssetReaderTrackOutput *g_videoOutput = nil;
-static AVAssetReader            *g_audioReader = nil;
-static AVAssetReaderTrackOutput *g_audioOutput = nil;
-
-// 最近一帧源画面。reader 读完后冻结复用，避免画面闪回真实摄像头。
-static CVPixelBufferRef g_lastVideoPixel = NULL;
-
-#pragma mark - 预览显示层
-static AVSampleBufferDisplayLayer *g_displayLayer     = nil;
-static CADisplayLink              *g_displayLink      = nil;
-static AVCaptureVideoOrientation   g_videoOrientation = AVCaptureVideoOrientationPortrait;
-
-#pragma mark - 音频解码缓存
-// AudioUnit 链路用的整段 PCM：解码一次，之后按 g_audioPlayOffset 切片播出。
-static NSData        *g_fullAudioPCM    = nil;
-static NSUInteger     g_audioPlayOffset = 0;
-static os_unfair_lock g_audioOffsetLock = OS_UNFAIR_LOCK_INIT;
-static BOOL           g_isAudioDecoding = NO;
-
-#pragma mark - AudioUnit 采集状态
-static BOOL                        g_hasProbedASBD = NO;
-static AudioStreamBasicDescription g_targetASBD    = {0};
-// 按麦克风 ASBD 反推解码输出格式。AudioUnit 链路把 PCM 裸字节直接 memcpy 进麦克风 buffer，
-// 格式必须逐位对齐，否则素材与麦克风采样率/位深不一致时会变调、播放速度也不对。
-// 仅用于 AudioUnit 链路：AVCapture 链路可能先于 ASBD 探测建好 reader，那时 g_targetASBD 还是全 0。
-static NSDictionary *vcm_asbdOutputSettings(const AudioStreamBasicDescription *asbd) {
-    UInt32 flags            = asbd ? asbd->mFormatFlags : 0;
-    BOOL   isFloat          = (flags & kAudioFormatFlagIsFloat)         != 0;
-    BOOL   isBigEndian      = (flags & kAudioFormatFlagIsBigEndian)     != 0;
-    BOOL   isNonInterleaved = (flags & kAudioFormatFlagIsNonInterleaved)!= 0;
-    double sampleRate       = (asbd && asbd->mSampleRate       > 0) ? asbd->mSampleRate       : 48000.0;
-    UInt32 channels         = (asbd && asbd->mChannelsPerFrame > 0) ? asbd->mChannelsPerFrame : 1;
-    UInt32 bitDepth         = (asbd && asbd->mBitsPerChannel   > 0) ? asbd->mBitsPerChannel   : 16;
-    return @{
-        AVFormatIDKey:               @(kAudioFormatLinearPCM),
-        AVSampleRateKey:             @(sampleRate),
-        AVNumberOfChannelsKey:       @(channels),
-        AVLinearPCMBitDepthKey:      @(bitDepth),
-        AVLinearPCMIsFloatKey:       @(isFloat),
-        AVLinearPCMIsNonInterleaved: @(isNonInterleaved),
-        AVLinearPCMIsBigEndianKey:   @(isBigEndian),
-    };
+/// 对齐 WCR 辅助函数 0x159556c：用调用栈判定当前 bundleIdentifier 的调用者
+/// 是否位于【主程序可执行文件镜像】内。
+///
+/// WCR 机制：取 [NSThread callStackReturnAddresses] 的 A[2]（bundleIdentifier 的
+/// 调用点返回地址），将该地址经配置类 NSString 化后与主包路径做前缀匹配。
+/// 本实现以 dladdr 取该返回地址所属镜像路径，与目标主程序 executablePath 精确比较，
+/// 语义等价且更严格：只命中"主程序镜像内"的调用（登录/鉴权多在此），
+/// 排除"框架镜像"调用（推送/SDK 多在此）→ 推送天然拿到真实 bid，APNs 不丢。
+///
+/// 与 WCR 的偏差（已尽量收窄）：WCR 实际比较的配置串来自运行时/远端、本机不可见，
+/// 故以 executablePath 近似。其余（取 A[2]、count<=2 早退）均与 WCR 逐条一致。
+static BOOL wc_callerInMainBundle(void) {
+    NSArray<NSNumber *> *addrs = [NSThread callStackReturnAddresses];
+    if (addrs.count <= 2) return NO;                         // 对齐 WCR: B<=2 → 不伪装
+    uintptr_t pc = addrs[2].unsignedLongLongValue;            // 对齐 WCR: C = A[2]
+    Dl_info info;
+    if (dladdr((void *)pc, &info) == 0 || info.dli_fname == NULL) return NO;
+    NSString *callerImage = [NSString stringWithUTF8String:info.dli_fname];
+    // 对齐 WCR 的"主包路径前缀匹配"：用主程序可执行文件路径精确判定调用者镜像。
+    return [callerImage isEqualToString:[NSBundle mainBundle].executablePath];
 }
 
-// 容错：单帧失败仅降级透传，下帧重试，不置全局标志、不关替换总开关。
-static OSStatus (*g_origAudioUnitRender)(
-    AudioUnit                   inUnit,
-    AudioUnitRenderActionFlags  *ioActionFlags,
-    const AudioTimeStamp       *inTimeStamp,
-    UInt32                      inOutputBusNumber,
-    UInt32                      inNumberFrames,
-    AudioBufferList             *ioData
-) = NULL;
+#pragma mark - 1:1 对齐 WCR 的 bundleIdentifier 三层门控
 
-#pragma mark - 路径辅助
-static NSString *vcm_documentPath(void) {
-    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-}
-static NSString *vcm_videoPath(void) {
-    return [g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"];
-}
+// WCR replacement IMP @0x1582ec0 逐条对应：
+//   ① g_wcBidEnabled == NO             → 返回真实 bid            (对齐 @0x2203560 开关)
+//   ② self != 主包                     → 返回真实 bid            (对齐 self==mainBundle 判定)
+//   ③ wc_callerInMainBundle() == YES   → 返回 @"com.tencent.xin" (对齐 0x159556c 调用者镜像判定)
+//   其余                               → 返回真实 bid
+// 即【默认真实、调用者位于主程序镜像才伪装】，与 WCR 行为同构。
+%hook NSBundle
 
-#pragma mark - 配置存取
-static void vcm_saveSettings(void) {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d setBool:g_isReplace      forKey:@"vcam_replace"];
-    [d setBool:g_isLoop         forKey:@"vcam_loop"];
-    [d setBool:g_isSound        forKey:@"vcam_sound"];
-    [d setBool:g_isMirrored     forKey:@"vcam_mirror"];
-    [d setInteger:g_rotation    forKey:@"vcam_rotation"];
-    [d synchronize];
-}
-static void vcm_loadSettings(void) {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if ([d objectForKey:@"vcam_replace"])  g_isReplace   = [d boolForKey:@"vcam_replace"];
-    if ([d objectForKey:@"vcam_loop"])     g_isLoop      = [d boolForKey:@"vcam_loop"];
-    if ([d objectForKey:@"vcam_sound"])    g_isSound     = [d boolForKey:@"vcam_sound"];
-    if ([d objectForKey:@"vcam_mirror"])   g_isMirrored  = [d boolForKey:@"vcam_mirror"];
-    else                                   g_isMirrored  = YES;
-    if ([d objectForKey:@"vcam_rotation"]) g_rotation    = (int)[d integerForKey:@"vcam_rotation"];
-    else                                   g_rotation    = 90;
-}
+- (NSString *)bundleIdentifier {
+    NSString *real = %orig;
 
-#pragma mark - 停止 reader 与重置
-// 丢弃冻结的末帧（切换素材时调用，避免新旧素材串帧）
-static void vcm_stopReaders(void) {
-    [g_mediaLock lock];
-    if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
-    if (g_audioReader) { [g_audioReader cancelReading]; g_audioReader = nil; g_audioOutput = nil; }
-    if (g_lastVideoPixel) { CVPixelBufferRelease(g_lastVideoPixel); g_lastVideoPixel = NULL; }
-    [g_mediaLock unlock];
-}
-// 换素材 / 会话重启时让两条链路都从头来过。关键是清 g_hasProbedASBD：
-// 不清则麦克风链路认为格式已探测完，既不重新探测新会话 ASBD 也不重新解码，新素材音频进不了麦克风。
-static void vcm_reloadReaders(void) {
-    g_videoReload   = YES;
-    g_audioReload   = YES;
-    g_hasProbedASBD = NO;
-    os_unfair_lock_lock(&g_audioOffsetLock);
-    g_fullAudioPCM    = nil;
-    g_audioPlayOffset = 0;
-    os_unfair_lock_unlock(&g_audioOffsetLock);
-}
-// 恢复默认设置，清空已选素材与解码缓存
-static void vcm_resetSettings(void) {
-    g_isReplace   = NO;
-    g_isLoop      = YES;
-    g_isSound     = YES;
-    g_isMirrored  = YES;
-    g_rotation    = 90;
-    vcm_saveSettings();
-
-    vcm_stopReaders();
-    vcm_reloadReaders();
-
-    if (g_tempAudioPath) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
-    [g_fileManager removeItemAtPath:vcm_videoPath() error:nil];
-}
-
-#pragma mark - 视图控制器查找
-static UIViewController *vcm_topViewController(void) {
-    UIWindow *key = nil;
-    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
-        for (UIWindow *w in scene.windows) {
-            if (w.isKeyWindow) { key = w; break; }
-        }
-        if (!key) key = scene.windows.firstObject;
-        break;
+    // 官方包（单开 / 非多开）：原样返回，无操作
+    if ([real isEqualToString:WC_OFFICIAL_BID]) {
+        return real;
     }
-    if (!key) return nil;
-    UIViewController *vc = key.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    return vc;
-}
-
-#pragma mark - VCamMediaManager
-@interface VCamMediaManager : NSObject
-+ (void)setupVideoReaderIfNeeded;
-+ (void)setupAudioReaderIfNeeded;
-+ (CVPixelBufferRef)nextSourcePixel;
-+ (CIImage *)composedImageForTarget:(CGSize)target;
-+ (CIImage *)blackImageForTarget:(CGSize)target;
-+ (CMSampleBufferRef)makeSampleFromImage:(CIImage *)img
-                                   width:(size_t)w height:(size_t)h
-                                  format:(OSType)pfmt
-                               timingSrc:(CMSampleBufferRef)src;
-+ (CMSampleBufferRef)getVideoFrame:(CMSampleBufferRef)origSample;
-+ (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample;
-+ (void)decodeAudioToMemory;
-+ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length;
-+ (void)cleanup;
-@end
-
-@implementation VCamMediaManager
-+ (void)setupVideoReaderIfNeeded {
-    [g_mediaLock lock];
-    @try {
-        @autoreleasepool {
-            // 没标重建且 reader 还没读完 → 保持现状；缺这道门禁会每帧重建，画面永远停在第一帧。
-            if (!g_videoReload && g_videoReader &&
-                g_videoReader.status != AVAssetReaderStatusCompleted) return;
-            // 循环关闭 + reader 已读完 → 冻结末帧，不重建；循环开启时此处必须放行，否则播完就再也不动。
-            if (!g_isLoop && g_videoReader &&
-                g_videoReader.status == AVAssetReaderStatusCompleted) return;
-            g_videoReload = NO;
-
-            if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
-            NSString *path = vcm_videoPath();
-            if (![g_fileManager fileExistsAtPath:path]) return;
-            AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
-            g_videoReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
-            AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
-            // 这里不清冻结的末帧，否则循环重建 reader 失败时会闪黑帧
-            if (track) {
-                NSDictionary *settings = @{
-                    (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-                };
-                g_videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
-                [g_videoReader addOutput:g_videoOutput];
-                [g_videoReader startReading];
-            }
-        }
-    } @catch (NSException *e) {
-    } @finally {
-        // 必须是 @finally：@try/@catch 里的 return 不执行块后语句，unlock 写在块后会漏解锁，下一帧直接卡死。
-        g_videoReload = NO;
-        [g_mediaLock unlock];
+    // ① 总开关关闭 → 真实 bid
+    if (!g_wcBidEnabled) {
+        return real;
     }
-}
-
-+ (void)setupAudioReaderIfNeeded {
-    [g_mediaLock lock];
-    @try {
-        @autoreleasepool {
-            if (!g_audioReload && g_audioReader &&
-                g_audioReader.status != AVAssetReaderStatusCompleted) return;
-            if (!g_isLoop && g_audioReader &&
-                g_audioReader.status == AVAssetReaderStatusCompleted) return;
-            g_audioReload = NO;
-
-            if (g_audioReader) {
-                [g_audioReader cancelReading]; g_audioReader = nil; g_audioOutput = nil;
-            }
-            NSString *path = g_tempAudioPath;
-            if (![g_fileManager fileExistsAtPath:path]) path = vcm_videoPath();
-            if (![g_fileManager fileExistsAtPath:path]) return;
-            AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
-            AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
-            if (track) {
-                g_audioReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
-                NSDictionary *settings = @{ AVFormatIDKey: @(kAudioFormatLinearPCM) };
-                g_audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
-                g_audioOutput.alwaysCopiesSampleData = NO;
-                [g_audioReader addOutput:g_audioOutput];
-                [g_audioReader startReading];
-            }
-        }
-        // 内存 PCM 只服务 AudioUnit 链路：探测到 ASBD 说明那条链路活着才值得预解码；通话途中换素材也要补一次。
-        if (g_hasProbedASBD) [self decodeAudioToMemory];
-    } @catch (NSException *e) {
-    } @finally {
-        // 早期 return 也要保证解锁
-        g_audioReload = NO;
-        [g_mediaLock unlock];
+    // ② 非主包（其它 embedded framework）→ 真实 bid
+    if (self != [NSBundle mainBundle]) {
+        return real;
     }
-}
-
-// 把音频整段解码进内存，避免实时解码抖动；异步执行，调用方不等待。
-// 注意：可能从 setupAudioReaderIfNeeded 内部（持锁）被调用，此处不得再加 g_mediaLock。
-+ (void)decodeAudioToMemory {
-    if (!g_hasProbedASBD)   return;
-    if (g_isAudioDecoding)  return;
-    g_isAudioDecoding = YES;
-    // HIGH 队列：解码越早完成，首帧音频越早接上
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        NSMutableData *pcm = nil;
-        @try {
-            @autoreleasepool {
-                // 自建一套 reader，全程不碰 g_audioReader / g_audioOutput：那组要留给 AVCapture 链路独占，
-                // 两边同时抽同一个 output 会互相抢 buffer。
-                NSString *path = g_tempAudioPath;
-                if (![g_fileManager fileExistsAtPath:path]) path = vcm_videoPath();
-                if ([g_fileManager fileExistsAtPath:path]) {
-                    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
-                    AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
-                    if (track) {
-                        NSError *err = nil;
-                        AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
-                        if (reader && !err) {
-                            AVAssetReaderTrackOutput *output = [[AVAssetReaderTrackOutput alloc]
-                                initWithTrack:track
-                               outputSettings:vcm_asbdOutputSettings(&g_targetASBD)];
-                            output.alwaysCopiesSampleData = NO;
-                            if ([reader canAddOutput:output]) [reader addOutput:output];
-                            [reader startReading];
-                            pcm = [NSMutableData data];
-                            while (reader.status == AVAssetReaderStatusReading) {
-                                @autoreleasepool {
-                                    CMSampleBufferRef s = [output copyNextSampleBuffer];
-                                    if (!s) break;
-                                    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(s);
-                                    if (block) {
-                                        size_t len = 0, lenAtOffset = 0; char *ptr = NULL;
-                                        if (CMBlockBufferGetDataPointer(block, 0, &lenAtOffset, &len, &ptr)
-                                            == kCMBlockBufferNoErr && len > 0 && ptr) {
-                                            [pcm appendBytes:ptr length:len];
-                                        }
-                                    }
-                                    CFRelease(s);
-                                }
-                            }
-                            // 异常跳出时 reader 可能还在 Reading，收掉别占着解码器
-                            if (reader.status == AVAssetReaderStatusReading) [reader cancelReading];
-                        }
-                    }
-                }
-            }
-            // 先在锁外生成快照，锁内只做赋值，避免持锁期间抛异常把 g_audioOffsetLock 锁死。
-            // 非空才覆盖：解码失败时留着旧 PCM 继续循环，比直接静音更不容易被察觉。
-            NSData *snapshot = (pcm && pcm.length > 0) ? [pcm copy] : nil;
-            if (snapshot) {
-                os_unfair_lock_lock(&g_audioOffsetLock);
-                g_fullAudioPCM    = snapshot;
-                g_audioPlayOffset = 0;
-                os_unfair_lock_unlock(&g_audioOffsetLock);
-            }
-        } @catch (NSException *e) {
-        } @finally {
-            g_isAudioDecoding = NO;
-        }
-    });
-}
-
-// 从内存 PCM 按偏移切片，到末尾回卷，不足补 0
-+ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length {
-    if (!outData || length == 0) return;
-    // 超大请求多半是参数异常，直接静音处理
-    if (length > 0x100000) { memset(outData, 0, length); return; }
-    os_unfair_lock_lock(&g_audioOffsetLock);
-    NSUInteger total = g_fullAudioPCM ? g_fullAudioPCM.length : 0;
-    if (total == 0) {
-        os_unfair_lock_unlock(&g_audioOffsetLock);
-        memset(outData, 0, length);
-        return;
+    // ③ 调用者位于主程序镜像（登录/鉴权多在此）→ 伪装成官方 bid，过服务端校验
+    if (wc_callerInMainBundle()) {
+        return WC_OFFICIAL_BID;
     }
-    const uint8_t *base = (const uint8_t *)g_fullAudioPCM.bytes;
-    NSUInteger written = 0;
-    while (written < length) {
-        if (g_audioPlayOffset >= total) {
-            if (g_isLoop) g_audioPlayOffset = 0;
-            else break;
-        }
-        NSUInteger avail = total - g_audioPlayOffset;
-        NSUInteger need  = length - written;
-        NSUInteger chunk = MIN(avail, need);
-        memcpy(outData + written, base + g_audioPlayOffset, chunk);
-        g_audioPlayOffset += chunk;
-        written += chunk;
-    }
-    os_unfair_lock_unlock(&g_audioOffsetLock);
-    if (written < length) memset(outData + written, 0, length - written);
+    // 其余（推送注册等浅栈路径）→ 真实 bid，保住 APNs
+    return real;
 }
 
-// 从音频 reader 取一帧，套用采集帧的时序后返回（调用方负责 CFRelease）。
-// setupAudioReaderIfNeeded 内部也会加 g_mediaLock，而 NSLock 不可重入，因此重建动作必须在加锁之前完成。
-+ (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample {
-    // 取帧失败（含异常）即返回 NULL → 调用方透传真实麦克风
-    if (g_audioReload) [self setupAudioReaderIfNeeded];
-
-    CMSampleBufferRef s = NULL;
-    [g_mediaLock lock];
-    @try {
-        @autoreleasepool {
-            if (g_audioOutput) s = [g_audioOutput copyNextSampleBuffer];
-        }
-    } @catch (NSException *e) {
-    } @finally {
-        [g_mediaLock unlock];
-    }
-
-    // 取不到帧就标重建，留给下一帧开头处理
-    if (!s) g_audioReload = YES;
-    if (!s) return NULL;
-
-    CMSampleBufferRef out = NULL;
-    @try {
-        // 先用 kCMTimingInfoInvalid 兜底，原帧时序取不到时不至于拿栈上垃圾值构造输出帧
-        CMSampleTimingInfo timing = kCMTimingInfoInvalid;
-        if (origSample && CMSampleBufferGetSampleTimingInfo(origSample, 0, &timing) == noErr) {
-            CMSampleBufferRef tmp = NULL;
-            if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, s, 1, &timing, &tmp) == noErr && tmp) {
-                out = tmp;
-            }
-        }
-    } @catch (NSException *e) {
-        CFRelease(s);
-        return NULL;
-    }
-    if (out) CFRelease(s); else out = s;
-    return out;
-}
-
-// 从当前 video reader 取一帧，返回 +1 引用。不做墙钟节流：一帧采集对应一帧源；
-// 预览由采集回调 enqueue 到显示层，不存在两条链路叠加消费同一批帧的问题。
-static CVPixelBufferRef vcm_pullVideoFrame(void) {
-    CVPixelBufferRef frame = NULL;
-    [g_mediaLock lock];
-    @try {
-        @autoreleasepool {
-            if (!g_videoOutput) return NULL;
-            CMSampleBufferRef s = [g_videoOutput copyNextSampleBuffer];
-            if (s) {
-                CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(s);
-                if (pb) frame = (CVPixelBufferRef)CVPixelBufferRetain(pb);
-                CFRelease(s);
-            }
-        }
-    } @catch (NSException *e) {
-    } @finally {
-        [g_mediaLock unlock];
-    }
-    return frame;
-}
-
-// 取下一帧源视频：读完时按 g_isLoop 决定回卷重播还是冻结末帧，返回 +1 引用
-+ (CVPixelBufferRef)nextSourcePixel {
-    // 取帧失败即返回 NULL，交给调用方透传真实摄像头
-    if (g_videoReload) [self setupVideoReaderIfNeeded];
-
-    CVPixelBufferRef frame = vcm_pullVideoFrame();
-    // 取不到帧就标重建，由下一帧开头处理。不拿 reader.status 判定「读完」——
-    // status 何时变 Completed 无时序保证，依赖它会让循环永远触发不了，画面一直冻结在末帧。
-    if (!frame) g_videoReload = YES;
-
-    [g_mediaLock lock];
-    if (frame) {
-        if (g_lastVideoPixel) CVPixelBufferRelease(g_lastVideoPixel);
-        g_lastVideoPixel = (CVPixelBufferRef)CVPixelBufferRetain(frame);
-    } else if (g_lastVideoPixel) {
-        // 刚重建 reader 还没出图、或循环关闭：冻结在最后一帧，避免闪回真实摄像头
-        frame = (CVPixelBufferRef)CVPixelBufferRetain(g_lastVideoPixel);
-    }
-    [g_mediaLock unlock];
-    return frame;
-}
-
-// 旋转 + 等比居中 + 黑底合成，返回 extent 严格为 (0,0,target) 的 CIImage
-+ (CIImage *)composedImageForTarget:(CGSize)target {
-    CGFloat targetW = target.width, targetH = target.height;
-    if (targetW <= 0 || targetH <= 0) return nil;
-
-    CVPixelBufferRef pix = [self nextSourcePixel];
-    if (!pix) return nil;
-    CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
-    CVPixelBufferRelease(pix);
-    if (!img) return nil;
-
-    NSInteger orient = 1;
-    if      (g_rotation == 90)  orient = 6;
-    else if (g_rotation == 180) orient = 3;
-    else if (g_rotation == 270) orient = 8;
-    img = [img imageByApplyingOrientation:(CGImagePropertyOrientation)orient];
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    if (g_isMirrored) img = [img imageByApplyingCGOrientation:kCGImagePropertyOrientationUpMirrored];
-#pragma clang diagnostic pop
-
-    CGRect e = img.extent;
-    if (e.size.width <= 0 || e.size.height <= 0) return nil;
-
-    CGFloat scale = MIN(targetW / e.size.width, targetH / e.size.height);
-    img = [img imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
-
-    CGFloat tx = (targetW - e.size.width  * scale) / 2.0;
-    CGFloat ty = (targetH - e.size.height * scale) / 2.0;
-    img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(tx, ty)];
-
-    return [img imageByCompositingOverImage:[self blackImageForTarget:target]];
-}
-
-+ (CIImage *)blackImageForTarget:(CGSize)target {
-    return [[CIImage imageWithColor:[CIColor blackColor]]
-            imageByCroppingToRect:CGRectMake(0, 0, target.width, target.height)];
-}
-
-// 渲染成新的 CMSampleBuffer，沿用采集帧的时序与 {Exif}/{TIFF} 附件
-+ (CMSampleBufferRef)makeSampleFromImage:(CIImage *)img
-                                   width:(size_t)w height:(size_t)h
-                                  format:(OSType)pfmt
-                               timingSrc:(CMSampleBufferRef)src {
-    if (!img || w == 0 || h == 0) return NULL;
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
-    CVPixelBufferRef pb = NULL;
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pfmt,
-                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess || !pb) return NULL;
-
-    [g_ciContext render:img toCVPixelBuffer:pb
-                 bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:nil];
-
-    CMVideoFormatDescriptionRef fmtDesc = NULL;
-    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmtDesc);
-    CMSampleBufferRef out = NULL;
-    if (fmtDesc) {
-        CMSampleTimingInfo timing;
-        timing.duration              = kCMTimeInvalid;
-        timing.presentationTimeStamp = kCMTimeInvalid;
-        timing.decodeTimeStamp       = kCMTimeInvalid;
-        if (src) CMSampleBufferGetSampleTimingInfo(src, 0, &timing);
-        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, YES,
-                                           NULL, NULL, fmtDesc, &timing, &out);
-        if (out && src) {
-            CFStringRef keys[2] = { kCGImagePropertyExifDictionary, kCGImagePropertyTIFFDictionary };
-            for (int i = 0; i < 2; i++) {
-                CFTypeRef v = CMGetAttachment(src, keys[i], NULL);
-                if (v) CMSetAttachment(out, keys[i], v, kCMAttachmentMode_ShouldPropagate);
-            }
-        }
-        CFRelease(fmtDesc);
-    }
-    CVPixelBufferRelease(pb);
-    return out;
-}
-
-// 画布恒等于采集帧尺寸，旋转只作用于源画面
-+ (CMSampleBufferRef)getVideoFrame:(CMSampleBufferRef)origSample {
-    if (!origSample) return NULL;
-    // 没选素材就原样透传，不输出黑帧；素材存在但取帧失败才走黑帧兜底。
-    // 取帧/合成失败即返回 NULL 让调用方透传真实摄像头，不能走黑帧兜底——那会令画面变全黑。
-    if (![g_fileManager fileExistsAtPath:vcm_videoPath()]) return NULL;
-    CVPixelBufferRef camPix = CMSampleBufferGetImageBuffer(origSample);
-    if (!camPix) return NULL;
-
-    CGSize target = CGSizeMake((CGFloat)CVPixelBufferGetWidth(camPix),
-                               (CGFloat)CVPixelBufferGetHeight(camPix));
-    OSType pfmt = CVPixelBufferGetPixelFormatType(camPix);
-
-    CMSampleBufferRef out = NULL;
-    // 合成或渲染抛异常时本帧返回 NULL（透传真实摄像头），不关替换。帧构建跑在采集回调线程上，
-    // 异常不拦会沿采集调用栈上抛，最坏直接崩掉宿主 App。
-    @try {
-        @autoreleasepool {
-            CIImage *img = [self composedImageForTarget:target];
-            if (!img) img = [self blackImageForTarget:target];
-            out = [self makeSampleFromImage:img
-                                      width:(size_t)target.width
-                                     height:(size_t)target.height
-                                     format:pfmt
-                                  timingSrc:origSample];
-        }
-    } @catch (NSException *e) {
-        if (out) { CFRelease(out); out = NULL; }
-    }
-    return out;
-}
-
-+ (void)cleanup { vcm_stopReaders(); }
-@end
-
-#pragma mark - AudioUnitRender Hook（麦克风采集替换）
-// 麦克风采集走裸 PCM：先按当前渲染总线号探测一次目标 ASBD，之后按 ioData 的 buffer 尺寸拉 PCM 再 memcpy。
-// 全程不做格式转换——解码时按 ASBD 对齐好了。
-static OSStatus hooked_AudioUnitRender(
-    AudioUnit                   inUnit,
-    AudioUnitRenderActionFlags  *ioActionFlags,
-    const AudioTimeStamp       *inTimeStamp,
-    UInt32                      inOutputBusNumber,
-    UInt32                      inNumberFrames,
-    AudioBufferList             *ioData
-) {
-    OSStatus status = g_origAudioUnitRender(inUnit, ioActionFlags, inTimeStamp,
-                                           inOutputBusNumber, inNumberFrames, ioData);
-    if (status != noErr)                    return status;
-    if (!g_isReplace || !g_isSound)         return status;
-    // 麦克风渲染落在 bus 1 才替换；本机WX麦克风渲染即 bus 1，保留此检查。
-    if (!ioData || inOutputBusNumber != 1)  return status;
-
-    if (!g_hasProbedASBD) {
-        UInt32 propSize = sizeof(g_targetASBD);
-        // 用当前渲染总线号探测 StreamFormat；经上方 bus==1 门控后此处等价于写死 bus 1。
-        if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
-                                 kAudioUnitScope_Output, inOutputBusNumber,
-                                 &g_targetASBD, &propSize) == noErr
-            && g_targetASBD.mSampleRate > 0) {
-            g_hasProbedASBD = YES;
-            // 探测到 ASBD 只触发整段解码，不重建 reader——那会和 AVCapture 链路抢同一组 output。
-            @try {
-                [VCamMediaManager decodeAudioToMemory];
-            } @catch (NSException *e) {
-                // 探测阶段出问题还没污染输出，吞掉异常让下帧重试即可，不关替换
-            }
-        }
-    }
-    if (!g_hasProbedASBD) return status;
-
-    UInt32 size = ioData->mBuffers[0].mDataByteSize;
-    if (size == 0 || size > 0x100000) return status;
-
-    uint8_t *temp = (uint8_t *)calloc(1, size);
-    if (!temp) return status;
-    @try {
-        [VCamMediaManager pullAudioData:temp length:size];
-        for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
-            if (!ioData->mBuffers[i].mData) continue;
-            if (ioData->mBuffers[i].mDataByteSize != size) continue;
-            memcpy(ioData->mBuffers[i].mData, temp, size);
-        }
-    } @catch (NSException *e) {
-        // memcpy 阶段抛异常（极少见）时本帧已不可信，free 后返回 noErr 让 ioData 维持原样（真实麦克风），下帧重试。
-    }
-    free(temp);
-    return noErr;
-}
-
-#pragma mark - VCamVideoProxy（相机采集替换）
-@interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
-- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
-@end
-
-@implementation VCamVideoProxy {
-    __weak id _originalDelegate;
-}
-- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue { _originalDelegate = delegate; }
-
-// 采集回调里取替换帧 → 塞进预览显示层 → 再转发给原 delegate
-- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-     fromConnection:(AVCaptureConnection *)connection {
-    g_videoOrientation = connection.videoOrientation;
-
-    CMSampleBufferRef newSample = NULL;
-    if (g_isReplace) {
-        @try {
-            newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
-            // 有替换帧且显示层就绪 → flush 丢掉未显示的旧帧保证低延迟 → 入队
-            if (newSample && g_displayLayer && g_displayLayer.isReadyForMoreMediaData) {
-                [g_displayLayer flush];
-                [g_displayLayer enqueueSampleBuffer:newSample];
-            }
-        } @catch (NSException *e) {
-            // 取帧/合成异常时本帧透传真实摄像头，下帧重试，不关替换
-            newSample     = NULL;
-        }
-    }
-
-    if (_originalDelegate &&
-        [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-        [_originalDelegate captureOutput:output
-                    didOutputSampleBuffer:(newSample ?: sampleBuffer)
-                           fromConnection:connection];
-    }
-    if (newSample) CFRelease(newSample);
-}
-@end
-static VCamVideoProxy *g_videoProxy = nil;
-
-%hook AVCaptureVideoDataOutput
-- (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
-    if (!g_videoProxy) g_videoProxy = [[VCamVideoProxy alloc] init];
-    [g_videoProxy setOriginalDelegate:delegate queue:queue];
-    %orig(g_videoProxy, queue);
-}
 %end
 
-#pragma mark - VCamAudioProxy（AVCapture 音频采集替换）
-@interface VCamAudioProxy : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
-- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
-@end
+#pragma mark - FaceRecogFlashHandler Hook：对齐 WCR 的 bid 伪装生命周期开关
 
-@implementation VCamAudioProxy {
-    __weak id _origDelegate;
-}
-- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue { _origDelegate = delegate; }
+// WCR 用 FaceRecogFlashHandler 的 lifecycle 驱动 bid 伪装总开关 @0x2203560：
+//   initPipeline (replacement IMP 0x1583034): strb #1 -> @0x2203560   (启用伪装)
+//   dealloc     (replacement IMP 0x1583074): strb #0 -> @0x2203560   (关闭伪装)
+// 这正是 WCR "完美" 的关键：推送令牌注册发生在 initPipeline 之前（开关=0 → 真实 bid
+// → APNs 正常），initPipeline 跑完才进入伪装态（登录/鉴权读到的才是官方 bid）。
+// 纯透传 %orig 会漏掉置位副作用 → 伪装永不启用。两个 hook 必须保留并保持置位顺序。
+//
+// 证据锚定：wx76/微信/FaceRecogFlashHandler.h:97
+//     @interface FaceRecogFlashHandler
+//     - (void)initPipeline;        // line 97
 
-- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-     fromConnection:(AVCaptureConnection *)connection {
-    CMSampleBufferRef outBuf = sampleBuffer;
+%hook FaceRecogFlashHandler
 
-    if (g_isReplace && g_isSound) {
-        // 取帧/异常时透传真实麦克风（outBuf 维持原样），下帧重试，不关替换
-        @try {
-            CMSampleBufferRef rep = [VCamMediaManager getAudioFrame:sampleBuffer];
-            if (rep) outBuf = rep;
-        } @catch (NSException *e) {
-            outBuf = sampleBuffer;
-        }
-    }
-
-    if (_origDelegate &&
-        [_origDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-        [_origDelegate captureOutput:output didOutputSampleBuffer:outBuf fromConnection:connection];
-    }
-    if (outBuf != sampleBuffer) CFRelease(outBuf);
-}
-@end
-static VCamAudioProxy *g_audioProxy = nil;
-
-%hook AVCaptureAudioDataOutput
-- (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
-    if (!g_audioProxy) g_audioProxy = [[VCamAudioProxy alloc] init];
-    [g_audioProxy setOriginalDelegate:delegate queue:queue];
-    %orig(g_audioProxy, queue);
-}
-%end
-
-#pragma mark - WeVisVoipEffectMgr（微信视频通话逐帧替换）
-@interface WeVisVoipEffectMgr : NSObject @end
-%hook WeVisVoipEffectMgr
-- (id)processVideoSampleBuffer:(CMSampleBufferRef)sampleBuffer
-                   outputTexture:(int *)outputTexture
-                 pixelBufferFlipX:(BOOL)flipX
-             shouldIgnoreBackground:(BOOL)ignoreBg {
-    (void)outputTexture; (void)flipX; (void)ignoreBg;
-    if (!g_isReplace) { return %orig; }
-
-    CMSampleBufferRef newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
-    if (newSample) return (__bridge_transfer id)newSample;
-    return %orig;
-}
-%end
-
-#pragma mark - AVCaptureSession（会话起停）
-%hook AVCaptureSession
-- (void)startRunning {
-    // 新会话的麦克风格式可能是另一套（采样率/位深随通话类型变），不把旧的 g_targetASBD 清掉会沿用上一通格式去解码。
-    vcm_reloadReaders();
-    if (g_isReplace) {
-        [VCamMediaManager setupVideoReaderIfNeeded];
-        [VCamMediaManager setupAudioReaderIfNeeded];
-    }
+- (void)initPipeline {
+    g_wcBidEnabled = YES;   // 对齐 WCR 0x1583034：置 @0x2203560=1，启用 bid 伪装
     %orig;
 }
-- (void)stopRunning {
-    // 这里只清标志、不 reload。stopRunning 后链路可能还在收尾取帧，此时清 reader 会打断它；
-    // 内存 PCM 留着，等下次 startRunning 再清。
+
+- (void)dealloc {
+    g_wcBidEnabled = NO;    // 对齐 WCR 0x1583074：置 @0x2203560=0，关闭 bid 伪装
     %orig;
 }
+
 %end
 
-#pragma mark - AVCaptureVideoPreviewLayer（叠加预览显示层）
-// 预览叠加层用 AVSampleBufferDisplayLayer 而非普通 CALayer：帧由采集回调 enqueue，播放节奏由素材自身 PTS 决定。
-%hook AVCaptureVideoPreviewLayer
-- (void)addSublayer:(CALayer *)layer {
-    %orig;
+#pragma mark - 构造函数：初始化所有 Hook
 
-    // displayLink 只建一次，target 就是当前 preview layer
-    if (!g_displayLink) {
-        g_displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(vcm_step:)];
-        [g_displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
-    }
-    if (![[self sublayers] containsObject:g_displayLayer]) {
-        g_displayLayer = [[AVSampleBufferDisplayLayer alloc] init];
-        [self insertSublayer:g_displayLayer above:layer];
-        dispatch_async(dispatch_get_main_queue(), ^{ g_displayLayer.frame = self.bounds; });
-    }
-}
-
-// 每帧同步显示层的可见性、填充模式、位置和旋转。不在这里取帧——取帧由采集回调驱动，这里只负责把显示层跟采集层状态对齐。
-%new
-- (void)vcm_step:(CADisplayLink *)link {
-    if (!g_displayLayer) return;
-
-    // 素材不存在或不替换时把显示层透明掉，露出真实摄像头
-    BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()];
-    [g_displayLayer setOpacity:(show ? 1.0f : 0.0f)];
-    if (!show) return;
-
-    [g_displayLayer setVideoGravity:[self videoGravity]];
-    [g_displayLayer setFrame:self.bounds];
-
-    // AVSampleBufferDisplayLayer 不会像 AVCaptureVideoPreviewLayer 那样自动跟随连接方向，必须按 videoOrientation 手动补偿。
-    switch (g_videoOrientation) {
-        case AVCaptureVideoOrientationLandscapeRight:
-            g_displayLayer.transform = CATransform3DMakeRotation(M_PI_2, 0, 0, 1);
-            break;
-        case AVCaptureVideoOrientationLandscapeLeft:
-            g_displayLayer.transform = CATransform3DMakeRotation(-M_PI_2, 0, 0, 1);
-            break;
-        default:
-            g_displayLayer.transform = CATransform3DIdentity;
-            break;
-    }
-}
-%end
-
-#pragma mark - VCamMenuVC（控制菜单界面）
-@interface VCamMenuVC : UIViewController
-    <UIImagePickerControllerDelegate, UIDocumentPickerDelegate, UINavigationControllerDelegate>
-@end
-
-@implementation VCamMenuVC {
-    UIView   *_panelView;      // 面板容器
-    UIView   *_contentView;    // 面板内的内容区（状态栏 + 按钮网格）
-    UILabel  *_statusLabel;    // 素材状态文案
-    UIButton *_btnRotate;      // 旋转（循环取值，非开关）
-    UIButton *_btnLoop;        // g_isLoop
-    UIButton *_btnSound;       // g_isSound
-    UIButton *_btnMirror;      // g_isMirrored
-    UIButton *_btnReplace;     // g_isReplace
-    UIButton *_btnReset;       // 重置
-}
-
-#pragma mark - 生命周期
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    [self setupBackground];
-    [self setupPanel];
-    [self setupNavBar];
-    [self setupContent];
-    [self setupButtons];
-    [self updateStatusUI];
-}
-
-#pragma mark - UI 构建（透明背景 + 深色面板，透明背景下天然形成边界对比）
-- (void)setupBackground {
-    self.view.backgroundColor = [UIColor clearColor];
-}
-- (void)setupPanel {
-    _panelView = [[UIView alloc] init];
-    _panelView.backgroundColor = [UIColor secondarySystemBackgroundColor];
-    _panelView.layer.cornerRadius = 16;
-    _panelView.layer.masksToBounds = YES;
-    _panelView.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:_panelView];
-    [NSLayoutConstraint activateConstraints:@[
-        [_panelView.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [_panelView.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
-        [_panelView.widthAnchor    constraintEqualToConstant:320],
-    ]];
-}
-- (void)setupNavBar {
-    UIView *navBar = [[UIView alloc] init];
-    navBar.backgroundColor = [UIColor systemGray5Color];
-    navBar.translatesAutoresizingMaskIntoConstraints = NO;
-    [_panelView addSubview:navBar];
-    [NSLayoutConstraint activateConstraints:@[
-        [navBar.topAnchor      constraintEqualToAnchor:_panelView.topAnchor],
-        [navBar.leadingAnchor  constraintEqualToAnchor:_panelView.leadingAnchor],
-        [navBar.trailingAnchor constraintEqualToAnchor:_panelView.trailingAnchor],
-        [navBar.heightAnchor   constraintEqualToConstant:44],
-    ]];
-    UILabel *title = [[UILabel alloc] init];
-    title.text = @"VCAM";
-    title.font = [UIFont systemFontOfSize:[UIFont systemFontSize] weight:UIFontWeightSemibold];
-    title.textAlignment = NSTextAlignmentCenter;
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-    [navBar addSubview:title];
-    [title.centerXAnchor constraintEqualToAnchor:navBar.centerXAnchor].active = YES;
-    [title.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
-    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    [close setTitle:@"关闭" forState:UIControlStateNormal];
-    close.titleLabel.font = [UIFont systemFontOfSize:[UIFont systemFontSize]];
-    [close addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
-    close.translatesAutoresizingMaskIntoConstraints = NO;
-    [navBar addSubview:close];
-    [close.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor constant:-16].active = YES;
-    [close.centerYAnchor  constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
-}
-- (void)setupContent {
-    _contentView = [[UIView alloc] init];
-    _contentView.translatesAutoresizingMaskIntoConstraints = NO;
-    [_panelView addSubview:_contentView];
-    [NSLayoutConstraint activateConstraints:@[
-        [_contentView.topAnchor      constraintEqualToAnchor:_panelView.topAnchor constant:56],
-        [_contentView.leadingAnchor  constraintEqualToAnchor:_panelView.leadingAnchor constant:16],
-        [_contentView.trailingAnchor constraintEqualToAnchor:_panelView.trailingAnchor constant:-16],
-        [_contentView.bottomAnchor   constraintEqualToAnchor:_panelView.bottomAnchor constant:-16],
-    ]];
-    _statusLabel = [[UILabel alloc] init];
-    _statusLabel.font = [UIFont systemFontOfSize:13];
-    _statusLabel.textColor = [UIColor secondaryLabelColor];
-    _statusLabel.numberOfLines = 0;
-    _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [_contentView addSubview:_statusLabel];
-    [NSLayoutConstraint activateConstraints:@[
-        [_statusLabel.topAnchor      constraintEqualToAnchor:_contentView.topAnchor],
-        [_statusLabel.leadingAnchor  constraintEqualToAnchor:_contentView.leadingAnchor],
-        [_statusLabel.trailingAnchor constraintEqualToAnchor:_contentView.trailingAnchor],
-    ]];
-}
-- (UIButton *)addGridButton:(NSString *)title x:(CGFloat)x y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h action:(SEL)action {
-    UIButtonConfiguration *config = [UIButtonConfiguration filledButtonConfiguration];
-    config.baseBackgroundColor = [UIColor systemGray5Color];
-    config.baseForegroundColor   = [UIColor labelColor];
-    config.contentInsets = NSDirectionalEdgeInsetsMake(8, 0, 8, 0);
-    config.attributedTitle = [[NSAttributedString alloc] initWithString:title
-        attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:[UIFont systemFontSize] weight:UIFontWeightMedium]}];
-    UIButton *btn = [UIButton buttonWithConfiguration:config primaryAction:nil];
-    btn.layer.cornerRadius = 8;
-    btn.layer.masksToBounds = YES;
-    btn.frame = CGRectMake(x, y, w, h);
-    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    [_contentView addSubview:btn];
-    return btn;
-}
-- (void)setupButtons {
-    CGFloat btnW = 140, btnH = 40, gap = 8;
-    CGFloat y = 28;
-
-    [self addGridButton:@"相册选择" x:0 y:y w:btnW h:btnH action:@selector(actionSelectAlbum)];
-    [self addGridButton:@"文件选择" x:btnW + gap y:y w:btnW h:btnH action:@selector(actionSelectFile)];
-    y += btnH + gap;
-
-    _btnRotate = [self addGridButton:[NSString stringWithFormat:@"旋转 (%d°)", g_rotation] x:0 y:y w:btnW h:btnH action:@selector(toggleRotate)];
-    _btnLoop   = [self addGridButton:g_isLoop ? @"循环: 开" : @"循环: 关" x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleLoop)];
-    y += btnH + gap;
-
-    _btnSound  = [self addGridButton:g_isSound ? @"声音: 开" : @"声音: 关" x:0 y:y w:btnW h:btnH action:@selector(toggleSound)];
-    _btnMirror = [self addGridButton:g_isMirrored ? @"镜像: 开" : @"镜像: 关"
-                                  x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleMirror)];
-    y += btnH + gap;
-
-    _btnReplace = [self addGridButton:g_isReplace ? @"替换: 开" : @"替换: 关"
-                   x:0 y:y w:btnW h:btnH action:@selector(toggleReplace)];
-    _btnReset  = [self addGridButton:@"重置" x:btnW + gap y:y w:btnW h:btnH action:@selector(actionReset)];
-    y += btnH + gap;
-
-    [_panelView.heightAnchor constraintEqualToConstant:y + 56 + 16].active = YES;
-}
-
-#pragma mark - 按钮动作（开关统一 toggleXxx，动作统一 actionXxx）
-- (void)toggleRotate  { g_rotation   = (g_rotation + 90) % 360; vcm_saveSettings(); [self refreshGridButtons]; }
-- (void)toggleLoop    { g_isLoop     = !g_isLoop;     vcm_saveSettings(); [self refreshGridButtons]; }
-- (void)toggleSound   { g_isSound    = !g_isSound;    vcm_saveSettings(); [self refreshGridButtons]; }
-- (void)toggleMirror  { g_isMirrored = !g_isMirrored; vcm_saveSettings(); [self refreshGridButtons]; }
-- (void)toggleReplace { g_isReplace  = !g_isReplace;  vcm_saveSettings(); [self refreshGridButtons]; }
-- (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
-
-#pragma mark - 面板刷新
-// UIButtonConfiguration 取出来是副本，改完必须整体赋值回写
-- (void)applyTitle:(NSString *)title toButton:(UIButton *)btn withFont:(UIFont *)font {
-    if (!btn) return;
-    UIButtonConfiguration *config = btn.configuration;
-    config.attributedTitle = [[NSAttributedString alloc] initWithString:title
-        attributes:@{NSFontAttributeName: font}];
-    btn.configuration = config;
-}
-// 刷新顺序与面板网格一致：旋转 → 循环 → 声音 → 镜像 → 替换
-- (void)refreshGridButtons {
-    UIFont *font = [UIFont systemFontOfSize:[UIFont systemFontSize] weight:UIFontWeightMedium];
-    [self applyTitle:[NSString stringWithFormat:@"旋转 (%d°)", g_rotation]
-            toButton:_btnRotate withFont:font];
-    [self applyTitle:(g_isLoop     ? @"循环: 开" : @"循环: 关") toButton:_btnLoop    withFont:font];
-    [self applyTitle:(g_isSound    ? @"声音: 开" : @"声音: 关") toButton:_btnSound   withFont:font];
-    [self applyTitle:(g_isMirrored ? @"镜像: 开" : @"镜像: 关") toButton:_btnMirror  withFont:font];
-    [self applyTitle:(g_isReplace  ? @"替换: 开" : @"替换: 关") toButton:_btnReplace withFont:font];
-    [self updateStatusUI];
-}
-- (void)updateStatusUI {
-    NSString *vStat = [g_fileManager fileExistsAtPath:vcm_videoPath()] ? @"已加载" : @"未选择";
-    _statusLabel.text = [NSString stringWithFormat:@"视频: %@", vStat];
-}
-- (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
-
-#pragma mark - 文件选择
-- (void)actionSelectAlbum {
-    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = @[@"public.movie"];
-    picker.delegate = (id)self;
-    [self presentViewController:picker animated:YES completion:nil];
-}
-- (void)actionSelectFile {
-    NSArray *contentTypes = @[UTTypeMovie, UTTypeAudio];
-    UIDocumentPickerViewController *picker =
-        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:contentTypes asCopy:YES];
-    picker.delegate = (id)self;
-    picker.allowsMultipleSelection = NO;
-    [self presentViewController:picker animated:YES completion:nil];
-}
-- (void)processSelectedVideoURL:(NSURL *)url {
-    if (!url) return;
-    NSString *src = [url.path stringByResolvingSymlinksInPath];
-    if (!src || ![g_fileManager fileExistsAtPath:src]) return;
-    AVAsset *asset  = [AVAsset assetWithURL:url];
-    BOOL hasVideo = [[asset tracksWithMediaType:AVMediaTypeVideo] count] > 0;
-    BOOL hasAudio  = [[asset tracksWithMediaType:AVMediaTypeAudio] count] > 0;
-    // reloadReaders 会清掉 g_hasProbedASBD，迫使下一帧重新探测 ASBD 并重新解码，否则新素材音频不生效。
-    vcm_reloadReaders();
-    if (hasVideo) {
-        NSString *dest = vcm_videoPath();
-        if ([g_fileManager fileExistsAtPath:dest]) [g_fileManager removeItemAtPath:dest error:nil];
-        [g_fileManager copyItemAtPath:src toPath:dest error:nil];
-        // 停掉 reader 而不只是清冻结帧：换素材时若循环关闭、且旧 reader 已读完，setup 里的 loop 门禁会把重建挡掉，新素材就永远不生效。
-        vcm_stopReaders();
-        g_isReplace = YES;
-        vcm_saveSettings();
-        [VCamMediaManager setupVideoReaderIfNeeded];
-        [VCamMediaManager setupAudioReaderIfNeeded];
-    } else if (hasAudio) {
-        if ([g_fileManager fileExistsAtPath:g_tempAudioPath]) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
-        [g_fileManager copyItemAtPath:src toPath:g_tempAudioPath error:nil];
-        [VCamMediaManager setupAudioReaderIfNeeded];
-    }
-    [self refreshGridButtons];
-}
-
-#pragma mark - UIImagePickerControllerDelegate
-- (void)imagePickerController:(UIImagePickerController *)picker
-didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
-    [picker dismissViewControllerAnimated:YES completion:nil];
-
-    NSURL *url = info[UIImagePickerControllerMediaURL];
-    if (url) { [self processSelectedVideoURL:url]; return; }
-}
-- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker { [picker dismissViewControllerAnimated:YES completion:nil]; }
-
-#pragma mark - UIDocumentPickerDelegate
-- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    [controller dismissViewControllerAnimated:YES completion:nil];
-    if (urls.count > 0) [self processSelectedVideoURL:urls.firstObject];
-}
-- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentAtURL:(NSURL *)url {
-    [controller dismissViewControllerAnimated:YES completion:nil];
-    [self processSelectedVideoURL:url];
-}
-- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller { [controller dismissViewControllerAnimated:YES completion:nil]; }
-@end
-
-#pragma mark - UIWindow 手势触发
-static void vcm_installTapGesture(UIWindow *win) {
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
-        initWithTarget:win action:@selector(vcm_presentMenu)];
-    tap.numberOfTapsRequired    = 2;
-    tap.numberOfTouchesRequired = 2;
-    tap.cancelsTouchesInView    = NO;
-    [win addGestureRecognizer:tap];
-}
-@interface UIWindow (VCam)
-- (void)vcm_presentMenu;
-@end
-@implementation UIWindow (VCam)
-- (void)vcm_presentMenu {
-    static BOOL menuVisible = NO;
-    if (menuVisible) return;
-    menuVisible = YES;
-    UIViewController *topVC = vcm_topViewController();
-    if (!topVC) { menuVisible = NO; return; }
-    VCamMenuVC *vc = [VCamMenuVC new];
-    vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
-    vc.modalTransitionStyle   = UIModalTransitionStyleCrossDissolve;
-    [topVC presentViewController:vc animated:YES completion:^{ menuVisible = NO; }];
-}
-@end
-%hook UIWindow
-- (void)becomeKeyWindow {
-    %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{ vcm_installTapGesture(self); });
-}
-%end
-
-#pragma mark - 构造 / 析构
-// 初始化全局状态、沙箱目录、音视频 reader
 %ctor {
-    g_fileManager = [NSFileManager defaultManager];
-    g_mediaLock   = [[NSLock alloc] init];
-    vcm_loadSettings();
-    g_ciContext = [CIContext contextWithOptions:@{
-        kCIContextWorkingColorSpace: [NSNull null],
-    }];
-    g_videoDir = [vcm_documentPath() stringByAppendingPathComponent:@"VCAM"];
-    [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
-    g_tempVideoPath = [vcm_videoPath() copy];
-    g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
-
-    if ([g_fileManager fileExistsAtPath:g_tempVideoPath]) {
-        [VCamMediaManager setupVideoReaderIfNeeded];
-        [VCamMediaManager setupAudioReaderIfNeeded];
+    @autoreleasepool {
+        %init;
     }
-    MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&g_origAudioUnitRender);
-}
-
-%dtor {
-    [VCamMediaManager cleanup];
-    g_fileManager = nil;
-    g_ciContext   = nil;
 }
