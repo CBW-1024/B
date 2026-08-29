@@ -11,12 +11,16 @@ static dispatch_queue_t g_ncLogQueue;
 static FILE *g_ncLogFile;
 
 static void nc_log_init(void) {
-    if (g_ncLogFile) return;
+    if (g_ncLogQueue && g_ncLogFile) return;
     NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *dir = paths.firstObject;
     NSString *path = [dir stringByAppendingPathComponent:@"NC_bid.log"];
-    g_ncLogFile = fopen(path.UTF8String, "a");
-    g_ncLogQueue = dispatch_queue_create("nc.bid.log", DISPATCH_QUEUE_SERIAL);
+    if (!g_ncLogQueue) {
+        g_ncLogQueue = dispatch_queue_create("nc.bid.log", DISPATCH_QUEUE_SERIAL);
+    }
+    if (!g_ncLogFile) {
+        g_ncLogFile = fopen(path.UTF8String, "a");
+    }
     NSLog(@"[NC] log file: %@", path);
 }
 
@@ -26,19 +30,20 @@ static void nc_log(NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSString *line = [NSString stringWithFormat:@"%@ [NC] %@", [NSDate date], msg];
-    dispatch_async(g_ncLogQueue, ^{
-        nc_log_init();
-        if (g_ncLogFile) {
+    nc_log_init();   // 必须在 dispatch_async 之前同步初始化，避免 dispatch 到 NULL 队列崩溃
+    dispatch_queue_t q = g_ncLogQueue;
+    if (q && g_ncLogFile) {
+        dispatch_async(q, ^{
             fprintf(g_ncLogFile, "%s\n", line.UTF8String);
             fflush(g_ncLogFile);
-        }
-    });
+        });
+    }
     NSLog(@"[NC] %@", msg);
 }
 
-// 伪装总开关。WCR 在 initPipeline 时置 1、dealloc 时置 0；但登录弹窗发生在
-// FaceRecog 初始化之前，故默认开启，靠 callerInMainBundle 过滤推送等浅栈调用。
-static BOOL g_wcBidEnabled = YES;
+// 伪装总开关。启动/launch 阶段保持 OFF（微信按 bid 派生沙盒路径/keychain，
+// 过早伪装会打不开数据容器而闪退）；登录开始时开启，登录结束后关闭。
+static BOOL g_wcBidEnabled = NO;
 
 #pragma mark - 调用栈判定
 
@@ -112,6 +117,32 @@ static BOOL wc_callerInMainBundle(void) {
 
 - (void)dealloc {
     nc_log(@"FaceRecogFlashHandler dealloc -> switch=NO");
+    g_wcBidEnabled = NO;
+    %orig;
+}
+
+%end
+
+#pragma mark - 登录流程触发：登录期间开启 bid 伪装
+
+// WCR 同样 hook 了 WCAccountLoginControlLogic。登录校验早于 FaceRecog 初始化，
+// 故用登录控制逻辑本身开启/关闭伪装开关，把窗口限制在登录流程内，launch 阶段不受影响。
+%hook WCAccountLoginControlLogic
+
+- (void)startLogic {
+    nc_log(@"startLogic -> switch=YES");
+    g_wcBidEnabled = YES;
+    %orig;
+}
+
+- (void)startIPadLoginLogic {
+    nc_log(@"startIPadLoginLogic -> switch=YES");
+    g_wcBidEnabled = YES;
+    %orig;
+}
+
+- (void)stopLogic {
+    nc_log(@"stopLogic -> switch=NO");
     g_wcBidEnabled = NO;
     %orig;
 }
