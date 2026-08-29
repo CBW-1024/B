@@ -891,7 +891,7 @@ static VCamAudioProxy *g_audioProxy = nil;
     _statusLabel.font = [UIFont systemFontOfSize:13];
     _statusLabel.textColor = [UIColor secondaryLabelColor];
     _statusLabel.numberOfLines = 0;
-    _statusLabel.translatesAutoresizingMaskToConstraints = NO;
+    _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [_contentView addSubview:_statusLabel];
     [NSLayoutConstraint activateConstraints:@[
         [_statusLabel.topAnchor      constraintEqualToAnchor:_contentView.topAnchor],
