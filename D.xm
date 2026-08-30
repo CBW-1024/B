@@ -30,12 +30,18 @@
 //         用访达/Finder「文件共享」或任意可访问 App 容器的工具把
 //         Documents/WCPGateLog.txt 拖出来即可。
 
+#import <Foundation/Foundation.h>   // 必须放在最前：提供 NSString/NSMutableData/NSLock/NSMutableSet/NSDate/NSBundle、NSHomeDirectory
+#import <string.h>                  // 保证 strncpy 等 C 函数在模块模式下可见（iOS 26.5 SDK 模块默认开启）
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <execinfo.h>
 #import <stdio.h>
+
+// ⚠️ 不要在此文件写 `@class NSString;` / `@class NSBundle;` 之类的手写前向声明：
+//   在 iOS 26.5 SDK（模块默认开启）下，前向声明会阻止 Foundation 模块导入且自身不暴露方法，
+//   直接触发 "unknown type name" / "forward declaration" 系列编译错误。需要类声明就靠上面的 Foundation import。
 
 // ── 运行时方法表（用于把 PC 反查成 类+selector）─────────────────────────
 typedef struct { void *imp; const char *cls; const char *sel; } MethodRec;
