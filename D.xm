@@ -1,91 +1,87 @@
 /*
- * Tweak.xm —— NSBundle -bundleIdentifier（严格对齐 WCRefine v4）
+ * Tweak.xm —— NSBundle -bundleIdentifier（对齐 WCRefine v5）
  *
  * ═══════════════════════════════════════════════════════════════════════
- *  对齐目标：WCRefine 静态初始化器 0x15826f4（193 个 init 中的第 96 个）
- *  注册的三个 hook，它们共享同一个 flag 字节：
+ *  反汇编来源：WCRefine.dylib，静态初始化器 0x15826f4（193 个中的第 96 个）
  *
- *   ┌──┬──────────┬────────────────────────────┬──────────────┬──────────┐
- *   │# │ 注册点   │ 目标                        │ 新 IMP       │ 原 IMP 槽│
- *   ├──┼──────────┼────────────────────────────┼──────────────┼──────────┤
- *   │1 │ 0x15827f0│ NSBundle -bundleIdentifier │ 0x1582ec0    │ 0x2203458│
- *   │2 │ 0x1582820│ FaceRecogFlashHandler      │ 0x1583034    │ 0x2203460│
- *   │  │          │   -initPipeline            │              │          │
- *   │3 │ 0x1582850│ FaceRecogFlashHandler      │ 0x1583074    │ 0x2203468│
- *   │  │          │   -dealloc                 │              │          │
- *   └──┴──────────┴────────────────────────────┴──────────────┴──────────┘
+ *  ┌──┬──────────┬──────────────────────────┬───────────────┬──────────┐
+ *  │# │ 注册点   │ 目标                      │ 新 IMP        │ 原 IMP 槽│
+ *  ├──┼──────────┼──────────────────────────┼───────────────┼──────────┤
+ *  │1 │ 0x1582764│ UIViewController         │ 0x1582c20     │ 0x2203440│
+ *  │  │          │   -viewDidAppear:        │               │          │
+ *  │2 │ 0x15827a0│ MMDiskUsageUtil (元类)    │ 0x1582c68     │ 0x2203448│
+ *  │  │          │   +movePath:to:          │               │          │
+ *  │3 │ 0x15827c0│ MMDiskUsageUtil (元类)    │ 0x1582db0     │ 0x2203450│
+ *  │  │          │   +RemoveFile:           │               │          │
+ *  │4 │ 0x15827f0│ NSBundle -bundleIdentifier│ 0x1582ec0     │ 0x2203458│
+ *  │5 │ 0x1582820│ FaceRecogFlashHandler     │ 0x1583034     │ 0x2203460│
+ *  │  │          │   -initPipeline          │               │          │
+ *  │6 │ 0x1582850│ FaceRecogFlashHandler     │ 0x1583074     │ 0x2203468│
+ *  │  │          │   -dealloc               │               │          │
+ *  └──┴──────────┴──────────────────────────┴───────────────┴──────────┘
+ *  （7~10 还有 SessionSelectController / ThemeBoxOperateView，与本功能无关）
  *
- *  WCR 0x1582ec0 的控制流（一步都不能换顺序）：
+ * ── flag 的真相（v4 之前理解错了，这里纠正）────────────────────────────
+ *  0x1583048:  adrp x9, #0x2203000
+ *  0x158304c:  mov  w8, #1
+ *  0x1583050:  strb w8, [x9, #0x560]      ; *(BYTE *)0x2203560 = 1
  *
- *      if (flag == 0)                    goto original;   // 0x1582ed0
- *      if (self != [NSBundle mainBundle]) goto original;  // 0x1582f48
- *      if (!callerIsInsideAppImage())     goto original;  // 0x1582f58
- *      return @"com.tencent.xin";                         // 0x1582fac
- *  original:
- *      return orig(self, _cmd);                           // 0x1583008
+ *  x9 来自 adrp（页对齐基址），所以 0x2203560 是【绝对地址的全局变量】，
+ *  不是 FaceRecogFlashHandler 实例的 +0x560 成员偏移。
+ *  全局扫描确认：该字节只有 3 处访问 —— 1 读(0x1582ed8) + 2 写(0x1583050/0x158308c)。
  *
- *  WCR 0x1583034 / 0x1583074（窗口开合，就两个字节的事）：
+ * ── 0x1582ec0 还原后的 C 代码（严格对照每条指令）───────────────────────
+ *      BOOL spoof = NO;                                  // 0x1582eec mov w0,#0; str
+ *      if (flag & 1) {                                   // 0x1582ed8 ldrb; 0x1582ef4 tbz #0
+ *          NSBundle *mb = [NSBundle mainBundle];         // 0x1582f1c blr objc_msgSend
+ *          if (self == mb)                               // 0x1582f48 subs; 0x1582f50 b.ne
+ *              spoof = callerIsInsideAppImage();         // 0x1582f58 bl 0x159556c
+ *      }
+ *      // 0x1582f70 收敛点，清理 mb
+ *      if (spoof) return @"com.tencent.xin";             // 0x1582fac cfstring 0x1f8fe88
+ *      return orig(self, _cmd);                          // 0x1582ffc ldr 0x2203458; blr
  *
- *      -initPipeline:  flag = 1;  return %orig;
- *      -dealloc:       flag = 0;  return %orig;
+ * ── 0x159556c（callerIsInsideAppImage）还原 ─────────────────────────────
+ *      NSArray *a = [NSThread callStackReturnAddresses]; // 0x159557c ldr 0x2073670 (NSThread)
+ *      if ([a count] <= 2) return NO;                    // 0x15955c4 subs #2; 0x15955c8 b.hi
+ *      unsigned long long pc =
+ *          [[a objectAtIndexedSubscript:2] unsignedLongLongValue];  // 0x1595610 mov x2,#2
+ *      Dl_info info = {0};                               // 0x1595630 movi v0.16b,#0 (清零32字节)
+ *      if (dladdr(pc, &info) == 0) return NO;            // 0x1595674 cbz
+ *      if (info.dli_fname == NULL) return NO;            // 0x159567c ldur [x29,#-0x50]; cbnz
+ *      NSString *caller = [NSString stringWithUTF8String:info.dli_fname]; // 0x15956d0
+ *      NSString *app    = [[NSBundle mainBundle] bundlePath];             // 0x1595730
+ *      if ([app length] <= 0) return NO;                 // 0x1595788 subs #0; 0x1595790 b.ls
+ *      return [caller hasPrefix:app];                    // 0x15957b0 blr
  *
- *  WCR 0x159556c（调用者归属）：
- *
- *      NSArray *a = [NSThread callStackReturnAddresses];
- *      if (a.count <= 2) return NO;
- *      Dl_info info = {0};
- *      if (dladdr([a[2] unsignedLongLongValue], &info) == 0) return NO;
- *      if (info.dli_fname == NULL) return NO;
- *      NSString *caller = [NSString stringWithUTF8String:info.dli_fname];
- *      NSString *app    = [[NSBundle mainBundle] bundlePath];
- *      return app.length > 0 && [caller hasPrefix:app];
- *
- * ═══════════════════════════════════════════════════════════════════════
- *  为什么 WCR 没 bug 而你的有 —— 三个关键点
- * ═══════════════════════════════════════════════════════════════════════
- *
- *  【1】flag 短路必须排在第一位，且窗口外零开销
- *       WCR 的 flag==0 分支里，连 self 都不比较、连栈都不取，直接跳原实现。
- *       bundleIdentifier 在微信启动期被调用几千次，任何"先取栈再判断"的写法
- *       都会把主线程拖死 → 启动看门狗 → 登录流程中断。
- *       你的 NC.txt 和我的 v2/v3 都在这一点上吃了亏。
- *
- *  【2】hook 函数体内不能出现任何会反过来读 bundleIdentifier 的调用
- *       NSFileManager / NSSearchPathForDirectoriesInDomains / stringByAppending…
- *       这些都会触发 bundleIdentifier → 递归回自己的 hook。
- *       WCR 的 hook 体里只有 flag 读、指针比较、dladdr、strcmp，全是纯 C。
- *       我的 v2 在里面调了 WCRPrepare()，这就是「直接登录不了」的根因。
- *
- *  【3】窗口必须是 FaceRecogFlashHandler 的生命周期，不是全时段
- *       全时段伪装会让登录、推送上报、数据库路径全部读到 com.tencent.xin，
- *       登录和 APNs 绑定就跟着乱了。WCR 用 initPipeline→dealloc 这个窄窗口，
- *       把影响面限制在人脸流程那几百毫秒内。
+ *  所有 selector 均已逐个核对：callStackReturnAddresses / count /
+ *  objectAtIndexedSubscript: / unsignedLongLongValue / stringWithUTF8String: /
+ *  mainBundle / bundlePath / length / hasPrefix:
  *
  * ═══════════════════════════════════════════════════════════════════════
- *  本实现相对 WCR 的 3 处差异（都是等价优化，语义不变，已逐条标注）
+ *  v5 修掉了 v4 那个让它【整体静默失效】的 bug
  * ═══════════════════════════════════════════════════════════════════════
- *   D1  flag 用全局 volatile int32，不用实例 +0x560 偏移。
- *       原因：WCR 靠硬编码偏移踩在 FaceRecogFlashHandler 实例内存里，
- *       一旦该类在别的微信版本里成员布局变了就是越界写。全局量行为等价且安全。
- *   D2  bundlePath 在 %ctor 期缓存，不每次调用都取。
- *       原因：App 生命周期内不变，且能避开 hook 内任何 NSBundle 调用。
- *   D3  加了 pthread TLS 重入守卫。
- *       原因：WCR 的 hook 体是纯 C 所以不需要；我们要在里面写日志，
- *       必须防重入。守卫命中时无条件走原实现，不改变任何对外行为。
+ *  v4 在 %ctor 里缓存了 [[NSBundle mainBundle] bundlePath]，还顺手打开了日志文件。
+ *  但 %ctor 跑在 dyld 构造期、main() 之前 —— 那时 NSBundle 还没初始化完，
+ *  bundlePath 拿到 nil；NSSearchPathForDirectoriesInDomains 也不可靠。
+ *  后果：gAppPath == NULL 让调用者判定恒为 NO，hook 完全不生效；
+ *        日志文件打不开，于是"一点日志都没有"。
  *
- * 日志：<App>/Documents/WCRBundleHook.log
- *       <App> = /var/mobile/Containers/Data/Application/<UUID>/
- *       注入 dylib 继承宿主沙盒，/var/mobile/Documents 不可写
- *       —— 这就是 v1 一个字都写不出来的原因。
- *       仅窗口内记录，窗口外不产生任何日志，不产生任何 I/O。
- *       同时 NSLog 一份，可用 macOS 控制台 / idevicesyslog 实时看。
+ *  WCR 为什么没事？—— 它的静态初始化器【只注册 hook】，一个多余的调用都没有。
+ *  bundlePath 是等到窗口真正打开、App 早已跑起来之后才取的。
+ *
+ *  v5 的对策：一切推迟到运行时按需初始化（lazy），且失败可重试。
+ *
+ * 另外两条必须守住（v4 已做对，继续保留）：
+ *   · flag 短路排第一：窗口外零开销，不比 self、不取栈
+ *   · hook 体内不出现会反查 bundleIdentifier 的调用（用 TLS 守卫兜底）
  */
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <pthread.h>
-#import <mach-o/dyld.h>
+#import <dispatch/dispatch.h>
 #import <sys/uio.h>
 #import <sys/time.h>
 #import <sys/stat.h>
@@ -96,46 +92,41 @@
 #import <stdlib.h>
 #import <limits.h>
 
-/* WCR 0x1582fac 返回的那个常量字符串 */
+/* 0x1582fac 返回的 cfstring @0x1f8fe88，已核实内容为 "com.tencent.xin"(len=15) */
 #define kWCRFakeBid @"com.tencent.xin"
 
 #define kWCRLogName     "WCRBundleHook.log"
 #define kWCRLogMaxBytes (1 * 1024 * 1024)
 #define kWCRLogMaxLines 5000
 
-/* callStackReturnAddresses 里哪一帧算「真正的调用者」。
- * WCR 硬编码取 index 2（0 = 当前 hook 帧，1 = objc_msgSend 相关，
- * 2 = 发起查询的业务代码）。若日志里 caller 判断总是落在
- * 「outside app image」，把这里改成 1 或 3 再看栈 dump 定位。 */
+/* callStackReturnAddresses 里取哪一帧。WCR 硬编码 x2 = 2（0x1595610）。 */
 #define kWCROffsetInStack 2
 
 /* 窗口内命中时，前多少次记完整调用栈 */
 #define kHITDetailLimit   20
 
-/* ═══════════════════ 状态 ═══════════════════ */
+/* ══════════════════════════ 状态 ══════════════════════════ */
 
-/* WCR 存在 FaceRecogFlashHandler 实例 +0x560 的那个字节（见 D1） */
-static volatile int32_t gFlag = 0;
+/* flag：对齐 WCR 的单字节 + bit0 测试（0x1582ed8 ldrb / 0x1582ef4 tbz #0）*/
+static volatile uint8_t gFlag = 0;
 
-/* WCR 0x159556c 里每次都取的 [[NSBundle mainBundle] bundlePath]（见 D2） */
-static char  *gAppPath  = NULL;
-static size_t gAppPathLen = 0;
-
-/* 重入守卫（见 D3） */
+/* 重入守卫（WCR 不需要，因为它的 hook 体是纯 C；我们要写日志，必须有）*/
 static pthread_key_t gReentryKey;
 static BOOL          gReentryReady = NO;
 
-/* 换行符用可写数组而非字符串字面量：Theos 用 Objective-C++ 编译(.xm.mm)，
- * 字面量类型是 const char[2]，赋给 iov_base(void *) 会报 drops const。 */
-static char  gNewline[] = "\n";
+/* ── 下面两项全部【延迟初始化】，绝不在 %ctor 里取 ── */
+static char  *gAppPath    = NULL;   /* WCR 每次实时取，这里缓存但保留重试能力 */
+static size_t gAppPathLen = 0;
 
-/* 日志 */
-static int   gLogFD    = -1;
-static int   gLogLines = 0;
-static char *gLogPath  = NULL;
-static int   gHitCount = 0;
+static int   gLogFD     = -1;
+static int   gLogLines  = 0;
+static BOOL  gLogTried  = NO;       /* 只尝试打开一次，失败就只走 NSLog */
+static char  gNewline[] = "\n";     /* 可写数组：ObjC++ 下字面量是 const char[2] */
 
-/* ═══════════════════ 重入守卫 ═══════════════════ */
+static int   gHitCount  = 0;
+static BOOL  gWindowGroupInstalled = NO;
+
+/* ══════════════════════ 重入守卫 ══════════════════════ */
 
 static inline BOOL WCRIsReentrant(void) {
     if (!gReentryReady) return YES;
@@ -144,10 +135,9 @@ static inline BOOL WCRIsReentrant(void) {
 static inline void WCREnter(void) { if (gReentryReady) pthread_setspecific(gReentryKey, (void *)1); }
 static inline void WCRLeave(void) { if (gReentryReady) pthread_setspecific(gReentryKey, NULL);      }
 
-/* ═══════════════════ 日志：纯 POSIX，零 Foundation ═══════════════════
- * 只在窗口内被调用，窗口外整个日志子系统一次都不会碰。 */
+/* ══════════════════════ 日志（纯 POSIX）══════════════════════
+ * 只在窗口内被调用；窗口外一行都不产生、一次 I/O 都不做。 */
 
-/* format 属性：让编译器校验每一处调用的格式串与实参类型是否匹配 */
 static void WCRLog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void WCRLog(const char *fmt, ...) {
@@ -168,14 +158,14 @@ static void WCRLog(const char *fmt, ...) {
                       tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000));
 
     struct iovec iov[3];
-    iov[0].iov_base = hdr;  iov[0].iov_len = (size_t)hn;
-    iov[1].iov_base = body; iov[1].iov_len = (size_t)n;
+    iov[0].iov_base = hdr;      iov[0].iov_len = (size_t)hn;
+    iov[1].iov_base = body;     iov[1].iov_len = (size_t)n;
     iov[2].iov_base = gNewline; iov[2].iov_len = 1;
     writev(gLogFD, iov, 3);
     gLogLines++;
 }
 
-/* 窗口内额外 dump 前 6 帧，用来看清到底是谁在问 bid */
+/* 窗口内 dump 前 8 帧，用来确认"到底谁在问 bid"以及帧索引选对没有 */
 static void WCRDumpStack(void) {
     if (gLogFD < 0) return;
     NSArray *a = [NSThread callStackReturnAddresses];
@@ -188,92 +178,117 @@ static void WCRDumpStack(void) {
         if (dladdr((const void *)(uintptr_t)pc, &info) == 0 || info.dli_fname == NULL) continue;
         const char *f = strrchr(info.dli_fname, '/');
         f = f ? f + 1 : info.dli_fname;
-        WCRLog("        #%lu 0x%llx %s  %s",
+        WCRLog("        #%lu 0x%llx %-24s %s",
                (unsigned long)i, pc, f, info.dli_sname ? info.dli_sname : "");
     }
 }
 
-/* ═══════════════════ WCR 0x159556c：调用者归属判定 ═══════════════════
- * 原实现每次都 [[NSBundle mainBundle] bundlePath]，这里用 %ctor 期缓存值，
- * 判定式完全一致：appPath.length > 0 && [callerImage hasPrefix:appPath] */
+/* ══════════════════════ 延迟初始化 ══════════════════════
+ * 第一次真正需要时才执行，此时 App 早已启动，NSBundle 完全可用。
+ * 调用点全部在重入守卫之内，所以这里用 NSBundle / NSFileManager 是安全的。 */
+
+static void WCRPrepareLazy(void) {
+    /* --- bundlePath：对齐 WCR 的 [[NSBundle mainBundle] bundlePath] ---
+     * 取不到就保持 NULL，下次再试 —— 绝不缓存失败结果。 */
+    if (gAppPath == NULL) {
+        @autoreleasepool {
+            NSString *p = [[NSBundle mainBundle] bundlePath];
+            if (p && [p length] > 0) {
+                const char *u = [p fileSystemRepresentation];
+                if (u) {
+                    char *dup = strdup(u);
+                    if (dup) { gAppPath = dup; gAppPathLen = strlen(gAppPath); }
+                }
+            }
+        }
+        if (gAppPath) WCRLog("INIT bundlePath acquired: %s", gAppPath);
+        else          WCRLog("INIT bundlePath NOT available yet (will retry)");
+    }
+
+    /* --- 日志文件：多路径回退，只试一次 --- */
+    if (!gLogTried) {
+        gLogTried = YES;
+        @autoreleasepool {
+            NSMutableArray *cands = [NSMutableArray array];
+            NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                NSUserDomainMask, YES);
+            if ([docs count] > 0) {
+                [cands addObject:[docs objectAtIndex:0]];
+            }
+            [cands addObject:NSTemporaryDirectory()];
+            [cands addObject:@"/var/mobile/Documents"];
+
+            for (NSString *dir in cands) {
+                if (!dir) continue;
+                [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                          withIntermediateDirectories:YES
+                                                           attributes:nil
+                                                                error:NULL];
+                NSString *lp = [dir stringByAppendingPathComponent:@(kWCRLogName)];
+                const char *u = [lp fileSystemRepresentation];
+                if (!u) continue;
+
+                struct stat st;
+                if (stat(u, &st) == 0 && st.st_size > (off_t)kWCRLogMaxBytes) truncate(u, 0);
+
+                int fd = open(u, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (fd >= 0) {
+                    gLogFD = fd;
+                    NSLog(@"[WCR] log opened: %s", u);
+                    WCRLog("INIT log opened: %s", u);
+                    break;
+                }
+            }
+            if (gLogFD < 0) {
+                NSLog(@"[WCR] WARNING: cannot open any log file, NSLog only");
+            }
+        }
+    }
+}
+
+/* ══════════════════════ WCR 0x159556c ══════════════════════ */
 
 static BOOL WCRCallerIsInAppImage(unsigned long long pc) {
     if (pc == 0) return NO;
 
     Dl_info info;
     memset(&info, 0, sizeof(info));
-    if (dladdr((const void *)(uintptr_t)pc, &info) == 0) return NO;   /* WCR 0x1595670 */
-    if (info.dli_fname == NULL) return NO;
+    if (dladdr((const void *)(uintptr_t)pc, &info) == 0) return NO;   /* 0x1595674 cbz   */
+    if (info.dli_fname == NULL) return NO;                            /* 0x1595680 cbnz */
 
-    if (gAppPath == NULL || gAppPathLen == 0) return NO;              /* appPath.length > 0 */
-    return strncmp(info.dli_fname, gAppPath, gAppPathLen) == 0;       /* hasPrefix: */
-}
-
-/* ═══════════════════ 一次性准备：必须在 %init 之前 ═══════════════════
- * 此时一个 hook 都还没装，用 NSFileManager / NSBundle 完全安全。 */
-
-static void WCRPrepareOnce(void) {
-    if (pthread_key_create(&gReentryKey, NULL) == 0) gReentryReady = YES;
-
-    @autoreleasepool {
-        /* 1) 缓存 App 主镜像路径（对应 WCR 里的 bundlePath）*/
-        NSString *appPath = [[NSBundle mainBundle] bundlePath];
-        if (appPath && [appPath length] > 0) {
-            const char *u = [appPath fileSystemRepresentation];
-            if (u) { gAppPath = strdup(u); gAppPathLen = strlen(gAppPath); }
-        }
-
-        /* 2) 日志文件放 App 自己的 Documents 下 —— 沙盒内唯一稳的地方 */
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                             NSUserDomainMask, YES);
-        NSString *doc = ([paths count] > 0)
-                      ? [paths objectAtIndex:0]
-                      : [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-
-        [[NSFileManager defaultManager] createDirectoryAtPath:doc
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:NULL];
-
-        NSString *logPath = [doc stringByAppendingPathComponent:@(kWCRLogName)];
-        const char *lp = [logPath fileSystemRepresentation];
-
-        struct stat st;
-        if (stat(lp, &st) == 0 && st.st_size > (off_t)kWCRLogMaxBytes) {
-            truncate(lp, 0);
-        }
-        gLogFD = open(lp, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        gLogPath = strdup(lp ? lp : "(unknown)");
-    }
+    if (gAppPath == NULL || gAppPathLen == 0) return NO;              /* [app length]>0 */
+    return strncmp(info.dli_fname, gAppPath, gAppPathLen) == 0;       /* hasPrefix:     */
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- *  hook 1 / 3 —— WCR 0x1582ec0：NSBundle -bundleIdentifier
+ *  hook 1/3 —— WCR 0x1582ec0：NSBundle -bundleIdentifier
  * ══════════════════════════════════════════════════════════════════════ */
 %hook NSBundle
 
 - (NSString *)bundleIdentifier {
-    /* ⓿ 重入守卫（D3，WCR 无此步，但语义等价：命中即走原实现）*/
+    /* ⓿ 重入：无条件走原实现 */
     if (WCRIsReentrant()) return %orig;
 
-    /* ❶ flag 短路 —— WCR 0x1582ed0
-     *    窗口外直接跳原实现。不比 self、不取栈、不写日志。
-     *    整个 hook 的常驻开销就是这一次 volatile 读 + 一次比较。
-     *    这一行是 WCR 敢把 hook 挂在 NSBundle 上的根本原因。 */
-    if (gFlag == 0) return %orig;
+    /* ❶ flag 短路 —— WCR 0x1582ed8 ldrb / 0x1582ef4 tbz #0
+     *    窗口外直接跳原实现：不比 self、不取栈、不写日志、不做 I/O。
+     *    整个 hook 的常驻开销 = 一次 volatile 字节读 + 一次位测试。 */
+    if ((gFlag & 1) == 0) return %orig;
 
     WCREnter();
 
-    /* ❷ 只认 mainBundle —— WCR 0x1582f48 */
+    /* 延迟初始化：第一次进窗口时才取 bundlePath、才开日志 */
+    WCRPrepareLazy();
+
+    /* ❷ 只认 mainBundle —— WCR 0x1582f1c / 0x1582f48 subs / 0x1582f50 b.ne */
     if (self != [NSBundle mainBundle]) {
-        WCRLog("PASS  self != mainBundle  (0x%x)", (unsigned)(uintptr_t)self);
+        WCRLog("PASS  self != mainBundle");
         WCRLeave();
         return %orig;
     }
 
-    /* ❸ 调用者必须来自 App 主镜像 —— WCR 0x1582f58 → 0x159556c */
+    /* ❸ 调用者归属 —— WCR 0x1582f58 bl 0x159556c */
     NSArray *addrs = [NSThread callStackReturnAddresses];
-    if ([addrs count] <= 2) {                       /* WCR 0x15955c8 */
+    if ([addrs count] <= 2) {
         WCRLog("PASS  stack too shallow (%lu)", (unsigned long)[addrs count]);
         WCRLeave();
         return %orig;
@@ -289,15 +304,14 @@ static void WCRPrepareOnce(void) {
             const char *s = strrchr(miss.dli_fname, '/');
             f = s ? s + 1 : miss.dli_fname;
         }
-        WCRLog("PASS  caller outside app image: 0x%llx %s", pc, f);
+        WCRLog("PASS  caller outside app image: 0x%llx %s  (appPath=%s)",
+               pc, f, gAppPath ? gAppPath : "(NULL)");
         WCRLeave();
         return %orig;
     }
 
-    /* 命中 —— WCR 0x1582fac：直接返回常量串，不调用原实现。
-     * 这里额外调一次 %orig 只为写日志，原实现是一次无副作用的读取。
-     * 日志限流：前 kHITDetailLimit 次记完整栈，之后只累加计数，
-     * 避免人脸流程里高频查询把主线程拖住 —— WCR 本体是不记日志的。 */
+    /* 命中 —— WCR 0x1582fac：返回常量串。
+     * 这里额外调一次 %orig 只为写日志（原实现是一次无副作用的读取）。 */
     gHitCount++;
     if (gHitCount <= kHITDetailLimit) {
         NSString *origVal = %orig;
@@ -307,14 +321,14 @@ static void WCRPrepareOnce(void) {
             const char *s = strrchr(hit.dli_fname, '/');
             fn = s ? s + 1 : hit.dli_fname;
         }
-        WCRLog("HIT   #%d -> com.tencent.xin   (orig=%s, caller=0x%llx %s, tid=%x)",
+        WCRLog("HIT   #%d -> com.tencent.xin  (orig=%s, caller=0x%llx %s, tid=0x%llx)",
                gHitCount,
                origVal ? [origVal UTF8String] : "(nil)",
-               pc, fn, (unsigned)(uintptr_t)pthread_self());
+               pc, fn, (unsigned long long)(uintptr_t)pthread_self());
         WCRDumpStack();
-        NSLog(@"[WCR] HIT #%d -> com.tencent.xin  (orig=%@)", gHitCount, origVal);
+        NSLog(@"[WCR] HIT #%d -> com.tencent.xin (orig=%@)", gHitCount, origVal);
     } else if (gHitCount == kHITDetailLimit + 1) {
-        WCRLog("HIT   ...后续命中不再逐条记录（见 #%d 的栈样本）", kHITDetailLimit);
+        WCRLog("HIT   ...后续命中不再逐条记录（见前 %d 条的栈样本）", kHITDetailLimit);
     }
 
     WCRLeave();
@@ -324,30 +338,26 @@ static void WCRPrepareOnce(void) {
 %end
 
 /* ══════════════════════════════════════════════════════════════════════
- *  hook 2、3 —— WCR 0x15826f4 里和上面一起注册的窗口开合
- *  WCR 的实现就两条指令：flag=1 / flag=0，然后原样转发。
- *
- *  单独成组：类不存在时整组跳过。
- *  对应 WCR 用 MSHookMessageEx 的语义 —— 类不存在时返回 NULL，不崩。
+ *  hook 2/3 —— 窗口开合。WCR 的实现就两条指令：
+ *      0x158304c mov w8,#1 ; 0x1583050 strb w8,[x9,#0x560] ; 然后转发
+ *      0x158308c strb wzr,[x8,#0x560]                      ; 然后转发
  * ══════════════════════════════════════════════════════════════════════ */
 %group FaceRecogGroup
 
 %hook FaceRecogFlashHandler
 
-/* WCR 0x1583034 */
 - (id)initPipeline {
     gFlag = 1;
-    WCRLog("WINDOW OPEN   self=0x%llx tid=%x",
-           (unsigned long long)(uintptr_t)self, (unsigned)(uintptr_t)pthread_self());
+    WCRLog("WINDOW OPEN   self=0x%llx tid=0x%llx",
+           (unsigned long long)(uintptr_t)self, (unsigned long long)(uintptr_t)pthread_self());
     NSLog(@"[WCR] WINDOW OPEN   self=0x%llx", (unsigned long long)(uintptr_t)self);
     return %orig;
 }
 
-/* WCR 0x1583074：先置 0，再转发 */
 - (void)dealloc {
     gFlag = 0;
-    WCRLog("WINDOW CLOSE  self=0x%llx tid=%x",
-           (unsigned long long)(uintptr_t)self, (unsigned)(uintptr_t)pthread_self());
+    WCRLog("WINDOW CLOSE  self=0x%llx tid=0x%llx",
+           (unsigned long long)(uintptr_t)self, (unsigned long long)(uintptr_t)pthread_self());
     NSLog(@"[WCR] WINDOW CLOSE  self=0x%llx", (unsigned long long)(uintptr_t)self);
     %orig;
 }
@@ -357,59 +367,64 @@ static void WCRPrepareOnce(void) {
 
 /* ══════════════════════════════════════════════════════════════════════ */
 %ctor {
-    @autoreleasepool {
-        WCRPrepareOnce();          /* 先准备，此时零 hook */
+    /* 这里只做三件事，全部不触碰 NSBundle / NSFileManager。
+     * 对齐 WCR：它的静态初始化器同样只注册 hook。 */
 
-        NSString *realBid = [[NSBundle mainBundle] bundleIdentifier];
+    if (pthread_key_create(&gReentryKey, NULL) == 0) gReentryReady = YES;
 
-        WCRLog("==============================================================");
-        WCRLog("WCRBundleHook v4  (aligned to WCRefine 0x15826f4)");
-        WCRLog("  real bundle id : %s", realBid ? [realBid UTF8String] : "(nil)");
-        WCRLog("  app path       : %s", gAppPath ? gAppPath : "(nil)");
-        WCRLog("  log file       : %s", gLogPath ? gLogPath : "(nil)");
-        WCRLog("  reentry guard  : %s", gReentryReady ? "OK" : "FAILED");
-        WCRLog("==============================================================");
+    %init;                                   /* NSBundle 组 */
 
-        NSLog(@"[WCR] v4 loaded | bid=%@ | log=%s", realBid, gLogPath ? gLogPath : "(nil)");
-
-        %init;                     /* NSBundle 组 */
-
-        if (objc_getClass("FaceRecogFlashHandler")) {
-            %init(FaceRecogGroup);
-            WCRLog("FaceRecogFlashHandler found -> window group installed");
-            NSLog(@"[WCR] FaceRecogFlashHandler found -> window group installed");
-        } else {
-            WCRLog("FaceRecogFlashHandler NOT found -> window group skipped");
-            WCRLog("  => 窗口永远不会打开，bundleIdentifier 永远走原实现（安全降级）");
-            NSLog(@"[WCR] FaceRecogFlashHandler NOT found");
-        }
+    if (objc_getClass("FaceRecogFlashHandler")) {
+        %init(FaceRecogGroup);
+        gWindowGroupInstalled = YES;
+        NSLog(@"[WCR] v5 loaded | FaceRecogFlashHandler found -> window group installed");
+    } else {
+        /* 类可能是懒加载的，稍后主线程上再试一次（WCR 没有这步，纯健壮性补充）*/
+        NSLog(@"[WCR] v5 loaded | FaceRecogFlashHandler NOT found, will retry in 3s");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            if (!gWindowGroupInstalled && objc_getClass("FaceRecogFlashHandler")) {
+                %init(FaceRecogGroup);
+                gWindowGroupInstalled = YES;
+                NSLog(@"[WCR] retry OK -> window group installed");
+                WCRLog("INIT retry OK -> window group installed");
+            } else if (!gWindowGroupInstalled) {
+                NSLog(@"[WCR] retry FAILED: class still missing");
+                WCRLog("INIT retry FAILED: FaceRecogFlashHandler still missing");
+            }
+        });
     }
+
+    NSLog(@"[WCR] v5 loaded | reentryGuard=%@", gReentryReady ? @"OK" : @"FAILED");
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- *  验证步骤
+ *  验证
  * ══════════════════════════════════════════════════════════════════════
- *  1) 打包注入，打开微信。此时窗口是关的，日志里只会有 v4 loaded 那一段，
- *     不应该有任何 HIT / PASS 行 —— 有的话说明 flag 短路没生效，检查代码。
- *  2) 确认微信能正常登录、收到横幅推送。这一步必须过，否则说明
- *     还有别的 hook 或别的插件在读 bundleIdentifier。
- *  3) 进一次人脸/刷脸流程，然后退出。日志里应该出现：
+ *  1) 打开微信。窗口是关的，日志里什么都不该有 —— 有就说明 flag 短路失效。
+ *  2) 确认能正常登录、能收横幅推送。这步必须过。
+ *  3) 走一次刷脸。预期日志：
+ *         INIT bundlePath acquired: /var/containers/Bundle/.../WeChat.app
+ *         INIT log opened: /var/mobile/Containers/Data/.../Documents/WCRBundleHook.log
  *         WINDOW OPEN   self=0x...
- *         HIT   -> com.tencent.xin   (orig=xxx, caller=0x...)
+ *         HIT   #1 -> com.tencent.xin  (orig=xxx, caller=0x... WeChat)
  *         WINDOW CLOSE  self=0x...
- *     如果只有 WINDOW OPEN 没有 HIT，看 PASS 行是三种里的哪一种：
- *       PASS self != mainBundle        → 查询对象不是主 bundle，正常
- *       PASS caller outside app image  → 调用者在别的镜像里，WCR 也会放行
- *       PASS stack too shallow         → 栈太浅，WCR 也会放行
- *  4) 日志文件在 /var/mobile/Containers/Data/Application/<UUID>/Documents/
- *     WCRBundleHook.log，用 Filza 搜索 WCRBundleHook.log 即可，
- *     不用去猜那个 UUID。
  *
- * ══════════════════════════════════════════════════════════════════════
- *  为什么这个窄窗口不会重演你之前遇到的两个 bug
- * ══════════════════════════════════════════════════════════════════════
- *  · 登录：窗口在 initPipeline 才打开，登录流程早就跑完了，读到的都是真 bid。
- *  · 横幅推送：APNs 的 aps-environment entitlement 来自签名，运行时改不了；
- *    微信上报 token 时窗口是关的，服务端拿到的还是真 bid，绑定关系正常。
- *    反过来，全时段伪装才会让服务端按正式版通道给测试设备下发 → 永远收不到。
+ *  排障对照表：
+ *   ┌────────────────────────────────┬──────────────────────────────────┐
+ *   │ 现象                            │ 原因与处理                        │
+ *   ├────────────────────────────────┼──────────────────────────────────┤
+ *   │ INIT bundlePath NOT available  │ NSBundle 仍不可用，重试即可；      │
+ *   │ (反复出现)                      │ 若一直是这个，说明宿主环境异常    │
+ *   │ PASS caller outside app image  │ 帧索引不对，改 kWCROffsetInStack  │
+ *   │                                │ 为 1 或 3，对照栈 dump 定位       │
+ *   │ PASS stack too shallow         │ 被调用时栈太浅，WCR 同样会放行    │
+ *   │ 只有 WINDOW OPEN 没有 HIT      │ 见上面三条 PASS                   │
+ *   │ 类 still missing               │ 这个微信版本里没 FaceRecogFlash-  │
+ *   │                                │ Handler，窗口开不了，功能不适用   │
+ *   └────────────────────────────────┴──────────────────────────────────┘
+ *
+ *  日志路径回退顺序：<App>/Documents → NSTemporaryDirectory() → /var/mobile/Documents
+ *  用 Filza 搜文件名 WCRBundleHook.log 即可，不用去猜 Container 的 UUID。
+ *  无论文件能否打开，关键事件都会 NSLog，可用 macOS 控制台 / idevicesyslog 看。
  */
