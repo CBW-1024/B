@@ -73,6 +73,31 @@
  *       未出现在任何 MSHookMessageEx 注册项里
  *     - WCR 没有 __mod_init_func，注册走 __objc_nlclslist 的 16 个 +load 类
  *
+ * [7] 第二份 WCRefine.dylib 交叉验证（同机制、地址全变）
+ *     目标：/workspace/work/wcr2/WCRefine.dylib
+ *           30,819,792 B, md5 b278d947f13bb46116fdc2313a32e74f
+ *           （上一份 36,491,920 B, md5 7bfc082a457e014ab62295455bfa0282 —— 确为不同二进制）
+ *     ------------------------------------------------------------------
+ *     项                            上一份              这一份
+ *     ------------------------------------------------------------------
+ *     _MSHookMessageEx stub         0x1ca5328           0x1821d70
+ *     NSBundle @bundleIdentifier    IMP 0x1582ec0       IMP 0x120a650
+ *                                   &orig 0x2203458     &orig 0x1cb9ee8
+ *     FaceRecog @initPipeline       IMP 0x1583034       IMP 0x120a7c4
+ *                                   &orig 0x2203460     &orig 0x1cb9ef0
+ *     FaceRecog @dealloc            IMP 0x1583074       IMP 0x120a804
+ *                                   &orig 0x2203468     &orig 0x1cb9ef8
+ *     全局开关                      0x2203560           0x1cb9ff0
+ *                                                       (__DATA,__bss +0x5c20)
+ *     调用栈门控                    0x159556c           0x121d68c
+ *     伪装 CFString                 0x1f8fe88           0x1a8ee80
+ *     "com.tencent.xin" 字面量      0x1d9f548           0x19729a8
+ *     hook 总数                     1788                1557
+ *     ------------------------------------------------------------------
+ *     这一份同样：CFBundleIdentifier 出现 0 次；com.tencent.xin 出现 1 次；
+ *     无 __mod_init_func；__objc_nlclslist 16 个 +load 类，同名同序。
+ *     → 两份二进制的 bid hook 机制 100% 一致，本文件无需任何改动。
+ *
  * ============================ 与上一版（NC_WCP.txt）的差异 ============================
  *   上一版                                  本版（WCR 事实）
  *   --------------------------------------  --------------------------------------
