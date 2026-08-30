@@ -42,7 +42,7 @@ typedef struct { void *imp; const char *cls; const char *sel; } MethodRec;
 static MethodRec *gMap = NULL;
 static int gMapCount = 0;
 static NSMutableData *gMapBuf = nil;          // 持有缓冲区，防止 realloc 失效
-static dispatch_once_t gMapInit = 0;
+static BOOL gInited = NO;                      // 惰性初始化标志（避免 GCD block 字面量触发 Logos 括号计数 bug）
 
 static int cmp_rec(const void *a, const void *b) {
     uintptr_t ia = (uintptr_t)((MethodRec *)a)->imp;
@@ -122,18 +122,24 @@ static NSLock *gLogLock = nil;
 static NSMutableSet *gSeen = nil;
 
 static void ensure_log(void) {
-    dispatch_once(&gMapInit, ^{
-        build_method_map();
-        gLogLock = [[NSLock alloc] init];
-        gSeen = [[NSMutableSet alloc] init];
-        NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/WCPGateLog.txt"];
-        gLog = fopen([path UTF8String], "a");
-        if (gLog) {
-            NSDate *now = [NSDate date];
-            fprintf(gLog, "=== WCPScout start %s ===\n", [[now description] UTF8String]);
-            fflush(gLog);
+    if (gInited) {
+        if (!gLog) {
+            NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/WCPGateLog.txt"];
+            gLog = fopen([path UTF8String], "a");
         }
-    });
+        return;
+    }
+    build_method_map();
+    gLogLock = [[NSLock alloc] init];
+    gSeen = [[NSMutableSet alloc] init];
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/WCPGateLog.txt"];
+    gLog = fopen([path UTF8String], "a");
+    if (gLog) {
+        NSDate *now = [NSDate date];
+        fprintf(gLog, "=== WCPScout start %s ===\n", [[now description] UTF8String]);
+        fflush(gLog);
+    }
+    gInited = YES;
 }
 
 // 记录一条去重后的调用现场（syms 为 backtrace 文本，可为 NULL）
@@ -197,6 +203,7 @@ static void log_gate(const char *tag, uintptr_t pc, NSString *detail, char **sym
         log_gate("isEqualToString(com.tencent)", pc,
                  [NSString stringWithFormat:@"\"%@\" ==? \"%@\"", selfs, aString], syms, n);
         if (syms) free(syms);
+        }
     }
     return r;
 }
