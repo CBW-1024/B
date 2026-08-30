@@ -294,6 +294,59 @@ static BOOL wcpscout_eq_CF(id self, SEL _cmd, id o) {
     return r;
 }
 
+// ── hook 4/5/6：其余 bid 比对方式（compare:/hasPrefix:/rangeOfString:/containsString:）──
+//   WCPGateLog 实证：登录闸门对 bid 的比对【没走 isEqualToString】，而是走下面这些之一，
+//   所以原版 scout 漏抓了真正的闸门调用方。补齐后，在【登录那一刻】跑即可定位。
+static NSComparisonResult (*gOrigCmp_NS)(id, SEL, NSString *) = NULL;
+static NSComparisonResult wcpscout_cmp_NS(id self, SEL _cmd, NSString *a) {
+    NSComparisonResult r = gOrigCmp_NS ? gOrigCmp_NS(self, _cmd, a) : NSOrderedSame;
+    scout_compare((NSString *)self, a);
+    return r;
+}
+static BOOL (*gOrigPre_NS)(id, SEL, NSString *) = NULL;
+static BOOL wcpscout_pre_NS(id self, SEL _cmd, NSString *a) {
+    BOOL r = gOrigPre_NS ? gOrigPre_NS(self, _cmd, a) : NO;
+    scout_compare((NSString *)self, a);
+    return r;
+}
+static NSRange (*gOrigRng_NS)(id, SEL, NSString *) = NULL;
+static NSRange wcpscout_rng_NS(id self, SEL _cmd, NSString *a) {
+    NSRange r = gOrigRng_NS ? gOrigRng_NS(self, _cmd, a) : (NSRange){NSNotFound,0};
+    scout_compare((NSString *)self, a);
+    return r;
+}
+static BOOL (*gOrigCtn_NS)(id, SEL, NSString *) = NULL;
+static BOOL wcpscout_ctn_NS(id self, SEL _cmd, NSString *a) {
+    BOOL r = gOrigCtn_NS ? gOrigCtn_NS(self, _cmd, a) : NO;
+    scout_compare((NSString *)self, a);
+    return r;
+}
+
+static NSComparisonResult (*gOrigCmp_CF)(id, SEL, NSString *) = NULL;
+static NSComparisonResult wcpscout_cmp_CF(id self, SEL _cmd, NSString *a) {
+    NSComparisonResult r = gOrigCmp_CF ? gOrigCmp_CF(self, _cmd, a) : NSOrderedSame;
+    scout_compare((NSString *)self, a);
+    return r;
+}
+static BOOL (*gOrigPre_CF)(id, SEL, NSString *) = NULL;
+static BOOL wcpscout_pre_CF(id self, SEL _cmd, NSString *a) {
+    BOOL r = gOrigPre_CF ? gOrigPre_CF(self, _cmd, a) : NO;
+    scout_compare((NSString *)self, a);
+    return r;
+}
+static NSRange (*gOrigRng_CF)(id, SEL, NSString *) = NULL;
+static NSRange wcpscout_rng_CF(id self, SEL _cmd, NSString *a) {
+    NSRange r = gOrigRng_CF ? gOrigRng_CF(self, _cmd, a) : (NSRange){NSNotFound,0};
+    scout_compare((NSString *)self, a);
+    return r;
+}
+static BOOL (*gOrigCtn_CF)(id, SEL, NSString *) = NULL;
+static BOOL wcpscout_ctn_CF(id self, SEL _cmd, NSString *a) {
+    BOOL r = gOrigCtn_CF ? gOrigCtn_CF(self, _cmd, a) : NO;
+    scout_compare((NSString *)self, a);
+    return r;
+}
+
 __attribute__((constructor))
 static void wcpscout_load(void) {
     ensure_log();   // 立刻写启动标记，证明 dylib 已加载（即使后面没有任何 hook 命中也能看到文件）
@@ -303,8 +356,17 @@ static void wcpscout_load(void) {
     swizzle_set(b, @selector(bundleIdentifier), (IMP)wcpscout_bundleIdentifier, (IMP *)&gOrigBundleID);
     swizzle_set(s, @selector(isEqualToString:), (IMP)wcpscout_es_NS, (IMP *)&gOrigES_NS);
     swizzle_set(s, @selector(isEqual:),         (IMP)wcpscout_eq_NS, (IMP *)&gOrigEq_NS);
+    // 其余比对方式（抓登录闸门用）
+    swizzle_set(s, @selector(compare:),              (IMP)wcpscout_cmp_NS, (IMP *)&gOrigCmp_NS);
+    swizzle_set(s, @selector(hasPrefix:),            (IMP)wcpscout_pre_NS, (IMP *)&gOrigPre_NS);
+    swizzle_set(s, @selector(rangeOfString:),         (IMP)wcpscout_rng_NS, (IMP *)&gOrigRng_NS);
+    swizzle_set(s, @selector(containsString:),        (IMP)wcpscout_ctn_NS, (IMP *)&gOrigCtn_NS);
     if (cf) {
         swizzle_set(cf, @selector(isEqualToString:), (IMP)wcpscout_es_CF, (IMP *)&gOrigES_CF);
         swizzle_set(cf, @selector(isEqual:),         (IMP)wcpscout_eq_CF, (IMP *)&gOrigEq_CF);
+        swizzle_set(cf, @selector(compare:),         (IMP)wcpscout_cmp_CF, (IMP *)&gOrigCmp_CF);
+        swizzle_set(cf, @selector(hasPrefix:),       (IMP)wcpscout_pre_CF, (IMP *)&gOrigPre_CF);
+        swizzle_set(cf, @selector(rangeOfString:),    (IMP)wcpscout_rng_CF, (IMP *)&gOrigRng_CF);
+        swizzle_set(cf, @selector(containsString:),   (IMP)wcpscout_ctn_CF, (IMP *)&gOrigCtn_CF);
     }
 }
