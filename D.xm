@@ -125,6 +125,10 @@ static size_t gAppPathLen = 0;
 static pthread_key_t gReentryKey;
 static BOOL          gReentryReady = NO;
 
+/* 换行符用可写数组而非字符串字面量：Theos 用 Objective-C++ 编译(.xm.mm)，
+ * 字面量类型是 const char[2]，赋给 iov_base(void *) 会报 drops const。 */
+static char  gNewline[] = "\n";
+
 /* 日志 */
 static int   gLogFD    = -1;
 static int   gLogLines = 0;
@@ -142,6 +146,9 @@ static inline void WCRLeave(void) { if (gReentryReady) pthread_setspecific(gReen
 
 /* ═══════════════════ 日志：纯 POSIX，零 Foundation ═══════════════════
  * 只在窗口内被调用，窗口外整个日志子系统一次都不会碰。 */
+
+/* format 属性：让编译器校验每一处调用的格式串与实参类型是否匹配 */
+static void WCRLog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void WCRLog(const char *fmt, ...) {
     if (gLogFD < 0 || gLogLines >= kWCRLogMaxLines) return;
@@ -163,7 +170,7 @@ static void WCRLog(const char *fmt, ...) {
     struct iovec iov[3];
     iov[0].iov_base = hdr;  iov[0].iov_len = (size_t)hn;
     iov[1].iov_base = body; iov[1].iov_len = (size_t)n;
-    iov[2].iov_base = "\n"; iov[2].iov_len = 1;
+    iov[2].iov_base = gNewline; iov[2].iov_len = 1;
     writev(gLogFD, iov, 3);
     gLogLines++;
 }
@@ -330,16 +337,18 @@ static void WCRPrepareOnce(void) {
 /* WCR 0x1583034 */
 - (id)initPipeline {
     gFlag = 1;
-    WCRLog("WINDOW OPEN   self=%p tid=%x", (void *)self, (unsigned)(uintptr_t)pthread_self());
-    NSLog(@"[WCR] WINDOW OPEN   self=%p", (void *)self);
+    WCRLog("WINDOW OPEN   self=0x%llx tid=%x",
+           (unsigned long long)(uintptr_t)self, (unsigned)(uintptr_t)pthread_self());
+    NSLog(@"[WCR] WINDOW OPEN   self=0x%llx", (unsigned long long)(uintptr_t)self);
     return %orig;
 }
 
 /* WCR 0x1583074：先置 0，再转发 */
 - (void)dealloc {
     gFlag = 0;
-    WCRLog("WINDOW CLOSE  self=%p tid=%x", (void *)self, (unsigned)(uintptr_t)pthread_self());
-    NSLog(@"[WCR] WINDOW CLOSE  self=%p", (void *)self);
+    WCRLog("WINDOW CLOSE  self=0x%llx tid=%x",
+           (unsigned long long)(uintptr_t)self, (unsigned)(uintptr_t)pthread_self());
+    NSLog(@"[WCR] WINDOW CLOSE  self=0x%llx", (unsigned long long)(uintptr_t)self);
     %orig;
 }
 
