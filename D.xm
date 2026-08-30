@@ -347,6 +347,31 @@ static BOOL wcpscout_ctn_CF(id self, SEL _cmd, NSString *a) {
     return r;
 }
 
+// ── hook 7：NSArray containsObject:（兜底"allowList 集合校验"型闸门）──
+//   WCPGateLog 实证：登录闸门对 bid【没有】字符串比对（isEqualToString/compare/… 全挂了都没抓到）。
+//   仅剩的合理客户端形态是集合校验，如 [allowedBundleIDs containsObject: bundleID]。
+//   这里只在该对象含 bid 子串时记录【数组内容】，从而直接看到 allowList 里有哪些 id。
+static BOOL (*gOrigContains)(id, SEL, id) = NULL;
+static BOOL wcpscout_contains(id self, SEL _cmd, id obj) {
+    BOOL r = gOrigContains ? gOrigContains(self, _cmd, obj) : NO;
+    if ([obj isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)obj;
+        if ([s rangeOfString:@"com.tencent.xin"].location != NSNotFound ||
+            [s rangeOfString:@"com.tencent.qy.xin"].location != NSNotFound) {
+            ensure_log();
+            void *frames[24];
+            int n = backtrace(frames, 24);
+            uintptr_t pc = (n > 2) ? (uintptr_t)frames[2] : 0;
+            char **syms = backtrace_symbols(frames, n);
+            NSString *arrDesc = [self description];
+            log_gate("containsObject(com.tencent)", pc,
+                     [NSString stringWithFormat:@"array contains \"%@\" ? array=%@", s, arrDesc], syms, n);
+            if (syms) free(syms);
+        }
+    }
+    return r;
+}
+
 __attribute__((constructor))
 static void wcpscout_load(void) {
     ensure_log();   // 立刻写启动标记，证明 dylib 已加载（即使后面没有任何 hook 命中也能看到文件）
@@ -369,4 +394,12 @@ static void wcpscout_load(void) {
         swizzle_set(cf, @selector(rangeOfString:),    (IMP)wcpscout_rng_CF, (IMP *)&gOrigRng_CF);
         swizzle_set(cf, @selector(containsString:),   (IMP)wcpscout_ctn_CF, (IMP *)&gOrigCtn_CF);
     }
+    // hook 7：NSArray containsObject:（allowList 集合校验型闸门兜底）
+    Class arr = objc_getClass("NSArray");
+    if (arr) swizzle_set(arr, @selector(containsObject:), (IMP)wcpscout_contains, (IMP *)&gOrigContains);
+    // 具体子类（@[] 字面量多为 __NSArrayI，可变数组为 __NSArrayM；抽象 NSArray 版本可能被它们覆盖）
+    Class ai = NSClassFromString(@"__NSArrayI");
+    if (ai) swizzle_set(ai, @selector(containsObject:), (IMP)wcpscout_contains, (IMP *)&gOrigContains);
+    Class am = NSClassFromString(@"__NSArrayM");
+    if (am) swizzle_set(am, @selector(containsObject:), (IMP)wcpscout_contains, (IMP *)&gOrigContains);
 }
