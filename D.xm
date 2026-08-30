@@ -26,11 +26,20 @@
 //       我们就是要它在被挡的那一刻把闸门方法名记下来。拿到 selector 后
 //       再换 WCPulseLite.xm 精准 hook 该方法即可。
 //
-// 构建（theos，无需 Substrate）：
-//   WCPScout_FILES = WCPScout.xm
-//   WCPScout_FRAMEWORKS = Foundation
-//   make package
-// 然后把它当普通 dylib 注入 IPA（insert_dylib + 重签）后 sideload。
+// 构建（★ 关键：自包含 dylib，不依赖 theos / 不链 Substrate，非越狱 sideload 也能加载）──
+//   用 clang 直接把本文件（已是纯 ObjC，无 Logos 指令）编成动态库：
+//
+//   SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+//   clang -dynamiclib -arch arm64 -arch arm64e \
+//       -target arm64-apple-ios14.0 -isysroot "$SDK" \
+//       -fno-objc-arc -framework Foundation \
+//       -install_name @executable_path/WCPScout.dylib \
+//       -x objective-c WCPScout.xm -o WCPScout.dylib
+//
+//   然后把它当普通 dylib 注入 IPA（insert_dylib + 重签）后 sideload，
+//   注入方式与你注入 WCPulse 完全一致即可。
+//   若你坚持用 theos：tweak 目标会强制链 Substrate，非越狱环境加载会失败——
+//   请勿用 theos tweak，改成上面的 clang 直编或 theos 的 library 类型。
 //
 // 取日志：在 WeChat 的 Info.plist 里加 UIFileSharingEnabled=true，
 //         用访达/Finder「文件共享」或任意可访问 App 容器的工具把
@@ -40,6 +49,7 @@
 
 #import <Foundation/Foundation.h>   // 必须放在最前：提供全部 Foundation 类与 NSHomeDirectory
 #import <string.h>                  // 保证 strncpy 等 C 函数在模块模式下可见（iOS 26.5 SDK 模块默认开启）
+#import <pthread.h>                  // 后台线程建符号表，避免启动卡死
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -56,7 +66,8 @@ typedef struct { void *imp; const char *cls; const char *sel; } MethodRec;
 static MethodRec *gMap = NULL;
 static int gMapCount = 0;
 static NSMutableData *gMapBuf = nil;          // 持有缓冲区，防止 realloc 失效
-static BOOL gInited = NO;                      // 惰性初始化标志（避免 GCD block 字面量/Substrate 依赖）
+static BOOL gInited = NO;                      // 日志文件已打开标志
+static BOOL gMapReady = NO;                    // 符号表是否已建好（建好前 hook 命中仍记原始 PC）
 
 static int cmp_rec(const void *a, const void *b) {
     uintptr_t ia = (uintptr_t)((MethodRec *)a)->imp;
@@ -70,6 +81,10 @@ static void build_method_map(void) {
     for (int i = 0; i < imgCount; i++) {
         const char *img = _dyld_get_image_name(i);
         if (!img) continue;
+        // ★ 跳过系统框架（/System/Library、/usr/lib），只扫 App 自己的镜像，
+        //   量级砍掉 90%+，避免启动卡死。登录闸门几乎必在 App 自身代码里。
+        if (strncmp(img, "/System/Library/", 15) == 0 ||
+            strncmp(img, "/usr/lib/", 9) == 0) continue;
         unsigned int clsCount = 0;
         const char **names = objc_copyClassNamesForImage(img, &clsCount);
         if (!names) continue;
@@ -109,6 +124,14 @@ static void build_method_map(void) {
     gMap = (MethodRec *)[gMapBuf mutableBytes];
     gMapCount = (int)([gMapBuf length] / sizeof(MethodRec));
     qsort(gMap, gMapCount, sizeof(MethodRec), cmp_rec);
+    gMapReady = YES;   // ★ 建表完成才允许符号化
+}
+
+// 后台线程建表：不阻塞微信启动（原同步建表会卡几十秒）
+static void *map_builder_thread(void *arg) {
+    build_method_map();
+    NSLog(@"[WCPScout] method map built (%d methods), ready", gMapCount);
+    return NULL;
 }
 
 // 反查：找到 imp <= pc 且最大者（即包含 pc 的方法，方法间不重叠）
@@ -135,24 +158,40 @@ static const int kMaxEntries = 400;
 static NSLock *gLogLock = nil;
 static NSMutableSet *gSeen = nil;
 
-static void ensure_log(void) {
-    if (gInited) {
-        if (!gLog) {
-            NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/WCPGateLog.txt"];
-            gLog = fopen([path UTF8String], "a");
-        }
-        return;
-    }
-    build_method_map();
-    gLogLock = [[NSLock alloc] init];
-    gSeen = [[NSMutableSet alloc] init];
+static void open_log_file(void) {
+    if (gLog) return;
+    // 优先写沙盒 Documents（可被文件共享取出）
     NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/WCPGateLog.txt"];
     gLog = fopen([path UTF8String], "a");
+    // 把实际尝试的绝对路径 + 成败打到 syslog：设备控制台一眼确认是「没加载」还是「路径/权限问题」
+    NSLog(@"[WCPScout] try path=%@ => %s", path, gLog ? "OK" : "FAIL(fopen)");
+    // Documents 不可写时的兜底路径（越狱或某些环境下可访问）
+    if (!gLog) {
+        gLog = fopen("/tmp/WCPGateLog.txt", "a");
+        NSLog(@"[WCPScout] fallback /tmp/WCPGateLog.txt => %s", gLog ? "OK" : "FAIL(fopen)");
+    }
+}
+
+static void ensure_log(void) {
+    if (gInited) {
+        open_log_file();
+        return;
+    }
+    // ★ 先落启动标记：只要 dylib 被加载，文件必然生成。即使后面 build_method_map
+    //   在某些环境异常，也不影响「dylib 有没有加载」的判定。
+    open_log_file();
     if (gLog) {
         NSDate *now = [NSDate date];
         fprintf(gLog, "=== WCPScout loaded %s ===\n", [[now description] UTF8String]);
         fflush(gLog);
     }
+    // 次要信号：写一行 syslog，设备控制台/日志工具可捕获（作为 Documents 不可见时的兜底）
+    NSLog(@"[WCPScout] dylib loaded (substrate-free, runtime-swizzle)");
+    // ★ 后台线程建符号表，启动不卡顿；建好前 hook 命中也会照常记原始 PC
+    pthread_t t;
+    if (pthread_create(&t, NULL, map_builder_thread, NULL) == 0) pthread_detach(t);
+    gLogLock = [[NSLock alloc] init];
+    gSeen = [[NSMutableSet alloc] init];
     gInited = YES;
 }
 
@@ -161,15 +200,18 @@ static void log_gate(const char *tag, uintptr_t pc, NSString *detail, char **sym
     if (!gLog || gLogged >= kMaxEntries) return;
     char cls[256], sel[256];
     resolve_caller(pc, cls, sel, sizeof(cls));
-    if (cls[0] == 0 && sel[0] == 0) return;        // 反查不到就不记
-
-    NSString *key = [NSString stringWithFormat:@"%s.%s", cls, sel];
+    // 符号表未建好时 cls/sel 为空 —— 仍照常记录原始 PC + 比对串，绝不漏掉闸门
+    const char *clsS = (cls[0] ? cls : "??");
+    const char *selS = (sel[0] ? sel : "??");
+    NSString *key;
+    if (cls[0] && sel[0]) key = [NSString stringWithFormat:@"%s.%s", cls, sel];
+    else key = [NSString stringWithFormat:@"pc=0x%lx", pc];   // 未符号化时按 PC 去重
     [gLogLock lock];
     BOOL seen = [gSeen containsObject:key];
     if (!seen) {
         [gSeen addObject:key];
         fprintf(gLog, "\n[%s] %s\n  callerPC=0x%lx  => -[%s %s]\n",
-                tag, [detail UTF8String], pc, cls, sel);
+                tag, [detail UTF8String], pc, clsS, selS);
         if (syms) {
             for (int k = 1; k < n; k++) {
                 if (syms[k]) fprintf(gLog, "    %s\n", syms[k]);
