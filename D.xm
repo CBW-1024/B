@@ -58,11 +58,12 @@
 #endif
 
 #ifndef NC_LOG
-#define NC_LOG 1
+#define NC_LOG 0
 #endif
 
 #pragma mark - 日志（同步写微信沙盒 Documents/NC_WCP.log）
 
+#if NC_LOG
 /* 必须同步写。早期 +initialize 阶段 dispatch_async 传 NULL 队列会直接 EXC_BAD_ACCESS。 */
 static FILE *g_logFile = NULL;
 static BOOL g_logTried = NO;
@@ -78,7 +79,6 @@ static void nc_openLog(void) {
     }
 }
 
-#if NC_LOG
 static void nc_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void nc_log(NSString *fmt, ...) {
     va_list ap;
@@ -208,21 +208,11 @@ static BOOL nc_shouldSpoof(id self_) {
 
 %end
 
-#pragma mark - 登录页（对齐 WCPulse IMP 0xa4060：置位在 orig 之后）
-
-/* 头文件证据：微信/WCAccountLoginFirstViewController.h:24  - (void)initView;
- * WCP 在该类上也挂了 hook（&orig 0xa20ef0，IMP 0xa4060），同样置 0xa21559 = 1。
- * 注：WCP 此处 selector 是 [x8,#0x940] 间接取址，静态未能解析；
- *     这里用头文件有实证的 -initView 替代，语义等价（登录页初始化时打点）。 */
-%hook WCAccountLoginFirstViewController
-
-- (void)initView {
-    %orig;
-    NC_STORE(&g_faceScene, YES);
-    nc_log(@"WCAccountLoginFirstViewController initView -> faceScene=YES");
-}
-
-%end
+/* 登录页 hook 已移除：
+ * WCPulse 里 0xa4060 那个 hook 的 selector 是 [x8,#0x940] 间接取址，静态未解析；
+ * 之前按头文件用 -initView 替代，结果登录页 UI 只剩"注册"按钮，说明该 hook
+ * 干扰了视图初始化时序。由于 0xa21559 是只写不读的死标志，对 bid 伪装无影响，
+ * 直接删掉即可。刷脸场景由 FaceRecogFlashHandler 单独覆盖。 */
 
 #pragma mark - 初始化
 
