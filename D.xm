@@ -79,6 +79,7 @@
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <substrate.h>          /* MSHookMessageEx —— 与 WCR 同一套注册方式 */
 #import <dlfcn.h>
 #import <pthread.h>
 #import <dispatch/dispatch.h>
@@ -341,29 +342,49 @@ static BOOL WCRCallerIsInAppImage(unsigned long long pc) {
  *  hook 2/3 —— 窗口开合。WCR 的实现就两条指令：
  *      0x158304c mov w8,#1 ; 0x1583050 strb w8,[x9,#0x560] ; 然后转发
  *      0x158308c strb wzr,[x8,#0x560]                      ; 然后转发
+ *
+ *  这里【不用 %group / %hook】，改成直接调 MSHookMessageEx，两个原因：
+ *   1) 需要在任意时机重复尝试注册（类可能懒加载），而 Logos 禁止对同一个
+ *      %group 两次 %init —— 就是这次编译报的 "re-%init" 错误。
+ *   2) WCR 本身就是直接调 MSHookMessageEx，而且 dealloc 的 selector 是用
+ *      sel_registerName("dealloc") 现拿的（0x1582834）—— 这样写才是一致的。
  * ══════════════════════════════════════════════════════════════════════ */
-%group FaceRecogGroup
 
-%hook FaceRecogFlashHandler
+static IMP gOrigInitPipeline = NULL;
+static IMP gOrigDealloc      = NULL;
 
-- (id)initPipeline {
+static id WCRNewInitPipeline(id self, SEL _cmd) {
     gFlag = 1;
     WCRLog("WINDOW OPEN   self=0x%llx tid=0x%llx",
            (unsigned long long)(uintptr_t)self, (unsigned long long)(uintptr_t)pthread_self());
     NSLog(@"[WCR] WINDOW OPEN   self=0x%llx", (unsigned long long)(uintptr_t)self);
-    return %orig;
+    if (!gOrigInitPipeline) return nil;
+    return ((id (*)(id, SEL))gOrigInitPipeline)(self, _cmd);
 }
 
-- (void)dealloc {
+static void WCRNewDealloc(id self, SEL _cmd) {
     gFlag = 0;
     WCRLog("WINDOW CLOSE  self=0x%llx tid=0x%llx",
            (unsigned long long)(uintptr_t)self, (unsigned long long)(uintptr_t)pthread_self());
     NSLog(@"[WCR] WINDOW CLOSE  self=0x%llx", (unsigned long long)(uintptr_t)self);
-    %orig;
+    if (gOrigDealloc) ((void (*)(id, SEL))gOrigDealloc)(self, _cmd);
 }
 
-%end
-%end
+/* 可重入调用：成功返回 YES。类不存在返回 NO，供调用方决定要不要重试。
+ * 用 NSClassFromString 而不是 objc_getClass —— 它返回的就是 Class，
+ * 省掉一次 ObjC 指针 → Class 的强制转换（那一步在 ARC 下要 __bridge，
+ * 在 MRR 下又不需要，容易踩）。两者语义等价，内部实现同为 objc_getClass。 */
+static BOOL WCRInstallFaceRecogHooks(void) {
+    Class c = NSClassFromString(@"FaceRecogFlashHandler");
+    if (!c) return NO;
+
+    MSHookMessageEx(c, @selector(initPipeline),
+                    (IMP)WCRNewInitPipeline, &gOrigInitPipeline);
+    MSHookMessageEx(c, sel_registerName("dealloc"),
+                    (IMP)WCRNewDealloc, &gOrigDealloc);
+
+    return (gOrigInitPipeline != NULL);
+}
 
 /* ══════════════════════════════════════════════════════════════════════ */
 %ctor {
@@ -372,22 +393,21 @@ static BOOL WCRCallerIsInAppImage(unsigned long long pc) {
 
     if (pthread_key_create(&gReentryKey, NULL) == 0) gReentryReady = YES;
 
-    %init;                                   /* NSBundle 组 */
+    %init;                                   /* 默认组，只装 NSBundle 这一个 hook */
 
-    if (objc_getClass("FaceRecogFlashHandler")) {
-        %init(FaceRecogGroup);
+    if (WCRInstallFaceRecogHooks()) {
         gWindowGroupInstalled = YES;
-        NSLog(@"[WCR] v5 loaded | FaceRecogFlashHandler found -> window group installed");
+        NSLog(@"[WCR] v5 loaded | FaceRecogFlashHandler found -> window hooks installed");
     } else {
-        /* 类可能是懒加载的，稍后主线程上再试一次（WCR 没有这步，纯健壮性补充）*/
+        /* 类可能是懒加载的，稍后主线程上再试一次。
+         * 手动注册才允许这样重复调用 —— %group 版会触发 Logos 的 re-%init 报错。 */
         NSLog(@"[WCR] v5 loaded | FaceRecogFlashHandler NOT found, will retry in 3s");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{
-            if (!gWindowGroupInstalled && objc_getClass("FaceRecogFlashHandler")) {
-                %init(FaceRecogGroup);
+            if (!gWindowGroupInstalled && WCRInstallFaceRecogHooks()) {
                 gWindowGroupInstalled = YES;
-                NSLog(@"[WCR] retry OK -> window group installed");
-                WCRLog("INIT retry OK -> window group installed");
+                NSLog(@"[WCR] retry OK -> window hooks installed");
+                WCRLog("INIT retry OK -> window hooks installed");
             } else if (!gWindowGroupInstalled) {
                 NSLog(@"[WCR] retry FAILED: class still missing");
                 WCRLog("INIT retry FAILED: FaceRecogFlashHandler still missing");
