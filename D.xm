@@ -1,36 +1,44 @@
 // WCPScout.xm — 纯诊断 dylib（不改 bid、不 spoof，只记录登录闸门调用）
 //
-// 目的：在【证书签名 sideload、无法用 Frida】的环境下，把"微信登录时
-//       哪个方法在读/比对该 bundle id"精准记录到沙盒文件，从而定位 WCPulse
-//       真正 hook 的闸门 selector（之前这个被混淆藏死了，静态读不出）。
+// 目的：在【证书签名 sideload、无法用 Frida、且通常非越狱】的环境下，把
+//       "微信登录时哪个方法在读/比对该 bundle id" 精准记录到沙盒文件，
+//       从而定位 WCPulse 真正 hook 的闸门 selector（静态读不出）。
+//
+// ★ 关键修复（v2）：改用 ObjC 运行时 method swizzling（method_setImplementation），
+//   不依赖 Substrate / CydiaSubstrate。上一版用 Logos %hook，%hook 需要 Substrate
+//   在场；非越狱 sideload 环境里 Substrate 不存在 → dylib 因找不到 MSHookMessageEx
+//   符号直接加载失败 → 沙盒里一个字节日志都没有。改用运行时 swizzle 后，只要 dylib
+//   被注入，就会在加载阶段（__attribute__((constructor))）立刻写一条启动标记，
+//   日志文件必然生成，从而把"dylib 没注入"和"hook 没命中"区分开。
 //
 // 原理：
 //   1) 本 dylib 注入 IPA 后运行在微信沙盒内，可直接 fopen 写
-//      NSHomeDirectory()/Documents/WCPGateLog.txt（沙盒内写文件不受限制，
-//      无需控制台/无需 Frida）。
-//   2) hook [NSBundle -bundleIdentifier]：仅当接收者是主 bundle 时记录调用栈，
-//      并把返回地址用 ObjC 运行时方法表反查成 (类名 + selector 名) ——
-//      因为发布版微信符号被 strip，backtrace 只有地址，必须在运行时自己符号化。
-//   3) hook [NSString -isEqualToString:]/[NSString -isEqual:]：当任一端包含
-//      "com.tencent.xin" 或 "com.tencent.qy.xin" 时记录调用方 —— 这正是
-//      登录闸门做 bid 比对的现场，命中即闸门方法。
+//      NSHomeDirectory()/Documents/WCPGateLog.txt（沙盒内写文件不受限制）。
+//   2) 运行时替换 [NSBundle -bundleIdentifier]：仅当接收者是主 bundle 时记录调用栈，
+//      并把 PC 用 ObjC 运行时方法表反查成 (类名 + selector)。发布版微信符号被 strip，
+//      backtrace 只有地址，必须在运行时自己符号化。
+//   3) 运行时替换 [NSString -isEqualToString:]/[NSString -isEqual:]（含 __NSCFString
+//      具体子类）：当任一端包含 "com.tencent.xin" 或 "com.tencent.qy.xin" 时记录
+//      调用方 —— 这正是登录闸门做 bid 比对的现场，命中即闸门方法。
 //   4) 按 (cls+sel) 去重，日志只保留「不同的调用方」，文件小且直指闸门。
 //
 // 注意：本 scout 不 spoof，所以注入后登录【仍会被闸门挡住】——这没问题，
 //       我们就是要它在被挡的那一刻把闸门方法名记下来。拿到 selector 后
-//       再换 WCPulseLite.xm（v6）精准 hook 该方法即可。
+//       再换 WCPulseLite.xm 精准 hook 该方法即可。
 //
-// 构建（theos）：
+// 构建（theos，无需 Substrate）：
 //   WCPScout_FILES = WCPScout.xm
 //   WCPScout_FRAMEWORKS = Foundation
 //   make package
-// 然后把它当普通 dylib 注入 IPA（与你注入 WCPulse 同一套流程），重签 sideload。
+// 然后把它当普通 dylib 注入 IPA（insert_dylib + 重签）后 sideload。
 //
 // 取日志：在 WeChat 的 Info.plist 里加 UIFileSharingEnabled=true，
 //         用访达/Finder「文件共享」或任意可访问 App 容器的工具把
 //         Documents/WCPGateLog.txt 拖出来即可。
+//         若 sideload 后【仍无任何文件】，说明 dylib 根本没被注入（不是 hook 问题），
+//         需检查 insert_dylib 是否写入 LC_LOAD_DYLIB 且已随 IPA 重签。
 
-#import <Foundation/Foundation.h>   // 必须放在最前：提供 NSString/NSMutableData/NSLock/NSMutableSet/NSDate/NSBundle、NSHomeDirectory
+#import <Foundation/Foundation.h>   // 必须放在最前：提供全部 Foundation 类与 NSHomeDirectory
 #import <string.h>                  // 保证 strncpy 等 C 函数在模块模式下可见（iOS 26.5 SDK 模块默认开启）
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -41,14 +49,14 @@
 
 // ⚠️ 不要在此文件写 `@class NSString;` / `@class NSBundle;` 之类的手写前向声明：
 //   在 iOS 26.5 SDK（模块默认开启）下，前向声明会阻止 Foundation 模块导入且自身不暴露方法，
-//   直接触发 "unknown type name" / "forward declaration" 系列编译错误。需要类声明就靠上面的 Foundation import。
+//   触发 "unknown type name" / "forward declaration" 系列编译错误。需要类声明就靠上面的 Foundation import。
 
 // ── 运行时方法表（用于把 PC 反查成 类+selector）─────────────────────────
 typedef struct { void *imp; const char *cls; const char *sel; } MethodRec;
 static MethodRec *gMap = NULL;
 static int gMapCount = 0;
 static NSMutableData *gMapBuf = nil;          // 持有缓冲区，防止 realloc 失效
-static BOOL gInited = NO;                      // 惰性初始化标志（避免 GCD block 字面量触发 Logos 括号计数 bug）
+static BOOL gInited = NO;                      // 惰性初始化标志（避免 GCD block 字面量/Substrate 依赖）
 
 static int cmp_rec(const void *a, const void *b) {
     uintptr_t ia = (uintptr_t)((MethodRec *)a)->imp;
@@ -142,7 +150,7 @@ static void ensure_log(void) {
     gLog = fopen([path UTF8String], "a");
     if (gLog) {
         NSDate *now = [NSDate date];
-        fprintf(gLog, "=== WCPScout start %s ===\n", [[now description] UTF8String]);
+        fprintf(gLog, "=== WCPScout loaded %s ===\n", [[now description] UTF8String]);
         fflush(gLog);
     }
     gInited = YES;
@@ -173,10 +181,19 @@ static void log_gate(const char *tag, uintptr_t pc, NSString *detail, char **sym
     [gLogLock unlock];
 }
 
+// ── 运行时 swizzle（不依赖 Substrate）──────────────────────────────────
+static void swizzle_set(Class cls, SEL sel, IMP repl, IMP *origStore) {
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    if (origStore) *origStore = method_getImplementation(m);
+    method_setImplementation(m, repl);
+}
+
 // ── hook 1：bundleIdentifier（聚焦主 bundle 读取）────────────────────────
-%hook NSBundle
-- (NSString *)bundleIdentifier {
-    NSString *real = %orig;
+static NSString *(*gOrigBundleID)(id, SEL) = NULL;
+static NSString *wcpscout_bundleIdentifier(id self, SEL _cmd) {
+    NSString *real = gOrigBundleID ? gOrigBundleID(self, _cmd) : nil;
     if (self == [NSBundle mainBundle]) {
         ensure_log();
         void *frames[24];
@@ -189,50 +206,63 @@ static void log_gate(const char *tag, uintptr_t pc, NSString *detail, char **sym
     }
     return real;
 }
-%end
 
-// ── hook 2：NSString 比较（捕获 bid 比对现场）───────────────────────────
-%hook NSString
-- (BOOL)isEqualToString:(NSString *)aString {
-    BOOL r = %orig;
-    NSString *selfs = (NSString *)self;
-    if ([selfs isKindOfClass:[NSString class]]) {
-        const char *a = [selfs UTF8String];
-        const char *b = [aString UTF8String];
-        if ((a && (strstr(a, "com.tencent.xin") || strstr(a, "com.tencent.qy.xin"))) ||
-            (b && (strstr(b, "com.tencent.xin") || strstr(b, "com.tencent.qy.xin")))) {
+// ── hook 2/3：NSString 比较（捕获 bid 比对现场）──────────────────────────
+static void scout_compare(NSString *aStr, NSString *bStr) {
+    const char *a = aStr ? [aStr UTF8String] : NULL;
+    const char *b = bStr ? [bStr UTF8String] : NULL;
+    if ((a && (strstr(a, "com.tencent.xin") || strstr(a, "com.tencent.qy.xin"))) ||
+        (b && (strstr(b, "com.tencent.xin") || strstr(b, "com.tencent.qy.xin")))) {
         ensure_log();
         void *frames[24];
         int n = backtrace(frames, 24);
         uintptr_t pc = (n > 2) ? (uintptr_t)frames[2] : 0;
         char **syms = backtrace_symbols(frames, n);
-        log_gate("isEqualToString(com.tencent)", pc,
-                 [NSString stringWithFormat:@"\"%@\" ==? \"%@\"", selfs, aString], syms, n);
+        log_gate("isEqual(com.tencent)", pc,
+                 [NSString stringWithFormat:@"\"%@\" ==? \"%@\"", aStr, bStr], syms, n);
         if (syms) free(syms);
-        }
     }
+}
+
+// NSString 基类路径（普通 NSString 实例极少，但保留以防）
+static BOOL (*gOrigES_NS)(id, SEL, NSString *) = NULL;
+static BOOL wcpscout_es_NS(id self, SEL _cmd, NSString *a) {
+    BOOL r = gOrigES_NS ? gOrigES_NS(self, _cmd, a) : NO;
+    scout_compare((NSString *)self, a);
+    return r;
+}
+static BOOL (*gOrigEq_NS)(id, SEL, id) = NULL;
+static BOOL wcpscout_eq_NS(id self, SEL _cmd, id o) {
+    BOOL r = gOrigEq_NS ? gOrigEq_NS(self, _cmd, o) : NO;
+    if ([o isKindOfClass:[NSString class]]) scout_compare((NSString *)self, (NSString *)o);
     return r;
 }
 
-- (BOOL)isEqual:(id)object {
-    BOOL r = %orig;
-    NSString *selfs = (NSString *)self;
-    if ([selfs isKindOfClass:[NSString class]] && [object isKindOfClass:[NSString class]]) {
-        NSString *o = (NSString *)object;
-        const char *a = [selfs UTF8String];
-        const char *b = [o UTF8String];
-        if ((a && (strstr(a, "com.tencent.xin") || strstr(a, "com.tencent.qy.xin"))) ||
-            (b && (strstr(b, "com.tencent.xin") || strstr(b, "com.tencent.qy.xin")))) {
-            ensure_log();
-            void *frames[24];
-            int n = backtrace(frames, 24);
-            uintptr_t pc = (n > 2) ? (uintptr_t)frames[2] : 0;
-            char **syms = backtrace_symbols(frames, n);
-            log_gate("isEqual(com.tencent)", pc,
-                     [NSString stringWithFormat:@"\"%@\" ==? \"%@\"", selfs, o], syms, n);
-            if (syms) free(syms);
-        }
-    }
+// __NSCFString 具体子类路径（@"..." 字面量实际都是它，主战场）
+static BOOL (*gOrigES_CF)(id, SEL, NSString *) = NULL;
+static BOOL wcpscout_es_CF(id self, SEL _cmd, NSString *a) {
+    BOOL r = gOrigES_CF ? gOrigES_CF(self, _cmd, a) : NO;
+    scout_compare((NSString *)self, a);
     return r;
 }
-%end
+static BOOL (*gOrigEq_CF)(id, SEL, id) = NULL;
+static BOOL wcpscout_eq_CF(id self, SEL _cmd, id o) {
+    BOOL r = gOrigEq_CF ? gOrigEq_CF(self, _cmd, o) : NO;
+    if ([o isKindOfClass:[NSString class]]) scout_compare((NSString *)self, (NSString *)o);
+    return r;
+}
+
+__attribute__((constructor))
+static void wcpscout_load(void) {
+    ensure_log();   // 立刻写启动标记，证明 dylib 已加载（即使后面没有任何 hook 命中也能看到文件）
+    Class b  = objc_getClass("NSBundle");
+    Class s  = objc_getClass("NSString");
+    Class cf = NSClassFromString(@"__NSCFString");
+    swizzle_set(b, @selector(bundleIdentifier), (IMP)wcpscout_bundleIdentifier, (IMP *)&gOrigBundleID);
+    swizzle_set(s, @selector(isEqualToString:), (IMP)wcpscout_es_NS, (IMP *)&gOrigES_NS);
+    swizzle_set(s, @selector(isEqual:),         (IMP)wcpscout_eq_NS, (IMP *)&gOrigEq_NS);
+    if (cf) {
+        swizzle_set(cf, @selector(isEqualToString:), (IMP)wcpscout_es_CF, (IMP *)&gOrigES_CF);
+        swizzle_set(cf, @selector(isEqual:),         (IMP)wcpscout_eq_CF, (IMP *)&gOrigEq_CF);
+    }
+}
