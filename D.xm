@@ -397,6 +397,10 @@ static UIViewController *vcm_topViewController(void) {
                         }
                     }
                     // 解码目标格式严格跟随真实 ASBD（rate/ch/bits/float/non-interleaved），不再写死 48000/1。
+                    // 当素材原生率≠目标率时（如本素材 22050Hz → 微信 48000Hz），AVAssetReader 内部必做重采样；
+                    // 默认线性插值对非整数倍升采样会在 Nyquist 带内引入镜像频率 → 听感发闷/不纯净（“不清晰”）。
+                    // 显式指定 Mastering 重采样算法 + High 质量：用更陡的抗镜像滤波，显著降镜像、提清晰度。
+                    // 这两个键仅在“发生重采样”时生效；源=目标时 Core Audio 自动忽略，无副作用（对齐 VCAM4 无 Converter 层）。
                     NSDictionary *outSettings = @{
                         AVFormatIDKey: @(kAudioFormatLinearPCM),
                         AVSampleRateKey: @(rate),
@@ -405,6 +409,8 @@ static UIViewController *vcm_topViewController(void) {
                         AVLinearPCMBitDepthKey: @(bits),
                         AVLinearPCMIsBigEndianKey: @NO,
                         AVLinearPCMIsNonInterleavedKey: @(isNonInt),
+                        AVSampleRateConverterAlgorithmKey: @"com.apple.audio.converter.mastering",
+                        AVSampleRateConverterAudioQualityKey: @(AVAudioQualityHigh),
                     };
                     AVAssetReaderTrackOutput *out = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:outSettings];
                     out.alwaysCopiesSampleData = NO;
