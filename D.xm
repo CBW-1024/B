@@ -857,7 +857,11 @@ static OSStatus hooked_AudioUnitRender(
     // 而 g_hasProbedASBD 已为 YES 使探测块不再执行 → feeder 永远起不来、环恒空、永久静音。
     // 把“确保 feeder 运行”移到探测块之外，每帧兜底重启即可彻底消除该竞态（startAudioFeeder 内部幂等，
     // 且对 g_audioFeederRunning 为 YES 时直接 return，每帧调用零开销）。
-    if (!g_audioFeederRunning) {
+    //
+    // 严格一次性播放（g_isLoop==NO）：加上 g_isLoop 门控后，本块仅在循环开时兜底重启；
+    // 循环关时 feeder 播完一遍自然退场(g_audioFeederRunning→NO)，本块不再拉起 → 真静音。
+    // 首次/换素材后的那一次播放仍由探测块内 D.xm:842 无条件启动，保证“一次性”也能响。
+    if (!g_audioFeederRunning && g_isLoop) {
         [VCamMediaManager startAudioFeeder];
     }
 
@@ -913,6 +917,23 @@ static OSStatus hooked_AudioUnitRender(
                 if (!ioData->mBuffers[i].mData) continue;
                 if (ioData->mBuffers[i].mDataByteSize != size) continue;
                 memcpy(ioData->mBuffers[i].mData, temp, size);
+            }
+        }
+        // 替换能量检测（每 3 秒一次）：直接扫描本帧写入 ioData 的替换音频，统计非零字节占比。
+        // 占比≈0% → 环里是静音（feeder/转换器产出零，属数据源问题）；
+        // 占比显著却仍无声 → 真实音频已写入 ioData 但通话不上传它，说明该 AudioUnitRender 的 ioData
+        //   并非微信实际上传麦克风路径（交付/微信版本音频路径变更问题），需换 hook 点。
+        {
+            static NSTimeInterval s_lastEnergy = 0;
+            NSTimeInterval t = [[NSDate date] timeIntervalSince1970];
+            if (t - s_lastEnergy >= 3.0 && ioData && ioData->mBuffers[0].mData && size > 0) {
+                uint8_t *p = (uint8_t *)ioData->mBuffers[0].mData;
+                size_t nz = 0;
+                for (UInt32 k = 0; k < size; k++) if (p[k] != 0) nz++;
+                vcam_log(@"替换能量：bus=%u 写入%u字节 非零%zu字节(占比%.1f%%) %s",
+                         inOutputBusNumber, size, nz, size ? (double)nz / size * 100.0 : 0.0,
+                         nz * 100 >= size * 5 ? "→真实音频已写入ioData" : "→疑似静音(全零)");
+                s_lastEnergy = t;
             }
         }
     } @catch (NSException *e) {
