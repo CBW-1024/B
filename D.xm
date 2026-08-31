@@ -347,15 +347,21 @@ static UIViewController *vcm_topViewController(void) {
             @autoreleasepool {
                 NSString *path = g_tempAudioPath;
                 if (![g_fileManager fileExistsAtPath:path]) path = vcm_videoPath();
-                if (!g_didLogFeedStart) { vcam_log(@"feeder 启动，素材=%@ (tempAudio=%@)", path, g_tempAudioPath); g_didLogFeedStart = YES; }
-                if (![g_fileManager fileExistsAtPath:path]) {
-                    // 典型场景：换素材时 removeItemAtPath 已删旧文件、copyItemAtPath 还没拷完，feeder 恰在此窗口启动。
-                    // 必须清 g_hasProbedASBD 让下一帧重新 probe 并重启 feeder——否则 ASBD 已探测、feeder 已死，
-                    // 整通电话再无任何路径重启解码，麦克风一路永久静音。
-                    if (!g_didLogUnavail) { vcam_log(@"素材暂不可用（可能正在拷贝），清 ASBD 待下帧重试"); g_didLogUnavail = YES; }
-                    g_hasProbedASBD = NO;
-                    return;
+
+                // 对齐 VCAM4：素材尚未拷贝完成时，feeder 内部轮询等待而非退出。
+                // 旧逻辑「素材不可用就清 g_hasProbedASBD 并 return」依赖后续 AudioUnitRender(bus=1)
+                // 重新探测来重启；但微信在换素材/通话切换窗口常暂时停止麦克风上行回调，
+                // bus=1 不再被调用 → 探测永远重不起来 → 整通电话静音。改为 feeder 进程存活、
+                // 最多轮询等待 30s，素材到位即解码，无需外部重探测，也不清 g_hasProbedASBD。
+                int waitRetry = 0;
+                while (!g_audioFeederStop && ![g_fileManager fileExistsAtPath:path]) {
+                    if (waitRetry == 0 && !g_didLogUnavail) { vcam_log(@"素材尚未就绪，feeder 轮询等待…"); g_didLogUnavail = YES; }
+                    [NSThread sleepForTimeInterval:0.2];
+                    if (++waitRetry > 150) { vcam_log(@"素材等待超时(30s)，feeder 退出"); return; }
                 }
+                if (g_audioFeederStop) return;
+                if (![g_fileManager fileExistsAtPath:path]) { vcam_log(@"素材暂不可用，feeder 退出"); return; }
+                if (!g_didLogFeedStart) { vcam_log(@"feeder 启动，素材=%@ (tempAudio=%@)", path, g_tempAudioPath); g_didLogFeedStart = YES; }
                 NSURL *url = [NSURL fileURLWithPath:path];
 
                 // 对齐 VCAM4：不写死 48000/1，直接用探测到的真实 ASBD 作为解码目标格式。
@@ -772,7 +778,10 @@ static OSStatus hooked_AudioUnitRender(
                 && (live.mSampleRate        != g_targetASBD.mSampleRate
                     || live.mChannelsPerFrame  != g_targetASBD.mChannelsPerFrame
                     || live.mBitsPerChannel    != g_targetASBD.mBitsPerChannel
-                    || live.mFormatFlags       != g_targetASBD.mFormatFlags)) {
+                    // 仅比较影响解码字节布局的语义位（float / non-interleaved），
+                    // 忽略 PACKED/SIGNED 等位——它们不改变字节排布，避免无关位波动误触发清 ASBD→静音。
+                    || ((live.mFormatFlags ^ g_targetASBD.mFormatFlags)
+                        & (kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved)))) {
             vcam_log(@"ASBD 变更：%.0f/%u/%u/0x%x → %.0f/%u/%u/0x%x，触发重探测",
                   g_targetASBD.mSampleRate, (unsigned)g_targetASBD.mChannelsPerFrame, g_targetASBD.mBitsPerChannel, g_targetASBD.mFormatFlags,
                   live.mSampleRate, (unsigned)live.mChannelsPerFrame, live.mBitsPerChannel, live.mFormatFlags);
