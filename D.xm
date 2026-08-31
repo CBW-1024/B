@@ -92,6 +92,28 @@ static AudioStreamBasicDescription g_targetASBD    = {0};
 // 已探测的麦克风 ASBD 即音频解码的目标格式：AudioConverter 把素材重采样/重排到该格式，
 // 输出统一为交错（interleaved）PCM，直接 memcpy 进麦克风 buffer。
 
+#pragma mark - 诊断日志（面板“导出日志”按钮会读取 g_diagLog 收集的内容）
+// vcam_log 同时做两件事：NSLog 打到系统日志（[VCAM-D] 前缀），并追加进 g_diagLog 供面板导出。
+// 后台解码/渲染线程都会写，故用 os_unfair_lock 保护；超过上限循环截断，避免常驻内存膨胀。
+static NSMutableString *g_diagLog     = nil;
+static os_unfair_lock   g_diagLock    = OS_UNFAIR_LOCK_INIT;
+static void vcam_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void vcam_log(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *full = [NSString stringWithFormat:@"[VCAM-D] %@", msg];
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], full];
+    NSLog(@"%@", full);
+    os_unfair_lock_lock(&g_diagLock);
+    if (!g_diagLog) g_diagLog = [NSMutableString new];
+    if (g_diagLog.length > 64000) {
+        [g_diagLog deleteCharactersInRange:NSMakeRange(0, g_diagLog.length - 64000)];
+    }
+    [g_diagLog appendString:line];
+    os_unfair_lock_unlock(&g_diagLock);
+}
+
 // 容错：单帧失败仅降级透传，下帧重试，不置全局标志、不关替换总开关。
 static OSStatus (*g_origAudioUnitRender)(
     AudioUnit                   inUnit,
@@ -321,10 +343,12 @@ static OSStatus VCamAudioConverterInputProc(
     g_audioFeederRunning = YES;
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        static BOOL g_didLogFeed = NO;
         @try {
             @autoreleasepool {
                 NSString *path = g_tempAudioPath;
                 if (![g_fileManager fileExistsAtPath:path]) path = vcm_videoPath();
+                vcam_log(@"feeder 启动，素材=%@ (tempAudio=%@)", path, g_tempAudioPath);
                 if (![g_fileManager fileExistsAtPath:path]) return;   // 无素材，直接退出
                 NSURL *url = [NSURL fileURLWithPath:path];
 
@@ -348,7 +372,7 @@ static OSStatus VCamAudioConverterInputProc(
                     AVAsset *asset = [AVAsset assetWithURL:url];
                     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
                     AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
-                    if (!track) return;
+                    if (!track) { vcam_log(@"feeder：%@ 无音频轨道（AVAssetReader 取不到轨道）", path); return; }
                     // 源解码：交错浮点 LinearPCM（采样率/声道数由 AVAssetReader 选定；AVAssetReader 不做重采样）
                     NSDictionary *outSettings = @{
                         AVFormatIDKey: @(kAudioFormatLinearPCM),
@@ -393,7 +417,11 @@ static OSStatus VCamAudioConverterInputProc(
                             // 源/目标格式变化（罕见）或首帧：重建 converter
                             if (!conv || srcDesc.mSampleRate != lastSrcRate || srcDesc.mChannelsPerFrame != lastSrcCh) {
                                 if (conv) { AudioConverterDispose(conv); conv = NULL; }
-                                if (AudioConverterNew(&srcDesc, &dstDesc, &conv) != noErr || !conv) continue;
+                                if (AudioConverterNew(&srcDesc, &dstDesc, &conv) != noErr || !conv) {
+                                    vcam_log(@"AudioConverterNew 失败 srcRate=%.0f srcCh=%u dstRate=%.0f dstCh=%u",
+                                          srcDesc.mSampleRate, srcDesc.mChannelsPerFrame, dstDesc.mSampleRate, dstDesc.mChannelsPerFrame);
+                                    continue;
+                                }
                                 lastSrcRate = srcDesc.mSampleRate;
                                 lastSrcCh   = srcDesc.mChannelsPerFrame;
                             }
@@ -419,7 +447,10 @@ static OSStatus VCamAudioConverterInputProc(
                                 conv, VCamAudioConverterInputProc, &feed, &outPackets, &outList, NULL);
                             if (cerr == noErr) {
                                 UInt32 gotBytes = outList.mBuffers[0].mDataByteSize;
-                                if (gotBytes > 0) [self ringWrite:outBuf length:gotBytes];
+                                if (gotBytes > 0) {
+                                    if (!g_didLogFeed) { vcam_log(@"feeder 首次写出 %u 字节到环形缓冲", gotBytes); g_didLogFeed = YES; }
+                                    [self ringWrite:outBuf length:gotBytes];
+                                }
                             }
                             free(outBuf);
                         } @finally {
@@ -692,17 +723,23 @@ static OSStatus hooked_AudioUnitRender(
                                            inOutputBusNumber, inNumberFrames, ioData);
     if (status != noErr)                    return status;
     if (!g_isReplace || !g_isSound)         return status;
-    // 麦克风渲染落在 bus 1 才替换；本机微信麦克风渲染即 bus 1，保留此检查。
-    if (!ioData || inOutputBusNumber != 1)  return status;
+    if (!ioData)                            return status;
+    // 放宽总线门禁：不再硬性要求 bus==1。微信不同版本麦克风渲染可能落在其它总线，
+    // 写死后会直接 passthrough 真实麦克风（听感即“没替换”）。改为按实际总线探测，
+    // 探测失败（拿不到合法 ASBD）自然跳过、不污染输出。
+    if (inOutputBusNumber != 1)
+        vcam_log(@"AudioUnitRender bus=%u (≠1)，仍按该总线探测", inOutputBusNumber);
 
     if (!g_hasProbedASBD) {
         UInt32 propSize = sizeof(g_targetASBD);
-        // 用当前渲染总线号探测 StreamFormat；经上方 bus==1 门控后此处等价于写死 bus 1。
-        if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
+        OSStatus perr = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
                                  kAudioUnitScope_Output, inOutputBusNumber,
-                                 &g_targetASBD, &propSize) == noErr
-            && g_targetASBD.mSampleRate > 0) {
+                                 &g_targetASBD, &propSize);
+        if (perr == noErr && g_targetASBD.mSampleRate > 0) {
             g_hasProbedASBD = YES;
+            vcam_log(@"探测成功 bus=%u rate=%.0f ch=%u bits=%u flags=0x%x",
+                  inOutputBusNumber, g_targetASBD.mSampleRate, g_targetASBD.mChannelsPerFrame,
+                  g_targetASBD.mBitsPerChannel, g_targetASBD.mFormatFlags);
             // 按 ASBD 分配环形缓冲（约 2 秒容量），并启动流式解码线程；不再整段解码，也不重建 AVCapture 的 reader。
             @try {
                 UInt32 bps = (g_targetASBD.mBitsPerChannel ?: 16) / 8;
@@ -722,7 +759,10 @@ static OSStatus hooked_AudioUnitRender(
                 if (!g_audioFeederRunning) [VCamMediaManager startAudioFeeder];
             } @catch (NSException *e) {
                 // 探测阶段出问题还没污染输出，吞掉异常让下帧重试即可，不关替换
+                vcam_log(@"探测后启动 feeder 抛异常：%@", e);
             }
+        } else {
+            vcam_log(@"探测失败 bus=%u perr=%d rate=%.0f", inOutputBusNumber, (int)perr, g_targetASBD.mSampleRate);
         }
     }
     if (!g_hasProbedASBD) return status;
@@ -940,7 +980,8 @@ static VCamAudioProxy *g_audioProxy = nil;
     UIButton *_btnSound;       // g_isSound
     UIButton *_btnMirror;      // g_isMirrored
     UIButton *_btnReplace;     // g_isReplace
-    UIButton *_btnReset;       // 重置
+    UIButton *_btnReset;
+    UIButton *_btnExport;       // 导出诊断日志       // 重置
 }
 
 #pragma mark - 生命周期
@@ -1058,6 +1099,10 @@ static VCamAudioProxy *g_audioProxy = nil;
     _btnReset  = [self addGridButton:@"重置" x:btnW + gap y:y w:btnW h:btnH action:@selector(actionReset)];
     y += btnH + gap;
 
+    // 导出日志：占满整行（两列总宽），点击把 g_diagLog 经系统分享面板导出
+    _btnExport = [self addGridButton:@"导出日志" x:0 y:y w:(btnW * 2 + gap) h:btnH action:@selector(actionExportLog)];
+    y += btnH + gap;
+
     [_panelView.heightAnchor constraintEqualToConstant:y + 56 + 16].active = YES;
 }
 
@@ -1068,6 +1113,40 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)toggleMirror  { g_isMirrored = !g_isMirrored; vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleReplace { g_isReplace  = !g_isReplace;  vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
+
+#pragma mark - 诊断日志导出
+// 面板“导出日志”按钮：把 g_diagLog（带时间戳）写成临时文件，经 UIActivityViewController 分享出去
+// （隔空投送 / 存储到文件 / 微信自己都行），免得再连 Xcode 抓系统日志。
+- (void)actionExportLog {
+    os_unfair_lock_lock(&g_diagLock);
+    NSString *content = g_diagLog ? [g_diagLog copy] : @"";
+    os_unfair_lock_unlock(&g_diagLock);
+    if (content.length == 0) {
+        [self flashStatus:@"暂无诊断日志：请先发起一次视频通话，再回来导出"];
+        return;
+    }
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"VCAM-D-diag.log"];
+    NSError *err = nil;
+    if (![content writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
+        [self flashStatus:[NSString stringWithFormat:@"写日志失败：%@", err.localizedDescription]];
+        return;
+    }
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *avc =
+        [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        avc.popoverPresentationController.sourceView = _btnExport;
+        avc.popoverPresentationController.sourceRect = _btnExport.bounds;
+    }
+    [self presentViewController:avc animated:YES completion:nil];
+}
+// 临时改写状态文案，3 秒后自动恢复素材状态
+- (void)flashStatus:(NSString *)msg {
+    if (!_statusLabel) return;
+    _statusLabel.text = msg;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self updateStatusUI]; });
+}
 
 #pragma mark - 面板刷新
 // UIButtonConfiguration 取出来是副本，改完必须整体赋值回写
