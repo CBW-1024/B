@@ -348,8 +348,10 @@ static UIViewController *vcm_topViewController(void) {
                             }
                             CMBlockBufferRef blk = CMSampleBufferGetDataBuffer(s);
                             if (!blk) continue;
-                            size_t len = 0; const void *ptr = NULL;
-                            if (CMBlockBufferGetDataPointer(blk, 0, NULL, &len, (void **)&ptr) != noErr || len == 0) continue;
+                            // SDK（Xcode 14+，尤其 26.x）要求第 5 参为 char* _Nullable*，
+                            // 在 ObjC++ 下 (void**)&ptr 不再隐式转换，故用 char* 承接再转 const void*。
+                            size_t len = 0; char *ptr = NULL;
+                            if (CMBlockBufferGetDataPointer(blk, 0, NULL, &len, &ptr) != noErr || len == 0) continue;
                             UInt32 numFrames = (UInt32)CMSampleBufferGetNumSamples(s);
                             if (numFrames == 0) continue;
 
