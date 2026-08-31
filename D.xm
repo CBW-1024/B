@@ -165,6 +165,8 @@ static void vcm_stopReaders(void) {
 // 换素材 / 会话重启时让两条链路都从头来过。关键是清 g_hasProbedASBD：
 // 不清则麦克风链路认为格式已探测完，既不重新探测新会话 ASBD 也不重新解码，新素材音频进不了麦克风。
 static void vcm_reloadReaders(void) {
+    // 留痕：reload 会杀 feeder 并清 ASBD，是「feeder 反复重启」时序的直接解释者
+    vcam_log(@"reloadReaders：清 ASBD、停 feeder、重置环形缓冲");
     g_videoReload   = YES;
     g_audioReload   = YES;
     g_hasProbedASBD = NO;
@@ -283,10 +285,18 @@ static OSStatus VCamAudioConverterInputProc(
                 };
                 g_videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
                 [g_videoReader addOutput:g_videoOutput];
-                [g_videoReader startReading];
+                // 首例留痕：循环模式下 reader 每遍素材都会重建，只记第一次失败，避免刷屏
+                if (![g_videoReader startReading]) {
+                    static BOOL didLogVS = NO;
+                    if (!didLogVS) { vcam_log(@"视频 reader startReading 失败：%@", g_videoReader.error.localizedDescription); didLogVS = YES; }
+                }
+            } else {
+                static BOOL didLogVT = NO;
+                if (!didLogVT) { vcam_log(@"视频 reader：素材无视频轨道"); didLogVT = YES; }
             }
         }
     } @catch (NSException *e) {
+        vcam_log(@"setupVideoReader 异常：%@ — %@", e.name, e.reason);
     } @finally {
         // 必须是 @finally：@try/@catch 里的 return 不执行块后语句，unlock 写在块后会漏解锁，下一帧直接卡死。
         g_videoReload = NO;
@@ -318,12 +328,20 @@ static OSStatus VCamAudioConverterInputProc(
                 g_audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
                 g_audioOutput.alwaysCopiesSampleData = NO;
                 [g_audioReader addOutput:g_audioOutput];
-                [g_audioReader startReading];
+                // 首例留痕：此 reader 服务 AVCapture 音频链路（getAudioFrame），失败会让该链路一直透传真实麦克风
+                if (![g_audioReader startReading]) {
+                    static BOOL didLogAS = NO;
+                    if (!didLogAS) { vcam_log(@"AVCapture 音频 reader startReading 失败：%@", g_audioReader.error.localizedDescription); didLogAS = YES; }
+                }
+            } else {
+                static BOOL didLogAT = NO;
+                if (!didLogAT) { vcam_log(@"AVCapture 音频 reader：素材无音频轨道"); didLogAT = YES; }
             }
         }
         // ASBD 探明后 AudioUnit 链路才需要喂数据：启动流式解码线程（幂等，已在跑则忽略）。
         if (g_hasProbedASBD) [self startAudioFeeder];
     } @catch (NSException *e) {
+        vcam_log(@"setupAudioReader 异常：%@ — %@", e.name, e.reason);
     } @finally {
         // 早期 return 也要保证解锁
         g_audioReload = NO;
@@ -349,7 +367,14 @@ static OSStatus VCamAudioConverterInputProc(
                 NSString *path = g_tempAudioPath;
                 if (![g_fileManager fileExistsAtPath:path]) path = vcm_videoPath();
                 vcam_log(@"feeder 启动，素材=%@ (tempAudio=%@)", path, g_tempAudioPath);
-                if (![g_fileManager fileExistsAtPath:path]) return;   // 无素材，直接退出
+                if (![g_fileManager fileExistsAtPath:path]) {
+                    // 典型场景：换素材时 removeItemAtPath 已删旧文件、copyItemAtPath 还没拷完，feeder 恰在此窗口启动。
+                    // 必须清 g_hasProbedASBD 让下一帧重新 probe 并重启 feeder——否则 ASBD 已探测、feeder 已死，
+                    // 整通电话再无任何路径重启解码，麦克风一路永久静音。
+                    vcam_log(@"素材暂不可用（可能正在拷贝），清 ASBD 待下帧重试");
+                    g_hasProbedASBD = NO;
+                    return;
+                }
                 NSURL *url = [NSURL fileURLWithPath:path];
 
                 // 目标格式：以麦克风 ASBD 为准，但强制交错（interleaved），与旧逻辑一致
@@ -383,11 +408,16 @@ static OSStatus VCamAudioConverterInputProc(
                     AVAssetReaderTrackOutput *out = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:outSettings];
                     out.alwaysCopiesSampleData = NO;
                     [reader addOutput:out];
-                    if (![reader startReading]) return;
+                    // startReading 失败必须带 error 打日志：这是“feeder 启动后静默死亡”的头号嫌疑点。
+                    if (![reader startReading]) {
+                        vcam_log(@"startReading 失败：%@ (status=%ld)", reader.error.localizedDescription, (long)reader.status);
+                        return;
+                    }
 
                     AudioConverterRef conv = NULL;
                     double lastSrcRate = 0;
                     UInt32  lastSrcCh  = 0;
+                    UInt64  samplesGot = 0;   // 本遍累计读到的样本帧数（诊断用）
 
                     while (reader.status == AVAssetReaderStatusReading && !g_audioFeederStop) {
                         CMSampleBufferRef s = [out copyNextSampleBuffer];
@@ -413,6 +443,7 @@ static OSStatus VCamAudioConverterInputProc(
                             if (CMBlockBufferGetDataPointer(blk, 0, NULL, &len, &ptr) != noErr || len == 0) continue;
                             UInt32 numFrames = (UInt32)CMSampleBufferGetNumSamples(s);
                             if (numFrames == 0) continue;
+                            samplesGot += numFrames;
 
                             // 源/目标格式变化（罕见）或首帧：重建 converter
                             if (!conv || srcDesc.mSampleRate != lastSrcRate || srcDesc.mChannelsPerFrame != lastSrcCh) {
@@ -424,6 +455,14 @@ static OSStatus VCamAudioConverterInputProc(
                                 }
                                 lastSrcRate = srcDesc.mSampleRate;
                                 lastSrcCh   = srcDesc.mChannelsPerFrame;
+                                static BOOL didLogConv = NO;
+                                if (!didLogConv) {
+                                    vcam_log(@"AudioConverter 就绪：%.0fHz/%uch float → %.0fHz/%uch %@",
+                                             srcDesc.mSampleRate, (unsigned)srcDesc.mChannelsPerFrame,
+                                             dstDesc.mSampleRate, (unsigned)dstDesc.mChannelsPerFrame,
+                                             (dstDesc.mFormatFlags & kAudioFormatFlagIsFloat) ? @"float" : @"int");
+                                    didLogConv = YES;
+                                }
                             }
 
                             VCamSrcFeed feed = { (const uint8_t *)ptr, (UInt32)len, 0, srcDesc.mBytesPerFrame };
@@ -451,6 +490,13 @@ static OSStatus VCamAudioConverterInputProc(
                                     if (!g_didLogFeed) { vcam_log(@"feeder 首次写出 %u 字节到环形缓冲", gotBytes); g_didLogFeed = YES; }
                                     [self ringWrite:outBuf length:gotBytes];
                                 }
+                            } else {
+                                // FillComplexBuffer 持续失败会导致环恒空（听感即静音），首败必须留痕
+                                static BOOL didLogCerr = NO;
+                                if (!didLogCerr) {
+                                    vcam_log(@"AudioConverterFillComplexBuffer 首次失败 cerr=%d (inBytes=%zu frames=%u)", (int)cerr, len, numFrames);
+                                    didLogCerr = YES;
+                                }
                             }
                             free(outBuf);
                         } @finally {
@@ -458,17 +504,27 @@ static OSStatus VCamAudioConverterInputProc(
                         }
                     }
                     if (conv) { AudioConverterDispose(conv); conv = NULL; }
+                    // 本遍结束留痕：status 区分 Completed（正常读完）与 Failed（解码失败）；
+                    // samplesGot=0 说明一个样本都没读到（reader 层问题，converter 还没轮到）。
+                    static BOOL didLogPass = NO;
+                    if (!didLogPass) {
+                        vcam_log(@"本遍读完：status=%ld samples=%llu stop=%d err=%@ (1=读完 2=失败)",
+                                 (long)reader.status, samplesGot, (int)g_audioFeederStop,
+                                 (reader.status == AVAssetReaderStatusFailed) ? reader.error.localizedDescription : @"无");
+                        didLogPass = YES;
+                    }
                 };
 
                 // 外层：按 g_isLoop 回卷重播或停喂
                 while (!g_audioFeederStop) {
                     decodeOnce();
-                    if (!g_isLoop) break;
+                    if (!g_isLoop) { vcam_log(@"外层退出：循环播放关闭，feeder 结束"); break; }
                     if (g_audioFeederStop) break;
                     [NSThread sleepForTimeInterval:0.05];   // 稍等避免空转，下一轮重建 reader 从头读
                 }
             }
         } @catch (NSException *e) {
+            vcam_log(@"feeder 线程异常退出：%@ — %@", e.name, e.reason);
         } @finally {
             g_audioFeederRunning = NO;
         }
@@ -502,7 +558,15 @@ static OSStatus VCamAudioConverterInputProc(
         g_audioRingFill--; avail--;
     }
     os_unfair_lock_unlock(&g_audioRingLock);
-    if (written < length) memset(outData + written, 0, length - written);
+    if (written < length) {
+        // 首例留痕：环里数据不够、本帧部分补零。偶发于启动瞬间属正常；持续出现说明 feeder 供给不足/未跑。
+        static BOOL didLogStarve = NO;
+        if (!didLogStarve) {
+            vcam_log(@"环数据不足：请求 %zu 字节仅取到 %zu（余下补零静音）", length, written);
+            didLogStarve = YES;
+        }
+        memset(outData + written, 0, length - written);
+    }
 }
 
 // 从音频 reader 取一帧，套用采集帧的时序后返回（调用方负责 CFRelease）。
@@ -518,12 +582,17 @@ static OSStatus VCamAudioConverterInputProc(
             if (g_audioOutput) s = [g_audioOutput copyNextSampleBuffer];
         }
     } @catch (NSException *e) {
+        vcam_log(@"getAudioFrame 取帧异常：%@ — %@", e.name, e.reason);
     } @finally {
         [g_mediaLock unlock];
     }
 
     // 取不到帧就标重建，留给下一帧开头处理
-    if (!s) g_audioReload = YES;
+    if (!s) {
+        static BOOL didLogAF = NO;
+        if (!didLogAF) { vcam_log(@"getAudioFrame 取不到帧（AVCapture 音频链路无数据，标重建重试）"); didLogAF = YES; }
+        g_audioReload = YES;
+    }
     if (!s) return NULL;
 
     CMSampleBufferRef out = NULL;
@@ -537,6 +606,7 @@ static OSStatus VCamAudioConverterInputProc(
             }
         }
     } @catch (NSException *e) {
+        vcam_log(@"getAudioFrame 套时序异常：%@ — %@", e.name, e.reason);
         CFRelease(s);
         return NULL;
     }
@@ -560,6 +630,7 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
             }
         }
     } @catch (NSException *e) {
+        vcam_log(@"取视频帧异常：%@ — %@", e.name, e.reason);
     } @finally {
         [g_mediaLock unlock];
     }
@@ -694,6 +765,7 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
         }
     } @catch (NSException *e) {
         if (out) { CFRelease(out); out = NULL; }
+        vcam_log(@"视频合成/渲染异常：%@ — %@", e.name, e.reason);
     }
     return out;
 }
@@ -727,8 +799,10 @@ static OSStatus hooked_AudioUnitRender(
     // 放宽总线门禁：不再硬性要求 bus==1。微信不同版本麦克风渲染可能落在其它总线，
     // 写死后会直接 passthrough 真实麦克风（听感即“没替换”）。改为按实际总线探测，
     // 探测失败（拿不到合法 ASBD）自然跳过、不污染输出。
-    if (inOutputBusNumber != 1)
-        vcam_log(@"AudioUnitRender bus=%u (≠1)，仍按该总线探测", inOutputBusNumber);
+    if (inOutputBusNumber != 1) {
+        static BOOL didLogBus = NO;
+        if (!didLogBus) { vcam_log(@"AudioUnitRender bus=%u (≠1)，仍按该总线探测", inOutputBusNumber); didLogBus = YES; }
+    }
 
     if (!g_hasProbedASBD) {
         UInt32 propSize = sizeof(g_targetASBD);
@@ -751,6 +825,7 @@ static OSStatus hooked_AudioUnitRender(
                     g_audioRingCap = g_audioRing ? cap : 0;
                     g_audioRingHead = g_audioRingTail = g_audioRingFill = 0;
                     os_unfair_lock_unlock(&g_audioRingLock);
+                    vcam_log(@"环形缓冲重建：cap=%zu 字节（约 2 秒）%@", g_audioRingCap, g_audioRing ? @"" : @"，malloc 失败！");
                 }
                 // 注意：此处不能用 !g_audioFeederStop 做门禁——vcm_reloadReaders（startRunning / 换素材时）
                 // 会把 g_audioFeederStop 置 YES 来停掉旧解码线程；若不把它清回 NO，新会话的 feeder 永远起不来，
@@ -777,6 +852,19 @@ static OSStatus hooked_AudioUnitRender(
     UInt32 nCh  = ioData->mNumberBuffers;
     UInt32 need = (nCh > 1) ? size * nCh : size;
     if (need == 0 || need > 0x100000) return status;
+
+    // 消费端首例留痕：一次性看清帧参数与环状态（fill=0 说明 feeder 没喂上，数据源问题而非消费问题）
+    {
+        static BOOL didLogConsume = NO;
+        if (!didLogConsume) {
+            os_unfair_lock_lock(&g_audioRingLock);
+            size_t fill = g_audioRingFill;
+            os_unfair_lock_unlock(&g_audioRingLock);
+            vcam_log(@"首次消费：bus=%u frames=%u size=%u nCh=%u need=%u 环fill=%zu/cap=%zu",
+                     inOutputBusNumber, (unsigned)inNumberFrames, size, nCh, need, fill, g_audioRingCap);
+            didLogConsume = YES;
+        }
+    }
 
     uint8_t *temp = (uint8_t *)calloc(1, need);
     if (!temp) return status;
@@ -806,6 +894,7 @@ static OSStatus hooked_AudioUnitRender(
         }
     } @catch (NSException *e) {
         // memcpy 阶段抛异常（极少见）时本帧已不可信，free 后返回 noErr 让 ioData 维持原样（真实麦克风），下帧重试。
+        vcam_log(@"消费端 memcpy 异常：%@ — %@", e.name, e.reason);
     }
     free(temp);
     return noErr;
@@ -825,6 +914,11 @@ static OSStatus hooked_AudioUnitRender(
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      fromConnection:(AVCaptureConnection *)connection {
     g_videoOrientation = connection.videoOrientation;
+    {
+        // 链路激活留痕：确认宿主 App 走的是 AVCaptureVideoDataOutput（画面）链路
+        static BOOL didLogVA = NO;
+        if (!didLogVA) { vcam_log(@"视频采集链路激活（AVCaptureVideoDataOutput 回调已触发）"); didLogVA = YES; }
+    }
 
     CMSampleBufferRef newSample = NULL;
     if (g_isReplace) {
@@ -837,6 +931,7 @@ static OSStatus hooked_AudioUnitRender(
             }
         } @catch (NSException *e) {
             // 取帧/合成异常时本帧透传真实摄像头，下帧重试，不关替换
+            vcam_log(@"视频代理异常：%@ — %@", e.name, e.reason);
             newSample     = NULL;
         }
     }
@@ -872,6 +967,12 @@ static VCamVideoProxy *g_videoProxy = nil;
 
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      fromConnection:(AVCaptureConnection *)connection {
+    {
+        // 链路激活留痕：若出现此日志，说明该 App 的音频走了 AVCaptureAudioDataOutput（CMSampleBuffer）链路
+        // 而非 AudioUnitRender——两条链路都要替换才能覆盖所有 App；这也是诊断“该走哪条”的直接证据。
+        static BOOL didLogAA = NO;
+        if (!didLogAA) { vcam_log(@"AVCapture 音频链路激活（AVCaptureAudioDataOutput 回调已触发）"); didLogAA = YES; }
+    }
     CMSampleBufferRef outBuf = sampleBuffer;
 
     if (g_isReplace && g_isSound) {
@@ -880,6 +981,7 @@ static VCamVideoProxy *g_videoProxy = nil;
             CMSampleBufferRef rep = [VCamMediaManager getAudioFrame:sampleBuffer];
             if (rep) outBuf = rep;
         } @catch (NSException *e) {
+            vcam_log(@"音频代理异常：%@ — %@", e.name, e.reason);
             outBuf = sampleBuffer;
         }
     }
@@ -906,6 +1008,7 @@ static VCamAudioProxy *g_audioProxy = nil;
 %hook AVCaptureSession
 - (void)startRunning {
     // 新会话的麦克风格式可能是另一套（采样率/位深随通话类型变），不把旧的 g_targetASBD 清掉会沿用上一通格式去解码。
+    vcam_log(@"AVCaptureSession startRunning（会话重启，将 reloadReaders）");
     vcm_reloadReaders();
     if (g_isReplace) {
         [VCamMediaManager setupVideoReaderIfNeeded];
@@ -1193,16 +1296,38 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)processSelectedVideoURL:(NSURL *)url {
     if (!url) return;
     NSString *src = [url.path stringByResolvingSymlinksInPath];
-    if (!src || ![g_fileManager fileExistsAtPath:src]) return;
+    if (!src || ![g_fileManager fileExistsAtPath:src]) { vcam_log(@"导入失败：源文件不存在 %@", url.path); return; }
     AVAsset *asset  = [AVAsset assetWithURL:url];
     BOOL hasVideo = [[asset tracksWithMediaType:AVMediaTypeVideo] count] > 0;
     BOOL hasAudio  = [[asset tracksWithMediaType:AVMediaTypeAudio] count] > 0;
+    // 素材音轨详情留痕：采样率/编码 FourCC——出现「startReading 失败/无音轨」时第一时间能对照格式找原因
+    AVAssetTrack *aTrack = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+    if (aTrack) {
+        double sampleRate = 0; NSString *fourCC = @"未知";
+        CMFormatDescriptionRef fd = (CMFormatDescriptionRef)aTrack.formatDescriptions.firstObject;
+        if (fd) {
+            FourCharCode sub = CMFormatDescriptionGetMediaSubType(fd);
+            char cc[5] = { (char)(sub >> 24), (char)(sub >> 16), (char)(sub >> 8), (char)sub, 0 };
+            fourCC = [NSString stringWithUTF8String:cc] ?: @"未知";
+            const AudioStreamBasicDescription *asd = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+            if (asd) sampleRate = asd->mSampleRate;
+        }
+        vcam_log(@"导入素材：hasVideo=%d hasAudio=%d 时长=%.1fs 音轨率=%.0fHz 编码=%@",
+                 (int)hasVideo, (int)hasAudio,
+                 aTrack.timeRange.duration.value / (double)aTrack.timeRange.duration.timescale,
+                 sampleRate, fourCC);
+    } else {
+        vcam_log(@"导入素材：hasVideo=%d hasAudio=0（无音轨）", (int)hasVideo);
+    }
     // reloadReaders 会清掉 g_hasProbedASBD，迫使下一帧重新探测 ASBD 并重新解码，否则新素材音频不生效。
     vcm_reloadReaders();
+    NSError *copyErr = nil;
     if (hasVideo) {
         NSString *dest = vcm_videoPath();
         if ([g_fileManager fileExistsAtPath:dest]) [g_fileManager removeItemAtPath:dest error:nil];
-        [g_fileManager copyItemAtPath:src toPath:dest error:nil];
+        BOOL copied = [g_fileManager copyItemAtPath:src toPath:dest error:&copyErr];
+        vcam_log(@"素材拷贝%@", copied ? @"成功" : [NSString stringWithFormat:@"失败：%@", copyErr.localizedDescription]);
+        if (!copied) return;
         // 停掉 reader 而不只是清冻结帧：换素材时若循环关闭、且旧 reader 已读完，setup 里的 loop 门禁会把重建挡掉，新素材就永远不生效。
         vcm_stopReaders();
         g_isReplace = YES;
@@ -1211,7 +1336,9 @@ static VCamAudioProxy *g_audioProxy = nil;
         [VCamMediaManager setupAudioReaderIfNeeded];
     } else if (hasAudio) {
         if ([g_fileManager fileExistsAtPath:g_tempAudioPath]) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
-        [g_fileManager copyItemAtPath:src toPath:g_tempAudioPath error:nil];
+        BOOL copied = [g_fileManager copyItemAtPath:src toPath:g_tempAudioPath error:&copyErr];
+        vcam_log(@"音频拷贝%@", copied ? @"成功" : [NSString stringWithFormat:@"失败：%@", copyErr.localizedDescription]);
+        if (!copied) return;
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
     [self refreshGridButtons];
@@ -1289,6 +1416,11 @@ static void vcm_installTapGesture(UIWindow *win) {
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
     MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&g_origAudioUnitRender);
+    vcam_log(@"初始化完成：目录=%@ 素材=%@ tempAudio=%@ 替换=%d 声音=%d 循环=%d hook=%d",
+             g_videoDir, @([g_fileManager fileExistsAtPath:vcm_videoPath()]),
+             @([g_fileManager fileExistsAtPath:g_tempAudioPath]),
+             (int)g_isReplace, (int)g_isSound, (int)g_isLoop,
+             (int)(g_origAudioUnitRender != NULL));
 }
 
 %dtor {
