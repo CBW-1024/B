@@ -34,11 +34,10 @@
 #import <objc/message.h>
 #import <substrate.h>
 #include <dlfcn.h>
-// fishhook：C 级符号重定向。.xm 经 theos 以 ObjC++ 编译，必须用 extern "C" 包裹，
-// 否则 rebind_symbols 在链接期按 C++ 改名，与 fishhook.c（纯 C）提供的符号不匹配 → 链接失败。
-extern "C" {
+// fishhook：C 级符号重定向。fishhook.h 自身已带 #ifdef __cplusplus extern "C" 守卫，
+// 故此处直接 include 即可（不可再包一层 extern "C"，否则头内的 <stdint.h> 模块导入会落在
+// extern "C" 上下文内，ObjC++ 模块模式下报 -Wmodule-import-in-extern-c 致命错误）。
 #include "fishhook.h"
-}
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
 
