@@ -850,6 +850,17 @@ static OSStatus hooked_AudioUnitRender(
     }
     if (!g_hasProbedASBD) return status;
 
+    // 自愈：feeder 必须每帧兜底确保“按需启动”，不能只依赖首帧探测块内的启动。
+    // 换素材时 vcm_reloadReaders 会停掉正在跑的 feeder(g_audioFeederStop=YES) 并清 g_hasProbedASBD；
+    // 若下一帧重探测成功、把 g_hasProbedASBD 重新置 YES 的那一瞬间，旧 feeder 的 @finally 还没把
+    // g_audioFeederRunning 清回 NO，则探测块内的启动调用被 startAudioFeeder 的幂等守卫挡掉，
+    // 而 g_hasProbedASBD 已为 YES 使探测块不再执行 → feeder 永远起不来、环恒空、永久静音。
+    // 把“确保 feeder 运行”移到探测块之外，每帧兜底重启即可彻底消除该竞态（startAudioFeeder 内部幂等，
+    // 且对 g_audioFeederRunning 为 YES 时直接 return，每帧调用零开销）。
+    if (!g_audioFeederRunning) {
+        [VCamMediaManager startAudioFeeder];
+    }
+
     UInt32 size = ioData->mBuffers[0].mDataByteSize;
     if (size == 0 || size > 0x100000) return status;
 
