@@ -33,6 +33,12 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
+#include <dlfcn.h>
+// fishhook：C 级符号重定向。.xm 经 theos 以 ObjC++ 编译，必须用 extern "C" 包裹，
+// 否则 rebind_symbols 在链接期按 C++ 改名，与 fishhook.c（纯 C）提供的符号不匹配 → 链接失败。
+extern "C" {
+#include "fishhook.h"
+}
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
 
@@ -1459,12 +1465,36 @@ static void vcm_installTapGesture(UIWindow *win) {
         [VCamMediaManager setupVideoReaderIfNeeded];
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
-    MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&g_origAudioUnitRender);
-    vcam_log(@"初始化完成：目录=%@ 素材=%@ tempAudio=%@ 替换=%d 声音=%d 循环=%d hook=%d",
-             g_videoDir, @([g_fileManager fileExistsAtPath:vcm_videoPath()]),
-             @([g_fileManager fileExistsAtPath:g_tempAudioPath]),
-             (int)g_isReplace, (int)g_isSound, (int)g_isLoop,
-             (int)(g_origAudioUnitRender != NULL));
+    // 改用 fishhook 的 rebind_symbols 重定向 AudioUnitRender（原版 VCAM.dylib 即此方案）。
+    // 与 MSHookFunction((void*)AudioUnitRender,...) 不同：fishhook 通过 dyld 遍历“已加载 + 后续加载”的
+    // 镜像、直接改写 __DATA/__DATA_CONST 里的间接符号指针，不依赖构造时取址；即使构造期 AudioToolbox
+    // 尚未 bound、或 hooking 库（substrate/ellekit/libhooker）注入顺序异常，也能在对应镜像就绪后正确接管，
+    // 从根上消除“MSHookFunction 静默失败 → hook=0 → 整条音频链路不触发”的问题。
+    dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_NOW);
+    struct rebinding reb = {
+        "AudioUnitRender",
+        (void *)hooked_AudioUnitRender,
+        (void **)&g_origAudioUnitRender,
+    };
+    int rc = rebind_symbols(&reb, 1);
+    if (rc != 0 || g_origAudioUnitRender == NULL) {
+        // rebind_symbols 失败或 AudioUnitRender 未在任意已加载镜像中导出：原始函数指针未回填，
+        // hooked_AudioUnitRender 永不触发。常见根因：hooking 库（substrate/ellekit/libhooker）未正确
+        // 初始化、或注入顺序异常；需 respring / iCleaner 重启后重装确认。
+        void *at = dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_NOLOAD);
+        vcam_log(@"警告：rebind_symbols(AudioUnitRender) 未生效 g_origAudioUnitRender=%p rc=%d（音频替换全链路不触发） AudioToolbox=%@",
+                 (void *)g_origAudioUnitRender, rc, (at ? @"已加载" : @"未加载"));
+        if (at) dlclose(at);
+    }
+    // 初始化完成日志延迟 2s 输出：让 AudioToolbox 真正就绪、dyld 回调完成重定向后再判定 hook 状态，
+    // 避免构造期镜像未加载导致的 hook=0 假阴性（fishhook 会在镜像加载后异步补上重定向）。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)2.0 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        vcam_log(@"初始化完成：目录=%@ 素材=%@ tempAudio=%@ 替换=%d 声音=%d 循环=%d hook=%d",
+                 g_videoDir, @([g_fileManager fileExistsAtPath:vcm_videoPath()]),
+                 @([g_fileManager fileExistsAtPath:g_tempAudioPath]),
+                 (int)g_isReplace, (int)g_isSound, (int)g_isLoop,
+                 (int)(g_origAudioUnitRender != NULL));
+    });
 }
 
 %dtor {
