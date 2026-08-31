@@ -388,7 +388,7 @@ static UIViewController *vcm_topViewController(void) {
                             if (srcASBD && srcASBD->mSampleRate > 0) {
                                 static BOOL didLogSrc = NO;
                                 if (!didLogSrc) {
-                                    vcam_log(@"[源诊断] 音轨原生采样率=%.0fHz ch=%u → 解码目标=%.0fHz ch=%u %s",
+                                    vcam_log(@"[源诊断] 音轨原生采样率=%.0fHz ch=%u → 解码目标=%.0fHz ch=%u %@",
                                              srcASBD->mSampleRate, srcASBD->mChannelsPerFrame, rate, (unsigned)ch,
                                              (fabs(srcASBD->mSampleRate - rate) > 1.0) ? @"→ 存在重采样" : @"→ 无重采样");
                                     didLogSrc = YES;
@@ -754,7 +754,7 @@ static OSStatus hooked_AudioUnitRender(
         if (now - sWinStart >= 3.0 && sCbCount > 0) {
             double secs = now - sWinStart;
             double measured = (double)sFrameSum / secs;
-            vcam_log(@"[速率诊断] bus=1 实测回调率≈%.0fHz (frames窗口=%llu 窗口=%.1fs 回调数=%u) ASBD报告=%.0fHz %s",
+            vcam_log(@"[速率诊断] bus=1 实测回调率≈%.0fHz (frames窗口=%llu 窗口=%.1fs 回调数=%u) ASBD报告=%.0fHz %@",
                      measured, sFrameSum, secs, sCbCount, g_targetASBD.mSampleRate,
                      (fabs(measured - g_targetASBD.mSampleRate) > g_targetASBD.mSampleRate * 0.05)
                          ? @"→ 不一致！解码速率需改为实测值" : @"→ 与 ASBD 一致");
