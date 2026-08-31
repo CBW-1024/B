@@ -88,6 +88,9 @@ static BOOL           g_audioFeederStop    = NO;  // 通知解码线程退出
 
 #pragma mark - AudioUnit 采集状态
 static BOOL                        g_hasProbedASBD = NO;
+static BOOL                        g_didLogProbe    = NO;  // 「探测成功」一次会话只打一次（reload 时清回）
+static BOOL                        g_didLogFeedStart= NO;  // 「feeder 启动」一次会话只打一次
+static BOOL                        g_didLogUnavail  = NO;  // 「素材暂不可用」一次会话只打一次
 static AudioStreamBasicDescription g_targetASBD    = {0};
 // 已探测的麦克风 ASBD 即音频解码的目标格式：AudioConverter 把素材重采样/重排到该格式，
 // 输出统一为交错（interleaved）PCM，直接 memcpy 进麦克风 buffer。
@@ -170,6 +173,7 @@ static void vcm_reloadReaders(void) {
     g_videoReload   = YES;
     g_audioReload   = YES;
     g_hasProbedASBD = NO;
+    g_didLogProbe = g_didLogFeedStart = g_didLogUnavail = NO;  // 会话级一次性日志守卫一并清回
     // 让正在跑的解码线程退出，并把环形缓冲读/写指针归零；新会话重新探测 ASBD 后会重建并重启 feeder。
     os_unfair_lock_lock(&g_audioRingLock);
     g_audioFeederStop = YES;
@@ -366,12 +370,12 @@ static OSStatus VCamAudioConverterInputProc(
             @autoreleasepool {
                 NSString *path = g_tempAudioPath;
                 if (![g_fileManager fileExistsAtPath:path]) path = vcm_videoPath();
-                vcam_log(@"feeder 启动，素材=%@ (tempAudio=%@)", path, g_tempAudioPath);
+                if (!g_didLogFeedStart) { vcam_log(@"feeder 启动，素材=%@ (tempAudio=%@)", path, g_tempAudioPath); g_didLogFeedStart = YES; }
                 if (![g_fileManager fileExistsAtPath:path]) {
                     // 典型场景：换素材时 removeItemAtPath 已删旧文件、copyItemAtPath 还没拷完，feeder 恰在此窗口启动。
                     // 必须清 g_hasProbedASBD 让下一帧重新 probe 并重启 feeder——否则 ASBD 已探测、feeder 已死，
                     // 整通电话再无任何路径重启解码，麦克风一路永久静音。
-                    vcam_log(@"素材暂不可用（可能正在拷贝），清 ASBD 待下帧重试");
+                    if (!g_didLogUnavail) { vcam_log(@"素材暂不可用（可能正在拷贝），清 ASBD 待下帧重试"); g_didLogUnavail = YES; }
                     g_hasProbedASBD = NO;
                     return;
                 }
@@ -505,11 +509,11 @@ static OSStatus VCamAudioConverterInputProc(
                         }
                     }
                     if (conv) { AudioConverterDispose(conv); conv = NULL; }
-                    // 本遍结束留痕：status 区分 Completed（正常读完）与 Failed（解码失败）；
-                    // samplesGot=0 说明一个样本都没读到（reader 层问题，converter 还没轮到）。
+                    // 本遍结束留痕：reader.status 为 AVAssetReaderStatus（0=Unknown 1=Reading 2=Completed成功 3=Failed 4=Cancelled）；
+                    // err 仅在 Failed 时给出描述，其余为「无」。samplesGot=0 说明一个样本都没读到（reader 层问题，converter 还没轮到）。
                     static BOOL didLogPass = NO;
                     if (!didLogPass) {
-                        vcam_log(@"本遍读完：status=%ld samples=%llu stop=%d err=%@ (1=读完 2=失败)",
+                        vcam_log(@"本遍读完：status=%ld samples=%llu stop=%d err=%@ (AVAssetReader: 2=Completed成功 3=Failed)",
                                  (long)reader.status, samplesGot, (int)g_audioFeederStop,
                                  (reader.status == AVAssetReaderStatusFailed) ? reader.error.localizedDescription : @"无");
                         didLogPass = YES;
@@ -812,9 +816,12 @@ static OSStatus hooked_AudioUnitRender(
                                  &g_targetASBD, &propSize);
         if (perr == noErr && g_targetASBD.mSampleRate > 0) {
             g_hasProbedASBD = YES;
-            vcam_log(@"探测成功 bus=%u rate=%.0f ch=%u bits=%u flags=0x%x",
-                  inOutputBusNumber, g_targetASBD.mSampleRate, g_targetASBD.mChannelsPerFrame,
-                  g_targetASBD.mBitsPerChannel, g_targetASBD.mFormatFlags);
+            if (!g_didLogProbe) {
+                vcam_log(@"探测成功 bus=%u rate=%.0f ch=%u bits=%u flags=0x%x",
+                      inOutputBusNumber, g_targetASBD.mSampleRate, g_targetASBD.mChannelsPerFrame,
+                      g_targetASBD.mBitsPerChannel, g_targetASBD.mFormatFlags);
+                g_didLogProbe = YES;
+            }
             // 按 ASBD 分配环形缓冲（约 2 秒容量），并启动流式解码线程；不再整段解码，也不重建 AVCapture 的 reader。
             @try {
                 UInt32 bps = (g_targetASBD.mBitsPerChannel ?: 16) / 8;
