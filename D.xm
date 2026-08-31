@@ -379,6 +379,23 @@ static UIViewController *vcm_topViewController(void) {
                     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
                     AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
                     if (!track) { vcam_log(@"feeder：%@ 无音频轨道（AVAssetReader 取不到轨道）", path); return; }
+                    // [源诊断] 打印音轨原生采样率/声道，确认 AVAssetReader 是否在做重采样（源≠目标即重采样，可能引入失真）。
+                    // 若原生率与解码目标(rate)不一致，说明我们在强制重采样——这是"不清晰"的潜在来源。
+                    {
+                        CMFormatDescriptionRef fmt = (__bridge CMFormatDescriptionRef)track.formatDescriptions.firstObject;
+                        if (fmt) {
+                            const AudioStreamBasicDescription *srcASBD = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
+                            if (srcASBD && srcASBD->mSampleRate > 0) {
+                                static BOOL didLogSrc = NO;
+                                if (!didLogSrc) {
+                                    vcam_log(@"[源诊断] 音轨原生采样率=%.0fHz ch=%u → 解码目标=%.0fHz ch=%u %s",
+                                             srcASBD->mSampleRate, srcASBD->mChannelsPerFrame, rate, (unsigned)ch,
+                                             (fabs(srcASBD->mSampleRate - rate) > 1.0) ? @"→ 存在重采样" : @"→ 无重采样");
+                                    didLogSrc = YES;
+                                }
+                            }
+                        }
+                    }
                     // 解码目标格式严格跟随真实 ASBD（rate/ch/bits/float/non-interleaved），不再写死 48000/1。
                     NSDictionary *outSettings = @{
                         AVFormatIDKey: @(kAudioFormatLinearPCM),
@@ -723,6 +740,27 @@ static OSStatus hooked_AudioUnitRender(
     // 微信其它总线的 AudioUnitRender（如扬声器回放）若也在此探测，会把错误 ASBD 缓存进 g_targetASBD，
     // 导致后续解码/喂数据全部按错误采样率进行 → 听感"加快 + 不清晰"。
     if (inOutputBusNumber != 1) return status;
+
+    // [速率诊断] 实测 AudioUnit 真实回调速率：累加 inNumberFrames，每 ~3s 算一次。
+    // 若实测值与 ASBD 报告的 rate 不符，说明我们解码用的速率错了 → 这正是"不清晰"的头号嫌疑。
+    {
+        static NSTimeInterval sWinStart = 0;
+        static UInt64 sFrameSum = 0;
+        static UInt32 sCbCount = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (sWinStart == 0) sWinStart = now;
+        sFrameSum += inNumberFrames;
+        sCbCount++;
+        if (now - sWinStart >= 3.0 && sCbCount > 0) {
+            double secs = now - sWinStart;
+            double measured = (double)sFrameSum / secs;
+            vcam_log(@"[速率诊断] bus=1 实测回调率≈%.0fHz (frames窗口=%llu 窗口=%.1fs 回调数=%u) ASBD报告=%.0fHz %s",
+                     measured, sFrameSum, secs, sCbCount, g_targetASBD.mSampleRate,
+                     (fabs(measured - g_targetASBD.mSampleRate) > g_targetASBD.mSampleRate * 0.05)
+                         ? @"→ 不一致！解码速率需改为实测值" : @"→ 与 ASBD 一致");
+            sWinStart = now; sFrameSum = 0; sCbCount = 0;
+        }
+    }
 
     if (!g_hasProbedASBD) {
         UInt32 propSize = sizeof(g_targetASBD);
