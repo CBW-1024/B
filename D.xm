@@ -407,9 +407,15 @@ static OSStatus VCamAudioConverterInputProc(
                     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
                     AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
                     if (!track) { vcam_log(@"feeder：%@ 无音频轨道（AVAssetReader 取不到轨道）", path); return; }
-                    // 源解码：交错浮点 LinearPCM（采样率/声道数由 AVAssetReader 选定；AVAssetReader 不做重采样）
+                    // 源解码：强制固定为 48000Hz/单声道/交错浮点32。
+                    // 关键：必须把采样率与声道数显式写死，否则 AVAssetReader 按音轨“原生格式”解码，
+                    // 而 AAC 的声道/采样率信令常误报（单声道被报成双声道、原生速率与解码速率不符），
+                    // 导致后续 AudioConverter 的源 ASBD 与实际 PCM 对不上 → 听感“加快 + 不清晰”。
+                    // 写死后解码产出恒为 48000/1ch/flt32，srcDesc 也按此构建，二者 100% 一致。
                     NSDictionary *outSettings = @{
                         AVFormatIDKey: @(kAudioFormatLinearPCM),
+                        AVSampleRateKey: @(48000.0),
+                        AVNumberOfChannelsKey: @(1),
                         AVLinearPCMIsFloatKey: @YES,
                         AVLinearPCMBitDepthKey: @(32),
                         AVLinearPCMIsBigEndianKey: @NO,
@@ -433,18 +439,20 @@ static OSStatus VCamAudioConverterInputProc(
                         CMSampleBufferRef s = [out copyNextSampleBuffer];
                         if (!s) break;
                         @try {
-                            CMFormatDescriptionRef fmtDesc = CMSampleBufferGetFormatDescription(s);
-                            if (!fmtDesc) continue;
-                            const AudioStreamBasicDescription *srcDescPtr =
-                                CMAudioFormatDescriptionGetStreamBasicDescription(fmtDesc);
-                            if (!srcDescPtr) continue;
-                            AudioStreamBasicDescription srcDesc = *srcDescPtr;
-                            // 强制源为交错浮点 32bit（与 outSettings 一致），保证 converter 输入稳定
-                            srcDesc.mFormatFlags     = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-                            srcDesc.mBitsPerChannel  = 32;
-                            srcDesc.mBytesPerFrame   = srcDesc.mChannelsPerFrame * 4;
-                            srcDesc.mFramesPerPacket = 1;
-                            srcDesc.mBytesPerPacket  = srcDesc.mBytesPerFrame;
+                            // 源 ASBD 不再信任「每采样缓冲的格式描述」——AAC 的声道/采样率信令常误报，
+                            // 一旦描述与解码出的真实 PCM 不符，AudioConverter 会按错误速率/声道读数据 →
+                            // 听感“加快 + 不清晰”。直接按 outSettings 强制的固定解码格式（48000/1ch/float32）
+                            // 构建 srcDesc，保证“解码产出”与“转换器输入”完全一致，彻底消除该误配。
+                            AudioStreamBasicDescription srcDesc;
+                            memset(&srcDesc, 0, sizeof(srcDesc));
+                            srcDesc.mFormatID          = kAudioFormatLinearPCM;
+                            srcDesc.mFormatFlags       = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+                            srcDesc.mSampleRate        = 48000.0;   // 与 outSettings.AVSampleRateKey 一致
+                            srcDesc.mChannelsPerFrame  = 1;         // 与 outSettings.AVNumberOfChannelsKey 一致
+                            srcDesc.mBitsPerChannel    = 32;
+                            srcDesc.mBytesPerFrame     = srcDesc.mChannelsPerFrame * (srcDesc.mBitsPerChannel / 8);
+                            srcDesc.mFramesPerPacket   = 1;
+                            srcDesc.mBytesPerPacket    = srcDesc.mBytesPerFrame;
 
                             CMBlockBufferRef blk = CMSampleBufferGetDataBuffer(s);
                             if (!blk) continue;
