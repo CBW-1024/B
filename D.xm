@@ -750,7 +750,7 @@ static OSStatus hooked_AudioUnitRender(
                 AudioBuffer *b = &ioData->mBuffers[c];
                 if (!b->mData) continue;
                 UInt32 cap = b->mDataByteSize;
-                uint8_t *dst = b->mData;
+                uint8_t *dst = (uint8_t *)b->mData;
                 for (UInt32 off = 0; off + unit <= cap; off += unit) {
                     UInt32 srcOff = off * nCh + c * unit;
                     if (srcOff + unit > need) break;
