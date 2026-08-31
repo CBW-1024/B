@@ -11,7 +11,7 @@
 //
 // 前两条投递 CMSampleBuffer，第三条是裸 PCM 字节流，故音频有两套实现：
 //   AVCapture 链路按帧取用（AVFoundation reader）；
-//   AudioUnit 链路用 AVFoundation（AVAssetReader 解码 + AVAudioConverter 重采样）流式产出目标格式 PCM，实时写入环形缓冲。
+//   AudioUnit 链路用 AVFoundation（AVAssetReader 解码 + AudioToolbox 的 AudioConverter 重采样）流式产出目标格式 PCM，实时写入环形缓冲。
 //
 // 画面流向：素材 → AVAssetReader 取帧 → 旋转/镜像/等比居中 →
 // CIContext 渲染到与采集帧同尺寸同格式的 CVPixelBuffer → 套用采集帧时序 → 新的 CMSampleBuffer。
@@ -23,7 +23,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
-#import <AVFAudio/AVFAudio.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <CoreImage/CoreImage.h>
@@ -37,7 +36,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
 
-// 音频解码后端：纯 AVFoundation（AVAssetReader 解码 + AVAudioConverter 重采样），不依赖 FFmpeg。
+// 音频解码后端：纯 AVFoundation（AVAssetReader 解码 + AudioToolbox 的 AudioConverter 重采样），不依赖 FFmpeg。
 // 仅用系统框架，Theos 直接编译即可，无需额外静态库或 CI 交叉编译。
 
 #pragma mark - 配置开关
@@ -90,7 +89,7 @@ static BOOL           g_audioFeederStop    = NO;  // 通知解码线程退出
 #pragma mark - AudioUnit 采集状态
 static BOOL                        g_hasProbedASBD = NO;
 static AudioStreamBasicDescription g_targetASBD    = {0};
-// 已探测的麦克风 ASBD 即音频解码的目标格式：AVAudioConverter 把素材重采样/重排到该格式，
+// 已探测的麦克风 ASBD 即音频解码的目标格式：AudioConverter 把素材重采样/重排到该格式，
 // 输出统一为交错（interleaved）PCM，直接 memcpy 进麦克风 buffer。
 
 // 容错：单帧失败仅降级透传，下帧重试，不置全局标志、不关替换总开关。
@@ -205,6 +204,37 @@ static UIViewController *vcm_topViewController(void) {
 + (void)cleanup;
 @end
 
+#pragma mark - AudioConverter 输入回调（C 级，AudioToolbox，不依赖 AVFAudio）
+// 把源 PCM 按帧喂给 AudioConverter；数据耗尽返回 kAudioConverterErr_NoData 通知结束。
+// 用 C 级 AudioConverter 而非 AVAudioConverter，规避新版 SDK 下 AVFAudio 头解析失败的问题。
+typedef struct {
+    const uint8_t *data;
+    UInt32        totalBytes;
+    UInt32        offset;
+    UInt32        bytesPerFrame;
+} VCamSrcFeed;
+
+static OSStatus VCamAudioConverterInputProc(
+    AudioConverterRef               inConverter,
+    UInt32                         *ioNumberDataPackets,
+    AudioBufferList                *ioData,
+    AudioStreamPacketDescription  **outDataPacketDescription,
+    void                           *inUserData)
+{
+    VCamSrcFeed *feed = (VCamSrcFeed *)inUserData;
+    if (!feed || feed->offset >= feed->totalBytes) {
+        *ioNumberDataPackets = 0;
+        return kAudioConverterErr_NoData;
+    }
+    UInt32 avail  = (feed->totalBytes - feed->offset) / feed->bytesPerFrame;
+    UInt32 toFeed = (*ioNumberDataPackets < avail) ? *ioNumberDataPackets : avail;
+    ioData->mBuffers[0].mData         = (void *)(feed->data + feed->offset);
+    ioData->mBuffers[0].mDataByteSize = toFeed * feed->bytesPerFrame;
+    feed->offset += ioData->mBuffers[0].mDataByteSize;
+    *ioNumberDataPackets = toFeed;
+    return noErr;
+}
+
 @implementation VCamMediaManager
 + (void)setupVideoReaderIfNeeded {
     [g_mediaLock lock];
@@ -280,10 +310,10 @@ static UIViewController *vcm_topViewController(void) {
 }
 
 // 流式解码线程：AVAssetReader 把素材音频解码成交错浮点 PCM（源采样率/声道数），
-// 再用 AVAudioConverter 按麦克风 ASBD 重采样/重排成目标 PCM，写入环形缓冲。
+// 再用 AudioToolbox 的 C 级 AudioConverter 按麦克风 ASBD 重采样/重排成目标 PCM，写入环形缓冲。
 // 到末尾按 g_isLoop 重建 reader 回卷重播，或停喂（环形缓冲排空后静音透传）。
-// 仅依赖系统框架（AVFoundation / AVFAudio），无 FFmpeg。解码上下文在线程内局部持有，
-// @finally 统一释放，不与 cleanup 竞争。
+// 仅依赖系统框架（AVFoundation / AudioToolbox 的 AudioConverter），无 FFmpeg、不依赖 AVFAudio 模块。
+// 解码上下文在线程内局部持有，@finally 统一释放，不与 cleanup 竞争。
 + (void)startAudioFeeder {
     if (!g_hasProbedASBD)     return;
     if (g_audioFeederRunning) return;   // 幂等：已在跑则忽略
@@ -308,7 +338,7 @@ static UIViewController *vcm_topViewController(void) {
                 if (dstDesc.mBytesPerFrame == 0)
                     dstDesc.mBytesPerFrame = dstDesc.mChannelsPerFrame * (dstDesc.mBitsPerChannel / 8);
                 if (dstDesc.mBytesPerPacket == 0)        dstDesc.mBytesPerPacket   = dstDesc.mBytesPerFrame;
-                AVAudioFormat *dstFmt = [[AVAudioFormat alloc] initWithStreamDescription:&dstDesc];
+                // 目标格式直接用 dstDesc（C 级 AudioConverter 读取），不再依赖 AVAudioFormat
 
                 void (^decodeOnce)(void) = ^{
                     AVAsset *asset = [AVAsset assetWithURL:url];
@@ -327,8 +357,9 @@ static UIViewController *vcm_topViewController(void) {
                     [reader addOutput:out];
                     if (![reader startReading]) return;
 
-                    AVAudioConverter *conv = nil;
-                    AVAudioFormat    *srcFmt = nil;
+                    AudioConverterRef conv = NULL;
+                    double lastSrcRate = 0;
+                    UInt32  lastSrcCh  = 0;
 
                     while (reader.status == AVAssetReaderStatusReading && !g_audioFeederStop) {
                         CMSampleBufferRef s = [out copyNextSampleBuffer];
@@ -336,59 +367,62 @@ static UIViewController *vcm_topViewController(void) {
                         @try {
                             CMFormatDescriptionRef fmtDesc = CMSampleBufferGetFormatDescription(s);
                             if (!fmtDesc) continue;
-                            const AudioStreamBasicDescription *srcDesc =
+                            const AudioStreamBasicDescription *srcDescPtr =
                                 CMAudioFormatDescriptionGetStreamBasicDescription(fmtDesc);
-                            if (!srcDesc) continue;
-                            // 源格式变化（罕见）时重建 converter
-                            if (!srcFmt || srcFmt.streamDescription->mSampleRate != srcDesc->mSampleRate ||
-                                srcFmt.channelCount != srcDesc->mChannelsPerFrame) {
-                                srcFmt = [[AVAudioFormat alloc] initWithStreamDescription:srcDesc];
-                                conv = [[AVAudioConverter alloc] initWithFromFormat:srcFmt toFormat:dstFmt];
-                            }
+                            if (!srcDescPtr) continue;
+                            AudioStreamBasicDescription srcDesc = *srcDescPtr;
+                            // 强制源为交错浮点 32bit（与 outSettings 一致），保证 converter 输入稳定
+                            srcDesc.mFormatFlags     = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+                            srcDesc.mBitsPerChannel  = 32;
+                            srcDesc.mBytesPerFrame   = srcDesc.mChannelsPerFrame * 4;
+                            srcDesc.mFramesPerPacket = 1;
+                            srcDesc.mBytesPerPacket  = srcDesc.mBytesPerFrame;
+
                             CMBlockBufferRef blk = CMSampleBufferGetDataBuffer(s);
                             if (!blk) continue;
-                            // SDK（Xcode 14+，尤其 26.x）要求第 5 参为 char* _Nullable*，
-                            // 在 ObjC++ 下 (void**)&ptr 不再隐式转换，故用 char* 承接再转 const void*。
+                            // 新版 SDK 下 CMBlockBufferGetDataPointer 第 5 参为 char* _Nullable*，故用 char* 承接
                             size_t len = 0; char *ptr = NULL;
                             if (CMBlockBufferGetDataPointer(blk, 0, NULL, &len, &ptr) != noErr || len == 0) continue;
                             UInt32 numFrames = (UInt32)CMSampleBufferGetNumSamples(s);
                             if (numFrames == 0) continue;
 
-                            // 源已是交错浮点，直接拷进 srcPCM 的 interleaved 缓冲
-                            AVAudioPCMBuffer *srcPCM = [[AVAudioPCMBuffer alloc] initWithPCMFormat:srcFmt frameCapacity:numFrames];
-                            memcpy(srcPCM.floatChannelData[0], ptr, len);
-                            srcPCM.frameLength = numFrames;
-
-                            double ratio = (dstDesc.mSampleRate > 0 && srcDesc->mSampleRate > 0)
-                                ? dstDesc.mSampleRate / srcDesc->mSampleRate : 1.0;
-                            AVAudioFrameCount outCap = (AVAudioFrameCount)(numFrames * ratio + numFrames + 8192);
-                            if (outCap < 8192) outCap = 8192;
-                            AVAudioPCMBuffer *dstPCM = [[AVAudioPCMBuffer alloc] initWithPCMFormat:dstFmt frameCapacity:outCap];
-
-                            __block AVAudioPCMBuffer *inBuf = srcPCM;
-                            __block BOOL consumed = NO;
-                            NSError *convErr = nil;
-                            AVAudioConverterOutputStatus st = [conv convertToBuffer:dstPCM error:&convErr
-                                withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount inNumberPackets,
-                                                                              AVAudioConverterInputStatus * _Nonnull outStatus) {
-                                    if (consumed) { *outStatus = AVAudioConverterInputStatus_EndOfStream; return nil; }
-                                    *outStatus = AVAudioConverterInputStatus_HaveData;
-                                    consumed = YES;
-                                    return inBuf;
-                                }];
-                            if ((st == AVAudioConverterOutputStatus_HaveData ||
-                                 st == AVAudioConverterOutputStatus_InputRanDry) && dstPCM.frameLength > 0) {
-                                void *dstPtr;
-                                if (dstDesc.mFormatFlags & kAudioFormatFlagIsFloat)        dstPtr = (void *)dstPCM.floatChannelData[0];
-                                else if (dstDesc.mBitsPerChannel > 16)                      dstPtr = (void *)dstPCM.int32ChannelData[0];
-                                else                                                       dstPtr = (void *)dstPCM.int16ChannelData[0];
-                                size_t bytes = dstPCM.frameLength * dstDesc.mBytesPerFrame;
-                                [self ringWrite:(const uint8_t *)dstPtr length:bytes];
+                            // 源/目标格式变化（罕见）或首帧：重建 converter
+                            if (!conv || srcDesc.mSampleRate != lastSrcRate || srcDesc.mChannelsPerFrame != lastSrcCh) {
+                                if (conv) { AudioConverterDispose(conv); conv = NULL; }
+                                if (AudioConverterNew(&srcDesc, &dstDesc, &conv) != noErr || !conv) continue;
+                                lastSrcRate = srcDesc.mSampleRate;
+                                lastSrcCh   = srcDesc.mChannelsPerFrame;
                             }
+
+                            VCamSrcFeed feed = { (const uint8_t *)ptr, (UInt32)len, 0, srcDesc.mBytesPerFrame };
+
+                            double ratio = (dstDesc.mSampleRate > 0 && srcDesc.mSampleRate > 0)
+                                ? dstDesc.mSampleRate / srcDesc->mSampleRate : 1.0;
+                            UInt32 maxOutFrames = (UInt32)(numFrames * ratio + numFrames + 8192);
+                            if (maxOutFrames < 8192) maxOutFrames = 8192;
+                            UInt32 outBytes = maxOutFrames * dstDesc.mBytesPerFrame;
+                            uint8_t *outBuf = (uint8_t *)malloc(outBytes);
+                            if (!outBuf) continue;
+
+                            AudioBufferList outList;
+                            outList.mNumberBuffers = 1;
+                            outList.mBuffers[0].mNumberChannels = dstDesc.mChannelsPerFrame;
+                            outList.mBuffers[0].mDataByteSize  = outBytes;
+                            outList.mBuffers[0].mData          = outBuf;
+                            UInt32 outPackets = maxOutFrames;  // PCM：frames == packets
+
+                            OSStatus cerr = AudioConverterFillComplexBuffer(
+                                conv, VCamAudioConverterInputProc, &feed, &outPackets, &outList, NULL);
+                            if (cerr == noErr || cerr == kAudioConverterErr_NoData) {
+                                UInt32 gotBytes = outList.mBuffers[0].mDataByteSize;
+                                if (gotBytes > 0) [self ringWrite:outBuf length:gotBytes];
+                            }
+                            free(outBuf);
                         } @finally {
                             CFRelease(s);
                         }
                     }
+                    if (conv) { AudioConverterDispose(conv); conv = NULL; }
                 };
 
                 // 外层：按 g_isLoop 回卷重播或停喂
