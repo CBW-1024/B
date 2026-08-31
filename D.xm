@@ -343,7 +343,6 @@ static UIViewController *vcm_topViewController(void) {
     g_audioFeederRunning = YES;
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        static BOOL g_didLogFeed = NO;
         @try {
             @autoreleasepool {
                 NSString *path = g_tempAudioPath;
