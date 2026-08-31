@@ -54,7 +54,6 @@ static BOOL g_audioReload = NO;
 
 #pragma mark - 沙箱路径
 static NSString *g_videoDir      = nil;
-static NSString *g_tempVideoPath = nil;
 static NSString *g_tempAudioPath = nil;
 
 #pragma mark - 运行时状态
@@ -1137,10 +1136,9 @@ static void vcm_installTapGesture(UIWindow *win) {
     }];
     g_videoDir = [vcm_documentPath() stringByAppendingPathComponent:@"VCAM"];
     [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
-    g_tempVideoPath = [vcm_videoPath() copy];
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
 
-    if ([g_fileManager fileExistsAtPath:g_tempVideoPath]) {
+    if ([g_fileManager fileExistsAtPath:vcm_videoPath()]) {
         [VCamMediaManager setupVideoReaderIfNeeded];
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
