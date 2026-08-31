@@ -861,16 +861,20 @@ static OSStatus hooked_AudioUnitRender(
     UInt32 need = (nCh > 1) ? size * nCh : size;
     if (need == 0 || need > 0x100000) return status;
 
-    // 消费端首例留痕：一次性看清帧参数与环状态（fill=0 说明 feeder 没喂上，数据源问题而非消费问题）
+    // 消费心跳：节流每 3 秒打一次，直接印环 fill，作为「消费者确实在取数」的铁证。
+    // 一次性门禁会因启动瞬间 fill=0 提前触发、之后永久静默，反而掩盖了 feeder 喂上后的正常取数；
+    // 改成周期采样后，只要出现「环fill=NNN/cap=64000 →有数据」即证明替换音频已流入麦克风。
     {
-        static BOOL didLogConsume = NO;
-        if (!didLogConsume) {
+        static NSTimeInterval s_lastConsumeLog = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - s_lastConsumeLog >= 3.0) {
             os_unfair_lock_lock(&g_audioRingLock);
             size_t fill = g_audioRingFill;
             os_unfair_lock_unlock(&g_audioRingLock);
-            vcam_log(@"首次消费：bus=%u frames=%u size=%u nCh=%u need=%u 环fill=%zu/cap=%zu",
-                     inOutputBusNumber, (unsigned)inNumberFrames, size, nCh, need, fill, g_audioRingCap);
-            didLogConsume = YES;
+            vcam_log(@"消费心跳：bus=%u frames=%u need=%u 环fill=%zu/cap=%zu %s",
+                     inOutputBusNumber, (unsigned)inNumberFrames, need, fill, g_audioRingCap,
+                     (fill > 0) ? "→有数据" : "→仍空(静音)");
+            s_lastConsumeLog = now;
         }
     }
 
