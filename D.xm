@@ -205,7 +205,7 @@ static UIViewController *vcm_topViewController(void) {
 @end
 
 #pragma mark - AudioConverter 输入回调（C 级，AudioToolbox，不依赖 AVFAudio）
-// 把源 PCM 按帧喂给 AudioConverter；数据耗尽返回 kAudioConverterErr_NoData 通知结束。
+// 把源 PCM 按帧喂给 AudioConverter；数据耗尽时返回 0 包 + noErr 即通知结束（不依赖 kAudioConverterErr_NoData 常量）。
 // 用 C 级 AudioConverter 而非 AVAudioConverter，规避新版 SDK 下 AVFAudio 头解析失败的问题。
 typedef struct {
     const uint8_t *data;
@@ -224,7 +224,7 @@ static OSStatus VCamAudioConverterInputProc(
     VCamSrcFeed *feed = (VCamSrcFeed *)inUserData;
     if (!feed || feed->offset >= feed->totalBytes) {
         *ioNumberDataPackets = 0;
-        return kAudioConverterErr_NoData;
+        return noErr;  // 0 包 + noErr 即告知 AudioConverter 数据耗尽
     }
     UInt32 avail  = (feed->totalBytes - feed->offset) / feed->bytesPerFrame;
     UInt32 toFeed = (*ioNumberDataPackets < avail) ? *ioNumberDataPackets : avail;
@@ -397,7 +397,7 @@ static OSStatus VCamAudioConverterInputProc(
                             VCamSrcFeed feed = { (const uint8_t *)ptr, (UInt32)len, 0, srcDesc.mBytesPerFrame };
 
                             double ratio = (dstDesc.mSampleRate > 0 && srcDesc.mSampleRate > 0)
-                                ? dstDesc.mSampleRate / srcDesc->mSampleRate : 1.0;
+                                ? dstDesc.mSampleRate / srcDesc.mSampleRate : 1.0;
                             UInt32 maxOutFrames = (UInt32)(numFrames * ratio + numFrames + 8192);
                             if (maxOutFrames < 8192) maxOutFrames = 8192;
                             UInt32 outBytes = maxOutFrames * dstDesc.mBytesPerFrame;
@@ -413,7 +413,7 @@ static OSStatus VCamAudioConverterInputProc(
 
                             OSStatus cerr = AudioConverterFillComplexBuffer(
                                 conv, VCamAudioConverterInputProc, &feed, &outPackets, &outList, NULL);
-                            if (cerr == noErr || cerr == kAudioConverterErr_NoData) {
+                            if (cerr == noErr) {
                                 UInt32 gotBytes = outList.mBuffers[0].mDataByteSize;
                                 if (gotBytes > 0) [self ringWrite:outBuf length:gotBytes];
                             }
