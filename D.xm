@@ -760,6 +760,28 @@ static OSStatus hooked_AudioUnitRender(
     }
     if (!g_hasProbedASBD) return status;
 
+    // 对齐 VCAM4：每帧轻量校验 ASBD 是否较已缓存的变化（微信通话建立初期 bus=1 的真实格式
+    // 往往晚于首次 AudioUnitRender 才落定）。若变化则清 g_hasProbedASBD 并停旧 feeder，
+    // 强迫下一帧重新探测+重建 ring+重启 feeder，避免「首帧定死占位格式→永久按错格式解码→还是不清晰」。
+    // VCAM4 反汇编确认其 GetProperty 在每次替换分支都重新执行（13f28-13f48，无缓存守卫）。
+    {
+        AudioStreamBasicDescription live = {0};
+        UInt32 ps = sizeof(live);
+        if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
+                kAudioUnitScope_Output, inOutputBusNumber, &live, &ps) == noErr
+                && live.mSampleRate > 0
+                && (live.mSampleRate        != g_targetASBD.mSampleRate
+                    || live.mChannelsPerFrame  != g_targetASBD.mChannelsPerFrame
+                    || live.mBitsPerChannel    != g_targetASBD.mBitsPerChannel
+                    || live.mFormatFlags       != g_targetASBD.mFormatFlags)) {
+            vcam_log(@"ASBD 变更：%.0f/%u/%u/0x%x → %.0f/%u/%u/0x%x，触发重探测",
+                  g_targetASBD.mSampleRate, (unsigned)g_targetASBD.mChannelsPerFrame, g_targetASBD.mBitsPerChannel, g_targetASBD.mFormatFlags,
+                  live.mSampleRate, (unsigned)live.mChannelsPerFrame, live.mBitsPerChannel, live.mFormatFlags);
+            g_hasProbedASBD = NO;  // 下一帧重新走探测+重建
+            if (g_audioFeederRunning) g_audioFeederStop = YES;  // 停旧 feeder，迫使其用新 ASBD 重启
+        }
+    }
+
     // 自愈：feeder 必须每帧兜底确保“按需启动”，不能只依赖首帧探测块内的启动。
     // 换素材时 vcm_reloadReaders 会停掉正在跑的 feeder(g_audioFeederStop=YES) 并清 g_hasProbedASBD；
     // 若下一帧重探测成功、把 g_hasProbedASBD 重新置 YES 的那一瞬间，旧 feeder 的 @finally 还没把
