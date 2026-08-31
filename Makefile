@@ -6,8 +6,10 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = D
 
-D_FILES =D.xm
+D_FILES = D.xm fishhook.c
 D_CFLAGS = -fobjc-arc
-D_FRAMEWORKS = UIKit Foundation
+D_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia CoreVideo \
+                   CoreImage CoreGraphics QuartzCore ImageIO AudioToolbox \
+                   UniformTypeIdentifiers
 
 include $(THEOS_MAKE_PATH)/tweak.mk
