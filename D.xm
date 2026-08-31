@@ -1304,7 +1304,7 @@ static VCamAudioProxy *g_audioProxy = nil;
     AVAssetTrack *aTrack = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
     if (aTrack) {
         double sampleRate = 0; NSString *fourCC = @"未知";
-        CMFormatDescriptionRef fd = (CMFormatDescriptionRef)aTrack.formatDescriptions.firstObject;
+        CMFormatDescriptionRef fd = (__bridge CMFormatDescriptionRef)aTrack.formatDescriptions.firstObject;
         if (fd) {
             FourCharCode sub = CMFormatDescriptionGetMediaSubType(fd);
             char cc[5] = { (char)(sub >> 24), (char)(sub >> 16), (char)(sub >> 8), (char)sub, 0 };
