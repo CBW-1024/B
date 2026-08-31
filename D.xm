@@ -41,7 +41,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
 
-// 音频解码后端：纯 AVFoundation（AVAssetReader 解码 + AudioToolbox 的 AudioConverter 重采样），不依赖 FFmpeg。
+// 音频解码后端：纯 AVFoundation（AVAssetReader 按真实 ASBD 直出解码，无 AudioConverter 重采样层），不依赖 FFmpeg。
 // 仅用系统框架，Theos 直接编译即可，无需额外静态库或 CI 交叉编译。
 
 #pragma mark - 配置开关
@@ -237,36 +237,10 @@ static UIViewController *vcm_topViewController(void) {
 + (void)cleanup;
 @end
 
-#pragma mark - AudioConverter 输入回调（C 级，AudioToolbox，不依赖 AVFAudio）
-// 把源 PCM 按帧喂给 AudioConverter；数据耗尽时返回 0 包 + noErr 即通知结束（不依赖 kAudioConverterErr_NoData 常量）。
-// 用 C 级 AudioConverter 而非 AVAudioConverter，规避新版 SDK 下 AVFAudio 头解析失败的问题。
-typedef struct {
-    const uint8_t *data;
-    UInt32        totalBytes;
-    UInt32        offset;
-    UInt32        bytesPerFrame;
-} VCamSrcFeed;
-
-static OSStatus VCamAudioConverterInputProc(
-    AudioConverterRef               inConverter,
-    UInt32                         *ioNumberDataPackets,
-    AudioBufferList                *ioData,
-    AudioStreamPacketDescription  **outDataPacketDescription,
-    void                           *inUserData)
-{
-    VCamSrcFeed *feed = (VCamSrcFeed *)inUserData;
-    if (!feed || feed->offset >= feed->totalBytes) {
-        *ioNumberDataPackets = 0;
-        return noErr;  // 0 包 + noErr 即告知 AudioConverter 数据耗尽
-    }
-    UInt32 avail  = (feed->totalBytes - feed->offset) / feed->bytesPerFrame;
-    UInt32 toFeed = (*ioNumberDataPackets < avail) ? *ioNumberDataPackets : avail;
-    ioData->mBuffers[0].mData         = (void *)(feed->data + feed->offset);
-    ioData->mBuffers[0].mDataByteSize = toFeed * feed->bytesPerFrame;
-    feed->offset += ioData->mBuffers[0].mDataByteSize;
-    *ioNumberDataPackets = toFeed;
-    return noErr;
-}
+#pragma mark - 音频解码（对齐 VCAM4：解码器直出目标 PCM，无 AudioConverter 重采样层）
+// VCAM4 反汇编确认：其 feeder 直接按真实 ASBD 解码产出，hooked_AudioUnitRender 仅做逐 buffer 零变换 memcpy，
+// 全程不经过任何 AudioConverter。我们照搬此结构：由 AVAssetReader 的 outputSettings 在解码器内部完成
+// 重采样/重排到微信真实 ASBD 格式，彻底消除 C 级 AudioConverter 的 srcDesc/dstDesc 误配导致的加速/失真。
 
 @implementation VCamMediaManager
 + (void)setupVideoReaderIfNeeded {
@@ -358,10 +332,9 @@ static OSStatus VCamAudioConverterInputProc(
     }
 }
 
-// 流式解码线程：AVAssetReader 把素材音频解码成交错浮点 PCM（源采样率/声道数），
-// 再用 AudioToolbox 的 C 级 AudioConverter 按麦克风 ASBD 重采样/重排成目标 PCM，写入环形缓冲。
+// 流式解码线程（对齐 VCAM4）：AVAssetReader 按探测到的真实 ASBD 把素材音频【直出】为该格式 PCM
+// （解码器内部完成重采样/重排），无需外部 AudioConverter 层，直接写入环形缓冲。
 // 到末尾按 g_isLoop 重建 reader 回卷重播，或停喂（环形缓冲排空后静音透传）。
-// 仅依赖系统框架（AVFoundation / AudioToolbox 的 AudioConverter），无 FFmpeg、不依赖 AVFAudio 模块。
 // 解码上下文在线程内局部持有，@finally 统一释放，不与 cleanup 竞争。
 + (void)startAudioFeeder {
     if (!g_hasProbedASBD)     return;
@@ -386,40 +359,30 @@ static OSStatus VCamAudioConverterInputProc(
                 }
                 NSURL *url = [NSURL fileURLWithPath:path];
 
-                // 目标格式：以麦克风 ASBD 为准，但强制交错（interleaved），与旧逻辑一致
-                AudioStreamBasicDescription dstDesc = g_targetASBD;
-                dstDesc.mFormatFlags &= ~kAudioFormatFlagIsNonInterleaved;
-                if (dstDesc.mSampleRate <= 0)            dstDesc.mSampleRate       = 48000.0;
-                if (dstDesc.mChannelsPerFrame == 0)      dstDesc.mChannelsPerFrame = 1;
-                if (dstDesc.mBitsPerChannel == 0)        dstDesc.mBitsPerChannel =
-                    (dstDesc.mFormatFlags & kAudioFormatFlagIsFloat) ? 32 : 16;
-                // 强制交错后必须按「声道数 × 每声道字节」重算每帧/每包字节数：
-                // 原始非交错格式下 mBytesPerFrame 仅含单声道字节，不重算会让 ASBD 自相矛盾，
-                // 导致 AudioConverterNew 失败、环形缓冲永远为空 → 没有声音。
-                dstDesc.mFormatFlags     |= kAudioFormatFlagIsPacked;
-                dstDesc.mBytesPerFrame   = dstDesc.mChannelsPerFrame * (dstDesc.mBitsPerChannel / 8);
-                dstDesc.mFramesPerPacket = 1;
-                dstDesc.mBytesPerPacket  = dstDesc.mBytesPerFrame;
-                // 目标格式直接用 dstDesc（C 级 AudioConverter 读取），不再依赖 AVAudioFormat
+                // 对齐 VCAM4：不写死 48000/1，直接用探测到的真实 ASBD 作为解码目标格式。
+                // AVAssetReader 在解码器内部把素材重采样/重排成该格式，无需外部 AudioConverter 层
+                // —— 这正是 VCAM4「无重采样层、直出解码」的精髓，彻底消除 srcDesc/dstDesc 误配导致的加速/失真。
+                AudioStreamBasicDescription t = g_targetASBD;
+                double rate    = (t.mSampleRate > 0)        ? t.mSampleRate       : 48000.0;
+                UInt32 ch      = (t.mChannelsPerFrame > 0)  ? t.mChannelsPerFrame : 1;
+                BOOL   isFloat = (t.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+                UInt32 bits    = (t.mBitsPerChannel > 0)    ? t.mBitsPerChannel   : (isFloat ? 32 : 16);
+                BOOL   isNonInt= (t.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
 
                 void (^decodeOnce)(void) = ^{
                     AVAsset *asset = [AVAsset assetWithURL:url];
                     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
                     AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
                     if (!track) { vcam_log(@"feeder：%@ 无音频轨道（AVAssetReader 取不到轨道）", path); return; }
-                    // 源解码：强制固定为 48000Hz/单声道/交错浮点32。
-                    // 关键：必须把采样率与声道数显式写死，否则 AVAssetReader 按音轨“原生格式”解码，
-                    // 而 AAC 的声道/采样率信令常误报（单声道被报成双声道、原生速率与解码速率不符），
-                    // 导致后续 AudioConverter 的源 ASBD 与实际 PCM 对不上 → 听感“加快 + 不清晰”。
-                    // 写死后解码产出恒为 48000/1ch/flt32，srcDesc 也按此构建，二者 100% 一致。
+                    // 解码目标格式严格跟随真实 ASBD（rate/ch/bits/float/non-interleaved），不再写死 48000/1。
                     NSDictionary *outSettings = @{
                         AVFormatIDKey: @(kAudioFormatLinearPCM),
-                        AVSampleRateKey: @(48000.0),
-                        AVNumberOfChannelsKey: @(1),
-                        AVLinearPCMIsFloatKey: @YES,
-                        AVLinearPCMBitDepthKey: @(32),
+                        AVSampleRateKey: @(rate),
+                        AVNumberOfChannelsKey: @(ch),
+                        AVLinearPCMIsFloatKey: @(isFloat),
+                        AVLinearPCMBitDepthKey: @(bits),
                         AVLinearPCMIsBigEndianKey: @NO,
-                        AVLinearPCMIsNonInterleavedKey: @NO,
+                        AVLinearPCMIsNonInterleavedKey: @(isNonInt),
                     };
                     AVAssetReaderTrackOutput *out = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:outSettings];
                     out.alwaysCopiesSampleData = NO;
@@ -430,30 +393,18 @@ static OSStatus VCamAudioConverterInputProc(
                         return;
                     }
 
-                    AudioConverterRef conv = NULL;
-                    double lastSrcRate = 0;
-                    UInt32  lastSrcCh  = 0;
-                    UInt64  samplesGot = 0;   // 本遍累计读到的样本帧数（诊断用）
+                    static BOOL didLogConv = NO;
+                    if (!didLogConv) {
+                        vcam_log(@"解码直出目标格式：%.0fHz/%uch %@%@ （对齐 VCAM4 无重采样层）",
+                                 rate, (unsigned)ch, isFloat ? @"float" : @"int", isNonInt ? @" non-interleaved" : @" interleaved");
+                        didLogConv = YES;
+                    }
 
+                    UInt64 samplesGot = 0;   // 本遍累计读到的样本帧数（诊断用）
                     while (reader.status == AVAssetReaderStatusReading && !g_audioFeederStop) {
                         CMSampleBufferRef s = [out copyNextSampleBuffer];
                         if (!s) break;
                         @try {
-                            // 源 ASBD 不再信任「每采样缓冲的格式描述」——AAC 的声道/采样率信令常误报，
-                            // 一旦描述与解码出的真实 PCM 不符，AudioConverter 会按错误速率/声道读数据 →
-                            // 听感“加快 + 不清晰”。直接按 outSettings 强制的固定解码格式（48000/1ch/float32）
-                            // 构建 srcDesc，保证“解码产出”与“转换器输入”完全一致，彻底消除该误配。
-                            AudioStreamBasicDescription srcDesc;
-                            memset(&srcDesc, 0, sizeof(srcDesc));
-                            srcDesc.mFormatID          = kAudioFormatLinearPCM;
-                            srcDesc.mFormatFlags       = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-                            srcDesc.mSampleRate        = 48000.0;   // 与 outSettings.AVSampleRateKey 一致
-                            srcDesc.mChannelsPerFrame  = 1;         // 与 outSettings.AVNumberOfChannelsKey 一致
-                            srcDesc.mBitsPerChannel    = 32;
-                            srcDesc.mBytesPerFrame     = srcDesc.mChannelsPerFrame * (srcDesc.mBitsPerChannel / 8);
-                            srcDesc.mFramesPerPacket   = 1;
-                            srcDesc.mBytesPerPacket    = srcDesc.mBytesPerFrame;
-
                             CMBlockBufferRef blk = CMSampleBufferGetDataBuffer(s);
                             if (!blk) continue;
                             // 新版 SDK 下 CMBlockBufferGetDataPointer 第 5 参为 char* _Nullable*，故用 char* 承接
@@ -462,68 +413,17 @@ static OSStatus VCamAudioConverterInputProc(
                             UInt32 numFrames = (UInt32)CMSampleBufferGetNumSamples(s);
                             if (numFrames == 0) continue;
                             samplesGot += numFrames;
-
-                            // 源/目标格式变化（罕见）或首帧：重建 converter
-                            if (!conv || srcDesc.mSampleRate != lastSrcRate || srcDesc.mChannelsPerFrame != lastSrcCh) {
-                                if (conv) { AudioConverterDispose(conv); conv = NULL; }
-                                if (AudioConverterNew(&srcDesc, &dstDesc, &conv) != noErr || !conv) {
-                                    vcam_log(@"AudioConverterNew 失败 srcRate=%.0f srcCh=%u dstRate=%.0f dstCh=%u",
-                                          srcDesc.mSampleRate, srcDesc.mChannelsPerFrame, dstDesc.mSampleRate, dstDesc.mChannelsPerFrame);
-                                    continue;
-                                }
-                                lastSrcRate = srcDesc.mSampleRate;
-                                lastSrcCh   = srcDesc.mChannelsPerFrame;
-                                static BOOL didLogConv = NO;
-                                if (!didLogConv) {
-                                    vcam_log(@"AudioConverter 就绪：%.0fHz/%uch float → %.0fHz/%uch %@",
-                                             srcDesc.mSampleRate, (unsigned)srcDesc.mChannelsPerFrame,
-                                             dstDesc.mSampleRate, (unsigned)dstDesc.mChannelsPerFrame,
-                                             (dstDesc.mFormatFlags & kAudioFormatFlagIsFloat) ? @"float" : @"int");
-                                    didLogConv = YES;
-                                }
-                            }
-
-                            VCamSrcFeed feed = { (const uint8_t *)ptr, (UInt32)len, 0, srcDesc.mBytesPerFrame };
-
-                            double ratio = (dstDesc.mSampleRate > 0 && srcDesc.mSampleRate > 0)
-                                ? dstDesc.mSampleRate / srcDesc.mSampleRate : 1.0;
-                            UInt32 maxOutFrames = (UInt32)(numFrames * ratio + numFrames + 8192);
-                            if (maxOutFrames < 8192) maxOutFrames = 8192;
-                            UInt32 outBytes = maxOutFrames * dstDesc.mBytesPerFrame;
-                            uint8_t *outBuf = (uint8_t *)malloc(outBytes);
-                            if (!outBuf) continue;
-
-                            AudioBufferList outList;
-                            outList.mNumberBuffers = 1;
-                            outList.mBuffers[0].mNumberChannels = dstDesc.mChannelsPerFrame;
-                            outList.mBuffers[0].mDataByteSize  = outBytes;
-                            outList.mBuffers[0].mData          = outBuf;
-                            UInt32 outPackets = maxOutFrames;  // PCM：frames == packets
-
-                            OSStatus cerr = AudioConverterFillComplexBuffer(
-                                conv, VCamAudioConverterInputProc, &feed, &outPackets, &outList, NULL);
-                            if (cerr == noErr) {
-                                UInt32 gotBytes = outList.mBuffers[0].mDataByteSize;
-                                if (gotBytes > 0) {
-                                    if (!g_didLogFeed) { vcam_log(@"feeder 首次写出 %u 字节到环形缓冲", gotBytes); g_didLogFeed = YES; }
-                                    [self ringWrite:outBuf length:gotBytes];
-                                }
-                            } else {
-                                // FillComplexBuffer 持续失败会导致环恒空（听感即静音），首败必须留痕
-                                static BOOL didLogCerr = NO;
-                                if (!didLogCerr) {
-                                    vcam_log(@"AudioConverterFillComplexBuffer 首次失败 cerr=%d (inBytes=%zu frames=%u)", (int)cerr, len, numFrames);
-                                    didLogCerr = YES;
-                                }
-                            }
-                            free(outBuf);
+                            static BOOL didLogWrite = NO;
+                            if (!didLogWrite) { vcam_log(@"feeder 首次写出 %zu 字节到环形缓冲", len); didLogWrite = YES; }
+                            // 直出：解码产物即目标格式 PCM，按字节原样写入环形缓冲（无 AudioConverter）。
+                            // 消费端按 ioData->mBuffers 顺序逐块 memcpy，零变换，对齐 VCAM4。
+                            [self ringWrite:(const uint8_t *)ptr length:(UInt32)len];
                         } @finally {
                             CFRelease(s);
                         }
                     }
-                    if (conv) { AudioConverterDispose(conv); conv = NULL; }
                     // 本遍结束留痕：reader.status 为 AVAssetReaderStatus（0=Unknown 1=Reading 2=Completed成功 3=Failed 4=Cancelled）；
-                    // err 仅在 Failed 时给出描述，其余为「无」。samplesGot=0 说明一个样本都没读到（reader 层问题，converter 还没轮到）。
+                    // err 仅在 Failed 时给出描述，其余为「无」。samplesGot=0 说明一个样本都没读到（reader 层问题）。
                     static BOOL didLogPass = NO;
                     if (!didLogPass) {
                         vcam_log(@"本遍读完：status=%ld samples=%llu stop=%d err=%@ (AVAssetReader: 2=Completed成功 3=Failed)",
@@ -814,13 +714,10 @@ static OSStatus hooked_AudioUnitRender(
     if (status != noErr)                    return status;
     if (!g_isReplace || !g_isSound)         return status;
     if (!ioData)                            return status;
-    // 放宽总线门禁：不再硬性要求 bus==1。微信不同版本麦克风渲染可能落在其它总线，
-    // 写死后会直接 passthrough 真实麦克风（听感即“没替换”）。改为按实际总线探测，
-    // 探测失败（拿不到合法 ASBD）自然跳过、不污染输出。
-    if (inOutputBusNumber != 1) {
-        static BOOL didLogBus = NO;
-        if (!didLogBus) { vcam_log(@"AudioUnitRender bus=%u (≠1)，仍按该总线探测", inOutputBusNumber); didLogBus = YES; }
-    }
+    // 对齐 VCAM4：严格只处理麦克风上行总线 bus==1（与 VCAM 反汇编 13ce4 的 `inOutputBusNumber==1` 门禁一致）。
+    // 微信其它总线的 AudioUnitRender（如扬声器回放）若也在此探测，会把错误 ASBD 缓存进 g_targetASBD，
+    // 导致后续解码/喂数据全部按错误采样率进行 → 听感"加快 + 不清晰"。
+    if (inOutputBusNumber != 1) return status;
 
     if (!g_hasProbedASBD) {
         UInt32 propSize = sizeof(g_targetASBD);
@@ -881,12 +778,17 @@ static OSStatus hooked_AudioUnitRender(
     UInt32 size = ioData->mBuffers[0].mDataByteSize;
     if (size == 0 || size > 0x100000) return status;
 
-    // ioData 在麦克风链路下几乎总为「非交错(non-interleaved)」：mNumberBuffers = 声道数，每声道一块独立缓冲。
-    // 环形缓冲内部统一存【交错】PCM（任意切片都自洽，优于 planar 在段边界处错位）。
-    // 这里按目标布局拉取并反交错写入各声道缓冲，效果对齐 VCAM4 的「逐声道填 mBuffers[ch]」；
-    // 单声道(mNumberBuffers==1)则直接整块拷贝。
-    UInt32 nCh  = ioData->mNumberBuffers;
-    UInt32 need = (nCh > 1) ? size * nCh : size;
+    // 对齐 VCAM4：环形缓冲内 PCM 的字节布局 = 微信 ioData->mBuffers[0..n] 的"顺序拼接"
+    // （feeder 已按真实 ASBD 直出解码：non-interleaved 即 ch0段+ch1段+…，interleaved 即单段）。
+    // 故这里只需按 mBuffers 顺序、每段 mDataByteSize 逐块 memcpy（对齐 VCAM 反汇编 14094-14114 拷贝循环），
+    // 不做任何反交错/重排 —— VCAM4 正是靠"零变换直拷"规避交错错乱导致的失真。
+    UInt32 nBuf = ioData->mNumberBuffers;
+    if (nBuf == 0) return status;
+    size_t need = 0;
+    for (UInt32 i = 0; i < nBuf; i++) {
+        if (ioData->mBuffers[i].mDataByteSize > 0x100000) return status;
+        need += ioData->mBuffers[i].mDataByteSize;
+    }
     if (need == 0 || need > 0x100000) return status;
 
     // 消费心跳：节流每 3 秒打一次，直接印环 fill，作为「消费者确实在取数」的铁证。
@@ -899,7 +801,7 @@ static OSStatus hooked_AudioUnitRender(
             os_unfair_lock_lock(&g_audioRingLock);
             size_t fill = g_audioRingFill;
             os_unfair_lock_unlock(&g_audioRingLock);
-            vcam_log(@"消费心跳：bus=%u frames=%u need=%u 环fill=%zu/cap=%zu %s",
+            vcam_log(@"消费心跳：bus=%u frames=%u need=%zu 环fill=%zu/cap=%zu %s",
                      inOutputBusNumber, (unsigned)inNumberFrames, need, fill, g_audioRingCap,
                      (fill > 0) ? "→有数据" : "→仍空(静音)");
             s_lastConsumeLog = now;
@@ -909,27 +811,14 @@ static OSStatus hooked_AudioUnitRender(
     uint8_t *temp = (uint8_t *)calloc(1, need);
     if (!temp) return status;
     @try {
-        [VCamMediaManager pullAudioData:temp length:need];
-        if (nCh > 1) {
-            // 反交错：交错布局中声道 c 第 f 帧样本字节偏移 = (f * unit) * nCh + c * unit
-            UInt32 unit = (g_targetASBD.mBitsPerChannel ?: 16) / 8;
-            if (unit == 0) unit = 4;
-            for (UInt32 c = 0; c < nCh; c++) {
-                AudioBuffer *b = &ioData->mBuffers[c];
-                if (!b->mData) continue;
-                UInt32 cap = b->mDataByteSize;
-                uint8_t *dst = (uint8_t *)b->mData;
-                for (UInt32 off = 0; off + unit <= cap; off += unit) {
-                    UInt32 srcOff = off * nCh + c * unit;
-                    if (srcOff + unit > need) break;
-                    memcpy(dst + off, temp + srcOff, unit);
-                }
-            }
-        } else {
-            for (UInt32 i = 0; i < nCh; i++) {
-                if (!ioData->mBuffers[i].mData) continue;
-                if (ioData->mBuffers[i].mDataByteSize != size) continue;
-                memcpy(ioData->mBuffers[i].mData, temp, size);
+        [VCamMediaManager pullAudioData:temp length:(UInt32)need];
+        // 逐 buffer 顺序直拷：off 按 mBuffers 顺序累加，与 feeder 直出的布局严格对应（零变换，对齐 VCAM4）
+        size_t off = 0;
+        for (UInt32 i = 0; i < nBuf; i++) {
+            AudioBuffer *b = &ioData->mBuffers[i];
+            if (b->mData && b->mDataByteSize > 0 && off + b->mDataByteSize <= need) {
+                memcpy(b->mData, temp + off, b->mDataByteSize);
+                off += b->mDataByteSize;
             }
         }
         // 替换能量检测（每 3 秒一次）：直接扫描本帧写入 ioData 的替换音频，统计非零字节占比。
