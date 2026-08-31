@@ -402,6 +402,7 @@ static OSStatus VCamAudioConverterInputProc(
                     NSDictionary *outSettings = @{
                         AVFormatIDKey: @(kAudioFormatLinearPCM),
                         AVLinearPCMIsFloatKey: @YES,
+                        AVLinearPCMBitDepthKey: @(32),
                         AVLinearPCMIsBigEndianKey: @NO,
                         AVLinearPCMIsNonInterleavedKey: @NO,
                     };
