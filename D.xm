@@ -335,9 +335,13 @@ static OSStatus VCamAudioConverterInputProc(
                 if (dstDesc.mChannelsPerFrame == 0)      dstDesc.mChannelsPerFrame = 1;
                 if (dstDesc.mBitsPerChannel == 0)        dstDesc.mBitsPerChannel =
                     (dstDesc.mFormatFlags & kAudioFormatFlagIsFloat) ? 32 : 16;
-                if (dstDesc.mBytesPerFrame == 0)
-                    dstDesc.mBytesPerFrame = dstDesc.mChannelsPerFrame * (dstDesc.mBitsPerChannel / 8);
-                if (dstDesc.mBytesPerPacket == 0)        dstDesc.mBytesPerPacket   = dstDesc.mBytesPerFrame;
+                // 强制交错后必须按「声道数 × 每声道字节」重算每帧/每包字节数：
+                // 原始非交错格式下 mBytesPerFrame 仅含单声道字节，不重算会让 ASBD 自相矛盾，
+                // 导致 AudioConverterNew 失败、环形缓冲永远为空 → 没有声音。
+                dstDesc.mFormatFlags     |= kAudioFormatFlagIsPacked;
+                dstDesc.mBytesPerFrame   = dstDesc.mChannelsPerFrame * (dstDesc.mBitsPerChannel / 8);
+                dstDesc.mFramesPerPacket = 1;
+                dstDesc.mBytesPerPacket  = dstDesc.mBytesPerFrame;
                 // 目标格式直接用 dstDesc（C 级 AudioConverter 读取），不再依赖 AVAudioFormat
 
                 void (^decodeOnce)(void) = ^{
@@ -711,7 +715,11 @@ static OSStatus hooked_AudioUnitRender(
                     g_audioRingHead = g_audioRingTail = g_audioRingFill = 0;
                     os_unfair_lock_unlock(&g_audioRingLock);
                 }
-                if (!g_audioFeederRunning && !g_audioFeederStop) [VCamMediaManager startAudioFeeder];
+                // 注意：此处不能用 !g_audioFeederStop 做门禁——vcm_reloadReaders（startRunning / 换素材时）
+                // 会把 g_audioFeederStop 置 YES 来停掉旧解码线程；若不把它清回 NO，新会话的 feeder 永远起不来，
+                // 环形缓冲为空 → 麦克风一路始终静音。是否已在跑只需由 g_audioFeederRunning 一个标志把关，
+                // startAudioFeeder 内部会在真正启动前把 g_audioFeederStop 清回 NO。
+                if (!g_audioFeederRunning) [VCamMediaManager startAudioFeeder];
             } @catch (NSException *e) {
                 // 探测阶段出问题还没污染输出，吞掉异常让下帧重试即可，不关替换
             }
@@ -722,14 +730,39 @@ static OSStatus hooked_AudioUnitRender(
     UInt32 size = ioData->mBuffers[0].mDataByteSize;
     if (size == 0 || size > 0x100000) return status;
 
-    uint8_t *temp = (uint8_t *)calloc(1, size);
+    // ioData 在麦克风链路下几乎总为「非交错(non-interleaved)」：mNumberBuffers = 声道数，每声道一块独立缓冲。
+    // 环形缓冲内部统一存【交错】PCM（任意切片都自洽，优于 planar 在段边界处错位）。
+    // 这里按目标布局拉取并反交错写入各声道缓冲，效果对齐 VCAM4 的「逐声道填 mBuffers[ch]」；
+    // 单声道(mNumberBuffers==1)则直接整块拷贝。
+    UInt32 nCh  = ioData->mNumberBuffers;
+    UInt32 need = (nCh > 1) ? size * nCh : size;
+    if (need == 0 || need > 0x100000) return status;
+
+    uint8_t *temp = (uint8_t *)calloc(1, need);
     if (!temp) return status;
     @try {
-        [VCamMediaManager pullAudioData:temp length:size];
-        for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
-            if (!ioData->mBuffers[i].mData) continue;
-            if (ioData->mBuffers[i].mDataByteSize != size) continue;
-            memcpy(ioData->mBuffers[i].mData, temp, size);
+        [VCamMediaManager pullAudioData:temp length:need];
+        if (nCh > 1) {
+            // 反交错：交错布局中声道 c 第 f 帧样本字节偏移 = (f * unit) * nCh + c * unit
+            UInt32 unit = (g_targetASBD.mBitsPerChannel ?: 16) / 8;
+            if (unit == 0) unit = 4;
+            for (UInt32 c = 0; c < nCh; c++) {
+                AudioBuffer *b = &ioData->mBuffers[c];
+                if (!b->mData) continue;
+                UInt32 cap = b->mDataByteSize;
+                uint8_t *dst = b->mData;
+                for (UInt32 off = 0; off + unit <= cap; off += unit) {
+                    UInt32 srcOff = off * nCh + c * unit;
+                    if (srcOff + unit > need) break;
+                    memcpy(dst + off, temp + srcOff, unit);
+                }
+            }
+        } else {
+            for (UInt32 i = 0; i < nCh; i++) {
+                if (!ioData->mBuffers[i].mData) continue;
+                if (ioData->mBuffers[i].mDataByteSize != size) continue;
+                memcpy(ioData->mBuffers[i].mData, temp, size);
+            }
         }
     } @catch (NSException *e) {
         // memcpy 阶段抛异常（极少见）时本帧已不可信，free 后返回 noErr 让 ioData 维持原样（真实麦克风），下帧重试。
