@@ -15,7 +15,7 @@
 //   对应 VCAM4 反汇编 @0x8228）；消费端只读游标顺序推进（到尾按 g_isLoop 回卷）+ 零变换 memcpy。
 //   无 AudioConverter 重采样层、无环形缓冲，故 PCM 永不被覆盖成碎片——这是清晰度的根本保证。
 //
-// 画面流向：素材 → AVAssetReader 取帧 → 旋转/镜像/等比居中 →
+// 画面流向：素材 → AVAssetReader 取帧 → 旋转/等比居中 →
 // CIContext 渲染到与采集帧同尺寸同格式的 CVPixelBuffer → 套用采集帧时序 → 新的 CMSampleBuffer。
 //
 // 容错约定：帧构建与音频拉取均跑在实时线程，任一步抛异常仅本帧降级
@@ -52,7 +52,6 @@
 static BOOL g_isReplace  = YES;     // YES=替换画面，NO=透传真实摄像头
 static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
 static BOOL g_isSound    = YES;     // 是否替换麦克风采集
-static BOOL g_isMirrored = YES;     // 是否对源画面左右镜像
 static int  g_rotation   = 90;      // 0 / 90 / 180 / 270（非开关，循环取值）
 
 #pragma mark - reader 重建标记
@@ -166,7 +165,6 @@ static void vcm_saveSettings(void) {
     [d setBool:g_isReplace      forKey:@"vcam_replace"];
     [d setBool:g_isLoop         forKey:@"vcam_loop"];
     [d setBool:g_isSound        forKey:@"vcam_sound"];
-    [d setBool:g_isMirrored     forKey:@"vcam_mirror"];
     [d setInteger:g_rotation    forKey:@"vcam_rotation"];
     // 音频素材路径持久化：扩展名随导入文件动态变化（mp3/m4a/m4r/...），不存盘则重启后找不到文件 → 回退到视频。
     [d setObject:g_tempAudioPath forKey:@"vcam_audio_path"];
@@ -177,8 +175,6 @@ static void vcm_loadSettings(void) {
     if ([d objectForKey:@"vcam_replace"])  g_isReplace   = [d boolForKey:@"vcam_replace"];
     if ([d objectForKey:@"vcam_loop"])     g_isLoop      = [d boolForKey:@"vcam_loop"];
     if ([d objectForKey:@"vcam_sound"])    g_isSound     = [d boolForKey:@"vcam_sound"];
-    if ([d objectForKey:@"vcam_mirror"])   g_isMirrored  = [d boolForKey:@"vcam_mirror"];
-    else                                   g_isMirrored  = YES;
     if ([d objectForKey:@"vcam_rotation"]) g_rotation    = (int)[d integerForKey:@"vcam_rotation"];
     else                                   g_rotation    = 90;
     // 恢复音频素材路径：存在则用持久化路径（动态扩展名），否则回退默认 .m4a 名（旧版兼容）。
@@ -225,7 +221,6 @@ static void vcm_resetSettings(void) {
     g_isReplace   = NO;
     g_isLoop      = YES;
     g_isSound     = YES;
-    g_isMirrored  = YES;
     g_rotation    = 90;
     vcm_saveSettings();
 
@@ -395,10 +390,10 @@ static UIViewController *vcm_topViewController(void) {
         @try {
             @autoreleasepool {
                 NSString *path = g_tempAudioPath;
-                // 【路径来源说明】两种素材来源，日志必须区分清楚，否则排查时会误判为 bug：
-                //   ① 导入【纯音频】素材（无视频轨）→ 拷到 g_tempAudioPath，解码直接用它；
-                //   ② 导入【视频】素材（哪怕含音轨）→ 只拷视频文件到 vcm_videoPath()，
-                //      g_tempAudioPath 不存在，此处回退到视频文件、从其音轨解码——这是正常设计，不是错误。
+                // 【路径来源说明 / 双素材语义】
+                //   优先级：① 独立导入的【声音文件】优先（bear_vcam_audio.* 存在即用它）；
+                //          ② 否则回退到【视频自带音轨】（vcm_videoPath() 存在且含音轨时用它）。
+                //   这正是「导入视频后还能单独换声音、没换声音就用视频原声」的语义。
                 BOOL usedVideoFallback = ![g_fileManager fileExistsAtPath:path];
                 if (usedVideoFallback) path = vcm_videoPath();
 
@@ -750,11 +745,7 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     else if (g_rotation == 270) orient = 8;
     img = [img imageByApplyingOrientation:(CGImagePropertyOrientation)orient];
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    if (g_isMirrored) img = [img imageByApplyingCGOrientation:kCGImagePropertyOrientationUpMirrored];
-#pragma clang diagnostic pop
-
+    // 镜像功能已移除：画面不再做左右镜像翻转。
     CGRect e = img.extent;
     if (e.size.width <= 0 || e.size.height <= 0) return nil;
 
@@ -1251,7 +1242,6 @@ static VCamAudioProxy *g_audioProxy = nil;
     UIButton *_btnRotate;      // 旋转（循环取值，非开关）
     UIButton *_btnLoop;        // g_isLoop
     UIButton *_btnSound;       // g_isSound
-    UIButton *_btnMirror;      // g_isMirrored
     UIButton *_btnReplace;     // g_isReplace
     UIButton *_btnReset;
     UIButton *_btnExport;       // 导出诊断日志       // 重置
@@ -1310,8 +1300,17 @@ static VCamAudioProxy *g_audioProxy = nil;
     [close addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
     close.translatesAutoresizingMaskIntoConstraints = NO;
     [navBar addSubview:close];
-    [close.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor constant:-16].active = YES;
+    [close.leadingAnchor constraintEqualToAnchor:navBar.leadingAnchor constant:16].active = YES;
     [close.centerYAnchor  constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
+    // 重置按钮移到导航栏右边
+    UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem];
+    [reset setTitle:@"重置" forState:UIControlStateNormal];
+    reset.titleLabel.font = [UIFont systemFontOfSize:[UIFont systemFontSize]];
+    [reset addTarget:self action:@selector(actionReset) forControlEvents:UIControlEventTouchUpInside];
+    reset.translatesAutoresizingMaskIntoConstraints = NO;
+    [navBar addSubview:reset];
+    [reset.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor constant:-16].active = YES;
+    [reset.centerYAnchor  constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
 }
 - (void)setupContent {
     _contentView = [[UIView alloc] init];
@@ -1363,13 +1362,11 @@ static VCamAudioProxy *g_audioProxy = nil;
     y += btnH + gap;
 
     _btnSound  = [self addGridButton:g_isSound ? @"声音: 开" : @"声音: 关" x:0 y:y w:btnW h:btnH action:@selector(toggleSound)];
-    _btnMirror = [self addGridButton:g_isMirrored ? @"镜像: 开" : @"镜像: 关"
-                                  x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleMirror)];
     y += btnH + gap;
 
     _btnReplace = [self addGridButton:g_isReplace ? @"替换: 开" : @"替换: 关"
                    x:0 y:y w:btnW h:btnH action:@selector(toggleReplace)];
-    _btnReset  = [self addGridButton:@"重置" x:btnW + gap y:y w:btnW h:btnH action:@selector(actionReset)];
+    // 注：镜像功能已按需求移除（不再提供切换开关）；重置按钮已移到导航栏右边。
     y += btnH + gap;
 
     // 导出日志：占满整行（两列总宽），点击把 g_diagLog 经系统分享面板导出
@@ -1383,7 +1380,6 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)toggleRotate  { g_rotation   = (g_rotation + 90) % 360; vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleLoop    { g_isLoop     = !g_isLoop;     vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleSound   { g_isSound    = !g_isSound;    vcm_saveSettings(); [self refreshGridButtons]; }
-- (void)toggleMirror  { g_isMirrored = !g_isMirrored; vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleReplace { g_isReplace  = !g_isReplace;  vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
 
@@ -1430,24 +1426,32 @@ static VCamAudioProxy *g_audioProxy = nil;
         attributes:@{NSFontAttributeName: font}];
     btn.configuration = config;
 }
-// 刷新顺序与面板网格一致：旋转 → 循环 → 声音 → 镜像 → 替换
+// 刷新顺序与面板网格一致：旋转 → 循环 → 声音 → 替换
 - (void)refreshGridButtons {
     UIFont *font = [UIFont systemFontOfSize:[UIFont systemFontSize] weight:UIFontWeightMedium];
     [self applyTitle:[NSString stringWithFormat:@"旋转 (%d°)", g_rotation]
             toButton:_btnRotate withFont:font];
     [self applyTitle:(g_isLoop     ? @"循环: 开" : @"循环: 关") toButton:_btnLoop    withFont:font];
     [self applyTitle:(g_isSound    ? @"声音: 开" : @"声音: 关") toButton:_btnSound   withFont:font];
-    [self applyTitle:(g_isMirrored ? @"镜像: 开" : @"镜像: 关") toButton:_btnMirror  withFont:font];
     [self applyTitle:(g_isReplace  ? @"替换: 开" : @"替换: 关") toButton:_btnReplace withFont:font];
     [self updateStatusUI];
 }
 - (void)updateStatusUI {
     // 视频状态：始终显示（已加载 / 未选择）
-    NSString *vStat = [g_fileManager fileExistsAtPath:vcm_videoPath()] ? @"已加载" : @"未选择";
+    BOOL hasVideo = [g_fileManager fileExistsAtPath:vcm_videoPath()];
+    BOOL hasAudio = [g_fileManager fileExistsAtPath:g_tempAudioPath];
+    NSString *vStat = hasVideo ? @"已加载" : @"未选择";
     NSMutableString *s = [NSMutableString stringWithFormat:@"视频: %@", vStat];
-    // 音频状态：仅当确实从文件导入过音频素材时才显示「声音: 已加载」；未导入则不显示（按需求）
-    if ([g_fileManager fileExistsAtPath:g_tempAudioPath]) {
-        [s appendFormat:@"   声音: 已加载"];
+    // 声音状态：
+    //   · 未导入声音、但有视频 → 用视频自带音轨，提示「已加载」（与视频共用一条音频链路）
+    //   · 导入了声音文件         → 提示「已加载自定义」
+    //   · 无视频且无声音         → 提示「未加载」
+    if (hasAudio) {
+        [s appendString:@"   声音: 已加载自定义"];
+    } else if (hasVideo) {
+        [s appendString:@"   声音: 已加载"];
+    } else {
+        [s appendString:@"   声音: 未加载"];
     }
     _statusLabel.text = s;
 }
@@ -1506,8 +1510,10 @@ static VCamAudioProxy *g_audioProxy = nil;
         // 这是设计如此（音频就在视频容器里），不是拷贝遗漏——日志写清楚，避免排查时误判。
         vcam_log(@"素材拷贝%@ → %@（%@）", copied ? @"成功" : [NSString stringWithFormat:@"失败：%@", copyErr.localizedDescription],
                  dest,
-                 hasAudio ? @"含音轨：AudioUnit 链路将从此视频文件解音频，tempAudio 不参与"
-                          : @"无音轨：AudioUnit 链路将保持静音透传");
+                 [g_fileManager fileExistsAtPath:g_tempAudioPath]
+                     ? @"含独立声音文件：音频优先用声音文件，视频仅提供画面"
+                     : (hasAudio ? @"未导入声音文件：音频回退用视频自带音轨"
+                                 : @"无音轨且未导入声音：AudioUnit 链路将保持静音透传"));
         if (!copied) return;
         // 停掉 reader 而不只是清冻结帧：换素材时若循环关闭、且旧 reader 已读完，setup 里的 loop 门禁会把重建挡掉，新素材就永远不生效。
         vcm_stopReaders();
@@ -1516,11 +1522,10 @@ static VCamAudioProxy *g_audioProxy = nil;
         [VCamMediaManager setupVideoReaderIfNeeded];
         [VCamMediaManager setupAudioReaderIfNeeded];
     } else if (hasAudio) {
-        // 导入纯音频时清掉残留视频素材：用户意图只是替换声音，不应让旧视频继续替换画面。
-        if ([g_fileManager fileExistsAtPath:vcm_videoPath()]) {
-            [g_fileManager removeItemAtPath:vcm_videoPath() error:nil];
-        }
-        // 【真凶修复】之前 g_tempAudioPath 写死 .m4a，mp3/m4r 等被强行冠上 .m4a 扩展名：
+        // 【双素材语义】导入声音文件只新增/替换声音源，绝不删视频：
+        // 画面仍由 vcm_videoPath() 提供，音频优先用本声音文件（decodeAudioToMemory 已按「有声音文件优先」选择）。
+        // 若此前没导入过视频，则只有声音、无画面（仍可替换麦克风声）。
+        // 【扩展名真凶修复】之前 g_tempAudioPath 写死 .m4a，mp3/m4r 等被强行冠上 .m4a 扩展名：
         //   · m4r 本质就是 m4a（MP4 容器 + AAC），扩展名对得上 → 正常；
         //   · mp3 是 MP3 容器，被冠 .m4a 后 AVURLAsset 按扩展名选错解封装器 → 读不到音轨 → 通话静音。
         // 故这里按导入文件的【真实扩展名】落地（mp3 存 .mp3 / m4a 存 .m4a / m4r 存 .m4r …），
@@ -1537,14 +1542,15 @@ static VCamAudioProxy *g_audioProxy = nil;
                             [NSString stringWithFormat:@"bear_vcam_audio.%@", ext]] copy];
         vcm_saveSettings();   // 持久化真实扩展名，否则重启后找不到文件
         BOOL copied = [g_fileManager copyItemAtPath:src toPath:g_tempAudioPath error:&copyErr];
-        vcam_log(@"音频拷贝%@ → %@（纯音频素材，AudioUnit 链路将从此文件解码）",
+        NSString *vStat = [g_fileManager fileExistsAtPath:vcm_videoPath()] ? @"（视频素材保留，画面继续用视频）" : @"（无视频素材，仅替换声音）";
+        vcam_log(@"音频拷贝%@ → %@（声音文件优先作音频源，未导入声音时才回退视频原声）%@",
                  copied ? @"成功" : [NSString stringWithFormat:@"失败：%@", copyErr.localizedDescription],
-                 g_tempAudioPath ?: @"(未设置)");
+                 g_tempAudioPath ?: @"(未设置)", vStat);
         if (!copied) { [self updateStatusUI]; return; }
-        // 导入纯音频时自动开启替换（用户意图就是替换麦克风声音），否则若 g_isReplace=NO 会被门禁透传真实麦克风。
+        // 自动开启替换（用户意图就是替换麦克风声音），否则若 g_isReplace=NO 会被门禁透传真实麦克风。
         g_isReplace = YES;
         vcm_saveSettings();
-        vcm_stopReaders();      // 清掉可能残留的视频 reader，换素材后让链路重新 setup
+        vcm_stopReaders();      // 让链路重新 setup（声音源变化需重启解码）
         [self updateStatusUI];
     }
     [self refreshGridButtons];
