@@ -44,7 +44,7 @@
 #import <os/lock.h>
 
 #pragma mark - 配置开关
-static BOOL g_isReplace  = YES;     // YES=替换画面+声音，NO=透传真实摄像头/麦克风
+static BOOL g_isReplace  = NO;      // 默认关：无素材时透传真实摄像头/麦克风；导入素材后自动开启
 static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
 static BOOL g_isSound    = YES;     // 是否替换麦克风采集
 static int  g_rotation   = 90;      // 0 / 90 / 180 / 270（点击旋转按钮循环取值）
