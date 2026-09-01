@@ -24,13 +24,15 @@
 //    ① 本地双路径：bundleIdentifier          -> 无条件 com.tencent.xin
 //                  objectForInfoDictionaryKey:CFBundleIdentifier -> 无条件 com.tencent.xin
 //                  （其余 key / 其它 Bundle 透传，不影响 Info.plist 其它读取）
-//    ② 网络层兜底：NSURL.URLWithString: / NSURLSession.dataTaskWithRequest:
-//       仍把请求 URL 里真实 bid 替换成官方 id（覆盖微信用网络请求携带 bid 的场景）
+//    ② 网络层（兜底，默认关）：NSURL.URLWithString: / NSURLSession.dataTaskWithRequest:
+//       把请求 URL 里真实 bid 替换成官方 id（覆盖微信用网络请求携带 bid 的场景）
+//       ★ 默认关闭：v1.0.6（无网络层）稳定、v3.0+（有网络层）全部闪退，且 WCP 反汇编证实
+//         它根本无网络层——故网络层判定为闪退源，改为 opt-in（wcp_enable_net 才开）
 //    ③ 刷脸窗口（initPipeline/dealloc）：仅作可观测日志，本地 spoof 已无条件覆盖刷脸
 //
 //  运行时开关（app 沙盒 Documents，与日志同目录，无需越狱文件管理器）：
 //    wcp_disable_local → 关本地双路径 spoof（= 纯网络层模式 / 基线，便于二分定位）
-//    wcp_disable_net   → 关网络层兜底（= 纯本地 spoof 模式）
+//    wcp_enable_net    → 开网络层兜底（默认关；WCP 无网络层，故默认关以对齐 WCP 且避闪退）
 //============================================================================
 
 #import <Foundation/Foundation.h>
@@ -42,7 +44,7 @@
 #include <string.h>
 
 //------------------------------ 配置开关 -------------------------------------
-#define WCP_VERSION                "4.0.0"
+#define WCP_VERSION                "4.1.0"
 #define HOOK_BUNDLE_IDENTIFIER    1   // bundleIdentifier：无条件回吐 com.tencent.xin（WCP 式）
 #define HOOK_OBJECT_KEY            1   // objectForInfoDictionaryKey:CFBundleIdentifier：无条件回吐 com.tencent.xin（WCP 式双路径）
 #define HOOK_NETWORK_SPOOF        1   // 网络层 bid 伪装（WCP 无此层；作为兜底保留）
@@ -64,7 +66,7 @@ static char         gWCPLogPath[2048] = {0};
 static NSString    *gWCPRealBid = nil;          // 真实 bundle id（%ctor 读取，ARC 下 strong 持有）
 static NSString    *gWCPTargetBid = @"com.tencent.xin";
 static BOOL         gWCPFaceActive = NO;         // 刷脸窗口标志（仅日志可观测，对齐 WCR 0x2203560）
-static BOOL         gWCPNetOff  = NO;            // 运行时降级：网络层关（wcp_disable_net 存在）
+static BOOL         gWCPNetOn   = NO;            // 运行时开关：网络层默认关，wcp_enable_net 文件存在才开（WCP 无网络层；默认关以对齐 WCP 且避闪退）
 static BOOL         gWCPLocalOff = NO;           // 运行时降级：本地 spoof 关（wcp_disable_local 存在）
 
 // 纯 C 落地异常，绝不经过 Objective-C 格式化，避免在已崩溃路径上二次崩溃
@@ -133,10 +135,10 @@ static NSString *WCPReplaceBid(NSString *s) {
     return [s stringByReplacingOccurrencesOfString:gWCPRealBid withString:gWCPTargetBid];
 }
 
-// 开关文件存在=关闭该层（免编译降级）。只在 app 沙盒 Documents 下查，与日志同目录。
+// 开关文件存在=对应行为生效（免编译切换）。只在 app 沙盒 Documents 下查，与日志同目录。
 //   wcp_disable_local -> 关本地双路径 spoof（= 纯网络层模式 / 基线）
-//   wcp_disable_net   -> 关网络层兜底（= 纯本地 spoof 模式）
-static BOOL WCPSwitchOff(NSString *name) {
+//   wcp_enable_net    -> 开网络层兜底（默认关；WCP 无网络层，故默认关以对齐 WCP 且避闪退）
+static BOOL WCPSwitchOn(NSString *name) {
     if (!gWCPLogPath[0]) return NO;
     NSString *dir = [[NSString stringWithUTF8String:gWCPLogPath]
                      stringByDeletingLastPathComponent];
@@ -210,7 +212,7 @@ static BOOL WCPSwitchOff(NSString *name) {
 + (NSURL *)URLWithString:(NSString *)URLString {
     @try {
         if (gWCPInHook) return %orig;
-        if (gWCPNetOff) return %orig;            // 运行时降级：网络层关，纯透传
+        if (!gWCPNetOn) return %orig;            // 网络层默认关；wcp_enable_net 才开
         if (!URLString) return %orig;            // 入口判空：nil 直接透传
         gWCPInHook = 1;
         NSString *repl = WCPReplaceBid(URLString);
@@ -241,7 +243,7 @@ static BOOL WCPSwitchOff(NSString *name) {
                             completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     @try {
         if (gWCPInHook) return %orig;
-        if (gWCPNetOff) return %orig;            // 运行时降级：网络层关，纯透传
+        if (!gWCPNetOn) return %orig;            // 网络层默认关；wcp_enable_net 才开
         if (!request) return %orig;
         gWCPInHook = 1;
 
@@ -325,20 +327,20 @@ static BOOL WCPSwitchOff(NSString *name) {
         NSString *exe = [[NSBundle mainBundle] executablePath];
 
         // 运行时开关（app 沙盒 Documents 下的空文件，与日志同目录）
-        gWCPNetOff   = WCPSwitchOff(@"wcp_disable_net");
-        gWCPLocalOff = WCPSwitchOff(@"wcp_disable_local");
+        gWCPLocalOff = WCPSwitchOn(@"wcp_disable_local");
+        gWCPNetOn    = WCPSwitchOn(@"wcp_enable_net");
 
-        WCPLog(@"=== WCPBidSpoof %s init (uid=%d) exe=%@ realBid=%@ LOCAL=%d(off=%d) NET=%d(off=%d) ===",
+        WCPLog(@"=== WCPBidSpoof %s init (uid=%d) exe=%@ realBid=%@ LOCAL=%d(off=%d) NET=%d(on=%d) ===",
                WCP_VERSION, getuid(), exe, gWCPRealBid,
-               HOOK_BUNDLE_IDENTIFIER, gWCPLocalOff, HOOK_NETWORK_SPOOF, gWCPNetOff);
+               HOOK_BUNDLE_IDENTIFIER, gWCPLocalOff, HOOK_NETWORK_SPOOF, gWCPNetOn);
 
         if (exe && [exe containsString:@"WeChat"]) {
-            %init(WCPBidSpoof);   // 本地双路径 spoof + 网络层兜底（netOff 时内部透传）
+            %init(WCPBidSpoof);   // 本地双路径 spoof（默认开）+ 网络层兜底（默认关，wcp_enable_net 才开）
             if (HOOK_FACE_SPOOF) {
                 %init(WCPFace);   // 仅 initPipeline/dealloc 日志，绝不 hook NSString
             }
-            WCPLog(@"init: hooks installed (WCP-style: local double-path spoof ON=%d, net fallback=%d)",
-                   !gWCPLocalOff, (HOOK_NETWORK_SPOOF && !gWCPNetOff));
+            WCPLog(@"init: hooks installed (WCP-style: local double-path spoof ON=%d, net fallback=%d[opt-in])",
+                   !gWCPLocalOff, gWCPNetOn);
         } else {
             WCPLog(@"init: executable not WeChat, skip");
         }
