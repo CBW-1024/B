@@ -1,59 +1,47 @@
 //============================================================================
-//  WCPBidSpoof — 微信多开 bundle id 处理（单文件 Logos tweak）
+//  WCPBidSpoof — 微信多开 bid 处理（单文件 Logos tweak）v3.0
 //----------------------------------------------------------------------------
-//  对齐商业插件 WCRefine (WCR) 的【已验证】行为：bundleIdentifier 透传真实 id。
+//  策略：对齐商业插件 WCRefine (WCR) / WCPulse (WCP) 的【已验证】bid 伪装机制，
+//        分两层处理，互不干扰：
 //
-//  ⚠️ 关键修正（v1.0.6）：之前版本全局把 bundleIdentifier 改成 com.tencent.xin，
-//     导致 UI 移位 + APNs 推送丢失。反编译 WCR 并用 Unicorn 模拟跑通后证实：
-//     WCR 的 bundleIdentifier hook【永远返回真实 id】，从不伪装成 com.tencent.xin。
+//  ┌───────────────┬──────────────────────────────────────────────────────────┐
+//  │ 场景          │ 伪装位置（对齐商业插件）                                    │
+//  ├───────────────┼──────────────────────────────────────────────────────────┤
+//  │ ① 登录/风控   │ 【网络层】NSURL / NSURLSession —— 把发出去的请求 URL/body │
+//  │               │   里的真实 bid 替换成 com.tencent.xin。本地 bundleIdentifier│
+//  │               │   保持真实（保 APNs topic + UI 资源）。                    │
+//  │               │   WCR 铁证：NSURL URLWithString: IMP=0x3a6fa8、            │
+//  │               │   NSURLSession dataTaskWithRequest: IMP=0x72e77c，        │
+//  │               │   修改函数 0x734d40 引用 URL/absoluteString/HTTPBody。     │
+//  ├───────────────┼──────────────────────────────────────────────────────────┤
+//  │ ② 人脸核身    │ 【NSString 层】刷脸 SDK 把 bid 当 NSString 流转，         │
+//  │               │   self == [NSString class] 语境（即“self == NSString”），  │
+//  │               │   仅在【刷脸窗口】内才替换。窗口由                         │
+//  │               │   FaceRecogFlashHandler -initPipeline 置位、              │
+//  │               │   -dealloc 清零（WCR hooks_inventory.txt:                 │
+//  │               │   FaceRecogFlashHandler initPipeline IMP=0x1582820）。     │
+//  │               │   → 平时绝不碰 NSString，刷脸时才改写 bid 字符串。         │
+//  └───────────────┴──────────────────────────────────────────────────────────┘
 //
-//  【证据：WCR bundleIdentifier IMP（0x1582ec0）Unicorn 模拟结果】
-//    * 门控=开：执行 61 条指令 → 最终 x0 = 真实 bid（"com.tencent.qy.xin"）
-//      门控=关：执行 32 条指令 → 最终 x0 = 真实 bid
-//      → 两种状态都返回真实 id，com.tencent.xin(CFString 0x1f8fe88) 分支是死代码
-//        （被 `self == bundleIdentifier 返回的 NSString` 这个永不成立的条件守着）。
-//    * 返回路径调 (*0x2203458)(self,_cmd)；二进制里无指令写入 0x2203458，
-//      该槽由动态链接器/CydiaSubstrate 在加载时填入【原始 bundleIdentifier IMP】，
-//      故返回真实 id。这是 WCR「没有任何问题」(推送/UI 正常) 的根因：
-//      它从不改动微信推送/UI 子系统读取的 bundle id。
+//  【本地 bundleIdentifier / objectForInfoDictionaryKey:】
+//    始终返回【真实 id】(透传 %orig)，仅记日志。这是 WCR 的做法：
+//    本地订阅/UI/APNs topic 全部基于真实 bid，无任何副作用。
 //
-//  【为什么全局伪装会坏推送/UI】
-//    APNs topic = app【真实】bundle id（苹果用它加密 device token）。微信把
-//    [NSBundle mainBundle] bundleIdentifier] 当 topic 上报服务器；伪装成官方 id 后
-//    topic 与 token 加密主题不符 → 苹果静默丢弃推送。WCR 返回真实 id，天然规避。
+//  【刷脸 NSString 伪装为什么用 self == [NSString class] 门控】
+//    商业插件的 gencode 模板是“if (self == NSString) 才吐 com.tencent.xin”，
+//    在 bundleIdentifier 里 self 是 NSBundle → 永假 → 死代码（故本地不伪装）；
+//    但在刷脸路径里 bid 是以 NSString 类方法（stringWithUTF8String:/stringWithFormat:…）
+//    构造的，self 正是 [NSString class] → 门控成活。我们用 gWCPFaceActive
+//    （initPipeline 置 1 / dealloc 置 0）保证只在刷脸窗口内开启该门控。
 //
-//  【证据来源】
-//  * WCR 反编译：/workspace/work/WCRefine.dylib（hooks_inventory.txt 共 1788 个 hook）
-//      - 仅 hook NSBundle @bundleIdentifier（IMP=0x1582ec0, &orig=0x2203458），
-//        门控字节 0x2203560；模拟证实返回真实 id。
-//      - 完整反汇编：python3 wcr/wcrdis.py 1582ec0 900
-//      - 模拟器：    python3 wcr/wcr_emu.py gate1 / gate0
-//      - **不 hook objectForInfoDictionaryKey:**（grep hooks_inventory 零命中）。
-//      - 仅 hook 通知*点击响应* userNotificationCenter:didReceiveNotificationResponse:
-//        （IMP 0x157b0f0 / 0x157b4c4）：先调 orig 再跑多开路由，不碰注册/deviceToken/解密。
-//  * WCP 还原（/workspace/WCP_bid_hook取证.md）：WCP 的 bundleIdentifier 在某些门控下
-//      确实会返回 com.tencent.xin，但那是 WCP 的行为；WCR 已修正为透传真实 id，
-//      本插件以【工作正常的 WCR】为对齐基准。
-//  * 微信头文件（/workspace/wx76/微信/）：TSEnvironment.h:25、FBSDKAppEventsDeviceInfo.h:17
-//      证明微信内部通过 NSBundle 读 bundleID，hook 在正确层级。
+//  【日志】写到 app 文件沙盒 Documents（NSSearchPathForDirectoriesInDomains），
+//    文件名 wcpbidspoof.log；打不开走 NSLog 兜底（syslog 搜 [WCPBidSpoof]）。
 //
-//  【本插件策略（对齐 WCR）】
-//    1. bundleIdentifier → 返回真实 id（%orig），仅记录日志供调试。
-//       这正是 WCR 的做法，可保推送 topic 与 UI 资源分支正确。
-//    2. objectForInfoDictionaryKey: → 默认不 hook（WCR 不 hook）。如需观察微信是否
-//       经此路径识别多开，可开 HOOK_OBJECT_FOR_INFO_DICT 仅记日志，不改返回值。
-//    3. 不 hook 任何推送注册 / deviceToken / 解密方法（与 WCR 一致）。
-//
-//  【登录 / 人脸 如何处理？】
-//    若你的多开仍需“登录 / 过人脸”，那不是 bundle id 伪装能解决的——WCR 返回真实 id
-//    也能正常登录/过人脸，说明相关机制在【其他 hook】（如 FaceRecogFlashHandler 之类），
-//    而非 bundle id。需要时可单独逆向 WCR 的对应 hook 再补。
-//
-//  【日志】
-//    无条件在 %ctor 开日志，写到【app 文件沙盒 Documents】：
-//      NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)
-//      → /var/mobile/Containers/Data/Application/<UUID>/Documents/wcpbidspoof.log
-//    （rootful / rootless 越狱下都正确；文件打不开则走 NSLog 兜底，syslog 搜 [WCPBidSpoof]）
+//  【如何验证】
+//    * 登录：日志应出现 NSURL | spoof / NSURLSession | spoof（服务端收到官方 bid）
+//    * 刷脸：日志应成对出现 face: initPipeline -> gWCPFaceActive=YES /
+//            face: dealloc -> gWCPFaceActive=NO，中间夹 NSString|face ... spoof
+//    * 推送/UI：本地仍是真实 bid，应正常。
 //============================================================================
 
 #import <Foundation/Foundation.h>
@@ -65,27 +53,31 @@
 #include <string.h>
 
 //------------------------------ 配置开关 -------------------------------------
-#define WCP_VERSION                "1.0.6"
-#define HOOK_BUNDLE_IDENTIFIER    1   // 是否 hook bundleIdentifier（仅记日志 + 透传真实 id）
-#define HOOK_OBJECT_FOR_INFO_DICT 0   // ⚠️ WCR 不 hook 此方法。开=仅记日志不改返回值
-#define ENABLE_LOGGING            1   // 沙盒文件日志（打不开则走 NSLog 兜底）
-#define LOG_VERBOSE               1   // 1 = 打印每次 bundleIdentifier 调用；0 = 不打印
+#define WCP_VERSION                "3.0.0"
+#define HOOK_BUNDLE_IDENTIFIER    1   // bundleIdentifier 返回真实 id（透传，打日志）
+#define HOOK_NETWORK_SPOOF        1   // 网络层 bid 伪装（对齐 WCR：登录/风控所需）
+#define HOOK_NSURL_REQUEST        1   // NSURL URLWithString: 替换
+#define HOOK_NSURLSESSION         1   // NSURLSession dataTaskWithRequest: 替换 URL
+#define HOOK_NSURLSESSION_BODY    0   // ⚠️ HTTPBody 替换（默认关：body 多为 protobuf 二进制，
+                                      //    字符串替换有破坏风险；如 URL 层不够可谨慎开启）
+#define HOOK_FACE_SPOOF           1   // 刷脸 NSString 级 bid 伪装（仅刷脸窗口内，self==NSString）
+#define ENABLE_LOGGING            1
+#define LOG_VERBOSE               1   // 1=打印每次调用；0=仅异常/替换
 #define WCP_LOG_MAX_LINES         8000
 
 //------------------------------ 日志子系统 -----------------------------------
 static FILE        *gWCPLog = NULL;
-static volatile int gWCPLogging = 0;     // 重入保护（日志内部若触发 hook 直接丢弃）
+static volatile int gWCPLogging = 0;
 static long         gWCPLogLines = 0;
-static volatile int gWCPInHook  = 0;     // hook 内部重入保护
+static volatile int gWCPInHook  = 0;
 static long         gWCPCallCount = 0;
-static char         gWCPLogPath[2048] = {0};  // 软件文件沙盒 Documents 路径（%ctor 解析）
+static char         gWCPLogPath[2048] = {0};
+static NSString    *gWCPRealBid = nil;          // 真实 bundle id（%ctor 读取）
+static NSString    *gWCPTargetBid = @"com.tencent.xin";
 
-// 只写到 app 的【文件沙盒 Documents】：/var/mobile/Containers/Data/Application/<UUID>/Documents
-// 取径方式用 NSSearchPathForDirectoriesInDomains，rootful / rootless 都正确（不受 /var/jb 重定向影响）。
-// 若沙盒路径打不开，不写文件、不散落到 /tmp 等非沙盒目录，改走 NSLog 兜底（syslog 可见）。
 static void WCPLogOpen(void) {
     if (gWCPLog) return;
-    if (!gWCPLogPath[0]) return;         // 路径未就绪（%ctor 未设置），交给 NSLog
+    if (!gWCPLogPath[0]) return;
     gWCPLog = fopen(gWCPLogPath, "a");
     if (gWCPLog) {
         fprintf(gWCPLog, "=== WCPBidSpoof log opened @ %s (uid=%d HOME=%s) ===\n",
@@ -94,11 +86,9 @@ static void WCPLogOpen(void) {
     }
 }
 
-// 先把格式串展开成 C 串（va_list 仅消费一次），再写文件 / NSLog。
 static void WCPLogV(const char *fmt, va_list ap) {
 #if !ENABLE_LOGGING
-    (void)fmt; (void)ap;
-    return;
+    (void)fmt; (void)ap; return;
 #else
     if (gWCPLogging) return;
     gWCPLogging = 1;
@@ -109,27 +99,20 @@ static void WCPLogV(const char *fmt, va_list ap) {
             time_t t = time(NULL);
             struct tm tm_now; localtime_r(&t, &tm_now);
             fprintf(gWCPLog, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
-                    tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+                    tm_now.tm_year+1900, tm_now.tm_mon+1, tm_now.tm_mday,
                     tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec, body);
             fflush(gWCPLog);
             gWCPLogLines++;
         }
     } else {
-        // 文件未开：兜底走 NSLog（设备 syslog / 控制台可见）
         NSLog(@"[WCPBidSpoof] %s", body);
     }
     gWCPLogging = 0;
 #endif
 }
 
-// 变参 C 壳：把 C 格式串 + 变参正确打包成 va_list 再交给 WCPLogV。
-// 注意：不能直接 WCPLogV("%s", charPtr) —— WCPLogV 第 2 形参是 va_list，
-// 直接塞 const char* 既编不过（arm64 上 va_list==char*，丢 const 限定符），
-// 运行时也会让 vsnprintf 读到野指针崩溃。必须经变参函数生成合法 va_list。
 static void WCPLogC(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    WCPLogV(fmt, ap);
-    va_end(ap);
+    va_list ap; va_start(ap, fmt); WCPLogV(fmt, ap); va_end(ap);
 }
 
 static void WCPLog(NSString *fmt, ...) {
@@ -139,79 +122,212 @@ static void WCPLog(NSString *fmt, ...) {
     WCPLogC("%s", [body UTF8String]);
 }
 
-//------------------------------ 判定逻辑 -------------------------------------
-static BOOL IsMainBundle(NSBundle *self) {
-    return self == [NSBundle mainBundle];
+// 把字符串里的真实 bid 替换为官方 bid（返回新字符串，若无需替换返回 nil）
+static NSString *WCPReplaceBid(NSString *s) {
+    if (!gWCPRealBid || gWCPRealBid.length == 0) return nil;
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return nil;
+    if ([s rangeOfString:gWCPRealBid].location == NSNotFound) return nil;
+    return [s stringByReplacingOccurrencesOfString:gWCPRealBid withString:gWCPTargetBid];
 }
 
 %group WCPBidSpoof
 
+// ============================ 本地 bundle id：透传真实 id ============================
 %hook NSBundle
 
-// 证据：WCR MSHookMessageEx(NSBundle, @bundleIdentifier, IMP=0x1582ec0, &orig=0x2203458)
-// 模拟证实：该 IMP 无论门控开/关都返回【真实 id】——com.tencent.xin 分支是死代码。
-// 故本 hook 对齐 WCR：仅记日志 + 透传真实 id（不伪装）。
 - (NSString *)bundleIdentifier {
-#if HOOK_BUNDLE_IDENTIFIER
-    if (gWCPInHook) return %orig;          // 重入保护
+#if !HOOK_BUNDLE_IDENTIFIER
+    return %orig;
+#else
+    if (gWCPInHook) return %orig;
     gWCPInHook = 1;
     NSString *orig = %orig;
     gWCPCallCount++;
-
 #if LOG_VERBOSE
-    if (IsMainBundle(self)) {
-        WCPLog(@"bundleIdentifier | MAIN orig=%@ (passthrough, WCR-aligned) #%ld",
-               orig, gWCPCallCount);
-    }
+    if (self == [NSBundle mainBundle])
+        WCPLog(@"bundleIdentifier | MAIN orig=%@ (passthrough, WCR-aligned) #%ld", orig, gWCPCallCount);
 #endif
-
     gWCPInHook = 0;
-    return orig;                            // ← 真实 id 透传（与 WCR 一致）
-#else
-    return %orig;
+    return orig;
 #endif
 }
 
-// 证据：WCR 不 hook objectForInfoDictionaryKey:（grep hooks_inventory 零命中）。
-// 默认不 hook；开启后仅记日志、不改返回值（用于观察微信是否经此路径识别多开）。
 - (id)objectForInfoDictionaryKey:(NSString *)key {
-#if HOOK_OBJECT_FOR_INFO_DICT
-    if (IsMainBundle(self) && [key isEqualToString:@"CFBundleIdentifier"]) {
-        NSString *orig = %orig;
-        WCPLog(@"objectForInfoDictionaryKey | key=CFBundleIdentifier orig=%@ (passthrough) #%ld",
-               orig, gWCPCallCount);
+    if (gWCPInHook) return %orig;
+    if (self == [NSBundle mainBundle] && [key isEqualToString:@"CFBundleIdentifier"]) {
+        gWCPInHook = 1;
+        id orig = %orig;
+#if LOG_VERBOSE
+        WCPLog(@"objectForInfoDictionaryKey | key=CFBundleIdentifier orig=%@ (passthrough) #%ld", orig, gWCPCallCount);
+#endif
+        gWCPInHook = 0;
         return orig;
     }
-#endif
     return %orig;
 }
 
 %end
 
+// ============================ 网络层伪装（对齐 WCR：登录/风控）============================
+#if HOOK_NETWORK_SPOOF
+
+#if HOOK_NSURL_REQUEST
+%hook NSURL
+
++ (NSURL *)URLWithString:(NSString *)URLString {
+    if (gWCPInHook) return %orig;
+    gWCPInHook = 1;
+    NSString *repl = WCPReplaceBid(URLString);
+    NSURL *u;
+    if (repl) {
+        u = %orig(repl);   // repl 已不含真实 bid，不会再次进入替换分支
+        WCPLog(@"NSURL | spoof %@ -> %@", URLString, repl);
+    } else {
+        u = %orig;
+    }
+    gWCPInHook = 0;
+    return u;
+}
+
 %end
+#endif // HOOK_NSURL_REQUEST
+
+#if HOOK_NSURLSESSION
+%hook NSURLSession
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    if (gWCPInHook) return %orig;
+    gWCPInHook = 1;
+
+    NSURL *origURL = request.URL;
+    NSString *abs = origURL.absoluteString;
+    NSString *newAbs = WCPReplaceBid(abs);
+
+    NSURLSessionDataTask *t;
+    if (newAbs) {
+        NSMutableURLRequest *mreq = [request mutableCopy];
+        mreq.URL = [NSURL URLWithString:newAbs];   // 触发 NSURL hook（已 guard）
+#if HOOK_NSURLSESSION_BODY
+        NSData *body = request.HTTPBody;
+        if (body) {
+            // 仅在 body 是 UTF-8 文本且含真实 bid 时才替换；否则原样保留，避免破坏 protobuf
+            NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+            NSString *newBody = WCPReplaceBid(bodyStr);
+            if (newBody) {
+                mreq.HTTPBody = [newBody dataUsingEncoding:NSUTF8StringEncoding];
+                WCPLog(@"NSURLSession | spoof body too");
+            }
+        }
+#endif
+        WCPLog(@"NSURLSession | spoof %@ -> %@", abs, newAbs);
+        t = %orig(mreq, completionHandler);
+    } else {
+        t = %orig;
+    }
+    gWCPInHook = 0;
+    return t;
+}
+
+%end
+#endif // HOOK_NSURLSESSION
+
+#endif // HOOK_NETWORK_SPOOF
+
+%end // WCPBidSpoof
+
+// ============================ 刷脸层：NSString 级伪装（仅刷脸窗口内）============================
+// 商业插件（WCR/WCP）的刷脸伪装：在 FaceRecogFlashHandler 生命周期内（initPipeline→dealloc）
+// 把流转中的 bid 字符串（self == NSString 语境）替换成 com.tencent.xin。
+// 证据：WCR hooks_inventory.txt FaceRecogFlashHandler initPipeline IMP=0x1582820(&orig 0x2203460)；
+//       WCP 深度报告 §6 同样 hook initPipeline（IMP 0xa4020），刷脸窗口内才置位门控。
+#if HOOK_FACE_SPOOF
+static BOOL gWCPFaceActive = NO;
+
+%group WCPFace
+
+%hook FaceRecogFlashHandler
+- (void)initPipeline {
+    gWCPFaceActive = YES;   // 在 %orig 之前置位，保证刷脸全程窗口已开
+    WCPLog(@"face: initPipeline -> gWCPFaceActive=YES");
+    %orig;
+}
+- (void)dealloc {
+    gWCPFaceActive = NO;    // 在 %orig 之前清零，刷脸结束立即关窗
+    WCPLog(@"face: dealloc -> gWCPFaceActive=NO");
+    %orig;
+}
+%end
+
+%hook NSString
+// 刷脸 SDK 通常经 NSString 类方法构造 bid 字符串（如 stringWithUTF8String:/stringWithFormat:）。
+// 门控：self == [NSString class]（类方法语境，即“self == NSString”）且处于刷脸窗口。
++ (instancetype)stringWithUTF8String:(const char *)nullTerminatedCString {
+    if (gWCPFaceActive && self == [NSString class] && !gWCPInHook) {
+        gWCPInHook = 1;
+        NSString *orig = %orig;
+        NSString *repl = WCPReplaceBid(orig);
+        if (repl) WCPLog(@"NSString|face utf8 spoof %@ -> %@", orig, repl);
+        gWCPInHook = 0;
+        return repl ?: orig;
+    }
+    return %orig;
+}
++ (instancetype)stringWithCString:(const char *)cString encoding:(NSStringEncoding)enc {
+    if (gWCPFaceActive && self == [NSString class] && !gWCPInHook) {
+        gWCPInHook = 1;
+        NSString *orig = %orig;
+        NSString *repl = WCPReplaceBid(orig);
+        if (repl) WCPLog(@"NSString|face cstr spoof %@ -> %@", orig, repl);
+        gWCPInHook = 0;
+        return repl ?: orig;
+    }
+    return %orig;
+}
++ (instancetype)stringWithFormat:(NSString *)format, ... {
+    if (gWCPFaceActive && self == [NSString class] && !gWCPInHook) {
+        gWCPInHook = 1;
+        va_list ap; va_start(ap, format);
+        NSString *s = [[NSString alloc] initWithFormat:format arguments:ap];
+        va_end(ap);
+        NSString *repl = WCPReplaceBid(s);
+        if (repl) WCPLog(@"NSString|face fmt spoof -> %@", repl);
+        gWCPInHook = 0;
+        return repl ?: s;
+    }
+    return %orig;
+}
+%end
+
+%end // WCPFace
+#endif // HOOK_FACE_SPOOF
 
 %ctor {
     @autoreleasepool {
-        // 先解析 app 文件沙盒 Documents 路径（此时 hook 尚未安装，调用原生方法安全）
         NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                                             NSUserDomainMask, YES).firstObject;
         if (!doc) {
             const char *home = getenv("HOME");
             if (home && *home) doc = [NSString stringWithFormat:@"%s/Documents", home];
         }
-        if (doc) snprintf(gWCPLogPath, sizeof(gWCPLogPath),
-                          "%s/wcpbidspoof.log", doc.UTF8String);
-        WCPLogOpen();   // 无条件开日志，保证能在沙盒里找到文件
+        if (doc) snprintf(gWCPLogPath, sizeof(gWCPLogPath), "%s/wcpbidspoof.log", doc.UTF8String);
+        WCPLogOpen();
+
+        // 在 hook 安装前读取真实 bundle id（此时 hook 未生效，拿到系统原始值）
+        gWCPRealBid = [[NSBundle mainBundle] bundleIdentifier];
+
         NSString *exe = [[NSBundle mainBundle] executablePath];
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        WCPLog(@"=== WCPBidSpoof %s init (uid=%d) exe=%@ bid=%@ BID=%d OFI=%d ===",
-               WCP_VERSION, getuid(), exe, bid,
-               HOOK_BUNDLE_IDENTIFIER, HOOK_OBJECT_FOR_INFO_DICT);
-        // 始终在微信进程内安装 hook；是否伪装在每次调用时按真实 bid + 调用方判定。
-        // 官方版（com.tencent.xin）调用会落到 orig，行为无变化。
+        WCPLog(@"=== WCPBidSpoof %s init (uid=%d) exe=%@ realBid=%@ NETSPOOF=%d URL=%d SESS=%d BODY=%d FACE=%d ===",
+               WCP_VERSION, getuid(), exe, gWCPRealBid,
+               HOOK_NETWORK_SPOOF, HOOK_NSURL_REQUEST, HOOK_NSURLSESSION, HOOK_NSURLSESSION_BODY,
+               HOOK_FACE_SPOOF);
+
         if (exe && [exe containsString:@"WeChat"]) {
             %init(WCPBidSpoof);
-            WCPLog(@"init: hooks installed (bundleIdentifier = passthrough real id, WCR-aligned)");
+#if HOOK_FACE_SPOOF
+            %init(WCPFace);
+#endif
+            WCPLog(@"init: hooks installed (network-layer login spoof + NSString face spoof, WCR-aligned)");
         } else {
             WCPLog(@"init: executable not WeChat, skip");
         }
