@@ -455,26 +455,24 @@ static UIViewController *vcm_topViewController(void) {
                     AVLinearPCMIsNonInterleavedKey: @(isNonInt),
                 };
 
-                // 重采样质量：22050→48000 是非整数倍升采样，默认算法抗镜像滤波较缓，
-                // 会在 Nyquist 带内残留镜像频率 → 听感发闷/毛刺。Mastering 算法（OSType 'mstr'）滤波更陡。
+                // 重采样本身【是必需的，不是多余的】：AVAssetReader 在解码器内部把素材 SRC 到
+                // AVSampleRateKey 指定的目标率（本素材 22050Hz → 微信 48000Hz）。
+                // 若去掉 AVSampleRateKey，直出的就是 22050Hz PCM，被塞进 48000Hz 的 AudioBufferList
+                // → 语速慢到 0.46 倍、音调低八度。VCAM4 同样靠这个键让解码器内部 SRC，只是它没有外部
+                // AudioConverter 层而已。
                 //
-                // 【血泪教训】该键的合法值是【4 字符 OSType 串】（@"mstr"），
-                // 之前的版本误写成 @"com.apple.audio.converter.mastering"，
-                // initWithTrack:outputSettings: 直接抛 NSInvalidArgumentException → 每次解码都崩 → 整通静音
-                // （2026-09-01 日志实测，几百条异常刷屏）。
-                // 故这里用 @try 包裹：一旦该值不被当前系统接受，就回退到默认重采样，绝不因此崩溃。
-                AVAssetReaderTrackOutput *out = nil;
-                @try {
-                    NSMutableDictionary *s = [outSettings mutableCopy];
-                    s[AVSampleRateConverterAlgorithmKey] = @"mstr";
-                    s[AVSampleRateConverterAudioQualityKey] = @(AVAudioQualityHigh);
-                    out = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:s];
-                    vcam_log(@"重采样：已启用 Mastering 算法(mstr) + High 质量");
-                } @catch (NSException *e) {
-                    vcam_log(@"重采样：Mastering 算法不被支持（%@），回退默认重采样", e.reason);
-                    out = nil;
-                }
-                if (!out) out = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:outSettings];
+                // 但【指定重采样算法】是多余的 —— VCAM4 的 outputSettings 恰好只有上面 7 个键，
+                // VCAM.dylib 的 Mach-O 符号表实锤：_AVFormatIDKey / _AVSampleRateKey /
+                // _AVNumberOfChannelsKey / _AVLinearPCMBitDepthKey / _AVLinearPCMIsBigEndianKey /
+                // _AVLinearPCMIsFloatKey / _AVLinearPCMIsNonInterleavedKey，
+                // 没有 _AVSampleRateConverterAlgorithmKey —— 它用系统默认 SRC 算法，不指定质量档。
+                //
+                // D 曾加过 AVSampleRateConverterAlgorithmKey=@"mstr" + AVAudioQualityHigh：
+                //   1) 是 D 相对 VCAM4 唯一的解码侧偏离点；
+                //   2) 因非法值抛 NSInvalidArgumentException，导致每帧解码重启 → 整通静音（2026-09-01 实测）；
+                //   3) 音质收益≈0：素材 22050Hz 只有 11kHz 带宽，这是天花板，换 SRC 算法补不回不存在的高频。
+                // 故完全对齐 VCAM4：不插手算法选择。
+                AVAssetReaderTrackOutput *out = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:outSettings];
                 out.alwaysCopiesSampleData = NO;
                 [reader addOutput:out];
                 // startReading 失败必须带 error 打日志：这是"解码启动后静默死亡"的头号嫌疑点。
