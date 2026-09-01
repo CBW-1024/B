@@ -168,6 +168,8 @@ static void vcm_saveSettings(void) {
     [d setBool:g_isSound        forKey:@"vcam_sound"];
     [d setBool:g_isMirrored     forKey:@"vcam_mirror"];
     [d setInteger:g_rotation    forKey:@"vcam_rotation"];
+    // 音频素材路径持久化：扩展名随导入文件动态变化（mp3/m4a/m4r/...），不存盘则重启后找不到文件 → 回退到视频。
+    [d setObject:g_tempAudioPath forKey:@"vcam_audio_path"];
     [d synchronize];
 }
 static void vcm_loadSettings(void) {
@@ -179,6 +181,9 @@ static void vcm_loadSettings(void) {
     else                                   g_isMirrored  = YES;
     if ([d objectForKey:@"vcam_rotation"]) g_rotation    = (int)[d integerForKey:@"vcam_rotation"];
     else                                   g_rotation    = 90;
+    // 恢复音频素材路径：存在则用持久化路径（动态扩展名），否则回退默认 .m4a 名（旧版兼容）。
+    NSString *savedAudio = [d stringForKey:@"vcam_audio_path"];
+    if (savedAudio.length > 0) g_tempAudioPath = [savedAudio copy];
 }
 
 #pragma mark - 停止 reader 与重置
@@ -228,6 +233,13 @@ static void vcm_resetSettings(void) {
     vcm_reloadReaders();
 
     if (g_tempAudioPath) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
+    // 删掉所有 bear_vcam_audio.* 残留（动态扩展名后可能不止 .m4a）
+    for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
+        if ([old hasPrefix:@"bear_vcam_audio."]) {
+            [g_fileManager removeItemAtPath:[g_videoDir stringByAppendingPathComponent:old] error:nil];
+        }
+    }
+    g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
     [g_fileManager removeItemAtPath:vcm_videoPath() error:nil];
 }
 
@@ -1430,8 +1442,14 @@ static VCamAudioProxy *g_audioProxy = nil;
     [self updateStatusUI];
 }
 - (void)updateStatusUI {
+    // 视频状态：始终显示（已加载 / 未选择）
     NSString *vStat = [g_fileManager fileExistsAtPath:vcm_videoPath()] ? @"已加载" : @"未选择";
-    _statusLabel.text = [NSString stringWithFormat:@"视频: %@", vStat];
+    NSMutableString *s = [NSMutableString stringWithFormat:@"视频: %@", vStat];
+    // 音频状态：仅当确实从文件导入过音频素材时才显示「声音: 已加载」；未导入则不显示（按需求）
+    if ([g_fileManager fileExistsAtPath:g_tempAudioPath]) {
+        [s appendFormat:@"   声音: 已加载"];
+    }
+    _statusLabel.text = s;
 }
 - (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
 
@@ -1498,13 +1516,36 @@ static VCamAudioProxy *g_audioProxy = nil;
         [VCamMediaManager setupVideoReaderIfNeeded];
         [VCamMediaManager setupAudioReaderIfNeeded];
     } else if (hasAudio) {
-        if ([g_fileManager fileExistsAtPath:g_tempAudioPath]) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
+        // 导入纯音频时清掉残留视频素材：用户意图只是替换声音，不应让旧视频继续替换画面。
+        if ([g_fileManager fileExistsAtPath:vcm_videoPath()]) {
+            [g_fileManager removeItemAtPath:vcm_videoPath() error:nil];
+        }
+        // 【真凶修复】之前 g_tempAudioPath 写死 .m4a，mp3/m4r 等被强行冠上 .m4a 扩展名：
+        //   · m4r 本质就是 m4a（MP4 容器 + AAC），扩展名对得上 → 正常；
+        //   · mp3 是 MP3 容器，被冠 .m4a 后 AVURLAsset 按扩展名选错解封装器 → 读不到音轨 → 通话静音。
+        // 故这里按导入文件的【真实扩展名】落地（mp3 存 .mp3 / m4a 存 .m4a / m4r 存 .m4r …），
+        // 并先删掉同前缀的旧扩展名残留文件，避免下次解码误判。
+        [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
+        for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
+            if ([old hasPrefix:@"bear_vcam_audio."]) {
+                [g_fileManager removeItemAtPath:[g_videoDir stringByAppendingPathComponent:old] error:nil];
+            }
+        }
+        NSString *ext = [src pathExtension].lowercaseString;
+        if (ext.length == 0) ext = @"m4a";
+        g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:
+                            [NSString stringWithFormat:@"bear_vcam_audio.%@", ext]] copy];
+        vcm_saveSettings();   // 持久化真实扩展名，否则重启后找不到文件
         BOOL copied = [g_fileManager copyItemAtPath:src toPath:g_tempAudioPath error:&copyErr];
         vcam_log(@"音频拷贝%@ → %@（纯音频素材，AudioUnit 链路将从此文件解码）",
                  copied ? @"成功" : [NSString stringWithFormat:@"失败：%@", copyErr.localizedDescription],
                  g_tempAudioPath ?: @"(未设置)");
-        if (!copied) return;
-        [VCamMediaManager setupAudioReaderIfNeeded];
+        if (!copied) { [self updateStatusUI]; return; }
+        // 导入纯音频时自动开启替换（用户意图就是替换麦克风声音），否则若 g_isReplace=NO 会被门禁透传真实麦克风。
+        g_isReplace = YES;
+        vcm_saveSettings();
+        vcm_stopReaders();      // 清掉可能残留的视频 reader，换素材后让链路重新 setup
+        [self updateStatusUI];
     }
     [self refreshGridButtons];
 }
@@ -1574,7 +1615,10 @@ static void vcm_installTapGesture(UIWindow *win) {
     }];
     g_videoDir = [vcm_documentPath() stringByAppendingPathComponent:@"VCAM"];
     [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
+    // 音频素材路径改由 vcm_loadSettings 决定（优先用持久化的真实扩展名文件，如 bear_vcam_audio.mp3）。
+    // 若从未导入过音频（UserDefaults 无 vcam_audio_path），给一个默认 .m4a 名做兜底（旧版兼容）。
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
+    vcm_loadSettings();   // 此处回填 g_tempAudioPath（若存过音频素材）等用户设置
 
     if ([g_fileManager fileExistsAtPath:vcm_videoPath()]) {
         [VCamMediaManager setupVideoReaderIfNeeded];
@@ -1606,7 +1650,7 @@ static void vcm_installTapGesture(UIWindow *win) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)2.0 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         vcam_log(@"初始化完成：目录=%@ 素材=%@ tempAudio=%@ 替换=%d 声音=%d 循环=%d hook=%d",
                  g_videoDir, @([g_fileManager fileExistsAtPath:vcm_videoPath()]),
-                 @([g_fileManager fileExistsAtPath:g_tempAudioPath]),
+                 g_tempAudioPath ? : @"(未设置)",
                  (int)g_isReplace, (int)g_isSound, (int)g_isLoop,
                  (int)(g_origAudioUnitRender != NULL));
     });
