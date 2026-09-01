@@ -1300,16 +1300,16 @@ static VCamAudioProxy *g_audioProxy = nil;
     [close addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
     close.translatesAutoresizingMaskIntoConstraints = NO;
     [navBar addSubview:close];
-    [close.leadingAnchor constraintEqualToAnchor:navBar.leadingAnchor constant:16].active = YES;
+    [close.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor constant:-16].active = YES;
     [close.centerYAnchor  constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
-    // 重置按钮移到导航栏右边
+    // 重置按钮在导航栏左边
     UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem];
     [reset setTitle:@"重置" forState:UIControlStateNormal];
     reset.titleLabel.font = [UIFont systemFontOfSize:[UIFont systemFontSize]];
     [reset addTarget:self action:@selector(actionReset) forControlEvents:UIControlEventTouchUpInside];
     reset.translatesAutoresizingMaskIntoConstraints = NO;
     [navBar addSubview:reset];
-    [reset.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor constant:-16].active = YES;
+    [reset.leadingAnchor constraintEqualToAnchor:navBar.leadingAnchor constant:16].active = YES;
     [reset.centerYAnchor  constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
 }
 - (void)setupContent {
@@ -1362,11 +1362,8 @@ static VCamAudioProxy *g_audioProxy = nil;
     y += btnH + gap;
 
     _btnSound  = [self addGridButton:g_isSound ? @"声音: 开" : @"声音: 关" x:0 y:y w:btnW h:btnH action:@selector(toggleSound)];
-    y += btnH + gap;
-
     _btnReplace = [self addGridButton:g_isReplace ? @"替换: 开" : @"替换: 关"
-                   x:0 y:y w:btnW h:btnH action:@selector(toggleReplace)];
-    // 注：镜像功能已按需求移除（不再提供切换开关）；重置按钮已移到导航栏右边。
+                   x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleReplace)];
     y += btnH + gap;
 
     // 导出日志：占满整行（两列总宽），点击把 g_diagLog 经系统分享面板导出
