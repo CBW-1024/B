@@ -101,6 +101,11 @@ static AudioStreamBasicDescription g_audioPCMFormat = {0};  // 预解码所用 A
 static NSUInteger     g_audioDecodeGen = 0;    // 解码代次：换素材/ASBD 变更时自增，作废在途解码结果
 static BOOL           g_audioFeederRunning = NO;  // 预解码线程是否在跑
 static BOOL           g_audioFeederStop    = NO;  // 通知预解码线程取消
+// 解码失败退避：自愈块每帧都会检查「PCM 未就绪」并重启解码。若解码必然失败（如素材损坏、
+// outputSettings 非法），会变成【每帧启动一次解码线程 → 每帧一条异常日志】，几百条刷屏且 CPU 打满。
+// 故记录连续失败次数，按 0.5s×次数（上限 5s）指数退避，避免实时音频线程被高频重启拖垮。
+static int            g_decodeFailCount  = 0;     // 连续解码失败次数
+static NSTimeInterval g_decodeNextRetry  = 0;     // 该时间戳之前不再重启解码（退避期）
 static const size_t   kAudioPCMMaxBytes = 64u * 1024u * 1024u;  // 64MB 上限，防极端长素材 OOM
 // 解码上下文全部在预解码线程内局部持有，线程退出时统一释放；不存全局，避免 cleanup 与解码线程竞争释放。
 
@@ -196,6 +201,10 @@ static void vcm_reloadReaders(void) {
     // 新会话重新探测 ASBD 后会按新素材重新预解码（对齐 VCAM4：换素材即重新 decodeAudioToMemory）。
     // 持锁释放：消费端(pullAudioData)同样在 g_audioPCMLock 下访问 g_audioPCM，不会读到已释放内存。
     g_audioDecodeGen++;
+    // 换素材/会话重启必须清零退避状态：否则上一轮素材的解码失败退避会推迟新素材的首次解码，
+    // 表现为「换了素材却要等几秒才出声」，甚至被误判为「新素材没生效」。
+    g_decodeFailCount = 0;
+    g_decodeNextRetry = 0;
     os_unfair_lock_lock(&g_audioPCMLock);
     g_audioFeederStop = YES;
     if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
@@ -361,6 +370,9 @@ static UIViewController *vcm_topViewController(void) {
     if (!g_hasProbedASBD)     return;
     if (g_audioPCMReady)      return;   // 已解码且素材/格式未变，无需重来
     if (g_audioFeederRunning) return;   // 幂等：解码线程已在跑
+    // 退避：本方法由实时音频回调每帧调用，若解码必然失败会每帧拉起一个解码线程（实测刷屏数百条）。
+    // 连续失败时按 0.5s×次数（上限 5s）推迟重试，一次通话最多浪费几次尝试，不影响正常路径。
+    if ([[NSDate date] timeIntervalSince1970] < g_decodeNextRetry) return;
     g_audioFeederStop   = NO;
     g_audioFeederRunning = YES;
     NSUInteger myGen = g_audioDecodeGen;   // 代次快照：期间若换素材/ASBD 变更，本轮结果作废
@@ -418,10 +430,14 @@ static UIViewController *vcm_topViewController(void) {
                 }
 
                 // 解码目标格式严格跟随真实 ASBD（rate/ch/bits/float/non-interleaved），不再写死 48000/1。
-                // 当素材原生率≠目标率时（如本素材 22050Hz → 微信 48000Hz），AVAssetReader 内部必做重采样；
-                // 默认线性插值对非整数倍升采样会在 Nyquist 带内引入镜像频率 → 听感发闷/不纯净（"不清晰"）。
-                // 显式指定 Mastering 重采样算法 + High 质量：更陡的抗镜像滤波，显著降镜像、提清晰度。
-                // 这两个键仅在"发生重采样"时生效；源=目标时 Core Audio 自动忽略，无副作用。
+                // 当素材原生率≠目标率时（如本素材 22050Hz → 微信 48000Hz），AVAssetReader 内部必做重采样。
+                // 【重要】这里【不要】加 AVSampleRateConverterAlgorithmKey / AVSampleRateConverterAudioQualityKey：
+                // 实测把 AVSampleRateConverterAlgorithmKey 设为 "com.apple.audio.converter.mastering" 会让
+                // initWithTrack:outputSettings: 直接抛 NSInvalidArgumentException（Unrecognized value），
+                // 解码线程每次启动都崩 → PCM 永远为空 → 整通静音（2026-09-01 日志实测，几百条异常刷屏）。
+                // 该键的合法值是 4 字符 OSType 串（如 @"mstr"），不是 bundle 风格的完整字符串；
+                // 且 VCAM4 反汇编里根本没有重采样质量配置，解码器默认重采样质量对清晰度影响是次要的
+                // （"不清晰"主因是流式环形缓冲被覆盖，已由整段预解码解决）。故保持最简、不引入崩溃点。
                 NSDictionary *outSettings = @{
                     AVFormatIDKey: @(kAudioFormatLinearPCM),
                     AVSampleRateKey: @(rate),
@@ -430,8 +446,6 @@ static UIViewController *vcm_topViewController(void) {
                     AVLinearPCMBitDepthKey: @(bits),
                     AVLinearPCMIsBigEndianKey: @NO,
                     AVLinearPCMIsNonInterleavedKey: @(isNonInt),
-                    AVSampleRateConverterAlgorithmKey: @"com.apple.audio.converter.mastering",
-                    AVSampleRateConverterAudioQualityKey: @(AVAudioQualityHigh),
                 };
                 AVAssetReaderTrackOutput *out = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:outSettings];
                 out.alwaysCopiesSampleData = NO;
@@ -483,6 +497,14 @@ static UIViewController *vcm_topViewController(void) {
                     vcam_log(@"预解码未产出：bytes=%zu stop=%d status=%ld err=%@",
                              (size_t)acc.length, (int)g_audioFeederStop, (long)reader.status,
                              (reader.status == AVAssetReaderStatusFailed) ? reader.error.localizedDescription : @"无");
+                    // 素材本身的问题（无音轨/损坏/解码失败）重试也没用，计入退避，避免每帧重启刷屏。
+                    if (acc.length == 0 && !g_audioFeederStop) {
+                        g_decodeFailCount++;
+                        g_decodeNextRetry = [[NSDate date] timeIntervalSince1970]
+                                          + ((0.5 * g_decodeFailCount > 5.0) ? 5.0 : 0.5 * g_decodeFailCount);
+                        vcam_log(@"预解码连续失败 %d 次，退避至 +%.1fs 后重试",
+                                 g_decodeFailCount, g_decodeNextRetry - [[NSDate date] timeIntervalSince1970]);
+                    }
                     return;
                 }
 
@@ -500,6 +522,8 @@ static UIViewController *vcm_topViewController(void) {
                 g_audioPCMReady  = YES;
                 g_audioPCMFormat = t;
                 os_unfair_lock_unlock(&g_audioPCMLock);
+                g_decodeFailCount = 0;      // 解码成功，清空退避状态
+                g_decodeNextRetry = 0;
 
                 double audioSecs = (rate > 0) ? (double)samplesGot / rate : 0.0;
                 vcam_log(@"预解码完成：%zu 字节 (%.1fs 音频) 实耗=%.1fs%@ status=%ld → 消费端只读游标顺序推进，PCM 永不被覆盖",
@@ -508,6 +532,12 @@ static UIViewController *vcm_topViewController(void) {
             }
         } @catch (NSException *e) {
             vcam_log(@"预解码线程异常退出：%@ — %@", e.name, e.reason);
+            // 异常多半是 outputSettings 非法或素材不可解析，重试同样失败，必须退避：
+            // 否则自愈块每帧拉起解码线程 → 每帧一条异常（实测刷屏数百条）并拖垮实时音频线程。
+            g_decodeFailCount++;
+            g_decodeNextRetry = [[NSDate date] timeIntervalSince1970]
+                              + ((0.5 * g_decodeFailCount > 5.0) ? 5.0 : 0.5 * g_decodeFailCount);
+            vcam_log(@"预解码异常连续 %d 次，退避 5s 内不再重启（上限）", g_decodeFailCount);
         } @finally {
             g_audioFeederRunning = NO;
         }
