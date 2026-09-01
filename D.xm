@@ -739,10 +739,13 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CVPixelBufferRelease(pix);
     if (!img) return nil;
 
+    // 旋转映射：CGImagePropertyOrientation 的 6/8 对无 EXIF 元数据的相机帧，
+    // 因微信前摄画面自带镜像，屏幕观感与 orientation 数值相反 → 故 90↔270 对调，
+    // 使点「旋转」时屏幕转向与用户直觉一致（90°=顺时针、270°=逆时针）。
     NSInteger orient = 1;
-    if      (g_rotation == 90)  orient = 6;
+    if      (g_rotation == 90)  orient = 8;
     else if (g_rotation == 180) orient = 3;
-    else if (g_rotation == 270) orient = 8;
+    else if (g_rotation == 270) orient = 6;
     img = [img imageByApplyingOrientation:(CGImagePropertyOrientation)orient];
 
     // 镜像功能已移除：画面不再做左右镜像翻转。
