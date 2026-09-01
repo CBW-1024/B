@@ -1,50 +1,59 @@
 //============================================================================
-//  WCPBidSpoof — 微信多开 bid 伪装（单文件 Logos tweak）
+//  WCPBidSpoof — 微信多开 bundle id 处理（单文件 Logos tweak）
 //----------------------------------------------------------------------------
-//  提取自商业插件 WCP/WCPulse 的 NSBundle 双 hook 方案，1:1 还原其核心逻辑，
-//  并按 WCRefine 交叉验证结论修正为「调用方作用域伪装」。
+//  对齐商业插件 WCRefine (WCR) 的【已验证】行为：bundleIdentifier 透传真实 id。
+//
+//  ⚠️ 关键修正（v1.0.6）：之前版本全局把 bundleIdentifier 改成 com.tencent.xin，
+//     导致 UI 移位 + APNs 推送丢失。反编译 WCR 并用 Unicorn 模拟跑通后证实：
+//     WCR 的 bundleIdentifier hook【永远返回真实 id】，从不伪装成 com.tencent.xin。
+//
+//  【证据：WCR bundleIdentifier IMP（0x1582ec0）Unicorn 模拟结果】
+//    * 门控=开：执行 61 条指令 → 最终 x0 = 真实 bid（"com.tencent.qy.xin"）
+//      门控=关：执行 32 条指令 → 最终 x0 = 真实 bid
+//      → 两种状态都返回真实 id，com.tencent.xin(CFString 0x1f8fe88) 分支是死代码
+//        （被 `self == bundleIdentifier 返回的 NSString` 这个永不成立的条件守着）。
+//    * 返回路径调 (*0x2203458)(self,_cmd)；二进制里无指令写入 0x2203458，
+//      该槽由动态链接器/CydiaSubstrate 在加载时填入【原始 bundleIdentifier IMP】，
+//      故返回真实 id。这是 WCR「没有任何问题」(推送/UI 正常) 的根因：
+//      它从不改动微信推送/UI 子系统读取的 bundle id。
+//
+//  【为什么全局伪装会坏推送/UI】
+//    APNs topic = app【真实】bundle id（苹果用它加密 device token）。微信把
+//    [NSBundle mainBundle] bundleIdentifier] 当 topic 上报服务器；伪装成官方 id 后
+//    topic 与 token 加密主题不符 → 苹果静默丢弃推送。WCR 返回真实 id，天然规避。
 //
 //  【证据来源】
-//  * 二进制还原：/workspace/WCP_bid_hook取证.md
-//      - hook 注册铁证（capstone 还原 0x646e24..0x646f6c）：
-//          objc_getClass("NSBundle")                         // 0x9eb801 解密 = "NSBundle"
-//          MSHookMessageEx(NSBundle, @bundleIdentifier,
-//                          IMP1=0x64712c, &orig=0xa220f8)
-//          MSHookMessageEx(NSBundle, @objectForInfoDictionaryKey:,
-//                          IMP2=0x649b7c, &orig=0xa22100)
-//      - 解密字符串表（OLLM 运行时流式 XOR 还原）：
-//          0x9eb81a "com.tencent.xin"      <- 伪装目标 bid
-//          0x9eb910 "com.tencent.qy.xin" / 0x9eb932 "com.tencent.wx" / 0x9eb970 "com.tencent.mm.xin"
-//      - 门控判定（IMP1 内 isEqualToString: + tbz 0x6478c0）：真实 bid 已是官方则不伪装。
-//  * 微信头文件（class-dump，/workspace/wx76/微信/）：
-//      - TSEnvironment.h:25   + (id)bundleIdentifier       （微信内部环境探测）
-//      - FBSDKAppEventsDeviceInfo.h:17  _bundleIdentifier  （内嵌 FBSDK 随设备信息上报）
-//  * WCR 交叉验证（/workspace/work/WCRefine.dylib，1788 个 hook）：
+//  * WCR 反编译：/workspace/work/WCRefine.dylib（hooks_inventory.txt 共 1788 个 hook）
 //      - 仅 hook NSBundle @bundleIdentifier（IMP=0x1582ec0, &orig=0x2203458），
-//        门控字节 0x2203560；命中返回 CFString 0x1f8fe88 = "com.tencent.xin"（铁证）。
-//      - **不 hook objectForInfoDictionaryKey:** —— 与 WCP 派生方案的唯一关键差异。
+//        门控字节 0x2203560；模拟证实返回真实 id。
+//      - 完整反汇编：python3 wcr/wcrdis.py 1582ec0 900
+//      - 模拟器：    python3 wcr/wcr_emu.py gate1 / gate0
+//      - **不 hook objectForInfoDictionaryKey:**（grep hooks_inventory 零命中）。
 //      - 仅 hook 通知*点击响应* userNotificationCenter:didReceiveNotificationResponse:
-//        （IMP 0x157b0f0 / 0x157b4c4）：先调 orig，再跑全局函数 0x22033d8 做多开路由。
-//        不碰注册 / deviceToken / 解密（WCNotificationEncryptionUtils 全程未 hook）。
+//        （IMP 0x157b0f0 / 0x157b4c4）：先调 orig 再跑多开路由，不碰注册/deviceToken/解密。
+//  * WCP 还原（/workspace/WCP_bid_hook取证.md）：WCP 的 bundleIdentifier 在某些门控下
+//      确实会返回 com.tencent.xin，但那是 WCP 的行为；WCR 已修正为透传真实 id，
+//      本插件以【工作正常的 WCR】为对齐基准。
+//  * 微信头文件（/workspace/wx76/微信/）：TSEnvironment.h:25、FBSDKAppEventsDeviceInfo.h:17
+//      证明微信内部通过 NSBundle 读 bundleID，hook 在正确层级。
 //
-//  【v1.0.4 设计修正：调用方作用域伪装（修复 UI 移位 + 推送丢失）】
-//  全局把 bundleIdentifier 改成 com.tencent.xin 会破坏两件事：
-//    (a) APNs topic 不匹配：苹果用 app【真实】bundle id 加密 device token，微信把
-//        [NSBundle mainBundle] bundleIdentifier] 当作 topic 上报服务器。伪装成官方 id
-//        后上报 topic 与 token 加密主题不符 → 苹果静默丢弃推送。
-//    (b) UI 资源/feature flag 错位：部分 UI 代码读 bundleIdentifier 选资源/布局分支，
-//        拿到官方 id 走到不存在的分支 → UI 移位。
-//  修正：对【推送/通知/UI 子系统】的调用返回【真实】bid（保推送 topic + UI），
-//        只对【反篡改/风控】调用方伪装成 com.tencent.xin。
-//        判定靠调用栈类名/方法名子串匹配（ObjC 调用栈即便 stripped 也会打印 [Class method]）。
+//  【本插件策略（对齐 WCR）】
+//    1. bundleIdentifier → 返回真实 id（%orig），仅记录日志供调试。
+//       这正是 WCR 的做法，可保推送 topic 与 UI 资源分支正确。
+//    2. objectForInfoDictionaryKey: → 默认不 hook（WCR 不 hook）。如需观察微信是否
+//       经此路径识别多开，可开 HOOK_OBJECT_FOR_INFO_DICT 仅记日志，不改返回值。
+//    3. 不 hook 任何推送注册 / deviceToken / 解密方法（与 WCR 一致）。
 //
-//  【日志（v1.0.1+，v1.0.4 修正路径）】
-//  * 无条件在 %ctor 开日志，写到【app 文件沙盒 Documents】：
+//  【登录 / 人脸 如何处理？】
+//    若你的多开仍需“登录 / 过人脸”，那不是 bundle id 伪装能解决的——WCR 返回真实 id
+//    也能正常登录/过人脸，说明相关机制在【其他 hook】（如 FaceRecogFlashHandler 之类），
+//    而非 bundle id。需要时可单独逆向 WCR 的对应 hook 再补。
+//
+//  【日志】
+//    无条件在 %ctor 开日志，写到【app 文件沙盒 Documents】：
 //      NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)
 //      → /var/mobile/Containers/Data/Application/<UUID>/Documents/wcpbidspoof.log
-//    （rootful / rootless 越狱下都正确，不受 /var/jb 重定向影响；绝不写 /tmp 等非沙盒目录）
-//  * 文件打不开则走 NSLog 兜底（设备 syslog / 控制台搜 [WCPBidSpoof] 可见）。
-//  * 行数上限 WCP_LOG_MAX_LINES，防止热路径写爆。
+//    （rootful / rootless 越狱下都正确；文件打不开则走 NSLog 兜底，syslog 搜 [WCPBidSpoof]）
 //============================================================================
 
 #import <Foundation/Foundation.h>
@@ -56,37 +65,12 @@
 #include <string.h>
 
 //------------------------------ 配置开关 -------------------------------------
-#define WCP_VERSION             "1.0.4"
-#define SPOOF_ENABLED           1   // 总开关：0 = 完全不改写任何返回值（用于对照实验）
-#define HOOK_BUNDLE_IDENTIFIER 1   // 关掉可测试是否 -bundleIdentifier 引起 UI/推送问题
-#define HOOK_OBJECT_FOR_INFO_DICT 0 // ⚠️ WCR 验证：WCRefine.dylib 完全不 hook 此方法。
-                                    //    开启会把微信 UI/推送子系统内部读的 CFBundleIdentifier 也改成官方 bid，
-                                    //    实测导致 UI 移位 + 推送丢失。默认关闭，对齐 WCR。
-#define ENABLE_LOGGING         1   // 沙盒文件日志（打不开则走 NSLog 兜底）
-#define CALLER_SCOPED          1   // 1 = 仅对「非推送/通知/UI 子系统」伪装（修复 UI+推送）
-                                    // 0 = 全局伪装（旧行为，会破坏推送，仅用于对照）
-#define LOG_VERBOSE            1   // 1 = 采样打印每次调用（诊断用）；0 = 仅打印豁免(返回真实)的调用
-#define WCP_LOG_MAX_LINES      8000
-
-// 伪装目标 bid：WCP 解密串 0x9eb81a = "com.tencent.xin"
-static NSString *const kWCPTargetBundleID = @"com.tencent.xin";
-
-// 返回【真实】bid 的调用方标记（子串匹配 ObjC 调用栈的 [Class method]）。
-// 这些子系统一旦吃到伪装值就会：推送 topic 错位（丢推送）/ UI 资源选错（移位）。
-static const char *kWCPRealIdMarkers[] = {
-    // —— 推送 / 通知 / APNs ——
-    "Push", "Notif", "RemoteNotif",
-    "registerForRemote", "didRegisterForRemote",
-    "UNUserNotif", "MicroMessengerAppDelegate",
-    "NotificationActionsMgr", "WCNotificationEncryption",
-    "handleReceiveRemote", "receiveRemoteNotification",
-    "processRemoteNotification", "apnsToken", "APNS", "apns",
-    "MMPush", "PushManager", "PushUtil", "WCNotification",
-    // —— UI / 资源 / 布局 ——
-    "ViewController", "View", "Layout", "Storyboard",
-    "Theme", "Skin", "ResManager", "MMResource", "AppSetting",
-    NULL
-};
+#define WCP_VERSION                "1.0.6"
+#define HOOK_BUNDLE_IDENTIFIER    1   // 是否 hook bundleIdentifier（仅记日志 + 透传真实 id）
+#define HOOK_OBJECT_FOR_INFO_DICT 0   // ⚠️ WCR 不 hook 此方法。开=仅记日志不改返回值
+#define ENABLE_LOGGING            1   // 沙盒文件日志（打不开则走 NSLog 兜底）
+#define LOG_VERBOSE               1   // 1 = 打印每次 bundleIdentifier 调用；0 = 不打印
+#define WCP_LOG_MAX_LINES         8000
 
 //------------------------------ 日志子系统 -----------------------------------
 static FILE        *gWCPLog = NULL;
@@ -97,9 +81,8 @@ static long         gWCPCallCount = 0;
 static char         gWCPLogPath[2048] = {0};  // 软件文件沙盒 Documents 路径（%ctor 解析）
 
 // 只写到 app 的【文件沙盒 Documents】：/var/mobile/Containers/Data/Application/<UUID>/Documents
-// 取径方式用 NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)，
-// 在 rootful / rootless 越狱下都返回正确的 app 容器路径（不受 /var/jb 重定向影响）。
-// 若连沙盒路径都打不开，不写文件、不散落到 /tmp 等非沙盒目录，改走 NSLog 兜底（syslog 可见）。
+// 取径方式用 NSSearchPathForDirectoriesInDomains，rootful / rootless 都正确（不受 /var/jb 重定向影响）。
+// 若沙盒路径打不开，不写文件、不散落到 /tmp 等非沙盒目录，改走 NSLog 兜底（syslog 可见）。
 static void WCPLogOpen(void) {
     if (gWCPLog) return;
     if (!gWCPLogPath[0]) return;         // 路径未就绪（%ctor 未设置），交给 NSLog
@@ -161,84 +144,43 @@ static BOOL IsMainBundle(NSBundle *self) {
     return self == [NSBundle mainBundle];
 }
 
-// 调用栈里是否含「应返回真实 bid」的标记（推送/通知/UI 子系统）。
-static BOOL WCPCallerWantsRealId(NSArray<NSString *> *syms, NSArray<NSString *> *markers) {
-#if CALLER_SCOPED
-    for (NSString *s in syms) {
-        for (NSString *m in markers) {
-            if ([s containsString:m]) return YES;
-        }
-    }
-#endif
-    return NO;
-}
-
 %group WCPBidSpoof
 
 %hook NSBundle
 
-// 证据：WCP MSHookMessageEx(NSBundle, @bundleIdentifier, IMP1=0x64712c, &orig=0xa220f8)
+// 证据：WCR MSHookMessageEx(NSBundle, @bundleIdentifier, IMP=0x1582ec0, &orig=0x2203458)
+// 模拟证实：该 IMP 无论门控开/关都返回【真实 id】——com.tencent.xin 分支是死代码。
+// 故本 hook 对齐 WCR：仅记日志 + 透传真实 id（不伪装）。
 - (NSString *)bundleIdentifier {
 #if HOOK_BUNDLE_IDENTIFIER
     if (gWCPInHook) return %orig;          // 重入保护
     gWCPInHook = 1;
-
     NSString *orig = %orig;
-    NSString *ret  = orig;
-
-    if (IsMainBundle(self) && orig.length > 0 &&
-        ![orig isEqualToString:kWCPTargetBundleID]) {
-        // 收集调用栈（即便 stripped，ObjC 帧也会打印 [Class method]）
-        NSArray<NSString *> *syms = [NSThread callStackSymbols];
-        static NSArray<NSString *> *markers = nil;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            NSMutableArray *a = [NSMutableArray array];
-            for (const char **m = kWCPRealIdMarkers; *m; m++)
-                [a addObject:[NSString stringWithUTF8String:*m]];
-            markers = a;
-        });
-
-        BOOL safeCaller = WCPCallerWantsRealId(syms, markers);
-        // 仅对非推送/通知/UI 子系统伪装；官方版(safeCaller 无关)也走这里但 orig 已是官方 id
-        BOOL spoof = !safeCaller;
-        ret = spoof ? kWCPTargetBundleID : orig;
+    gWCPCallCount++;
 
 #if LOG_VERBOSE
-        gWCPCallCount++;
-        BOOL wantLog = (gWCPCallCount <= 400) || safeCaller;  // 前 400 次全打 + 之后只打豁免
-        if (wantLog) {
-            WCPLog(@"bundleIdentifier | orig=%@ spoof=%d safeCaller=%d #%ld",
-                   orig, spoof, safeCaller, gWCPCallCount);
-            if (safeCaller) {
-                NSUInteger take = MIN(syms.count, 6);
-                WCPLog(@"   stack: %@", [syms subarrayWithRange:NSMakeRange(0, take)]);
-            }
-        }
-#else
-        if (safeCaller)
-            WCPLog(@"bundleIdentifier RETURN-REAL | orig=%@ (push/ui caller)", orig);
-#endif
+    if (IsMainBundle(self)) {
+        WCPLog(@"bundleIdentifier | MAIN orig=%@ (passthrough, WCR-aligned) #%ld",
+               orig, gWCPCallCount);
     }
+#endif
 
     gWCPInHook = 0;
-    return ret;
+    return orig;                            // ← 真实 id 透传（与 WCR 一致）
 #else
     return %orig;
 #endif
 }
 
-// 证据：WCP MSHookMessageEx(NSBundle, @objectForInfoDictionaryKey:, IMP2=0x649b7c, &orig=0xa22100)
-// ⚠️ WCR 验证：WCRefine.dylib 不 hook 此方法。默认关闭（见顶部开关注释）。
-//    保留用于调试：开启后观察微信是否经此路径识别多开（配合 ENABLE_LOGGING）。
+// 证据：WCR 不 hook objectForInfoDictionaryKey:（grep hooks_inventory 零命中）。
+// 默认不 hook；开启后仅记日志、不改返回值（用于观察微信是否经此路径识别多开）。
 - (id)objectForInfoDictionaryKey:(NSString *)key {
 #if HOOK_OBJECT_FOR_INFO_DICT
     if (IsMainBundle(self) && [key isEqualToString:@"CFBundleIdentifier"]) {
         NSString *orig = %orig;
-        BOOL spoof = (orig.length > 0 && ![orig isEqualToString:kWCPTargetBundleID]);
-        WCPLog(@"objectForInfoDictionaryKey | key=CFBundleIdentifier orig=%@ spoof=%d ret=%@",
-               orig, spoof, spoof ? kWCPTargetBundleID : orig);
-        return spoof ? kWCPTargetBundleID : orig;
+        WCPLog(@"objectForInfoDictionaryKey | key=CFBundleIdentifier orig=%@ (passthrough) #%ld",
+               orig, gWCPCallCount);
+        return orig;
     }
 #endif
     return %orig;
@@ -262,14 +204,14 @@ static BOOL WCPCallerWantsRealId(NSArray<NSString *> *syms, NSArray<NSString *> 
         WCPLogOpen();   // 无条件开日志，保证能在沙盒里找到文件
         NSString *exe = [[NSBundle mainBundle] executablePath];
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        WCPLog(@"=== WCPBidSpoof %s init (uid=%d) exe=%@ bid=%@ SPOOF=%d BID=%d OFI=%d SCOPED=%d ===",
+        WCPLog(@"=== WCPBidSpoof %s init (uid=%d) exe=%@ bid=%@ BID=%d OFI=%d ===",
                WCP_VERSION, getuid(), exe, bid,
-               SPOOF_ENABLED, HOOK_BUNDLE_IDENTIFIER, HOOK_OBJECT_FOR_INFO_DICT, CALLER_SCOPED);
+               HOOK_BUNDLE_IDENTIFIER, HOOK_OBJECT_FOR_INFO_DICT);
         // 始终在微信进程内安装 hook；是否伪装在每次调用时按真实 bid + 调用方判定。
         // 官方版（com.tencent.xin）调用会落到 orig，行为无变化。
         if (exe && [exe containsString:@"WeChat"]) {
             %init(WCPBidSpoof);
-            WCPLog(@"init: hooks installed");
+            WCPLog(@"init: hooks installed (bundleIdentifier = passthrough real id, WCR-aligned)");
         } else {
             WCPLog(@"init: executable not WeChat, skip");
         }
