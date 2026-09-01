@@ -22,6 +22,15 @@
 //      - TSEnvironment.h:25   + (id)bundleIdentifier       （微信内部环境探测，转调 mainBundle）
 //      - FBSDKAppEventsDeviceInfo.h:17  _bundleIdentifier  （内嵌 FBSDK 随设备信息上报）
 //        证明微信内部确实通过 NSBundle 读取 bundleID，hook 在正确层级。
+//  * WCR 交叉验证（/workspace/work/WCRefine.dylib，1788 个 hook，hooks_inventory.txt）：
+//      - 仅 hook NSBundle @bundleIdentifier（IMP=0x1582ec0, &orig=0x2203458），
+//        门控字节 0x2203560；命中返回 CFString 0x1f8fe88 = "com.tencent.xin"（铁证）。
+//      - **不 hook objectForInfoDictionaryKey:**（grep 零命中）—— 这正是与 WCP 派生方案的唯一关键差异。
+//      - 仅 hook 通知*点击响应* MicroMessengerAppDelegate / NotificationActionsMgr 的
+//        userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:
+//        （IMP 0x157b0f0 / 0x157b4c4）：先调 orig，再跑全局函数 0x22033d8 做多开路由。
+//        不碰注册 / deviceToken / 解密（WCNotificationEncryptionUtils 全程未 hook）。
+//      ⇒ 结论：WCR 的可用方案 = 只 spoof bundleIdentifier，绝不 spoof CFBundleIdentifier。
 //
 //  【APNs 隔离（关键设计，勿动）】
 //  上一轮已核实 WCP 仅 hook 上述两个 NSBundle 方法，绝不碰：
@@ -30,10 +39,37 @@
 //      NotificationActionsMgr（wcp_hooks.txt 无该类推送方法 hook）
 //      WCNotificationEncryptionUtils（连字符串都未引用）
 //  device token 由系统固件层用真实 entitlements+bundle 签发，与微信内
-//  bundleIdentifier 返回什么无关；放过整条推送链路即可保 APNs 不坏。
+//  bundleIdentifier 返回值无关；放过整条推送链路即可保 APNs 不坏。
+//  —— 但注意：hook 在 NSBundle 层是「全局」的，上述类内部若自行调用
+//     [NSBundle mainBundle] bundleIdentifier，会吃到伪装值。UI 移位 / 推送
+//     丢失的最常见诱因，是额外 hook 了 objectForInfoDictionaryKey:（见下方开关默认值，
+//     已按 WCR 验证结论默认关闭）。
+//
+//  【调试开关 / 日志（v1.0.1 新增）】
+//  * 沙盒文件日志：写入 $HOME/Documents/wcpbidspoof.log（同时 NSLog）
+//    —— 用 getenv("HOME") 取沙盒根，纯 C 实现，避免触发被 hook 的 ObjC 方法造成重入。
+//  * HOOK_BUNDLE_IDENTIFIER / HOOK_OBJECT_FOR_INFO_DICT：可分别关掉两个 hook，
+//    用来隔离「UI 移位 / 推送丢失」到底是哪个 hook 引起的。
+//  * LOG_CALLSTACK：打印调用方返回地址（需配合二进制方法列表反查是哪个微信方法触发）。
+//  * 日志行数上限 WCP_LOG_MAX_LINES，防止热路径（bundleIdentifier 调用极频繁）写爆。
 //============================================================================
 
 #import <Foundation/Foundation.h>
+#include <stdio.h>
+#include <time.h>
+#include <stdarg.h>
+#include <execinfo.h>
+
+//------------------------------ 配置开关 -------------------------------------
+#define SPOOF_ENABLED               1   // 总开关：0 = 完全不改写任何返回值
+#define HOOK_BUNDLE_IDENTIFIER     1   // 关掉可测试是否 -bundleIdentifier 引起 UI/推送问题
+#define HOOK_OBJECT_FOR_INFO_DICT  0   // ⚠️ WCR 验证：WCRefine.dylib(1788 hook) 完全不 hook 此方法。
+                                        //    开启会把微信 UI/推送子系统内部读的 CFBundleIdentifier 也改成官方 bid，
+                                        //    实测导致 UI 移位 + 推送丢失。默认关闭，对齐 WCR 的可用方案。
+                                        //    如需调试再临时改 1，并配合 ENABLE_LOGGING 看是哪次调用触发问题。
+#define ENABLE_LOGGING             1   // 沙盒文件日志
+#define LOG_CALLSTACK              0   // 1 = 打印调用方返回地址（调试 UI 移位/推送丢失用）
+#define WCP_LOG_MAX_LINES          4000
 
 // 伪装目标 bid：WCP 解密串 0x9eb81a = "com.tencent.xin"
 static NSString *const kWCPTargetBundleID = @"com.tencent.xin";
@@ -46,11 +82,69 @@ static NSString *const kMultiOpenBIDs[] = {
     @"com.tencent.mm.xin",
 };
 
-// 编译期总开关。设为 0 可整体关停伪装（保留插件加载但不改写任何返回值）。
-#ifndef SPOOF_ENABLED
-#define SPOOF_ENABLED 1
-#endif
+//------------------------------ 日志子系统 -----------------------------------
+static FILE        *gWCPLog = NULL;
+static volatile int gWCPLogging = 0;     // 重入保护
+static long         gWCPLogLines = 0;
 
+static const char *WCPLogPath(void) {
+    // 用 getenv("HOME") 拿沙盒根，纯 C，不触发任何被 hook 的 ObjC 方法
+    static char buf[1024];
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = "/var/mobile";
+    snprintf(buf, sizeof(buf), "%s/Documents/wcpbidspoof.log", home);
+    return buf;
+}
+
+static void WCPLogV(const char *fmt, va_list ap) {
+#if !ENABLE_LOGGING
+    (void)fmt; (void)ap;
+    return;
+#else
+    if (gWCPLogging) return;             // 重入保护：日志内部若间接触发 hook，直接丢弃
+    gWCPLogging = 1;
+
+    if (!gWCPLog) {
+        gWCPLog = fopen(WCPLogPath(), "a");
+        if (gWCPLog) {
+            fprintf(gWCPLog, "=== WCPBidSpoof log open @ %s ===\n", WCPLogPath());
+            fflush(gWCPLog);
+        }
+    }
+
+    if (gWCPLog && gWCPLogLines < WCP_LOG_MAX_LINES) {
+        time_t t = time(NULL);
+        struct tm tm_now;
+        localtime_r(&t, &tm_now);
+        fprintf(gWCPLog, "[%04d-%02d-%02d %02d:%02d:%02d] ",
+                tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+                tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+        vfprintf(gWCPLog, fmt, ap);
+#if LOG_CALLSTACK
+        void *frames[6];
+        int n = backtrace(frames, 6);
+        if (n > 2)
+            fprintf(gWCPLog, "    bt: %p %p %p", frames[2], frames[3], frames[4]);
+#endif
+        fprintf(gWCPLog, "\n");
+        fflush(gWCPLog);
+        gWCPLogLines++;
+        if (gWCPLogLines == WCP_LOG_MAX_LINES)
+            fprintf(gWCPLog, "=== log line cap reached, stop writing ===\n");
+    }
+    gWCPLogging = 0;
+#endif
+}
+
+static void WCPLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    // 先把 NSString 格式化展开，再交给 C 日志层（避免日志体里出现非 C 字符串）
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    WCPLogV("%s", [body UTF8String]);
+}
+
+//------------------------------ 判定逻辑 -------------------------------------
 static BOOL IsMainBundle(NSBundle *self) {
     return self == [NSBundle mainBundle];
 }
@@ -60,8 +154,7 @@ static BOOL ShouldSpoof(NSString *realBid) {
     return NO;
 #else
     if (realBid == nil) return NO;
-    // 官方版本身已是目标 bid，无需伪装（对齐 WCP isEqualToString: 门控）。
-    if ([realBid isEqualToString:kWCPTargetBundleID]) return NO;
+    if ([realBid isEqualToString:kWCPTargetBundleID]) return NO; // 官方版不伪装
     for (size_t i = 0; i < sizeof(kMultiOpenBIDs) / sizeof(kMultiOpenBIDs[0]); i++) {
         if ([realBid isEqualToString:kMultiOpenBIDs[i]]) return YES;
     }
@@ -75,24 +168,34 @@ static BOOL ShouldSpoof(NSString *realBid) {
 
 // 证据：WCP MSHookMessageEx(NSBundle, @bundleIdentifier, IMP1=0x64712c, &orig=0xa220f8)
 - (NSString *)bundleIdentifier {
+#if HOOK_BUNDLE_IDENTIFIER
     NSString *orig = %orig;
-    if (IsMainBundle(self) && ShouldSpoof(orig)) {
-        return kWCPTargetBundleID;
-    }
-    return orig;
+    BOOL main = IsMainBundle(self);
+    BOOL spoof = main && ShouldSpoof(orig);
+    WCPLog(@"bundleIdentifier | isMain=%d orig=%@ spoof=%d ret=%@",
+           main, orig, spoof, spoof ? kWCPTargetBundleID : orig);
+    return spoof ? kWCPTargetBundleID : orig;
+#else
+    return %orig;
+#endif
 }
 
 // 证据：WCP MSHookMessageEx(NSBundle, @objectForInfoDictionaryKey:, IMP2=0x649b7c, &orig=0xa22100)
 // 部分微信代码走 [mainBundle objectForInfoDictionaryKey:@"CFBundleIdentifier"]
-// 而非 -bundleIdentifier，必须同步伪装，否则被风控按真实 bid 识破。
+// 而非 -bundleIdentifier。
+// ⚠️ WCR 验证：WCRefine.dylib 不 hook 此方法，开启反而导致 UI 移位 + 推送丢失。
+//    故 HOOK_OBJECT_FOR_INFO_DICT 默认 0。如需研究微信如何经此路径识别多开，
+//    临时改 1 并配合 ENABLE_LOGGING 观察调用方（必要时再上 LOG_CALLSTACK）。
 - (id)objectForInfoDictionaryKey:(NSString *)key {
+#if HOOK_OBJECT_FOR_INFO_DICT
     if (IsMainBundle(self) && [key isEqualToString:@"CFBundleIdentifier"]) {
         NSString *orig = %orig;
-        if (ShouldSpoof(orig)) {
-            return kWCPTargetBundleID;
-        }
-        return orig;
+        BOOL spoof = ShouldSpoof(orig);
+        WCPLog(@"objectForInfoDictionaryKey | key=CFBundleIdentifier isMain=1 orig=%@ spoof=%d ret=%@",
+               orig, spoof, spoof ? kWCPTargetBundleID : orig);
+        return spoof ? kWCPTargetBundleID : orig;
     }
+#endif
     return %orig;
 }
 
@@ -103,11 +206,10 @@ static BOOL ShouldSpoof(NSString *realBid) {
 %ctor {
     @autoreleasepool {
         // 二次保险：仅在微信主二进制（官方或任意多开变体）内初始化。
-        // plist 已按 Executable "WeChat" 过滤，此处再按真实 bid 收敛到多开场景，
-        // 避免把伪装逻辑意外注入到同名执行文件的非微信进程。
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        if (ShouldSpoof(bid)) {
-            %init(WCPBidSpoof);
-        }
+        BOOL go = ShouldSpoof(bid);
+        WCPLog(@"init | realBid=%@ go=%d HOOK_BID=%d HOOK_OFI=%d SPOOF=%d",
+               bid, go, HOOK_BUNDLE_IDENTIFIER, HOOK_OBJECT_FOR_INFO_DICT, SPOOF_ENABLED);
+        if (go) %init(WCPBidSpoof);
     }
 }
