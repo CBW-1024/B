@@ -1,17 +1,36 @@
 //============================================================================
-//  WCPBidSpoof — 微信多开 bid 处理（单文件 Logos tweak）v3.1
+//  WCPBidSpoof — 微信多开 bid 处理（单文件 Logos tweak）v4.0
 //----------------------------------------------------------------------------
-//  相对 v3.0 的唯一改动：把"启动即闪退"修掉。
-//    * 每个业务 hook 用 @try/@catch 兜底，异常时回退 %orig —— 微信【必能打开】，
-//      且异常名会被纯 C 写进 wcpbidspoof.log（[CATCH] 行），便于定位真凶。
-//    * NSURL hook 入口判空，避免对 nil 做字符串处理。
-//    * 新增运行时降级开关（app 沙盒 Documents 下建空文件即可，无需重编译）：
-//        wcp_disable_net  → 关闭网络层（NSURL/NSURLSession）伪装，只保留本地透传
-//        wcp_disable_face → 关闭刷脸 NSString 层伪装
-//  策略不变（对齐 WCR）：
-//    ① 登录/风控 = 网络层（NSURL/NSURLSession 把请求里的真实 bid 换成 com.tencent.xin）
-//    ② 人脸核身 = NSString 层（仅 FaceRecogFlashHandler 窗口内，self==NSString）
-//    本地 bundleIdentifier 始终透传真实 id（保 APNs topic + UI 资源）
+//  本版改为「WCP 式」——已用 capstone 反汇编 WCPulse 正式版 dylib 坐实：
+//    · bundleIdentifier (imp 0x64712c) 与 objectForInfoDictionaryKey: (imp 0x649b7c)
+//      都是 OLLVM 扁平化 + 算术混淆，但门控结构一致：读 0xa2211c（解密锁/防重入，
+//      【不是功能开关】）→ cbnz 直接跳回吐 @"com.tencent.xin" 的分支。
+//      => WCP 对两条读取路径【无条件】本地 spoof 成官方 id。
+//    · WCP 全量 304 条 hook 里【没有】任何 NSURL/dataTask 网络层 hook——
+//      它靠「源头改 id」让微信自己用官方 id 拼出请求，自然过登录，无需碰网络层。
+//    · WCP 有推送：APNs 按代码签名的 bundle id 路由 device token，根本不读运行时
+//      bundleIdentifier 返回值；我们全量扫描确认 WCP 三个推送处理器函数体内
+//      【零处】引用 com.tencent.xin(0x9eb000)/bundleIdentifier(0x997000) 页
+//      => 推送处理器与 spoof 无关，是 WCP 其它功能。
+//
+//  为什么「本地双路径无条件 spoof」比 WCR 网络层式更稳（反汇编证据支撑）：
+//    ① 登录态二次校验很可能走 objectForInfoDictionaryKey:CFBundleIdentifier 这条
+//       本地路径（不经 bundleIdentifier 方法）——WCP 堵两条路，故「划后台重开」不踢；
+//       只 spoof bundleIdentifier 的版本会出现「首次能登、重开被踢」。
+//    ② APNs 投递与运行时 bundle id 正交，本地全改不坏推送（WCP 实证）。
+//    ③ 无全局 NSString hook（WCP 也不 hook）——启动不崩（v3.0/v3.1 闪退根因已根除）。
+//
+//  v4.0 架构（对齐 WCP，网络层作兜底）：
+//    ① 本地双路径：bundleIdentifier          -> 无条件 com.tencent.xin
+//                  objectForInfoDictionaryKey:CFBundleIdentifier -> 无条件 com.tencent.xin
+//                  （其余 key / 其它 Bundle 透传，不影响 Info.plist 其它读取）
+//    ② 网络层兜底：NSURL.URLWithString: / NSURLSession.dataTaskWithRequest:
+//       仍把请求 URL 里真实 bid 替换成官方 id（覆盖微信用网络请求携带 bid 的场景）
+//    ③ 刷脸窗口（initPipeline/dealloc）：仅作可观测日志，本地 spoof 已无条件覆盖刷脸
+//
+//  运行时开关（app 沙盒 Documents，与日志同目录，无需越狱文件管理器）：
+//    wcp_disable_local → 关本地双路径 spoof（= 纯网络层模式 / 基线，便于二分定位）
+//    wcp_disable_net   → 关网络层兜底（= 纯本地 spoof 模式）
 //============================================================================
 
 #import <Foundation/Foundation.h>
@@ -23,15 +42,16 @@
 #include <string.h>
 
 //------------------------------ 配置开关 -------------------------------------
-#define WCP_VERSION                "3.1.0"
-#define HOOK_BUNDLE_IDENTIFIER    1   // bundleIdentifier 返回真实 id（透传，打日志）
-#define HOOK_NETWORK_SPOOF        1   // 网络层 bid 伪装（对齐 WCR：登录/风控所需）
+#define WCP_VERSION                "4.0.0"
+#define HOOK_BUNDLE_IDENTIFIER    1   // bundleIdentifier：无条件回吐 com.tencent.xin（WCP 式）
+#define HOOK_OBJECT_KEY            1   // objectForInfoDictionaryKey:CFBundleIdentifier：无条件回吐 com.tencent.xin（WCP 式双路径）
+#define HOOK_NETWORK_SPOOF        1   // 网络层 bid 伪装（WCP 无此层；作为兜底保留）
 #define HOOK_NSURL_REQUEST        1   // NSURL URLWithString: 替换
 #define HOOK_NSURLSESSION         1   // NSURLSession dataTaskWithRequest: 替换 URL
-#define HOOK_NSURLSESSION_BODY    0   // ⚠️ HTTPBody 替换（默认关：body 多为 protobuf 二进制）
-#define HOOK_FACE_SPOOF           1   // 刷脸 NSString 级 bid 伪装（仅刷脸窗口内，self==NSString）
+#define HOOK_NSURLSESSION_BODY    0   // HTTPBody 替换（默认关：微信 body 多为 protobuf 二进制，字符串替换可能破坏 wire 长度；若仅本地+URL 级替换登录仍不过，置 1 开启——二进制 body 转 NSString 失败会自动跳过）
+#define HOOK_FACE_SPOOF           1   // 刷脸窗口（initPipeline/dealloc）：仅日志可观测，不影响 spoof
 #define ENABLE_LOGGING            1
-#define LOG_VERBOSE               1   // 1=打印每次调用；0=仅异常/替换
+#define LOG_VERBOSE               1   // 1=详细；0=仅替换/异常。bundleIdentifier 调用极多，已做抽样日志避免刷屏
 #define WCP_LOG_MAX_LINES         8000
 
 //------------------------------ 日志子系统 -----------------------------------
@@ -43,8 +63,9 @@ static long         gWCPCallCount = 0;
 static char         gWCPLogPath[2048] = {0};
 static NSString    *gWCPRealBid = nil;          // 真实 bundle id（%ctor 读取，ARC 下 strong 持有）
 static NSString    *gWCPTargetBid = @"com.tencent.xin";
+static BOOL         gWCPFaceActive = NO;         // 刷脸窗口标志（仅日志可观测，对齐 WCR 0x2203560）
 static BOOL         gWCPNetOff  = NO;            // 运行时降级：网络层关（wcp_disable_net 存在）
-static BOOL         gWCPFaceOff = NO;            // 运行时降级：刷脸层关（wcp_disable_face 存在）
+static BOOL         gWCPLocalOff = NO;           // 运行时降级：本地 spoof 关（wcp_disable_local 存在）
 
 // 纯 C 落地异常，绝不经过 Objective-C 格式化，避免在已崩溃路径上二次崩溃
 static void WCPLogCatch(const char *where, const char *what) {
@@ -112,8 +133,9 @@ static NSString *WCPReplaceBid(NSString *s) {
     return [s stringByReplacingOccurrencesOfString:gWCPRealBid withString:gWCPTargetBid];
 }
 
-// 开关文件存在=关闭该层（免编译降级）。只在 app 沙盒 Documents 下查，
-// 与日志同目录，无需越狱文件管理器也能操作。
+// 开关文件存在=关闭该层（免编译降级）。只在 app 沙盒 Documents 下查，与日志同目录。
+//   wcp_disable_local -> 关本地双路径 spoof（= 纯网络层模式 / 基线）
+//   wcp_disable_net   -> 关网络层兜底（= 纯本地 spoof 模式）
 static BOOL WCPSwitchOff(NSString *name) {
     if (!gWCPLogPath[0]) return NO;
     NSString *dir = [[NSString stringWithUTF8String:gWCPLogPath]
@@ -124,7 +146,7 @@ static BOOL WCPSwitchOff(NSString *name) {
 
 %group WCPBidSpoof
 
-// ============================ 本地 bundle id：透传真实 id ============================
+// ============================ 本地双路径无条件 spoof（对齐 WCP 0x64712c / 0x649b7c）============================
 %hook NSBundle
 
 - (NSString *)bundleIdentifier {
@@ -132,38 +154,57 @@ static BOOL WCPSwitchOff(NSString *name) {
     return %orig;
 #else
     if (gWCPInHook) return %orig;
-    gWCPInHook = 1;
-    NSString *orig = %orig;
-    gWCPCallCount++;
-#if LOG_VERBOSE
-    if (self == [NSBundle mainBundle])
-        WCPLog(@"bundleIdentifier | MAIN orig=%@ (passthrough, WCR-aligned) #%ld", orig, gWCPCallCount);
-#endif
-    gWCPInHook = 0;
-    return orig;
+    @try {
+        gWCPInHook = 1;
+        gWCPCallCount++;
+        if (!gWCPLocalOff) {
+            // WCP 式：无条件本地 spoof。抽样日志，避免启动期海量调用刷屏。
+            if (LOG_VERBOSE && (gWCPCallCount % 200 == 0 || gWCPFaceActive)) {
+                WCPLog(@"bundleIdentifier | LOCAL SPOOF -> com.tencent.xin (real=%@) #%ld", gWCPRealBid, gWCPCallCount);
+            }
+            gWCPInHook = 0;
+            return gWCPTargetBid;
+        }
+        NSString *orig = %orig;
+        gWCPInHook = 0;
+        return orig;
+    } @catch (NSException *e) {
+        gWCPInHook = 0;
+        WCPLogCatch("NSBundle.bundleIdentifier", [[e name] UTF8String]);
+        return %orig;
+    }
 #endif
 }
 
 - (id)objectForInfoDictionaryKey:(NSString *)key {
+#if !HOOK_OBJECT_KEY
+    return %orig;
+#else
     if (gWCPInHook) return %orig;
-    if (self == [NSBundle mainBundle] && [key isEqualToString:@"CFBundleIdentifier"]) {
-        gWCPInHook = 1;
-        id orig = %orig;
-#if LOG_VERBOSE
-        WCPLog(@"objectForInfoDictionaryKey | key=CFBundleIdentifier orig=%@ (passthrough) #%ld", orig, gWCPCallCount);
-#endif
-        gWCPInHook = 0;
-        return orig;
+    if (!gWCPLocalOff && [key isEqualToString:@"CFBundleIdentifier"]) {
+        @try {
+            gWCPInHook = 1;
+            id orig = %orig;
+            gWCPInHook = 0;
+            WCPLog(@"objectForInfoDictionaryKey | LOCAL SPOOF key=CFBundleIdentifier -> com.tencent.xin (orig=%@)", orig);
+            return gWCPTargetBid;
+        } @catch (NSException *e) {
+            gWCPInHook = 0;
+            WCPLogCatch("NSBundle.objectForInfoDictionaryKey", [[e name] UTF8String]);
+            return %orig(key);
+        }
     }
     return %orig;
+#endif
 }
 
 %end
 
-// ============================ 网络层伪装（对齐 WCR：登录/风控）============================
+// ============================ 网络层兜底（WCP 无此层；作为补充保留）============================
 #if HOOK_NETWORK_SPOOF
 
 #if HOOK_NSURL_REQUEST
+// 补充层：覆盖微信内部 [NSURL URLWithString:] 构造的含 bid 的 URL
 %hook NSURL
 
 + (NSURL *)URLWithString:(NSString *)URLString {
@@ -245,76 +286,22 @@ static BOOL WCPSwitchOff(NSString *name) {
 
 %end // WCPBidSpoof
 
-// ============================ 刷脸层：NSString 级伪装（仅刷脸窗口内）============================
+// ============================ 刷脸窗口：initPipeline/dealloc（仅日志可观测，不影响 spoof）============================
+// WCP 式本地 spoof 已无条件覆盖刷脸（刷脸核身读 bundleIdentifier，已被无条件 spoof）。
+// 此层仅 hook initPipeline/dealloc 记录刷脸起止，便于确认刷脸路径；绝不 hook NSString 方法。
 #if HOOK_FACE_SPOOF
-static BOOL gWCPFaceActive = NO;
-
 %group WCPFace
 
 %hook FaceRecogFlashHandler
 - (void)initPipeline {
-    gWCPFaceActive = YES;   // 在 %orig 之前置位，保证刷脸全程窗口已开
-    WCPLog(@"face: initPipeline -> gWCPFaceActive=YES");
+    gWCPFaceActive = YES;   // 刷脸开始（仅日志标记）
+    WCPLog(@"face: initPipeline -> gWCPFaceActive=YES (local spoof already covers it)");
     %orig;
 }
 - (void)dealloc {
-    gWCPFaceActive = NO;    // 在 %orig 之前清零，刷脸结束立即关窗
+    gWCPFaceActive = NO;    // 刷脸结束
     WCPLog(@"face: dealloc -> gWCPFaceActive=NO");
     %orig;
-}
-%end
-
-%hook NSString
-// 刷脸 SDK 通常经 NSString 类方法构造 bid 字符串。门控：self==[NSString class] 且处于刷脸窗口。
-+ (instancetype)stringWithUTF8String:(const char *)nullTerminatedCString {
-    @try {
-        if (!(gWCPFaceActive && self == [NSString class] && !gWCPInHook)) return %orig;
-        gWCPInHook = 1;
-        NSString *orig = %orig;
-        NSString *repl = WCPReplaceBid(orig);
-        if (repl) WCPLog(@"NSString|face utf8 spoof %@ -> %@", orig, repl);
-        gWCPInHook = 0;
-        return repl ?: orig;
-    }
-    @catch (NSException *e) {
-        gWCPInHook = 0;
-        WCPLogCatch("NSString.stringWithUTF8String", [[e name] UTF8String]);
-        return %orig;
-    }
-}
-+ (instancetype)stringWithCString:(const char *)cString encoding:(NSStringEncoding)enc {
-    @try {
-        if (!(gWCPFaceActive && self == [NSString class] && !gWCPInHook)) return %orig;
-        gWCPInHook = 1;
-        NSString *orig = %orig;
-        NSString *repl = WCPReplaceBid(orig);
-        if (repl) WCPLog(@"NSString|face cstr spoof %@ -> %@", orig, repl);
-        gWCPInHook = 0;
-        return repl ?: orig;
-    }
-    @catch (NSException *e) {
-        gWCPInHook = 0;
-        WCPLogCatch("NSString.stringWithCString:encoding:", [[e name] UTF8String]);
-        return %orig;
-    }
-}
-+ (instancetype)stringWithFormat:(NSString *)format, ... {
-    @try {
-        if (!(gWCPFaceActive && self == [NSString class] && !gWCPInHook)) return %orig;
-        gWCPInHook = 1;
-        va_list ap; va_start(ap, format);
-        NSString *s = [[NSString alloc] initWithFormat:format arguments:ap];
-        va_end(ap);
-        NSString *repl = WCPReplaceBid(s);
-        if (repl) WCPLog(@"NSString|face fmt spoof -> %@", repl);
-        gWCPInHook = 0;
-        return repl ?: s;
-    }
-    @catch (NSException *e) {
-        gWCPInHook = 0;
-        WCPLogCatch("NSString.stringWithFormat:", [[e name] UTF8String]);
-        return %orig;
-    }
 }
 %end
 
@@ -337,25 +324,21 @@ static BOOL gWCPFaceActive = NO;
 
         NSString *exe = [[NSBundle mainBundle] executablePath];
 
-        // 运行时降级开关（app 沙盒 Documents 下的空文件）
-        gWCPNetOff  = WCPSwitchOff(@"wcp_disable_net");
-        gWCPFaceOff = WCPSwitchOff(@"wcp_disable_face");
+        // 运行时开关（app 沙盒 Documents 下的空文件，与日志同目录）
+        gWCPNetOff   = WCPSwitchOff(@"wcp_disable_net");
+        gWCPLocalOff = WCPSwitchOff(@"wcp_disable_local");
 
-        WCPLog(@"=== WCPBidSpoof %s init (uid=%d) exe=%@ realBid=%@ NETSPOOF=%d URL=%d SESS=%d BODY=%d FACE=%d netOff=%d faceOff=%d ===",
+        WCPLog(@"=== WCPBidSpoof %s init (uid=%d) exe=%@ realBid=%@ LOCAL=%d(off=%d) NET=%d(off=%d) ===",
                WCP_VERSION, getuid(), exe, gWCPRealBid,
-               HOOK_NETWORK_SPOOF, HOOK_NSURL_REQUEST, HOOK_NSURLSESSION, HOOK_NSURLSESSION_BODY,
-               HOOK_FACE_SPOOF, gWCPNetOff, gWCPFaceOff);
+               HOOK_BUNDLE_IDENTIFIER, gWCPLocalOff, HOOK_NETWORK_SPOOF, gWCPNetOff);
 
         if (exe && [exe containsString:@"WeChat"]) {
-            // NSBundle 透传始终装（与 v1.0.6 一样安全，无副作用）；网络层 hook 也装，
-            // 但 netOff 时其内部直接 %orig 透传。face 层按开关决定。
-            %init(WCPBidSpoof);
-            if (HOOK_FACE_SPOOF && !gWCPFaceOff) {
-                %init(WCPFace);
-                WCPLog(@"init: hooks installed (net=%d face=%d, WCR-aligned)", (HOOK_NETWORK_SPOOF && !gWCPNetOff), YES);
-            } else {
-                WCPLog(@"init: hooks installed (net=%d face=OFF, WCR-aligned)", (HOOK_NETWORK_SPOOF && !gWCPNetOff));
+            %init(WCPBidSpoof);   // 本地双路径 spoof + 网络层兜底（netOff 时内部透传）
+            if (HOOK_FACE_SPOOF) {
+                %init(WCPFace);   // 仅 initPipeline/dealloc 日志，绝不 hook NSString
             }
+            WCPLog(@"init: hooks installed (WCP-style: local double-path spoof ON=%d, net fallback=%d)",
+                   !gWCPLocalOff, (HOOK_NETWORK_SPOOF && !gWCPNetOff));
         } else {
             WCPLog(@"init: executable not WeChat, skip");
         }
