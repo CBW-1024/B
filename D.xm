@@ -136,12 +136,22 @@ static void WCPLogV(const char *fmt, va_list ap) {
 #endif
 }
 
+// 变参 C 壳：把 C 格式串 + 变参正确打包成 va_list 再交给 WCPLogV。
+// 注意：不能直接 WCPLogV("%s", charPtr) —— WCPLogV 的第 2 个形参是 va_list，
+// 直接塞一个 const char* 既编不过（arm64 上 va_list == char*，丢 const 限定符），
+// 运行时也会让 vfprintf 读到野指针崩溃。必须经变参函数生成合法 va_list。
+static void WCPLogC(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    WCPLogV(fmt, ap);
+    va_end(ap);
+}
+
 static void WCPLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     // 先把 NSString 格式化展开，再交给 C 日志层（避免日志体里出现非 C 字符串）
     NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    WCPLogV("%s", [body UTF8String]);
+    WCPLogC("%s", [body UTF8String]);
 }
 
 //------------------------------ 判定逻辑 -------------------------------------
