@@ -41,6 +41,7 @@
 // fishhook：C 级符号重定向，通过 dyld 改写间接符号指针实现 hook。
 #include "fishhook.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <Metal/Metal.h>
 #import <os/lock.h>
 
 #pragma mark - 配置开关
@@ -57,6 +58,7 @@ static BOOL g_audioReload = NO;
 #pragma mark - 沙箱路径
 static NSString *g_videoDir       = nil;
 static NSString *g_tempAudioPath  = nil;   // 独立声音文件（扩展名随导入文件动态变化）
+static NSString *g_videoPath      = nil;   // 视频素材（扩展名随导入文件动态变化）
 
 #pragma mark - 运行时状态
 static NSFileManager *g_fileManager = nil;
@@ -70,6 +72,20 @@ static AVAssetReaderTrackOutput *g_audioOutput = nil;
 
 // 最近一帧源画面。reader 读完后冻结复用，避免画面闪回真实摄像头。
 static CVPixelBufferRef g_lastVideoPixel = NULL;
+
+#pragma mark - 视频预取（与音频预解码对称：后台线程逐帧读源+渲染，采集回调只取最近一帧）
+// 设计目标：把 copyNextSampleBuffer(I/O) + CIImage 合成 + g_ciContext 渲染 全部移出采集回调线程，
+// 消除 TrollStore 等弱调度环境下同步阻塞采集线程导致的卡顿。单槽 producer/consumer，
+// 由采集回调的取帧节奏驱动源推进（回调取走一帧，预取才渲染下一帧），天然按摄像头帧率播放。
+static BOOL           g_videoFeederRunning = NO;  // 预取线程是否在跑
+static BOOL           g_videoFeederStop    = NO;  // 通知预取线程取消
+static os_unfair_lock g_videoFrameLock     = OS_UNFAIR_LOCK_INIT;
+static CVPixelBufferRef g_videoRendered    = NULL;  // 最近一帧已渲染结果（预取线程写入，+1 引用由取走方释放）
+static BOOL           g_videoFrameTaken    = NO;    // 采集回调已取走上帧：置位后预取才推下一帧（消费信号）
+static dispatch_queue_t g_videoFeedQueue   = NULL;  // 预取专用串行队列（显式 QoS，不挤占音频解码 HIGH 队列）
+// 渲染目标尺寸缓存：来自采集帧，预取线程据此渲染；尺寸变更时回调清槽，待预取追上。
+static size_t g_targetW = 0, g_targetH = 0;
+static OSType g_targetFmt = 0;
 
 #pragma mark - 预览显示层
 static AVSampleBufferDisplayLayer *g_displayLayer     = nil;
@@ -113,7 +129,7 @@ static NSString *vcm_documentPath(void) {
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 }
 static NSString *vcm_videoPath(void) {
-    return [g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"];
+    return g_videoPath;
 }
 
 #pragma mark - 配置存取
@@ -123,7 +139,9 @@ static void vcm_saveSettings(void) {
     [d setBool:g_isLoop      forKey:@"vcam_loop"];
     [d setBool:g_isSound     forKey:@"vcam_sound"];
     [d setInteger:g_rotation forKey:@"vcam_rotation"];
-    // 音频素材路径持久化：扩展名随导入文件动态变化，不存盘则重启后找不到文件 → 回退到视频音轨。
+    // 音视频素材路径持久化：扩展名随导入文件动态变化，不存盘则重启后找不到文件。
+    if (g_videoPath) [d setObject:g_videoPath forKey:@"vcam_video_path"];
+    else             [d removeObjectForKey:@"vcam_video_path"];
     [d setObject:g_tempAudioPath forKey:@"vcam_audio_path"];
     [d synchronize];
 }
@@ -134,7 +152,9 @@ static void vcm_loadSettings(void) {
     if ([d objectForKey:@"vcam_sound"])    g_isSound   = [d boolForKey:@"vcam_sound"];
     if ([d objectForKey:@"vcam_rotation"]) g_rotation  = (int)[d integerForKey:@"vcam_rotation"];
     else                                   g_rotation  = 90;
-    // 恢复音频素材路径：存在则用持久化路径（动态扩展名），否则回退默认 .m4a 名。
+    // 恢复素材路径：存在则用持久化路径（动态扩展名），否则回退默认名（由 %ctor 在 loadSettings 前给定）。
+    NSString *savedVideo = [d stringForKey:@"vcam_video_path"];
+    if (savedVideo.length > 0) g_videoPath = [savedVideo copy];
     NSString *savedAudio = [d stringForKey:@"vcam_audio_path"];
     if (savedAudio.length > 0) g_tempAudioPath = [savedAudio copy];
 }
@@ -157,6 +177,7 @@ static void vcm_reloadReaders(void) {
     g_audioDecodeGen++;
     g_decodeFailCount = 0;
     g_decodeNextRetry = 0;
+    [VCamMediaManager stopVideoFeeder];   // 换素材前停预取并清在途帧，避免下一帧秀出旧素材画面
     os_unfair_lock_lock(&g_audioPCMLock);
     g_audioFeederStop = YES;
     if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
@@ -175,6 +196,7 @@ static void vcm_resetSettings(void) {
 
     vcm_stopReaders();
     vcm_reloadReaders();
+    [VCamMediaManager stopVideoFeeder];
 
     if (g_tempAudioPath) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
     // 删掉所有 bear_vcam_audio.* 残留（动态扩展名后可能不止 .m4a）
@@ -184,7 +206,13 @@ static void vcm_resetSettings(void) {
         }
     }
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
-    [g_fileManager removeItemAtPath:vcm_videoPath() error:nil];
+    g_videoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
+    // 删掉所有 bear_vcam_temp.* 残留（动态扩展名后可能不止 .mov）
+    for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
+        if ([old hasPrefix:@"bear_vcam_temp."]) {
+            [g_fileManager removeItemAtPath:[g_videoDir stringByAppendingPathComponent:old] error:nil];
+        }
+    }
 }
 
 #pragma mark - 视图控制器查找
@@ -210,15 +238,21 @@ static UIViewController *vcm_topViewController(void) {
 + (void)setupAudioReaderIfNeeded;
 + (CVPixelBufferRef)nextSourcePixel;
 + (CIImage *)composedImageForTarget:(CGSize)target;
++ (CIImage *)composedImageForPixel:(CVPixelBufferRef)pix target:(CGSize)target;
 + (CIImage *)blackImageForTarget:(CGSize)target;
 + (CMSampleBufferRef)makeSampleFromImage:(CIImage *)img
                                    width:(size_t)w height:(size_t)h
                                   format:(OSType)pfmt
                                timingSrc:(CMSampleBufferRef)src;
++ (CVPixelBufferRef)renderImage:(CIImage *)img w:(size_t)w h:(size_t)h fmt:(OSType)pfmt;
++ (CMSampleBufferRef)wrapPixelBuffer:(CVPixelBufferRef)pb timingSrc:(CMSampleBufferRef)src;
 + (CMSampleBufferRef)getVideoFrame:(CMSampleBufferRef)origSample;
 + (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample;
 + (void)decodeAudioToMemory;   // 整段音频一次性预解码进内存（非流式）
 + (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length;  // 顺序推进读游标 + 到尾按 g_isLoop 回卷
++ (void)videoFeederLoop;       // 视频预取主循环：后台逐帧读源+渲染，单槽等待采集回调取走
++ (void)startVideoFeederIfNeeded;
++ (void)stopVideoFeeder;
 + (void)cleanup;
 @end
 
@@ -515,14 +549,11 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 }
 
 // 旋转 + 等比居中 + 黑底合成，返回 extent 严格为 (0,0,target) 的 CIImage
-+ (CIImage *)composedImageForTarget:(CGSize)target {
++ (CIImage *)composedImageForPixel:(CVPixelBufferRef)pix target:(CGSize)target {
     CGFloat targetW = target.width, targetH = target.height;
-    if (targetW <= 0 || targetH <= 0) return nil;
+    if (targetW <= 0 || targetH <= 0 || !pix) return nil;
 
-    CVPixelBufferRef pix = [self nextSourcePixel];
-    if (!pix) return nil;
     CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
-    CVPixelBufferRelease(pix);
     if (!img) return nil;
 
     // 旋转映射：对无 EXIF 元数据的相机帧，屏幕观感与 orientation 数值相反，故 90↔270 对调，
@@ -546,45 +577,68 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     return [img imageByCompositingOverImage:[self blackImageForTarget:target]];
 }
 
+// 兜底/首帧路径：从 reader 取源帧后合成。预取线程走 composedImageForPixel: 直接复用已取帧，避免重复拉取。
++ (CIImage *)composedImageForTarget:(CGSize)target {
+    CVPixelBufferRef pix = [self nextSourcePixel];
+    if (!pix) return nil;
+    CIImage *img = [self composedImageForPixel:pix target:target];
+    CVPixelBufferRelease(pix);
+    return img;
+}
+
 + (CIImage *)blackImageForTarget:(CGSize)target {
     return [[CIImage imageWithColor:[CIColor blackColor]]
             imageByCroppingToRect:CGRectMake(0, 0, target.width, target.height)];
 }
 
 // 渲染成新的 CMSampleBuffer，沿用采集帧的时序与 Exif/TIFF 附件
+// 渲染合成结果到一块新的 CVPixelBuffer（Metal/IOSurface 兼容），返回 +1 引用由调用方释放。
++ (CVPixelBufferRef)renderImage:(CIImage *)img w:(size_t)w h:(size_t)h fmt:(OSType)pfmt {
+    if (!img || w == 0 || h == 0) return NULL;
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferMetalCompatibilityKey:  @YES,
+    };
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pfmt,
+                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess || !pb) return NULL;
+    [g_ciContext render:img toCVPixelBuffer:pb
+                 bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:nil];
+    return pb;  // +1
+}
+
+// 将已渲染的 CVPixelBuffer 包裹成 CMSampleBuffer，沿用采集帧的时序与 Exif/TIFF 附件。
++ (CMSampleBufferRef)wrapPixelBuffer:(CVPixelBufferRef)pb timingSrc:(CMSampleBufferRef)src {
+    if (!pb) return NULL;
+    CMVideoFormatDescriptionRef fmtDesc = NULL;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmtDesc);
+    if (!fmtDesc) return NULL;
+    CMSampleTimingInfo timing;
+    timing.duration              = kCMTimeInvalid;
+    timing.presentationTimeStamp = kCMTimeInvalid;
+    timing.decodeTimeStamp       = kCMTimeInvalid;
+    if (src) CMSampleBufferGetSampleTimingInfo(src, 0, &timing);
+    CMSampleBufferRef out = NULL;
+    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, YES,
+                                       NULL, NULL, fmtDesc, &timing, &out);
+    if (out && src) {
+        CFStringRef keys[2] = { kCGImagePropertyExifDictionary, kCGImagePropertyTIFFDictionary };
+        for (int i = 0; i < 2; i++) {
+            CFTypeRef v = CMGetAttachment(src, keys[i], NULL);
+            if (v) CMSetAttachment(out, keys[i], v, kCMAttachmentMode_ShouldPropagate);
+        }
+    }
+    CFRelease(fmtDesc);
+    return out;
+}
+
 + (CMSampleBufferRef)makeSampleFromImage:(CIImage *)img
                                    width:(size_t)w height:(size_t)h
                                   format:(OSType)pfmt
                                timingSrc:(CMSampleBufferRef)src {
-    if (!img || w == 0 || h == 0) return NULL;
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
-    CVPixelBufferRef pb = NULL;
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pfmt,
-                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess || !pb) return NULL;
-
-    [g_ciContext render:img toCVPixelBuffer:pb
-                 bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:nil];
-
-    CMVideoFormatDescriptionRef fmtDesc = NULL;
-    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmtDesc);
-    CMSampleBufferRef out = NULL;
-    if (fmtDesc) {
-        CMSampleTimingInfo timing;
-        timing.duration              = kCMTimeInvalid;
-        timing.presentationTimeStamp = kCMTimeInvalid;
-        timing.decodeTimeStamp       = kCMTimeInvalid;
-        if (src) CMSampleBufferGetSampleTimingInfo(src, 0, &timing);
-        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, YES,
-                                           NULL, NULL, fmtDesc, &timing, &out);
-        if (out && src) {
-            CFStringRef keys[2] = { kCGImagePropertyExifDictionary, kCGImagePropertyTIFFDictionary };
-            for (int i = 0; i < 2; i++) {
-                CFTypeRef v = CMGetAttachment(src, keys[i], NULL);
-                if (v) CMSetAttachment(out, keys[i], v, kCMAttachmentMode_ShouldPropagate);
-            }
-        }
-        CFRelease(fmtDesc);
-    }
+    CVPixelBufferRef pb = [self renderImage:img w:w h:h fmt:pfmt];
+    if (!pb) return NULL;
+    CMSampleBufferRef out = [self wrapPixelBuffer:pb timingSrc:src];
     CVPixelBufferRelease(pb);
     return out;
 }
@@ -597,20 +651,46 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CVPixelBufferRef camPix = CMSampleBufferGetImageBuffer(origSample);
     if (!camPix) return NULL;
 
-    CGSize target = CGSizeMake((CGFloat)CVPixelBufferGetWidth(camPix),
-                               (CGFloat)CVPixelBufferGetHeight(camPix));
+    size_t w = CVPixelBufferGetWidth(camPix);
+    size_t h = CVPixelBufferGetHeight(camPix);
     OSType pfmt = CVPixelBufferGetPixelFormatType(camPix);
 
+    // 懒启动预取线程（替换开启且素材存在时）。
+    [self startVideoFeederIfNeeded];
+
+    // 渲染目标尺寸变更（换摄像头/分辨率）：清槽作废在途帧并通知预取推一帧新尺寸画面，本帧走兜底同步渲染，待预取追上。
+    if (w != g_targetW || h != g_targetH || pfmt != g_targetFmt) {
+        g_targetW = w; g_targetH = h; g_targetFmt = pfmt;
+        os_unfair_lock_lock(&g_videoFrameLock);
+        if (g_videoRendered) { CVPixelBufferRelease(g_videoRendered); g_videoRendered = NULL; }
+        g_videoFrameTaken = YES;  // 通知预取推一帧新尺寸画面
+        os_unfair_lock_unlock(&g_videoFrameLock);
+    }
+
+    // 取预取线程已渲染的最近一帧（尺寸匹配才用，避免换尺寸瞬间的错位帧）。取走后置 taken=YES 驱动预取渲染下一帧。
+    CVPixelBufferRef rend = NULL;
+    os_unfair_lock_lock(&g_videoFrameLock);
+    if (g_videoRendered &&
+        CVPixelBufferGetWidth(g_videoRendered)  == w &&
+        CVPixelBufferGetHeight(g_videoRendered) == h) {
+        rend = (CVPixelBufferRef)CVPixelBufferRetain(g_videoRendered);
+        g_videoFrameTaken = YES;
+    }
+    os_unfair_lock_unlock(&g_videoFrameLock);
+
+    if (rend) {
+        CMSampleBufferRef out = [self wrapPixelBuffer:rend timingSrc:origSample];
+        CVPixelBufferRelease(rend);
+        return out;
+    }
+
+    // 兜底：预取未就绪（首帧）或尺寸刚变更。同步渲染一帧，保证不黑屏；正常播放后极少见。
     CMSampleBufferRef out = NULL;
     @try {
         @autoreleasepool {
-            CIImage *img = [self composedImageForTarget:target];
-            if (!img) img = [self blackImageForTarget:target];
-            out = [self makeSampleFromImage:img
-                                      width:(size_t)target.width
-                                     height:(size_t)target.height
-                                     format:pfmt
-                                  timingSrc:origSample];
+            CIImage *img = [self composedImageForTarget:CGSizeMake(w, h)];
+            if (!img) img = [self blackImageForTarget:CGSizeMake(w, h)];
+            out = [self makeSampleFromImage:img width:w height:h format:pfmt timingSrc:origSample];
         }
     } @catch (NSException *e) {
         if (out) { CFRelease(out); out = NULL; }  // 合成/渲染异常本帧透传真实摄像头
@@ -621,6 +701,7 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 + (void)cleanup {
     g_audioDecodeGen++;                 // 作废在途预解码结果
     g_audioFeederStop = YES;            // 通知预解码线程取消
+    [VCamMediaManager stopVideoFeeder]; // 停预取线程并释放在途帧
     vcm_stopReaders();
     os_unfair_lock_lock(&g_audioPCMLock);
     if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
@@ -628,6 +709,71 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     g_audioPCMRead  = 0;
     g_audioPCMReady = NO;
     os_unfair_lock_unlock(&g_audioPCMLock);
+}
+
+// 预取主循环：逐帧读源 + 合成 + 渲染到 CVPixelBuffer，由采集回调的消费信号（g_videoFrameTaken）驱动推进。
+// 回调取走一帧才推下一帧，天然按摄像头帧率播放，源不会过快；源耗尽且不复读时保留末帧、稳定冻结。
++ (void)videoFeederLoop {
+    while (!g_videoFeederStop) {
+        size_t tw = g_targetW, th = g_targetH; OSType tfmt = g_targetFmt;
+        if (tw == 0 || th == 0) { usleep(10000); continue; }  // 目标尺寸未知，等采集回调先喂
+
+        // 等待回调取走上一个渲染帧后再推下一帧（消费信号），避免源过快 & 空耗 CPU。
+        BOOL taken = NO;
+        os_unfair_lock_lock(&g_videoFrameLock);
+        taken = g_videoFrameTaken;
+        os_unfair_lock_unlock(&g_videoFrameLock);
+        if (!taken) { usleep(8000); continue; }
+
+        if (g_videoReload) [self setupVideoReaderIfNeeded];
+
+        CVPixelBufferRef src = vcm_pullVideoFrame();
+        if (!src) {
+            g_videoReload = YES;
+            if (!g_isLoop) {
+                // 源耗尽且不复读：保留上一渲染帧（g_videoRendered 不动），复位 taken 让回调反复取同一帧 → 冻结末帧。
+                os_unfair_lock_lock(&g_videoFrameLock);
+                g_videoFrameTaken = NO;
+                os_unfair_lock_unlock(&g_videoFrameLock);
+                usleep(16000); continue;
+            }
+            usleep(8000); continue;  // 复读：下轮重建 reader 续播
+        }
+
+        CIImage *img = [self composedImageForPixel:src target:CGSizeMake(tw, th)];
+        CVPixelBufferRelease(src);
+        if (!img) { usleep(4000); continue; }
+
+        CVPixelBufferRef pb = [self renderImage:img w:tw h:th fmt:tfmt];
+        if (!pb) { usleep(4000); continue; }
+
+        os_unfair_lock_lock(&g_videoFrameLock);
+        if (g_videoRendered) CVPixelBufferRelease(g_videoRendered);
+        g_videoRendered  = pb;  // +1 引用
+        g_videoFrameTaken = NO;  // 新帧就绪，待回调取走
+        os_unfair_lock_unlock(&g_videoFrameLock);
+    }
+    g_videoFeederRunning = NO;
+}
+
+// 懒启动预取线程：素材存在且尚未运行时才起。换素材/reload 后由 stop 清空，下次取帧再起。
++ (void)startVideoFeederIfNeeded {
+    if (g_videoFeederRunning) return;
+    if (![g_fileManager fileExistsAtPath:vcm_videoPath()]) return;
+    g_videoFeederStop = NO;
+    g_videoFeederRunning = YES;
+    dispatch_async(g_videoFeedQueue, ^{
+        [VCamMediaManager videoFeederLoop];
+    });
+}
+
+// 停止预取并释放在途渲染帧。reload/重置/关闭替换/卸载时调用。
++ (void)stopVideoFeeder {
+    g_videoFeederStop = YES;
+    os_unfair_lock_lock(&g_videoFrameLock);
+    if (g_videoRendered) { CVPixelBufferRelease(g_videoRendered); g_videoRendered = NULL; }
+    g_videoFrameTaken = NO;
+    os_unfair_lock_unlock(&g_videoFrameLock);
 }
 @end
 
@@ -1042,7 +1188,7 @@ static VCamAudioProxy *g_audioProxy = nil;
 - (void)toggleRotate  { g_rotation   = (g_rotation + 90) % 360; vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleLoop    { g_isLoop     = !g_isLoop;     vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleSound   { g_isSound    = !g_isSound;    vcm_saveSettings(); [self refreshGridButtons]; }
-- (void)toggleReplace { g_isReplace  = !g_isReplace;  vcm_saveSettings(); [self refreshGridButtons]; }
+- (void)toggleReplace { g_isReplace  = !g_isReplace;  if (!g_isReplace) [VCamMediaManager stopVideoFeeder]; vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
 
 #pragma mark - 面板刷新
@@ -1108,10 +1254,21 @@ static VCamAudioProxy *g_audioProxy = nil;
     vcm_reloadReaders();
     NSError *copyErr = nil;
     if (hasVideo) {
-        NSString *dest = vcm_videoPath();
-        if ([g_fileManager fileExistsAtPath:dest]) [g_fileManager removeItemAtPath:dest error:nil];
-        BOOL copied = [g_fileManager copyItemAtPath:src toPath:dest error:&copyErr];
-        if (!copied) return;
+        // 按导入文件真实扩展名落地（如 mp4 存 .mp4），与音频逻辑一致，避免写死 .mov 扩展名。
+        // 先删掉同前缀的旧扩展名残留文件，再设新路径并持久化。
+        [g_fileManager removeItemAtPath:g_videoPath error:nil];
+        for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
+            if ([old hasPrefix:@"bear_vcam_temp."]) {
+                [g_fileManager removeItemAtPath:[g_videoDir stringByAppendingPathComponent:old] error:nil];
+            }
+        }
+        NSString *ext = [src pathExtension].lowercaseString;
+        if (ext.length == 0) ext = @"mov";
+        g_videoPath = [[g_videoDir stringByAppendingPathComponent:
+                        [NSString stringWithFormat:@"bear_vcam_temp.%@", ext]] copy];
+        vcm_saveSettings();   // 持久化真实扩展名，否则重启后找不到文件
+        BOOL copied = [g_fileManager copyItemAtPath:src toPath:g_videoPath error:&copyErr];
+        if (!copied) { [self updateStatusUI]; return; }
         // 停掉 reader 而不只是清冻结帧：换素材时若循环关闭且旧 reader 已读完，setup 里的 loop 门禁会把重建挡掉。
         vcm_stopReaders();
         g_isReplace = YES;
@@ -1203,13 +1360,23 @@ static void vcm_installTapGesture(UIWindow *win) {
     g_fileManager = [NSFileManager defaultManager];
     g_mediaLock   = [[NSLock alloc] init];
     vcm_loadSettings();
-    g_ciContext = [CIContext contextWithOptions:@{
-        kCIContextWorkingColorSpace: [NSNull null],
-    }];
+    // 渲染后端优先 Metal：把旋转/缩放/合成从 CPU 卸到 GPU，弱调度环境（TrollStore 注入）下大幅降负载。
+    // 无 Metal 设备时回退 CPU 渲染，功能不变。
+    id<MTLDevice> mtlDevice = MTLCreateSystemDefaultDevice();
+    if (mtlDevice) {
+        g_ciContext = [CIContext contextWithMTLDevice:mtlDevice
+                                              options:@{ kCIContextWorkingColorSpace: [NSNull null] }];
+    } else {
+        g_ciContext = [CIContext contextWithOptions:@{ kCIContextWorkingColorSpace: [NSNull null] }];
+    }
+    // 视频预取专用串行队列：显式 USER_INITIATED QoS，不挤占音频解码用的 HIGH 队列，也避免被系统限流。
+    g_videoFeedQueue = dispatch_queue_create("com.vcam.videofeeder", DISPATCH_QUEUE_SERIAL);
+    dispatch_set_target_queue(g_videoFeedQueue, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
     g_videoDir = [vcm_documentPath() stringByAppendingPathComponent:@"VCAM"];
     [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
-    // 音频素材路径由 vcm_loadSettings 决定（优先用持久化的真实扩展名文件），缺省给默认 .m4a 名兜底。
+    // 素材路径由 vcm_loadSettings 决定（优先用持久化的真实扩展名文件），缺省给默认名兜底。
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
+    g_videoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
     vcm_loadSettings();
 
     if ([g_fileManager fileExistsAtPath:vcm_videoPath()]) {
