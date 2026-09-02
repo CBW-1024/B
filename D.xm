@@ -71,6 +71,24 @@ static void WCBLog(NSString *fmt, ...) {
 
 // 窗口开关：仅在状态真正翻转时记录。
 // 关闭时顺带输出本窗口内官方包名命中次数，为零说明伪造没生效。
+//
+// 嵌套安全：登录/前后台类钩子是"包裹式"（进入开窗、%orig 后关窗），
+// 而人脸流程是"长窗口"。两者会互相嵌套——实测日志里人脸进行中
+// applicationDidBecomeActive: 触发并直接把人脸窗口关掉，
+// makeAutoAuth 内部又嵌套 startAutoAuth:。若包裹式钩子无条件置 NO，
+// 内层退出时会提前收掉外层的窗。因此这类钩子统一采用
+// "保存旧值 → 开窗 → %orig → 仅在自己开窗时才收口"的模式，
+// 由 WCBFlagBegin/WCBFlagEnd 成对使用。
+static inline BOOL WCBFlagBegin(const char *where) {
+    BOOL prev = g_inAuthChain;
+    WCBSetFlag(YES, where);
+    return prev;
+}
+
+static inline void WCBFlagEnd(BOOL prev, const char *where) {
+    if (!prev) WCBSetFlag(NO, where);
+}
+
 static void WCBSetFlag(BOOL on, const char *where) {
     @synchronized (WCBLogPath()) {
         if (g_inAuthChain == on) return;
@@ -110,16 +128,16 @@ static void WCBHit(const char *where) {
 %hook WCAccountManualAuthControlLogic
 - (id)genManualAuthRequest:(BOOL)arg {
     WCBHit("WCAccountManualAuthControlLogic -genManualAuthRequest:");
-    WCBSetFlag(YES, "WCAccountManualAuthControlLogic.genManualAuthRequest:");
+    BOOL prev = WCBFlagBegin("WCAccountManualAuthControlLogic.genManualAuthRequest:");
     id r = %orig;
-    WCBSetFlag(NO, "WCAccountManualAuthControlLogic.genManualAuthRequest:");
+    WCBFlagEnd(prev, "WCAccountManualAuthControlLogic.genManualAuthRequest:");
     return r;
 }
 - (id)genManualAuthRequest {
     WCBHit("WCAccountManualAuthControlLogic -genManualAuthRequest");
-    WCBSetFlag(YES, "WCAccountManualAuthControlLogic.genManualAuthRequest");
+    BOOL prev = WCBFlagBegin("WCAccountManualAuthControlLogic.genManualAuthRequest");
     id r = %orig;
-    WCBSetFlag(NO, "WCAccountManualAuthControlLogic.genManualAuthRequest");
+    WCBFlagEnd(prev, "WCAccountManualAuthControlLogic.genManualAuthRequest");
     return r;
 }
 %end
@@ -129,9 +147,9 @@ static void WCBHit(const char *where) {
 %hook WCAccountAutoLoginControlLogic
 - (BOOL)startAutoAuth:(id)arg {
     WCBHit("WCAccountAutoLoginControlLogic -startAutoAuth:");
-    WCBSetFlag(YES, "WCAccountAutoLoginControlLogic.startAutoAuth:");
+    BOOL prev = WCBFlagBegin("WCAccountAutoLoginControlLogic.startAutoAuth:");
     BOOL r = %orig;
-    WCBSetFlag(NO, "WCAccountAutoLoginControlLogic.startAutoAuth:");
+    WCBFlagEnd(prev, "WCAccountAutoLoginControlLogic.startAutoAuth:");
     return r;
 }
 %end
@@ -143,15 +161,15 @@ static void WCBHit(const char *where) {
 %hook WCAccountControlMgr
 - (void)startManualAuth {
     WCBHit("WCAccountControlMgr -startManualAuth");
-    WCBSetFlag(YES, "WCAccountControlMgr.startManualAuth");
+    BOOL prev = WCBFlagBegin("WCAccountControlMgr.startManualAuth");
     %orig;
-    WCBSetFlag(NO, "WCAccountControlMgr.startManualAuth");
+    WCBFlagEnd(prev, "WCAccountControlMgr.startManualAuth");
 }
 - (void)makeAutoAuth {
     WCBHit("WCAccountControlMgr -makeAutoAuth");
-    WCBSetFlag(YES, "WCAccountControlMgr.makeAutoAuth");
+    BOOL prev = WCBFlagBegin("WCAccountControlMgr.makeAutoAuth");
     %orig;
-    WCBSetFlag(NO, "WCAccountControlMgr.makeAutoAuth");
+    WCBFlagEnd(prev, "WCAccountControlMgr.makeAutoAuth");
 }
 %end
 
@@ -163,15 +181,15 @@ static void WCBHit(const char *where) {
 %hook MicroMessengerAppDelegate
 - (void)applicationDidBecomeActive:(id)arg {
     WCBHit("MicroMessengerAppDelegate -applicationDidBecomeActive:");
-    WCBSetFlag(YES, "MicroMessengerAppDelegate.applicationDidBecomeActive:");
+    BOOL prev = WCBFlagBegin("MicroMessengerAppDelegate.applicationDidBecomeActive:");
     %orig;
-    WCBSetFlag(NO, "MicroMessengerAppDelegate.applicationDidBecomeActive:");
+    WCBFlagEnd(prev, "MicroMessengerAppDelegate.applicationDidBecomeActive:");
 }
 - (void)applicationWillEnterForeground:(id)arg {
     WCBHit("MicroMessengerAppDelegate -applicationWillEnterForeground:");
-    WCBSetFlag(YES, "MicroMessengerAppDelegate.applicationWillEnterForeground:");
+    BOOL prev = WCBFlagBegin("MicroMessengerAppDelegate.applicationWillEnterForeground:");
     %orig;
-    WCBSetFlag(NO, "MicroMessengerAppDelegate.applicationWillEnterForeground:");
+    WCBFlagEnd(prev, "MicroMessengerAppDelegate.applicationWillEnterForeground:");
 }
 - (void)applicationDidEnterBackground:(id)arg {
     WCBHit("MicroMessengerAppDelegate -applicationDidEnterBackground:");
@@ -378,8 +396,16 @@ static void WCBHit(const char *where) {
 %end
 
 // Hook 13: FaceRecogFlashHandler 活体检测与上传
-// 真正的活体检测与数据上传处理器。start 处打开窗口作为纵深，
-// 流水线结束与结果回调处关闭。
+// 真正的活体检测与数据上传处理器。
+// 重要教训（实测日志得出）：callbackFlashWithData:error: 在一次人脸
+// 会话里会被调用多次（本次实测 4 次，间隔数秒，err 均为 null），
+// 它贯穿"活体检测完成 → 数据提交服务器"的全过程。早期版本在第一次
+// 回调就把窗口关掉，导致后面几次真正提交给服务器的请求带着真实
+// 测试版 bid，服务器据此拒绝，最终 procedureDidFailed。日志表现为
+// officialBidHits=76 之后再无命中。因此这两个回调一律改为"只开不关"：
+// 每次进入都确保窗口打开，绝不提前收口。窗口的最终关闭交给
+// FaceRecogPayHandler 的 faceRecogHandlerDidFinish:/DidCancel: 与
+// FaceRecogBaseViewController 的 procedureDidFinish/procedureDidFailed。
 %hook FaceRecogFlashHandler
 - (void)start {
     WCBHit("FaceRecogFlashHandler -start");
@@ -388,12 +414,12 @@ static void WCBHit(const char *where) {
 }
 - (void)onPipelineFinishWithSuccess:(BOOL)arg {
     WCBLog(@"HIT  FaceRecogFlashHandler -onPipelineFinishWithSuccess: success=%d", arg);
+    WCBSetFlag(YES, "FaceRecogFlashHandler.onPipelineFinishWithSuccess:");
     %orig;
-    WCBSetFlag(NO, "FaceRecogFlashHandler.onPipelineFinishWithSuccess:");
 }
 - (void)callbackFlashWithData:(id)arg1 error:(id)arg2 {
     WCBLog(@"HIT  FaceRecogFlashHandler -callbackFlashWithData:error: err=%@", arg2);
+    WCBSetFlag(YES, "FaceRecogFlashHandler.callbackFlashWithData:error:");
     %orig;
-    WCBSetFlag(NO, "FaceRecogFlashHandler.callbackFlashWithData:error:");
 }
 %end
