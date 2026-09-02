@@ -227,9 +227,9 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
             for (NSNumber *o in opts) {
                 double v = o.doubleValue;
                 // centerCellForSel: 文字居中、右侧无箭头（参照 WCTableViewCellManager.h:70）
-                id optCell = [cellCls centerCellForSel:@selector(delayOptionTapped:)
-                                               target:self
-                                                title:[NSString stringWithFormat:@"[%.1f秒]", v]];
+                WCTableViewCellManager *optCell = [cellCls centerCellForSel:@selector(delayOptionTapped:)
+                                                                     target:self
+                                                                      title:[NSString stringWithFormat:@"[%.1f秒]", v]];
                 DD_SetCellOption(optCell, o);
                 optCell.userInfo = o;
                 [section addCell:optCell];
