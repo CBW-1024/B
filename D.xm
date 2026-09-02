@@ -1,8 +1,8 @@
 // DDTR - 转账自动收款 + 自动回复
 
-// 延迟收款秒数：点击展开下拉选择
+// 延迟收款秒数：点击展开下拉选择（centerCellForSel: 居中、无右侧箭头），4个秒数选项 [x.x秒]；父级行（延迟收款秒数/启用自动回复/自定义回复）
 // 自定义回复：输入框 + 确认按钮（rightView，无箭头）
-// 回复内容为空时等于不自动回复
+// 回复内容为空时等于不自动回复；全部基于微信76 头文件核对
 
 #import <UIKit/UIKit.h>
 #import <substrate.h>
@@ -474,11 +474,10 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
 
 %ctor {
     @autoreleasepool {
-        [DDTRConfig shared];
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
             [[mgr sharedInstance] registerControllerWithTitle:@"DD转账自动收款"
-                                                      version:@"1.1.0"
+                                                      version:@"1.0.0"
                                                    controller:@"DDTRSettingsViewController"];
         }
     }
