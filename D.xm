@@ -48,6 +48,29 @@ static BOOL g_inAuthChain = NO;
     %orig;
     g_inAuthChain = NO;
 }
+- (void)makeAutoAuth {
+    g_inAuthChain = YES;
+    %orig;
+    g_inAuthChain = NO;
+}
+- (void)makeAutoAuthForUpdateInfo {
+    g_inAuthChain = YES;
+    %orig;
+    g_inAuthChain = NO;
+}
+%end
+
+%hook MicroMessengerAppDelegate
+- (void)applicationDidBecomeActive:(id)arg {
+    g_inAuthChain = YES;
+    %orig;
+    g_inAuthChain = NO;
+}
+- (void)applicationWillEnterForeground:(id)arg {
+    g_inAuthChain = YES;
+    %orig;
+    g_inAuthChain = NO;
+}
 %end
 
 %hook ManualAuthAesReqData
