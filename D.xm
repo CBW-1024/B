@@ -2,13 +2,20 @@
 
 #define WC_OFFICIAL_BID @"com.tencent.xin"
 
-%hook NSBundle
-
-- (NSString *)bundleIdentifier {
-    if (self == [NSBundle mainBundle]) {
-        return WC_OFFICIAL_BID;
-    }
-    return %orig;
+%hook ManualAuthAesReqData
+- (void)setBundleId:(NSString *)bundleId {
+    %orig(WC_OFFICIAL_BID);
 }
+- (NSString *)bundleId {
+    return WC_OFFICIAL_BID;
+}
+%end
 
+%hook AutoAuthAesReqData
+- (void)setBundleId:(NSString *)bundleId {
+    %orig(WC_OFFICIAL_BID);
+}
+- (NSString *)bundleId {
+    return WC_OFFICIAL_BID;
+}
 %end
