@@ -1,248 +1,126 @@
 #import <Foundation/Foundation.h>
 
 // WCBetaUnlock
-// 让微信内测/测试版包名（如 om.tencent.qy.xin / com.tencent.wx /
-// com.tencent.mm.xin）能够正常登录并通过人脸核身。原理：在登录与
-// 人脸核身流程期间，把主 bundle 的 bundleIdentifier 伪装成官方正式版
-// 包名 com.tencent.xin，使服务器不按内测白名单拒绝，也不按测试版
-// bid 拒绝人脸。流程之外保持真实 bundle id，避免污染推送与 UI。
-//
-// 日志：写入微信沙盒 Documents/WCBetaUnlock.log（未越狱也能取）。
-// 每条格式 [+秒.毫秒] HIT/FLAG。窗口翻转时会带上本窗口内
-// officialBidHits（返回官方包名的次数），用于确认伪造是否真的生效。
-// 注意 NSBundle -bundleIdentifier 调用极其频繁，故该处不逐条打日志，
-// 只累计命中次数，避免日志刷屏与影响性能；其余 hook 都记录命中，
-// 便于排查哪些 hook 从未触发（死钩子）。
-// 日志超过 1.5MB 自动覆盖重写，不会无限增长。
+// 让微信内测 / 测试版以官方正式版(com.tencent.xin)身份通过登录与人脸核身。
+// 原理：在登录、人脸核身流程期间，把主 bundle 的 bundleIdentifier 伪装成
+// 官方包名；流程之外保持真实包名，避免污染推送与 UI。官方正式版自身包名
+// 已是 com.tencent.xin，本插件对其完全不生效。
 
 #define WC_OFFICIAL_BID @"com.tencent.xin"
 
-// 鉴权/人脸窗口标志：为 YES 时，主 bundle 的 bundleIdentifier 返回官方包名
-static BOOL g_inAuthChain = NO;
+// 真实主 bundle 包名，于 %ctor 阶段读取（此时窗口未开，读到的是原始值）。
+// 用于判断当前是否运行在内测版：官方版此项等于 WC_OFFICIAL_BID，插件整体不生效。
+static NSString *WC_REAL_BID = nil;
 
-// 当前窗口内返回官方包名的次数
-static int g_bidHit = 0;
+// 伪装窗口标志：为 YES 时主 bundle 的 bundleIdentifier 返回官方包名。
+static BOOL g_masking = NO;
 
-static NSString *WCBLogPath(void) {
-    static NSString *path = nil;
-    if (!path) {
-        NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        path = [[dirs firstObject] stringByAppendingPathComponent:@"WCBetaUnlock.log"];
-    }
-    return path;
-}
+// 直接开 / 关窗口（人脸这类长窗口钩子使用）。
+static inline void WCBSetMasking(BOOL on) { g_masking = on; }
 
-static NSTimeInterval WCBElapsed(void) {
-    static NSTimeInterval t0 = 0;
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (t0 == 0) t0 = now;
-    return now - t0;
-}
-
-static void WCBWriteLog(NSString *line) {
-    NSString *full = [NSString stringWithFormat:@"[+%8.3f] %@\n", WCBElapsed(), line];
-    NSData *data = [full dataUsingEncoding:NSUTF8StringEncoding];
-    NSString *p = WCBLogPath();
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:p]) {
-        [fm createFileAtPath:p contents:nil attributes:nil];
-    } else {
-        NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
-        if (attr && [attr fileSize] > 1500000) {
-            [data writeToFile:p atomically:YES];
-            return;
-        }
-    }
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-    [fh seekToEndOfFile];
-    [fh writeData:data];
-    [fh closeFile];
-}
-
-static void WCBLog(NSString *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    @synchronized (WCBLogPath()) {
-        WCBWriteLog(msg);
-    }
-}
-
-// 窗口开关：仅在状态真正翻转时记录。
-// 关闭时顺带输出本窗口内官方包名命中次数，为零说明伪造没生效。
-//
-// 嵌套安全：登录/前后台类钩子是"包裹式"（进入开窗、%orig 后关窗），
-// 而人脸流程是"长窗口"。两者会互相嵌套——人脸进行中 app 回到前台
-// 也会触发 applicationDidBecomeActive:，若此时无条件收口会提前收掉人脸的长窗口；
-// makeAutoAuth 内部又嵌套 startAutoAuth:。若包裹式钩子无条件置 NO，
-// 内层退出时会提前收掉外层的窗。因此这类钩子统一采用
-// "保存旧值 → 开窗 → %orig → 仅在自己开窗时才收口"的模式，
-// 由 WCBFlagBegin/WCBFlagEnd 成对使用。
-static void WCBSetFlag(BOOL on, const char *where);
-
-static inline BOOL WCBFlagBegin(const char *where) {
-    BOOL prev = g_inAuthChain;
-    WCBSetFlag(YES, where);
+// 包裹式开 / 关：保存旧状态并开窗，返回旧状态；%orig 后仅当自己开的窗才收口，
+// 避免嵌套钩子里层退出时提前收掉外层窗（人脸长窗口与登录重连相互嵌套）。
+static inline BOOL WCBBeginMasking(void) {
+    BOOL prev = g_masking;
+    g_masking = YES;
     return prev;
 }
-
-static inline void WCBFlagEnd(BOOL prev, const char *where) {
-    if (!prev) WCBSetFlag(NO, where);
+static inline void WCBEndMasking(BOOL prev) {
+    if (!prev) g_masking = NO;
 }
 
-static void WCBSetFlag(BOOL on, const char *where) {
-    @synchronized (WCBLogPath()) {
-        if (g_inAuthChain == on) return;
-        if (!on) {
-            WCBWriteLog([NSString stringWithFormat:@"FLAG OFF @ %s (officialBidHits=%d)", where, g_bidHit]);
-            g_bidHit = 0;
-        } else {
-            WCBWriteLog([NSString stringWithFormat:@"FLAG  ON @ %s", where]);
-        }
-        g_inAuthChain = on;
-    }
-}
-
-static void WCBHit(const char *where) {
-    WCBLog(@"HIT  %s", where);
-}
-
-// Hook 1: NSBundle -bundleIdentifier
-// 核心伪装点。当处于登录或人脸窗口（g_inAuthChain 为 YES）且是主
-// bundle 时，返回官方包名 com.tencent.xin；其余情况返回真实值。
-// 微信的登录请求、风控上报、人脸核身公共包头都从这里读取 bundle id，
-// 因此只改这一处即可覆盖所有这些上送路径。
-// 此处不打逐条日志，只累计命中次数（窗口关闭时统一输出）。
+// 核心伪装点：登录 / 人脸流程期间，主 bundle 返回官方包名。
+// 微信登录请求、风控上报、人脸核身公共包头都从这里读 bundle id，故只改这一处即可。
+// 官方版(WC_REAL_BID == WC_OFFICIAL_BID)下条件恒假，伪装不触发。
 %hook NSBundle
 - (NSString *)bundleIdentifier {
-    if (g_inAuthChain && self == [NSBundle mainBundle]) {
-        g_bidHit++;
+    if (g_masking && self == [NSBundle mainBundle] && ![WC_REAL_BID isEqualToString:WC_OFFICIAL_BID]) {
         return WC_OFFICIAL_BID;
     }
     return %orig;
 }
 %end
 
-// Hook 2: WCAccountManualAuthControlLogic -genManualAuthRequest: / -genManualAuthRequest
-// 手动登录请求体的构造入口。打开鉴权窗口包裹整个构造过程，使请求体
-// 内外所有读取 bundle id 的地方（含风控、版本上报）一并拿到官方包名。
+// 手动登录请求体构造入口：开窗包裹整个构造，使请求体内部所有读 bundle id 处拿到官方包名。
 %hook WCAccountManualAuthControlLogic
 - (id)genManualAuthRequest:(BOOL)arg {
-    WCBHit("WCAccountManualAuthControlLogic -genManualAuthRequest:");
-    BOOL prev = WCBFlagBegin("WCAccountManualAuthControlLogic.genManualAuthRequest:");
+    BOOL prev = WCBBeginMasking();
     id r = %orig;
-    WCBFlagEnd(prev, "WCAccountManualAuthControlLogic.genManualAuthRequest:");
+    WCBEndMasking(prev);
     return r;
 }
 - (id)genManualAuthRequest {
-    WCBHit("WCAccountManualAuthControlLogic -genManualAuthRequest");
-    BOOL prev = WCBFlagBegin("WCAccountManualAuthControlLogic.genManualAuthRequest");
+    BOOL prev = WCBBeginMasking();
     id r = %orig;
-    WCBFlagEnd(prev, "WCAccountManualAuthControlLogic.genManualAuthRequest");
+    WCBEndMasking(prev);
     return r;
 }
 %end
 
-// Hook 3: WCAccountAutoLoginControlLogic -startAutoAuth:
-// 自动登录入口。打开鉴权窗口，覆盖自动登录请求构造时的包名读取。
+// 自动登录入口：开窗覆盖自动登录请求构造时的包名读取。
 %hook WCAccountAutoLoginControlLogic
 - (BOOL)startAutoAuth:(id)arg {
-    WCBHit("WCAccountAutoLoginControlLogic -startAutoAuth:");
-    BOOL prev = WCBFlagBegin("WCAccountAutoLoginControlLogic.startAutoAuth:");
+    BOOL prev = WCBBeginMasking();
     BOOL r = %orig;
-    WCBFlagEnd(prev, "WCAccountAutoLoginControlLogic.startAutoAuth:");
+    WCBEndMasking(prev);
     return r;
 }
 %end
 
-// Hook 4: WCAccountControlMgr -startManualAuth / -makeAutoAuth
-// 账号控制管理器的手动重登与回到前台/超时重连入口。打开鉴权窗口，
-// 覆盖这些重连路径下的包名读取。实测 startManualAuth 在重新登录时
-// 会触发一次，makeAutoAuth 在前台重连时频繁触发。
+// 账号管理器的手动重登与前台 / 超时重连入口：开窗覆盖这些重连路径下的包名读取。
 %hook WCAccountControlMgr
 - (void)startManualAuth {
-    WCBHit("WCAccountControlMgr -startManualAuth");
-    BOOL prev = WCBFlagBegin("WCAccountControlMgr.startManualAuth");
+    BOOL prev = WCBBeginMasking();
     %orig;
-    WCBFlagEnd(prev, "WCAccountControlMgr.startManualAuth");
+    WCBEndMasking(prev);
 }
 - (void)makeAutoAuth {
-    WCBHit("WCAccountControlMgr -makeAutoAuth");
-    BOOL prev = WCBFlagBegin("WCAccountControlMgr.makeAutoAuth");
+    BOOL prev = WCBBeginMasking();
     %orig;
-    WCBFlagEnd(prev, "WCAccountControlMgr.makeAutoAuth");
+    WCBEndMasking(prev);
 }
 %end
 
-// Hook 5: MicroMessengerAppDelegate 前后台生命周期
-// 划掉后台再打开时，微信在这两个回调期间触发自动重连，因此打开
-// 鉴权窗口覆盖前台重连的包名读取。这两个方法仅做登录链路的包裹式
-// 开关（WCBFlagBegin/WCBFlagEnd），不额外强制收口——人脸窗口的收口
-// 交给 FaceRecogBaseHandler 的 dealloc 兜底（微信切后台即关，dealloc 会触发）。
+// 前后台生命周期：回到前台时微信触发自动重连，开窗覆盖重连的包名读取。
+// 仅做包裹式开关，不额外强制收口；人脸窗口由 FaceRecogBaseHandler 自行收口。
 %hook MicroMessengerAppDelegate
 - (void)applicationDidBecomeActive:(id)arg {
-    WCBHit("MicroMessengerAppDelegate -applicationDidBecomeActive:");
-    BOOL prev = WCBFlagBegin("MicroMessengerAppDelegate.applicationDidBecomeActive:");
+    BOOL prev = WCBBeginMasking();
     %orig;
-    WCBFlagEnd(prev, "MicroMessengerAppDelegate.applicationDidBecomeActive:");
+    WCBEndMasking(prev);
 }
 - (void)applicationWillEnterForeground:(id)arg {
-    WCBHit("MicroMessengerAppDelegate -applicationWillEnterForeground:");
-    BOOL prev = WCBFlagBegin("MicroMessengerAppDelegate.applicationWillEnterForeground:");
+    BOOL prev = WCBBeginMasking();
     %orig;
-    WCBFlagEnd(prev, "MicroMessengerAppDelegate.applicationWillEnterForeground:");
+    WCBEndMasking(prev);
 }
 %end
 
-// Hook 6: FaceRecogBaseHandler 人脸核身（唯一的人脸钩子，开关都在这一类）
-// 人脸 CGI 不带 bundleId 字段，bid 取自微信统一公共包头
-// （即 NSBundle.bundleIdentifier），所以只需控制住主 bundle 的
-// bundleIdentifier，无需逐个 hook 发包方法。
-//
-// 为什么只 hook 这一类就够——微信四条人脸流程的继承/持有关系：
-//   FaceRecogBaseHandler
-//     └─ FaceRecogInternelHandler（持有 FaceRecogFlashHandler）
-//          └─ FaceRecog3rdVerifyHandler（第三方核身）
-//   WebviewJSEventHandler_internelWxFaceVerify 持有 InternelHandler
-//     （新设备登录验证走这条）
-//   FaceRecogPayHandler : NSObject（支付，唯一不是 BaseHandler 子类的）
-// 前三条直接继承或持有 BaseHandler；支付那条虽是独立 NSObject，但实测
-// 日志显示它内部启动的活体处理器同样走到 -startFaceRecog（+48.378，
-// 在其自身 startFace: 之后约 3 秒）。故 startFaceRecog 是四条路的共同
-// 入口，而 onRealFinish / faceRecogDidCancel / dealloc 是共同终态，
-// 开关都落在同一个类即可覆盖支付实名、绑卡、重置支付密码、新设备
-// 登录验证、第三方核身等全部人脸场景。
-//
-// 实测病根：officialBidHits=76 说明伪造生效，活体回调 err=(null) 说明
-// 本地检测成功，但窗口在第一次 callbackFlashWithData: 时就被关掉了，
-// 后续提交服务器的请求带着真实测试版 bid。因此开窗后不再设任何中间
-// 收口点——窗口是全局时间区间，首尾卡准即覆盖全程；钩得越密反而越多
-// "提前收口"的机会，这正是旧版失效的原因。
-//
-// 收口点的选择：onRealFinish 是正常结束、faceRecogDidCancel 是用户
-// 取消，两者都只在终态触发；dealloc 作为兜底，保证即使前两者因异常
-// 路径未触发，窗口也会随 handler 释放而关闭，不会长期卡在开启状态
-// （卡住会让主 bundle 一直返回官方 bid，污染推送与 UI）。
+// 人脸核身：微信各人脸流程(支付实名 / 绑卡 / 重置支付密码 / 新设备登录 / 第三方核身)
+// 最终都经 FaceRecogBaseHandler。startFaceRecog 是共同入口，onRealFinish /
+// faceRecogDidCancel / dealloc 是共同终态，开窗与收口都落在这一个类。
+// 人脸 CGI 不带 bundleId 字段，bid 取自统一公共包头(即 NSBundle.bundleIdentifier)，
+// 故只需控制主 bundle 的包名即可覆盖全部人脸场景。
 %hook FaceRecogBaseHandler
 - (void)startFaceRecog {
-    WCBHit("FaceRecogBaseHandler -startFaceRecog");
-    WCBSetFlag(YES, "FaceRecogBaseHandler.startFaceRecog");
+    WCBSetMasking(YES);
     %orig;
 }
 - (void)onRealFinish {
-    WCBHit("FaceRecogBaseHandler -onRealFinish");
     %orig;
-    WCBSetFlag(NO, "FaceRecogBaseHandler.onRealFinish");
+    WCBSetMasking(NO);
 }
 - (void)faceRecogDidCancel {
-    WCBHit("FaceRecogBaseHandler -faceRecogDidCancel");
     %orig;
-    WCBSetFlag(NO, "FaceRecogBaseHandler.faceRecogDidCancel");
+    WCBSetMasking(NO);
 }
 - (void)dealloc {
-    WCBHit("FaceRecogBaseHandler -dealloc");
-    WCBSetFlag(NO, "FaceRecogBaseHandler.dealloc");
+    WCBSetMasking(NO);
     %orig;
 }
 %end
+
+// 启动缓存真实包名，决定插件是否对当前安装生效。
+%ctor {
+    WC_REAL_BID = [[NSBundle mainBundle] bundleIdentifier];
+}
