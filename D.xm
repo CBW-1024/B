@@ -7,6 +7,10 @@
 //       校验（AuthSectResp.applyBetaUrl 不返回）。
 //       用 g_inAuthChain 标志位把伪装限定在鉴权链路窗口内，
 //       链外仍返回真实 bundle id，避免污染推送/UI。
+//       保留 hook：NSBundle.bundleIdentifier、genManualAuthRequest:*、
+//       startAutoAuth:、WCAccountControlMgr.startManualAuth/makeAutoAuth、
+//       MicroMessengerAppDelegate 前后台。死代码 startAutoAuth/
+//       makeAutoAuthForUpdateInfo/请求类 setBundleId 已据日志删除。
 // 日志：编译时设 WC_LOG=1 会在微信沙盒 Documents/WCBetaUnlock.log
 //       记录每个 hook 的触发情况，便于排查是否有多余 hook。
 // ============================================================
@@ -115,11 +119,12 @@ static void WCLog(NSString *fmt, ...) {
 %end
 
 // ============================================================
-// Hook 3: WCAccountControlMgr 统一鉴权调度入口
-// startManualAuth / startAutoAuth 是手动/自动登录的统一调度点；
-// makeAutoAuth / makeAutoAuthForUpdateInfo 是回到前台或信息更新时
-// 触发的重连/刷新入口。全部包裹标志位，覆盖所有重连时机。
-// 锚定: WCAccountControlMgr.h:31/39/49/50
+// Hook 3: WCAccountControlMgr 重连/手动登录入口
+// makeAutoAuth 是回到前台或会话超时触发的自动重连入口，必须包裹
+// 标志位；startManualAuth 是手动重登路径(实测重登时触发 1 次)，
+// 同样需要覆盖。日志实测 startAutoAuth / makeAutoAuthForUpdateInfo
+// 从未走到，已移除；setBundleId 双保险 setter 也从未被调用，已移除。
+// 锚定: WCAccountControlMgr.h:31/49
 // ============================================================
 %hook WCAccountControlMgr
 - (void)startManualAuth {
@@ -129,26 +134,12 @@ static void WCLog(NSString *fmt, ...) {
     g_inAuthChain = NO;
     WCLog(@"startManualAuth 退出鉴权链");
 }
-- (void)startAutoAuth {
-    g_inAuthChain = YES;
-    WCLog(@"startAutoAuth 进入鉴权链");
-    %orig;
-    g_inAuthChain = NO;
-    WCLog(@"startAutoAuth 退出鉴权链");
-}
 - (void)makeAutoAuth {
     g_inAuthChain = YES;
     WCLog(@"makeAutoAuth 进入鉴权链");
     %orig;
     g_inAuthChain = NO;
     WCLog(@"makeAutoAuth 退出鉴权链");
-}
-- (void)makeAutoAuthForUpdateInfo {
-    g_inAuthChain = YES;
-    WCLog(@"makeAutoAuthForUpdateInfo 进入鉴权链");
-    %orig;
-    g_inAuthChain = NO;
-    WCLog(@"makeAutoAuthForUpdateInfo 退出鉴权链");
 }
 %end
 
@@ -174,24 +165,4 @@ static void WCLog(NSString *fmt, ...) {
     g_inAuthChain = NO;
     WCLog(@"applicationWillEnterForeground 退出鉴权链");
 }
-%end
-
-// ============================================================
-// Hook 5: ManualAuthAesReqData -setBundleId: / -bundleId
-// 双保险。手动登录请求体的 bundleId 字段(锚定 .h:22)直接钉死为
-// 官方包名，防止微信绕过 setter 直接写 ivar。
-// ============================================================
-%hook ManualAuthAesReqData
-- (void)setBundleId:(NSString *)bundleId { %orig(WC_OFFICIAL_BID); }
-- (NSString *)bundleId { return WC_OFFICIAL_BID; }
-%end
-
-// ============================================================
-// Hook 6: AutoAuthAesReqData -setBundleId: / -bundleId
-// 双保险。自动登录请求体的 bundleId 字段(锚定 .h:20)直接钉死为
-// 官方包名。
-// ============================================================
-%hook AutoAuthAesReqData
-- (void)setBundleId:(NSString *)bundleId { %orig(WC_OFFICIAL_BID); }
-- (NSString *)bundleId { return WC_OFFICIAL_BID; }
 %end
