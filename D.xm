@@ -79,6 +79,8 @@ static void WCBLog(NSString *fmt, ...) {
 // 内层退出时会提前收掉外层的窗。因此这类钩子统一采用
 // "保存旧值 → 开窗 → %orig → 仅在自己开窗时才收口"的模式，
 // 由 WCBFlagBegin/WCBFlagEnd 成对使用。
+static void WCBSetFlag(BOOL on, const char *where);
+
 static inline BOOL WCBFlagBegin(const char *where) {
     BOOL prev = g_inAuthChain;
     WCBSetFlag(YES, where);
