@@ -198,53 +198,54 @@ static void WCBHit(const char *where) {
 }
 %end
 
-// Hook 6: FaceRecogBaseHandler -startFaceRecog（全部人脸流程的共同入口）
+// Hook 6: FaceRecogBaseHandler 人脸核身（唯一的人脸钩子，开关都在这一类）
 // 人脸 CGI 不带 bundleId 字段，bid 取自微信统一公共包头
 // （即 NSBundle.bundleIdentifier），所以只需控制住主 bundle 的
 // bundleIdentifier，无需逐个 hook 发包方法。
 //
-// 为什么只 hook 这一个点就够——微信四条人脸流程的继承/持有关系：
+// 为什么只 hook 这一类就够——微信四条人脸流程的继承/持有关系：
 //   FaceRecogBaseHandler
 //     └─ FaceRecogInternelHandler（持有 FaceRecogFlashHandler）
 //          └─ FaceRecog3rdVerifyHandler（第三方核身）
 //   WebviewJSEventHandler_internelWxFaceVerify 持有 InternelHandler
 //     （新设备登录验证走这条）
 //   FaceRecogPayHandler : NSObject（支付，唯一不是 BaseHandler 子类的）
-// 前三条直接继承或持有 BaseHandler；支付那条虽然是独立 NSObject，
-// 但实测日志显示它内部启动的活体处理器同样走到
-// FaceRecogBaseHandler -startFaceRecog（+48.378，在其自身 startFace:
-// 之后约 3 秒）。因此 startFaceRecog 是四条路的共同入口，在此开窗
-// 即可一次性覆盖支付实名、绑卡、重置支付密码、新设备登录验证、
-// 第三方核身等全部人脸场景。
+// 前三条直接继承或持有 BaseHandler；支付那条虽是独立 NSObject，但实测
+// 日志显示它内部启动的活体处理器同样走到 -startFaceRecog（+48.378，
+// 在其自身 startFace: 之后约 3 秒）。故 startFaceRecog 是四条路的共同
+// 入口，而 onRealFinish / faceRecogDidCancel / dealloc 是共同终态，
+// 开关都落在同一个类即可覆盖支付实名、绑卡、重置支付密码、新设备
+// 登录验证、第三方核身等全部人脸场景。
 //
-// 实测病根：officialBidHits=76 说明伪造生效，活体回调 err=(null)
-// 说明本地检测成功，但窗口在第一次 callbackFlashWithData: 时就被
-// 关掉了，后续提交服务器的请求带着真实测试版 bid。因此这里开窗后
-// 不再设任何中间收口点——窗口是全局时间区间，首尾卡准即覆盖全程；
-// 钩得越密反而越多"提前收口"的机会，这正是旧版失效的原因。
+// 实测病根：officialBidHits=76 说明伪造生效，活体回调 err=(null) 说明
+// 本地检测成功，但窗口在第一次 callbackFlashWithData: 时就被关掉了，
+// 后续提交服务器的请求带着真实测试版 bid。因此开窗后不再设任何中间
+// 收口点——窗口是全局时间区间，首尾卡准即覆盖全程；钩得越密反而越多
+// "提前收口"的机会，这正是旧版失效的原因。
+//
+// 收口点的选择：onRealFinish 是正常结束、faceRecogDidCancel 是用户
+// 取消，两者都只在终态触发；dealloc 作为兜底，保证即使前两者因异常
+// 路径未触发，窗口也会随 handler 释放而关闭，不会长期卡在开启状态
+// （卡住会让主 bundle 一直返回官方 bid，污染推送与 UI）。
 %hook FaceRecogBaseHandler
 - (void)startFaceRecog {
     WCBHit("FaceRecogBaseHandler -startFaceRecog");
     WCBSetFlag(YES, "FaceRecogBaseHandler.startFaceRecog");
     %orig;
 }
-%end
-
-// Hook 7: FaceRecogBaseViewController 收口（人脸界面的共同终点）
-// 所有人脸流程的结果最终都经 VC 呈现：成功走 procedureDidFinish，
-// 失败走 procedureDidFailed:errorTips:canRetry:（"系统繁忙，请重试"
-// 就由它渲染）。二者是跨场景的统一收口点，此处仅透传并打印服务端
-// 提示，不做阻断。
-// 若异常路径下二者都没触发，进后台安全网（Hook 5）会强制收口。
-%hook FaceRecogBaseViewController
-- (void)procedureDidFinish {
-    WCBHit("FaceRecogBaseViewController -procedureDidFinish");
+- (void)onRealFinish {
+    WCBHit("FaceRecogBaseHandler -onRealFinish");
     %orig;
-    WCBSetFlag(NO, "FaceRecogBaseViewController.procedureDidFinish");
+    WCBSetFlag(NO, "FaceRecogBaseHandler.onRealFinish");
 }
-- (void)procedureDidFailed:(id)arg1 errorTips:(id)arg2 canRetry:(BOOL)arg3 {
-    WCBLog(@"HIT  FaceRecogBaseViewController -procedureDidFailed  tips=%@ canRetry=%d", arg2, arg3);
+- (void)faceRecogDidCancel {
+    WCBHit("FaceRecogBaseHandler -faceRecogDidCancel");
     %orig;
-    WCBSetFlag(NO, "FaceRecogBaseViewController.procedureDidFailed");
+    WCBSetFlag(NO, "FaceRecogBaseHandler.faceRecogDidCancel");
+}
+- (void)dealloc {
+    WCBHit("FaceRecogBaseHandler -dealloc");
+    WCBSetFlag(NO, "FaceRecogBaseHandler.dealloc");
+    %orig;
 }
 %end
