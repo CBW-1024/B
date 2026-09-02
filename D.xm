@@ -343,7 +343,7 @@ static void DD_SendTransferReply(NSString *toUserName) {
     NSString *currentUser = DD_GetSelfUserName();
     if (!currentUser.length) return;
 
-    CMessageWrap *replyMsg = [[CMessageWrap alloc] initWithMsgType:1 nsFromUsr:toUserName];
+    CMessageWrap *replyMsg = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:1 nsFromUsr:toUserName];
     if (!replyMsg) return;
 
     replyMsg.m_nsContent = replyText;
