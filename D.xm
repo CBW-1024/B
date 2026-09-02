@@ -322,22 +322,6 @@ static NSString *DD_GetSelfUserName(void) {
 	return mgr.getSelfContact.m_nsUsrName;
 }
 
-static CContact *DD_GetContact(NSString *userName) {
-	if (!userName.length) return nil;
-	CContactMgr *mgr = DD_GetService(@"CContactMgr");
-	return [mgr getContactByName:userName];
-}
-
-static NSString *DD_GetContactDisplayName(NSString *userName) {
-	CContact *contact = DD_GetContact(userName);
-	if (contact) {
-		NSString *displayName = [contact getContactDisplayName];
-		if (displayName.length) return displayName;
-		if (contact.m_nsNickName.length) return contact.m_nsNickName;
-	}
-	return userName;
-}
-
 #pragma mark - 发送转账回复（自定义内容）
 
 static void DD_SendTransferReply(NSString *toUserName) {
