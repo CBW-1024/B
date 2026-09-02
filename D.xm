@@ -219,7 +219,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
         // 延迟收款秒数：表头显示当前值，点按展开下拉选项
         [section addCell:[cellCls normalCellForSel:@selector(delayHeaderTapped:)
                                           target:self
-                                           title:@"↳延迟收款秒数"
+                                           title:@"↳延迟秒数"
                                        rightValue:[NSString stringWithFormat:@"[%.1f秒]", [DDTRConfig shared].autoReceiveDelay]]];
 
         if (self.delayExpanded) {
@@ -238,7 +238,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 
         [section addCell:[cellCls switchCellForSel:@selector(autoReplySwitchChanged:)
                                           target:self
-                                           title:@"↳启用自动回复"
+                                           title:@"↳自动回复"
                                               on:[DDTRConfig shared].autoReplyEnabled]];
 
         if ([DDTRConfig shared].autoReplyEnabled) {
@@ -250,7 +250,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
             [self.contentField addTarget:self action:@selector(contentChanged:) forControlEvents:UIControlEventEditingChanged];
             [section addCell:[cellCls normalCellForSel:nil
                                               target:nil
-                                               title:@"↳自定义回复"
+                                               title:@"↳回复内容"
                                             rightView:[self inputRowWithField:self.contentField action:@selector(contentConfirmed:)]]];
         }
     }
@@ -476,7 +476,7 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD转账自动收款"
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD自动收款"
                                                       version:@"1.0.0"
                                                    controller:@"DDTRSettingsViewController"];
         }
