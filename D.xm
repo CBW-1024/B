@@ -1,6 +1,6 @@
 // DDTR - 转账自动收款 + 自动回复
 // 设置项改用 WCTableViewCellManager 下拉列表（normalCell 的 rightValue / selected:）
-// 避免键盘无法收起的问题；自定义回复内容经 UIAlertController 输入
+// 全部为列表选择，不弹窗、不弹键盘
 
 #import <UIKit/UIKit.h>
 #import <substrate.h>
@@ -259,17 +259,6 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
                     DD_SetCellOption(optCell, t);
                     [section addCell:optCell];
                 }
-                id customCell = [cellCls normalCellForSel:@selector(replyCustomTapped:)
-                                                   target:self
-                                               leftImage:nil
-                                                    title:@"自定义…"
-                                                   badge:nil
-                                               rightValue:nil
-                                               rightImage:nil
-                                          withRightRedDot:NO
-                                                 selected:NO];
-                DD_SetCellOption(customCell, @"__DD_CUSTOM__");
-                [section addCell:customCell];
             }
         }
     }
@@ -325,24 +314,6 @@ static id DD_CellOption(id cell) {
     if (t) [DDTRConfig shared].autoReplyContent = t;
     self.replyExpanded = NO;
     [self buildTable];
-}
-
-- (void)replyCustomTapped:(id)sender {
-    self.replyExpanded = NO;
-    [self buildTable];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"自定义回复内容"
-                                                                   message:nil
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"请输入回复内容";
-        tf.text = [DDTRConfig shared].autoReplyContent;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSString *txt = [alert.textFields.firstObject text];
-        if (txt.length) [DDTRConfig shared].autoReplyContent = txt;
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
 }
 
 @end
