@@ -1,4 +1,15 @@
-// DDTR.xm - 增强版（自动收款 + 自动回复感谢）
+// DDTR.xm - 增强版（自动收款 + 自动回复）
+//
+// 依赖的微信类/方法均已对照微信头文件 dump 核实：
+//   WCPayInfoItem / WCPayConfirmTransferRequest / WCPayLogicMgr
+//   CMessageWrap / CMessageMgr / CContact / CContactMgr / MMContext
+//   WCTableViewManager / WCTableViewSectionManager / WCTableViewCellManager
+//
+// 设置页“自定义回复内容 / 延迟收款秒数”的文本输入框，采用与 WCR 相同的
+// 做法：WCTableViewCellManager
+//   + normalCellForSel:target:title:rightView:
+// （WCTableViewCellManager.h:44）把 UITextField 作为 rightView 挂到 cell 上。
+
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 #import <objc/runtime.h>
@@ -23,7 +34,7 @@
 @property (retain, nonatomic) NSString *m_nsToUsr;
 @property (retain, nonatomic) NSString *m_nsContent;
 @property (retain, nonatomic) NSString *m_nsRealChatUsr;
-@property (assign, nonatomic) NSUInteger m_uiMessageType;
+@property (assign, nonatomic) unsigned int m_uiMessageType;
 @property (assign, nonatomic) long long m_n64MesSvrID;
 - (void)parseWCPayInfoItemIfNeed;
 @end
@@ -85,6 +96,7 @@
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
++ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;
 @end
 
 // 9. 插件管理器
@@ -95,10 +107,17 @@
 
 #pragma mark - 配置管理（DDTRConfig）
 
+static NSString *const kDDReceiveEnabled  = @"DDTransferAutoReceive";
+static NSString *const kDDReceiveDelay    = @"DDTransferAutoReceiveDelay";
+static NSString *const kDDReplyEnabled     = @"DDTransferAutoReplyEnabled";
+static NSString *const kDDReplyContent     = @"DDTransferAutoReplyContent";
+
 @interface DDTRConfig : NSObject
 + (instancetype)shared;
-@property (nonatomic) BOOL autoReceiveEnabled;
-@property (nonatomic) BOOL autoReplyEnabled;      // 自动回复总开关
+@property (nonatomic) BOOL autoReceiveEnabled;      // 启用自动收款
+@property (nonatomic) double autoReceiveDelay;      // 延迟收款秒数
+@property (nonatomic) BOOL autoReplyEnabled;        // 启用自动回复
+@property (nonatomic, copy) NSString *autoReplyContent; // 自定义回复内容
 @end
 
 @implementation DDTRConfig
@@ -112,33 +131,63 @@
 
 - (instancetype)init {
 	if (self = [super init]) {
-		_autoReceiveEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"DDTransferAutoReceive"];
-		if (![[NSUserDefaults standardUserDefaults] objectForKey:@"DDTransferAutoReceive"]) {
+		NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+
+		// 自动收款（默认开启）
+		if ([ud objectForKey:kDDReceiveEnabled]) {
+			_autoReceiveEnabled = [ud boolForKey:kDDReceiveEnabled];
+		} else {
 			_autoReceiveEnabled = YES;
-			[[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"DDTransferAutoReceive"];
+			[ud setBool:YES forKey:kDDReceiveEnabled];
 		}
-		
-		// 自动回复开关（默认关闭）
-		_autoReplyEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"DDTransferAutoReplyEnabled"];
-		if (![[NSUserDefaults standardUserDefaults] objectForKey:@"DDTransferAutoReplyEnabled"]) {
+
+		// 延迟收款秒数（默认 0.2 秒，向后兼容原写死的延迟）
+		_autoReceiveDelay = [ud objectForKey:kDDReceiveDelay]
+			? [ud doubleForKey:kDDReceiveDelay]
+			: 0.2;
+
+		// 启用自动回复（默认关闭）
+		if ([ud objectForKey:kDDReplyEnabled]) {
+			_autoReplyEnabled = [ud boolForKey:kDDReplyEnabled];
+		} else {
 			_autoReplyEnabled = NO;
-			[[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"DDTransferAutoReplyEnabled"];
+			[ud setBool:NO forKey:kDDReplyEnabled];
 		}
-		
-		[[NSUserDefaults standardUserDefaults] synchronize];
+
+		// 自定义回复内容（默认一条感谢语）
+		_autoReplyContent = [ud stringForKey:kDDReplyContent];
+		if (!_autoReplyContent) {
+			_autoReplyContent = @"感谢老板的转账💰！";
+			[ud setObject:_autoReplyContent forKey:kDDReplyContent];
+		}
+
+		[ud synchronize];
 	}
 	return self;
 }
 
-- (void)setAutoReceiveEnabled:(BOOL)autoReceiveEnabled {
-	_autoReceiveEnabled = autoReceiveEnabled;
-	[[NSUserDefaults standardUserDefaults] setBool:autoReceiveEnabled forKey:@"DDTransferAutoReceive"];
+- (void)setAutoReceiveEnabled:(BOOL)v {
+	_autoReceiveEnabled = v;
+	[[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDReceiveEnabled];
 	[[NSUserDefaults standardUserDefaults] synchronize];
 }
 
-- (void)setAutoReplyEnabled:(BOOL)autoReplyEnabled {
-	_autoReplyEnabled = autoReplyEnabled;
-	[[NSUserDefaults standardUserDefaults] setBool:autoReplyEnabled forKey:@"DDTransferAutoReplyEnabled"];
+- (void)setAutoReceiveDelay:(double)v {
+	if (v < 0) v = 0;
+	_autoReceiveDelay = v;
+	[[NSUserDefaults standardUserDefaults] setDouble:v forKey:kDDReceiveDelay];
+	[[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setAutoReplyEnabled:(BOOL)v {
+	_autoReplyEnabled = v;
+	[[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDReplyEnabled];
+	[[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setAutoReplyContent:(NSString *)v {
+	_autoReplyContent = [v copy];
+	[[NSUserDefaults standardUserDefaults] setObject:_autoReplyContent forKey:kDDReplyContent];
 	[[NSUserDefaults standardUserDefaults] synchronize];
 }
 
@@ -148,6 +197,8 @@
 
 @interface DDTRSettingsViewController : UIViewController
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
+@property (nonatomic, strong) UITextField *delayField;    // 延迟收款秒数
+@property (nonatomic, strong) UITextField *contentField;  // 自定义回复内容
 @end
 
 @implementation DDTRSettingsViewController
@@ -163,18 +214,7 @@
 	[super viewDidLoad];
 	self.title = @"DD转账自动收款";
 
-	[self.tableViewMgr clearAllSection];
-	WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") defaultSection];
-	[section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(switchChanged:)
-																		target:self
-																		 title:@"启用自动收款"
-																			on:[DDTRConfig shared].autoReceiveEnabled]];
-	// 添加自动回复开关
-	[section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(autoReplySwitchChanged:)
-																		target:self
-																		 title:@"自动回复感谢"
-																			on:[DDTRConfig shared].autoReplyEnabled]];
-	[self.tableViewMgr addSection:section];
+	[self rebuildSettings];
 
 	UITableView *tableView = [self.tableViewMgr getTableView];
 	tableView.frame = self.view.bounds;
@@ -183,12 +223,88 @@
 	[self.view addSubview:tableView];
 }
 
+// 依据当前配置重建整个设置列表。
+// “启用自动回复”开启时，才展开“自定义回复内容”输入框；
+// 关闭时该输入框不渲染，实现“展开/收起”。
+- (void)rebuildSettings {
+	[self.tableViewMgr clearAllSection];
+
+	// ---- 收款区 ----
+	WCTableViewSectionManager *recvSection = [objc_getClass("WCTableViewSectionManager") defaultSection];
+
+	[recvSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(switchChanged:)
+																		  target:self
+																		   title:@"启用自动收款"
+																			  on:[DDTRConfig shared].autoReceiveEnabled]];
+
+	// 延迟收款秒数：右侧挂一个小数键盘的数字输入框
+	self.delayField = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 90, 30)];
+	self.delayField.placeholder = @"0.2";
+	self.delayField.text = [NSString stringWithFormat:@"%.2f", [DDTRConfig shared].autoReceiveDelay];
+	self.delayField.keyboardType = UIKeyboardTypeDecimalPad;
+	self.delayField.textAlignment = NSTextAlignmentRight;
+	[self.delayField addTarget:self action:@selector(delayChanged:) forControlEvents:UIControlEventEditingChanged];
+	[recvSection addCell:[objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(delayCellTapped:)
+																		   target:self
+																			title:@"延迟收款秒数"
+																		  rightView:self.delayField]];
+	[self.tableViewMgr addSection:recvSection];
+
+	// ---- 自动回复区 ----
+	WCTableViewSectionManager *replySection = [objc_getClass("WCTableViewSectionManager") defaultSection];
+
+	[replySection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(autoReplySwitchChanged:)
+																		   target:self
+																			title:@"启用自动回复"
+																			   on:[DDTRConfig shared].autoReplyEnabled]];
+
+	// 仅在开启自动回复时展开“自定义回复内容”
+	if ([DDTRConfig shared].autoReplyEnabled) {
+		self.contentField = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 220, 30)];
+		self.contentField.placeholder = @"请输入回复内容";
+		self.contentField.text = [DDTRConfig shared].autoReplyContent;
+		self.contentField.textAlignment = NSTextAlignmentRight;
+		[self.contentField addTarget:self action:@selector(contentChanged:) forControlEvents:UIControlEventEditingChanged];
+		[replySection addCell:[objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(contentCellTapped:)
+																			 target:self
+																			  title:@"自定义回复内容"
+																			rightView:self.contentField]];
+	}
+	[self.tableViewMgr addSection:replySection];
+}
+
+#pragma mark 开关回调
+
 - (void)switchChanged:(UISwitch *)sender {
 	[DDTRConfig shared].autoReceiveEnabled = sender.isOn;
 }
 
 - (void)autoReplySwitchChanged:(UISwitch *)sender {
 	[DDTRConfig shared].autoReplyEnabled = sender.isOn;
+	// 重新构建列表以实现“自定义回复内容”的展开/收起
+	[self rebuildSettings];
+	[self.tableViewMgr reloadTableView];
+}
+
+#pragma mark 文本框回调
+
+// 点击 cell（右侧文本框区域）时聚焦输入框，便于直接输入
+- (void)delayCellTapped:(id)sender {
+	[self.delayField becomeFirstResponder];
+}
+
+- (void)contentCellTapped:(id)sender {
+	[self.contentField becomeFirstResponder];
+}
+
+// 实时保存延迟秒数
+- (void)delayChanged:(UITextField *)field {
+	[DDTRConfig shared].autoReceiveDelay = field.text.doubleValue;
+}
+
+// 实时保存自定义回复内容
+- (void)contentChanged:(UITextField *)field {
+	[DDTRConfig shared].autoReplyContent = field.text;
 }
 
 @end
@@ -222,119 +338,50 @@ static NSString *DD_GetContactDisplayName(NSString *userName) {
 	return userName;
 }
 
-#pragma mark - 回复语资源
-
-static NSArray *DD_GetReplyMessages(void) {
-	static NSArray *messages = nil;
-	static dispatch_once_t onceToken;
-	dispatch_once(&onceToken, ^{
-		messages = @[
-			@"老板的转账已收到，心里暖暖的💰，感恩遇见！",
-			@"每次老板转账都觉得特别幸福，感谢老板的关怀💰！",
-			@"老板的转账不只是钱，更是对我们的认可和鼓励💰❤️！",
-			@"感谢老板的慷慨，跟着您干，再累都值得💰！",
-			@"老板转账的时候最有人格魅力💰，真心感谢！",
-			@"转账虽小，情意重，老板的心意我们都记在心里💰！",
-			@"谢谢老板的厚爱，努力干活回报您💰！",
-			@"老板每次转账都让人感动，太贴心了💰！",
-			@"老板这手速，转账比我还快💰，活该您发财！",
-			@"老板转账的姿势，堪称教科书级别💰！",
-			@"老板的转账一出手，就知道有没有💰，太顶了！",
-			@"老板不仅会赚钱，更会散财💰，格局打开了！",
-			@"老板的手气真好，转账都这么吉利💰！",
-			@"老板转账的样子，像极了财神爷下凡💰！",
-			@"老板，下次能不能偷偷告诉我什么时候转账💰？",
-			@"收到老板转账的时候，我的网速从来没让我失望过💰！",
-			@"老板的转账治好了我多年的颈椎病💰！",
-			@"老板，你这转账发得我都不好意思不加班了💰😂！",
-			@"老板的转账让我相信人间有真情💰，明天继续搬砖！",
-			@"收到老板转账的那一刻，我感觉自己中了彩票💰！",
-			@"刚想买杯咖啡，老板转账就到了💰，太及时了！",
-			@"今天本来有点丧，老板一个转账满血复活💰⚡！",
-			@"早上一睁眼就看到老板的转账，今天注定是美好的一天💰☀️！",
-			@"工作累了，老板转账来提神，比红牛还管用💰！",
-			@"下雨天和老板的转账最配💰🌧️，心情瞬间放晴！",
-			@"午饭时间收到老板转账，这顿饭吃得格外香💰🍚！",
-			@"老板的转账收到了，祝老板财源滚滚，日进斗金💰💰！",
-			@"谢谢老板转账，祝老板股票全红，基金全涨💰📈！",
-			@"老板的转账已领，祝老板家庭幸福，事业腾飞💰🦅！",
-			@"感谢老板，祝您出门遇贵人，在家数钱忙💰🏠！",
-			@"谢谢老板转账💰，福气回送给您，好运加倍！",
-			@"转账是意外之喜，感谢是发自内心💰✨！",
-			@"每一笔转账都是老板的善意，每一次收到都是幸运💰🍀！",
-			@"金钱有价，心意无价，感谢老板的转账💰💎！",
-			@"老板的转账像一束光，照亮了打工人平凡的一天💰☀️！",
-			@"转账带来的快乐很简单，却足够温暖一整天💰❤️！",
-			@"老板转账，大家收得开心，干活更有劲💰💪！",
-			@"一笔转账拉近了我们和老板的距离💰🤝，感谢！",
-			@"老板的转账让团队更有温度，干活都带风💰🌪️！",
-			@"有老板的转账在，咱们团队的凝聚力就是强💰🛡️！",
-			@"谢谢老板，咱们跟着您一起冲，一起赢💰🏆！",
-			@"💰💰💰感谢老板三连！转账收到，快乐加倍！",
-			@"老板的转账🤑让我的钱包瞬间鼓起来了，感谢！",
-			@"🍀收到老板转账，好运+1，幸福+1，感谢老板💰！",
-			@"🔥老板的转账太火爆了，一秒收完，幸好有我💰！",
-			@"💯给老板的转账打个满分，感谢大气的老板💰！",
-			@"这笔转账我收下了，老板的心意我也收下了💰！",
-			@"老板大气，话不多说，都在转账里了💰！",
-			@"感谢老板，转账已领，干活更有劲了💰！",
-			@"老板的转账到了，今天的目标就是好好工作💰！",
-			@"领了老板的转账，就是老板的人了💰🤝！",
-			@"Thank you 老板，转账太nice了💰！",
-			@"老板的转账让我感觉so lucky💰🍀！",
-			@"Good luck 老板，转账very good💰👍！",
-			@"老板转账，简直perfect💰💯！",
-			@"老板大气，转账feeling so good💰😎！",
-		];
-	});
-	return messages;
-}
-
-static NSString *DD_GetRandomReply(void) {
-	NSArray *messages = DD_GetReplyMessages();
-	if (messages.count == 0) return @"感谢老板的转账💰！";
-	NSInteger index = arc4random_uniform((uint32_t)messages.count);
-	return messages[index];
-}
-
-#pragma mark - 发送转账感谢回复
+#pragma mark - 发送转账回复（自定义内容）
 
 static void DD_SendTransferReply(NSString *toUserName) {
 	@autoreleasepool {
 		if (!toUserName || toUserName.length == 0) return;
 		if (![DDTRConfig shared].autoReplyEnabled) return;
-		
+
+		// 使用自定义回复内容（空则回退默认感谢语）
+		NSString *replyText = [DDTRConfig shared].autoReplyContent;
+		if (!replyText.length) replyText = @"感谢老板的转账💰！";
+
 		@try {
-			NSString *replyText = DD_GetRandomReply();
-			
 			CMessageMgr *msgMgr = DD_GetService(@"CMessageMgr");
 			if (!msgMgr) return;
-			
+
 			NSString *currentUser = DD_GetSelfUserName();
 			if (!currentUser.length) return;
-			
+
 			Class msgWrapClass = NSClassFromString(@"CMessageWrap");
 			if (!msgWrapClass) return;
-			
+
 			SEL initSelector = NSSelectorFromString(@"initWithMsgType:nsFromUsr:");
 			if (![msgWrapClass instancesRespondToSelector:initSelector]) return;
-			
+
 			#pragma clang diagnostic push
 			#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-			CMessageWrap *replyMsg = [[msgWrapClass alloc] performSelector:initSelector 
-																 withObject:@(1) 
+			CMessageWrap *replyMsg = [[msgWrapClass alloc] performSelector:initSelector
+																 withObject:@(1)
 																 withObject:toUserName];
 			#pragma clang diagnostic pop
-			
+
 			if (!replyMsg) return;
-			
+
 			replyMsg.m_nsContent = replyText;
 			replyMsg.m_nsFromUsr = currentUser;
 			replyMsg.m_nsToUsr = toUserName;
-			
+
 			[msgMgr AddMsg:toUserName MsgWrap:replyMsg];
-			[msgMgr SendMsg:toUserName MsgWrap:replyMsg];
-			
+			// 头文件 dump 中 CMessageMgr 未暴露 SendMsg:MsgWrap:，
+			// 旧版微信运行时仍可能存在，故做能力探测避免新版崩溃。
+			if ([msgMgr respondsToSelector:@selector(SendMsg:MsgWrap:)]) {
+				[msgMgr SendMsg:toUserName MsgWrap:replyMsg];
+			}
+
 		} @catch (NSException *exception) {
 			// 静默处理
 		}
@@ -348,14 +395,12 @@ static BOOL DD_IsTransfer(CMessageWrap *msg) {
 	[msg parseWCPayInfoItemIfNeed];
 	WCPayInfoItem *info = msg.m_oWCPayInfoItem;
 	if (!info) return NO;
-	
-	// 子类型为 3 或 4，或者存在转账 ID
+
 	if (info.m_uiPaySubType != 3 && info.m_uiPaySubType != 4 && info.m_nsTransferID.length == 0) {
 		return NO;
 	}
 	if (info.m_nsTransferID.length == 0) return NO;
-	
-	// 排除红包：检查 URL 和内容
+
 	NSString *url = info.m_c2cNativeUrl ?: @"";
 	if ([url rangeOfString:@"receivehongbao" options:NSCaseInsensitiveSearch].location != NSNotFound) {
 		return NO;
@@ -385,36 +430,33 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
 	if (![DDTRConfig shared].autoReceiveEnabled) return;
 	if (!sessionId.length || !wrap) return;
 	if (!DD_IsTransfer(wrap)) return;
-	
+
 	WCPayInfoItem *info = wrap.m_oWCPayInfoItem;
 	if (!info.m_nsTransferID.length) return;
-	
-	// 状态判断：排除已领取（1）和已过期（2）
+
 	unsigned int status = info.m_c2cPayReceiveStatus;
 	if (status == 1 || status == 2) return;
-	
-	// 去重
+
 	NSString *key = [NSString stringWithFormat:@"%@|%lld", info.m_nsTransferID, wrap.m_n64MesSvrID];
 	NSCache *cache = DD_ProcessedCache();
 	if ([cache objectForKey:key]) return;
 	[cache setObject:@(YES) forKey:key];
-	
-	// 获取自身用户名
+
 	NSString *selfUser = DD_GetSelfUserName();
 	if (!selfUser.length) return;
-	
-	// 确定付款方
+
 	BOOL isGroup = [wrap.m_nsFromUsr rangeOfString:@"@chatroom"].location != NSNotFound;
 	NSString *peer = isGroup ? (wrap.m_nsRealChatUsr ?: @"") : (wrap.m_nsFromUsr ?: @"");
 	if (!peer.length || [peer isEqualToString:selfUser]) return;
-	
-	// 延迟 0.2 秒后执行确认
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+
+	// 按“延迟收款秒数”配置延迟后执行确认
+	double delay = [DDTRConfig shared].autoReceiveDelay;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 		if (![DDTRConfig shared].autoReceiveEnabled) return;
-		
+
 		WCPayLogicMgr *logic = DD_GetService(@"WCPayLogicMgr");
 		if (!logic || ![logic respondsToSelector:@selector(ConfirmTransferMoney:)]) return;
-		
+
 		WCPayConfirmTransferRequest *req = [[objc_getClass("WCPayConfirmTransferRequest") alloc] init];
 		req.m_nsTransferID = info.m_nsTransferID;
 		req.m_nsFromUserName = peer;
@@ -424,22 +466,17 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
 			req.groupType = 1;
 		}
 		req.m_nsTransferAttach = info.transfer_attach;
-		
+
 		@try {
 			[logic ConfirmTransferMoney:req];
-			
-			// ============================================================
-			// 自动收款成功后，发送感谢回复（延迟1.5秒避免冲突）
-			// ============================================================
-			if ([DDTRConfig shared].autoReplyEnabled) {
-				// 判断不是自己给自己转账
-				if (![peer isEqualToString:selfUser]) {
-					dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-						DD_SendTransferReply(peer);
-					});
-				}
+
+			// 自动收款成功后，发送自定义回复（延迟 1.5 秒避免冲突）
+			if ([DDTRConfig shared].autoReplyEnabled && ![peer isEqualToString:selfUser]) {
+				dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+					DD_SendTransferReply(peer);
+				});
 			}
-			
+
 		} @catch (NSException *e) {}
 	});
 }
@@ -462,7 +499,7 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
 		[DDTRConfig shared];
 		if (NSClassFromString(@"WCPluginsMgr")) {
 			[[objc_getClass("WCPluginsMgr") sharedInstance] registerControllerWithTitle:@"DD转账自动收款"
-																			   version:@"1.0.0"
+																			   version:@"1.1.0"
 																			controller:@"DDTRSettingsViewController"];
 		}
 	}
