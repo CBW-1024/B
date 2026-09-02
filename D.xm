@@ -186,7 +186,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD转账自动收款";
+    self.title = @"转账收款设置";
     [self ensureTableViewMgr];
     if (!_tableViewMgr) return;
     [self buildTable];
@@ -476,7 +476,7 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD自动收款"
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD转账收款"
                                                       version:@"1.0.0"
                                                    controller:@"DDTRSettingsViewController"];
         }
