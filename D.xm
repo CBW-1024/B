@@ -1,6 +1,7 @@
 // DDTR - 转账自动收款 + 自动回复
-// 设置项沿用 WCTableViewCellManager 的 rightView：输入框 + 确认按钮（参照 DDHB.txt）
-// 既支持自己输入，点确认即可写入并收起键盘，不弹窗
+// 延迟收款秒数：点击展开下拉选择（WCTableViewCellManager 的 rightValue / selected:）
+// 自定义回复内容：输入框 + 确认按钮（rightView，无箭头，参照 DDHB.txt）
+// 回复内容为空时等于不自动回复；全部基于微信76 头文件核对
 
 #import <UIKit/UIKit.h>
 #import <substrate.h>
@@ -75,6 +76,8 @@
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;
++ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
++ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 leftImage:(id)arg3 title:(id)arg4 badge:(id)arg5 rightValue:(id)arg6 rightImage:(id)arg7 withRightRedDot:(BOOL)arg8 selected:(BOOL)arg9;
 @end
 
 @interface WCPluginsMgr : NSObject
@@ -152,8 +155,8 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 
 @interface DDTRSettingsViewController : UIViewController
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
-@property (nonatomic, strong) UITextField *delayField;
 @property (nonatomic, strong) UITextField *contentField;
+@property (nonatomic) BOOL delayExpanded;
 @end
 
 @implementation DDTRSettingsViewController
@@ -188,6 +191,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 }
 
 // 总开关“启用自动收款”控制整个分组；子开关“启用自动回复”控制回复项。
+// 延迟收款秒数为下拉选择；自定义回复内容为输入框 + 确认按钮。
 - (void)buildTable {
     id cellCls = objc_getClass("WCTableViewCellManager");
     id secCls = objc_getClass("WCTableViewSectionManager");
@@ -203,17 +207,31 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
                                           on:[DDTRConfig shared].autoReceiveEnabled]];
 
     if ([DDTRConfig shared].autoReceiveEnabled) {
-        // 延迟收款秒数：输入框 + 确认按钮（挂在 rightView）
-        self.delayField = [[UITextField alloc] init];
-        self.delayField.placeholder = @"0.2";
-        self.delayField.text = [NSString stringWithFormat:@"%.2f", [DDTRConfig shared].autoReceiveDelay];
-        self.delayField.keyboardType = UIKeyboardTypeDecimalPad;
-        self.delayField.textAlignment = NSTextAlignmentRight;
-        [self.delayField addTarget:self action:@selector(delayChanged:) forControlEvents:UIControlEventEditingChanged];
-        [section addCell:[cellCls normalCellForSel:@selector(delayCellTapped:)
+        // 延迟收款秒数：表头显示当前值，点按展开下拉选项
+        [section addCell:[cellCls normalCellForSel:@selector(delayHeaderTapped:)
                                           target:self
                                            title:@"延迟收款秒数"
-                                        rightView:[self inputRowWithField:self.delayField action:@selector(delayConfirmed:)]]];
+                                       rightValue:[NSString stringWithFormat:@"%.1f秒", [DDTRConfig shared].autoReceiveDelay]]];
+
+        if (self.delayExpanded) {
+            NSArray *opts = @[@0.2, @1.0, @3.0, @5.0];
+            double cur = [DDTRConfig shared].autoReceiveDelay;
+            for (NSNumber *o in opts) {
+                double v = o.doubleValue;
+                BOOL sel = fabs(v - cur) < 0.001;
+                id optCell = [cellCls normalCellForSel:@selector(delayOptionTapped:)
+                                              target:self
+                                            leftImage:nil
+                                                 title:[NSString stringWithFormat:@"%.1f秒", v]
+                                                badge:nil
+                                           rightValue:nil
+                                           rightImage:nil
+                                      withRightRedDot:NO
+                                             selected:sel];
+                DD_SetCellOption(optCell, o);
+                [section addCell:optCell];
+            }
+        }
 
         [section addCell:[cellCls switchCellForSel:@selector(autoReplySwitchChanged:)
                                           target:self
@@ -221,14 +239,14 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
                                               on:[DDTRConfig shared].autoReplyEnabled]];
 
         if ([DDTRConfig shared].autoReplyEnabled) {
-            // 自定义回复内容：输入框 + 确认按钮
+            // 自定义回复内容：输入框 + 确认按钮（无箭头）
             self.contentField = [[UITextField alloc] init];
             self.contentField.placeholder = @"请输入回复内容";
             self.contentField.text = [DDTRConfig shared].autoReplyContent;
             self.contentField.textAlignment = NSTextAlignmentRight;
             [self.contentField addTarget:self action:@selector(contentChanged:) forControlEvents:UIControlEventEditingChanged];
-            [section addCell:[cellCls normalCellForSel:@selector(contentCellTapped:)
-                                              target:self
+            [section addCell:[cellCls normalCellForSel:nil
+                                              target:nil
                                                title:@"自定义回复内容"
                                             rightView:[self inputRowWithField:self.contentField action:@selector(contentConfirmed:)]]];
         }
@@ -265,25 +283,29 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
     [self buildTable];
 }
 
-- (void)delayCellTapped:(id)sender {
-    [self.delayField becomeFirstResponder];
+// 把下拉项对应的值挂到 cell 上，点击时回读
+static const void *kDDOptionValue = &kDDOptionValue;
+static void DD_SetCellOption(id cell, id value) {
+    objc_setAssociatedObject(cell, kDDOptionValue, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static id DD_CellOption(id cell) {
+    return objc_getAssociatedObject(cell, kDDOptionValue);
 }
 
-- (void)contentCellTapped:(id)sender {
-    [self.contentField becomeFirstResponder];
+- (void)delayHeaderTapped:(id)sender {
+    self.delayExpanded = !self.delayExpanded;
+    [self buildTable];
 }
 
-- (void)delayChanged:(UITextField *)field {
-    [DDTRConfig shared].autoReceiveDelay = field.text.doubleValue;
+- (void)delayOptionTapped:(id)sender {
+    NSNumber *o = DD_CellOption(sender);
+    if (o) [DDTRConfig shared].autoReceiveDelay = o.doubleValue;
+    self.delayExpanded = NO;
+    [self buildTable];
 }
 
 - (void)contentChanged:(UITextField *)field {
     [DDTRConfig shared].autoReplyContent = field.text;
-}
-
-- (void)delayConfirmed:(id)sender {
-    [DDTRConfig shared].autoReceiveDelay = self.delayField.text.doubleValue;
-    [self.delayField resignFirstResponder];
 }
 
 - (void)contentConfirmed:(id)sender {
@@ -313,8 +335,8 @@ static void DD_SendTransferReply(NSString *toUserName) {
         if (!toUserName.length) return;
         if (![DDTRConfig shared].autoReplyEnabled) return;
 
-        NSString *replyText = [DDTRConfig shared].autoReplyContent;
-        if (!replyText.length) replyText = @"感谢老板的转账💰！";
+            NSString *replyText = [DDTRConfig shared].autoReplyContent;
+            if (!replyText.length) return; // 回复内容为空等于不自动回复
 
         @try {
             CMessageMgr *msgMgr = DD_GetService(@"CMessageMgr");
