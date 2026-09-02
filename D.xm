@@ -1,6 +1,6 @@
 // DDTR - 转账自动收款 + 自动回复
-// 延迟收款秒数：点击展开下拉选择（WCTableViewCellManager 的 rightValue / selected:）
-// 自定义回复内容：输入框 + 确认按钮（rightView，无箭头，参照 DDHB.txt）
+// 延迟收款秒数：点击展开下拉选择（WCTableViewCellManager 的 rightValue / selected:），选项前加 ↳、文本加 []、去箭头
+// 自定义回复：输入框 + 确认按钮（rightView，无箭头，参照 DDHB.txt）
 // 回复内容为空时等于不自动回复；全部基于微信76 头文件核对
 
 #import <UIKit/UIKit.h>
@@ -65,8 +65,10 @@
 - (instancetype)initWithFrame:(CGRect)frame style:(NSInteger)style;
 - (void)clearAllSection;
 - (id)getTableView;
+- (id)cellInfoAtIndexPath:(NSIndexPath *)indexPath;
 - (void)addSection:(id)arg1;
 - (void)reloadTableView;
+@property (nonatomic, weak) id delegate;
 @end
 
 @interface WCTableViewSectionManager : NSObject
@@ -79,6 +81,7 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 leftImage:(id)arg3 title:(id)arg4 badge:(id)arg5 rightValue:(id)arg6 rightImage:(id)arg7 withRightRedDot:(BOOL)arg8 selected:(BOOL)arg9;
+@property (nonatomic, retain) id userInfo;
 @end
 
 @interface WCPluginsMgr : NSObject
@@ -119,7 +122,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
         [ud setDouble:_autoReceiveDelay forKey:kDDReceiveDelay];
         _autoReplyEnabled = [ud objectForKey:kDDReplyEnabled] ? [ud boolForKey:kDDReplyEnabled] : NO;
         [ud setBool:_autoReplyEnabled forKey:kDDReplyEnabled];
-        _autoReplyContent = [ud stringForKey:kDDReplyContent] ?: @"感谢老板的转账💰！";
+        _autoReplyContent = [ud stringForKey:kDDReplyContent] ?: @"已收款💰，感谢❤️";
         [ud setObject:_autoReplyContent forKey:kDDReplyContent];
         [ud synchronize];
     }
@@ -154,13 +157,15 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 
 #pragma mark - 设置界面
 
-@interface DDTRSettingsViewController : UIViewController
+@interface DDTRSettingsViewController : UIViewController <UITableViewDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
 @property (nonatomic, strong) UITextField *contentField;
 @property (nonatomic) BOOL delayExpanded;
 @end
 
-@implementation DDTRSettingsViewController
+@implementation DDTRSettingsViewController {
+    id<UITableViewDelegate> _originalDelegate;
+}
 
 - (void)ensureTableViewMgr {
     if (_tableViewMgr) return;
@@ -188,10 +193,12 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     [self.view addSubview:tableView];
+    _originalDelegate = self.tableViewMgr.delegate;
+    self.tableViewMgr.delegate = self;
 }
 
 // 总开关“启用自动收款”控制整个分组；子开关“启用自动回复”控制回复项。
-// 延迟收款秒数为下拉选择；自定义回复内容为输入框 + 确认按钮。
+// 延迟收款秒数为下拉选择；自定义回复为输入框 + 确认按钮。
 - (void)buildTable {
     id cellCls = objc_getClass("WCTableViewCellManager");
     id secCls = objc_getClass("WCTableViewSectionManager");
@@ -211,7 +218,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
         [section addCell:[cellCls normalCellForSel:@selector(delayHeaderTapped:)
                                           target:self
                                            title:@"延迟收款秒数"
-                                       rightValue:[NSString stringWithFormat:@"%.1f秒", [DDTRConfig shared].autoReceiveDelay]]];
+                                       rightValue:[NSString stringWithFormat:@"[%.1f秒]", [DDTRConfig shared].autoReceiveDelay]]];
 
         if (self.delayExpanded) {
             NSArray *opts = @[@0.2, @1.0, @3.0, @5.0];
@@ -222,13 +229,14 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
                 id optCell = [cellCls normalCellForSel:@selector(delayOptionTapped:)
                                               target:self
                                             leftImage:nil
-                                                 title:[NSString stringWithFormat:@"%.1f秒", v]
+                                                 title:[NSString stringWithFormat:@"↳[%.1f秒]", v]
                                                 badge:nil
                                            rightValue:nil
                                            rightImage:nil
                                       withRightRedDot:NO
                                              selected:sel];
                 DD_SetCellOption(optCell, o);
+                optCell.userInfo = @"DelayOption";
                 [section addCell:optCell];
             }
         }
@@ -239,7 +247,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
                                               on:[DDTRConfig shared].autoReplyEnabled]];
 
         if ([DDTRConfig shared].autoReplyEnabled) {
-            // 自定义回复内容：输入框 + 确认按钮（无箭头）
+            // 自定义回复：输入框 + 确认按钮（无箭头）
             self.contentField = [[UITextField alloc] init];
             self.contentField.placeholder = @"请输入回复内容";
             self.contentField.text = [DDTRConfig shared].autoReplyContent;
@@ -247,7 +255,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
             [self.contentField addTarget:self action:@selector(contentChanged:) forControlEvents:UIControlEventEditingChanged];
             [section addCell:[cellCls normalCellForSel:nil
                                               target:nil
-                                               title:@"自定义回复内容"
+                                               title:@"自定义回复"
                                             rightView:[self inputRowWithField:self.contentField action:@selector(contentConfirmed:)]]];
         }
     }
@@ -311,6 +319,30 @@ static id DD_CellOption(id cell) {
 - (void)contentConfirmed:(id)sender {
     [DDTRConfig shared].autoReplyContent = self.contentField.text;
     [self.contentField resignFirstResponder];
+}
+
+#pragma mark - UITableViewDelegate 转发
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)]) {
+        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+    }
+    WCTableViewCellManager *cellInfo = (WCTableViewCellManager *)[self.tableViewMgr cellInfoAtIndexPath:indexPath];
+    if (cellInfo && [cellInfo.userInfo isEqualToString:@"DelayOption"]) {
+        if (cell.accessoryType == UITableViewCellAccessoryDisclosureIndicator) {
+            cell.accessoryType = UITableViewCellAccessoryNone;
+        }
+    }
+}
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
+        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
+    }
+}
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)]) {
+        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
+    }
+    return UITableViewAutomaticDimension;
 }
 
 @end
