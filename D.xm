@@ -423,11 +423,12 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     unsigned int status = info.m_c2cPayReceiveStatus;
     if (status == 1 || status == 2) return;
 
-    // 方向判定：只处理“我是收款方”的转账，跳过我发出的转账被对方领取等情况
-    // （参照 WCPayInfoItem.h: transfer_receiver_username 收款人 / transfer_payer_username 付款人）
+    // 方向判定（参照 WCPayInfoItem.h:146 transfer_payer_username 付款人 / 147 transfer_receiver_username 收款人）
+    // 只处理“我是收款方”的待收转账，跳过我发出的转账被对方领取（transfer_payer_username 为我）误触发
     NSString *selfUser = DD_GetSelfUserName();
     if (!selfUser.length) return;
-    if (info.transfer_receiver_username.length > 0 && ![info.transfer_receiver_username isEqualToString:selfUser]) return;
+    if ([info.transfer_payer_username isEqualToString:selfUser]) return;                                                  // 我发出的转账：付款人是我，直接跳过
+    if (info.transfer_receiver_username.length > 0 && ![info.transfer_receiver_username isEqualToString:selfUser]) return; // 收款方明确不是我，也跳过
 
     NSString *key = [NSString stringWithFormat:@"%@|%lld", info.m_nsTransferID, wrap.m_n64MesSvrID];
     NSCache *cache = DD_ProcessedCache();
