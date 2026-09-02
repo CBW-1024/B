@@ -29,6 +29,7 @@ static BOOL g_inAuthChain = NO;
 // Hook 2: WCAccountManualAuthControlLogic -genManualAuthRequest: / -genManualAuthRequest
 // 手动登录请求体的构造入口。打开鉴权窗口包裹整个构造过程，使请求体
 // 内外所有读取 bundle id 的地方（含风控、版本上报）一并拿到官方包名。
+%hook WCAccountManualAuthControlLogic
 - (id)genManualAuthRequest:(BOOL)arg {
     g_inAuthChain = YES;
     id r = %orig;
