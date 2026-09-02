@@ -25,16 +25,9 @@ static void WCLog(NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
 
-    // 优先用微信自身取沙盒路径的类，兼容性更好
-    NSString *dir = nil;
-    Class pathUtil = NSClassFromString(@"MMPathUtility");
-    if (pathUtil && [pathUtil respondsToSelector:@selector(GetDocumentPath)]) {
-        dir = [pathUtil GetDocumentPath];
-    }
-    if (!dir || ![dir length]) {
-        NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        dir = docs.firstObject;
-    }
+    // 用标准 API 取沙盒 Documents 目录（不依赖微信私有类头文件）
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *dir = docs.firstObject;
     if (!dir) return;
 
     NSString *logPath = [dir stringByAppendingPathComponent:@"WCBetaUnlock.log"];
