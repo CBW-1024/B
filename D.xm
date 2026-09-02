@@ -18,6 +18,7 @@
 @property (retain, nonatomic) NSString *transfer_attach;
 @property (retain, nonatomic) NSString *transfer_payer_username;
 @property (retain, nonatomic) NSString *transfer_receiver_username;
+@property (retain, nonatomic) NSString *exclusive_recv_username;
 @end
 
 @interface CMessageWrap : NSObject
@@ -423,12 +424,14 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     unsigned int status = info.m_c2cPayReceiveStatus;
     if (status == 1 || status == 2) return;
 
-    // 方向判定（参照 WCPayInfoItem.h:146 transfer_payer_username 付款人 / 147 transfer_receiver_username 收款人）
-    // 只处理“我是收款方”的待收转账，跳过我发出的转账被对方领取（transfer_payer_username 为我）误触发
+    // 方向判定（参照 WCPayInfoItem.h:146-148 + WCR 多 key 提取逻辑）
+    // 只处理“收款人是我、付款人是别人”的待收转账；收款人不是我、或付款人是我都跳过
     NSString *selfUser = DD_GetSelfUserName();
     if (!selfUser.length) return;
-    if ([info.transfer_payer_username isEqualToString:selfUser]) return;                                                  // 我发出的转账：付款人是我，直接跳过
-    if (info.transfer_receiver_username.length > 0 && ![info.transfer_receiver_username isEqualToString:selfUser]) return; // 收款方明确不是我，也跳过
+
+    NSString *recv = info.transfer_receiver_username.length ? info.transfer_receiver_username : info.exclusive_recv_username;
+    if (![recv isEqualToString:selfUser]) return;                  // 收款人不是我 → 跳过（别人转别人、或我发出的转账被别人领取）
+    if ([info.transfer_payer_username isEqualToString:selfUser]) return; // 付款人是我 → 跳过（我发出的转账、自己转自己）
 
     NSString *key = [NSString stringWithFormat:@"%@|%lld", info.m_nsTransferID, wrap.m_n64MesSvrID];
     NSCache *cache = DD_ProcessedCache();
