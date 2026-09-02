@@ -25,6 +25,7 @@
 @property (retain, nonatomic) NSString *m_nsRealChatUsr;
 @property (assign, nonatomic) unsigned int m_uiMessageType;
 @property (assign, nonatomic) long long m_n64MesSvrID;
+- (id)initWithMsgType:(long long)arg1 nsFromUsr:(id)arg2;
 - (void)parseWCPayInfoItemIfNeed;
 @end
 
@@ -164,7 +165,6 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 - (void)ensureTableViewMgr {
     if (_tableViewMgr) return;
     id mgrCls = objc_getClass("WCTableViewManager");
-    if (!mgrCls) return;
     WCTableViewManager *mgr = [mgrCls alloc];
     _tableViewMgr = [mgr initWithFrame:[UIScreen mainScreen].bounds
                                  style:UITableViewStyleInsetGrouped];
@@ -195,7 +195,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 - (void)buildTable {
     id cellCls = objc_getClass("WCTableViewCellManager");
     id secCls = objc_getClass("WCTableViewSectionManager");
-    if (!cellCls || !secCls || !_tableViewMgr) return;
+    if (!_tableViewMgr) return;
 
     [self.tableViewMgr clearAllSection];
 
@@ -331,42 +331,26 @@ static NSString *DD_GetSelfUserName(void) {
 #pragma mark - 自动回复
 
 static void DD_SendTransferReply(NSString *toUserName) {
-    @autoreleasepool {
-        if (!toUserName.length) return;
-        if (![DDTRConfig shared].autoReplyEnabled) return;
+    if (!toUserName.length) return;
+    if (![DDTRConfig shared].autoReplyEnabled) return;
 
-            NSString *replyText = [DDTRConfig shared].autoReplyContent;
-            if (!replyText.length) return; // 回复内容为空等于不自动回复
+    NSString *replyText = [DDTRConfig shared].autoReplyContent;
+    if (!replyText.length) return; // 回复内容为空等于不自动回复
 
-        @try {
-            CMessageMgr *msgMgr = DD_GetService(@"CMessageMgr");
-            if (!msgMgr) return;
+    CMessageMgr *msgMgr = DD_GetService(@"CMessageMgr");
+    if (!msgMgr) return;
 
-            NSString *currentUser = DD_GetSelfUserName();
-            if (!currentUser.length) return;
+    NSString *currentUser = DD_GetSelfUserName();
+    if (!currentUser.length) return;
 
-            Class msgWrapClass = NSClassFromString(@"CMessageWrap");
-            if (!msgWrapClass) return;
+    CMessageWrap *replyMsg = [[CMessageWrap alloc] initWithMsgType:1 nsFromUsr:toUserName];
+    if (!replyMsg) return;
 
-            SEL initSelector = NSSelectorFromString(@"initWithMsgType:nsFromUsr:");
-            if (![msgWrapClass instancesRespondToSelector:initSelector]) return;
+    replyMsg.m_nsContent = replyText;
+    replyMsg.m_nsFromUsr = currentUser;
+    replyMsg.m_nsToUsr = toUserName;
 
-            #pragma clang diagnostic push
-            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            CMessageWrap *replyMsg = [[msgWrapClass alloc] performSelector:initSelector
-                                                             withObject:@(1)
-                                                             withObject:toUserName];
-            #pragma clang diagnostic pop
-
-            if (!replyMsg) return;
-
-            replyMsg.m_nsContent = replyText;
-            replyMsg.m_nsFromUsr = currentUser;
-            replyMsg.m_nsToUsr = toUserName;
-
-            [msgMgr AddMsg:toUserName MsgWrap:replyMsg];
-        } @catch (NSException *exception) {}
-    }
+    [msgMgr AddMsg:toUserName MsgWrap:replyMsg];
 }
 
 #pragma mark - 转账识别
@@ -427,7 +411,7 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
         if (![DDTRConfig shared].autoReceiveEnabled) return;
 
         WCPayLogicMgr *logic = DD_GetService(@"WCPayLogicMgr");
-        if (!logic || ![logic respondsToSelector:@selector(ConfirmTransferMoney:)]) return;
+        if (!logic) return;
 
         WCPayConfirmTransferRequest *req = [[objc_getClass("WCPayConfirmTransferRequest") alloc] init];
         req.m_nsTransferID = info.m_nsTransferID;
@@ -439,14 +423,12 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
         }
         req.m_nsTransferAttach = info.transfer_attach;
 
-        @try {
-            [logic ConfirmTransferMoney:req];
-            if ([DDTRConfig shared].autoReplyEnabled) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    DD_SendTransferReply(peer);
-                });
-            }
-        } @catch (NSException *e) {}
+        [logic ConfirmTransferMoney:req];
+        if ([DDTRConfig shared].autoReplyEnabled) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                DD_SendTransferReply(peer);
+            });
+        }
     });
 }
 
