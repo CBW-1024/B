@@ -1,7 +1,8 @@
 // DDTR - 转账自动收款 + 自动回复
-// 延迟收款秒数：点击展开下拉选择（WCTableViewCellManager 的 rightValue / selected:），选项前加 ↳、文本加 []、去箭头
-// 自定义回复：输入框 + 确认按钮（rightView，无箭头，参照 DDHB.txt）
-// 回复内容为空时等于不自动回复；全部基于微信76 头文件核对
+
+// 延迟收款秒数：点击展开下拉选择
+// 自定义回复：输入框 + 确认按钮（rightView，无箭头）
+// 回复内容为空时等于不自动回复
 
 #import <UIKit/UIKit.h>
 #import <substrate.h>
@@ -81,6 +82,7 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 leftImage:(id)arg3 title:(id)arg4 badge:(id)arg5 rightValue:(id)arg6 rightImage:(id)arg7 withRightRedDot:(BOOL)arg8 selected:(BOOL)arg9;
++ (id)centerCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3;
 @property (nonatomic, retain) id userInfo;
 @end
 
@@ -217,33 +219,26 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
         // 延迟收款秒数：表头显示当前值，点按展开下拉选项
         [section addCell:[cellCls normalCellForSel:@selector(delayHeaderTapped:)
                                           target:self
-                                           title:@"延迟收款秒数"
+                                           title:@"↳延迟收款秒数"
                                        rightValue:[NSString stringWithFormat:@"[%.1f秒]", [DDTRConfig shared].autoReceiveDelay]]];
 
         if (self.delayExpanded) {
-            NSArray *opts = @[@0.2, @1.0, @3.0, @5.0];
-            double cur = [DDTRConfig shared].autoReceiveDelay;
+            NSArray *opts = @[@0.2, @2.0, @5.0, @8.0];
             for (NSNumber *o in opts) {
                 double v = o.doubleValue;
-                BOOL sel = fabs(v - cur) < 0.001;
-                id optCell = [cellCls normalCellForSel:@selector(delayOptionTapped:)
-                                              target:self
-                                            leftImage:nil
-                                                 title:[NSString stringWithFormat:@"↳[%.1f秒]", v]
-                                                badge:nil
-                                           rightValue:nil
-                                           rightImage:nil
-                                      withRightRedDot:NO
-                                             selected:sel];
+                // centerCellForSel: 文字居中、右侧无箭头（参照 WCTableViewCellManager.h:70）
+                id optCell = [cellCls centerCellForSel:@selector(delayOptionTapped:)
+                                               target:self
+                                                title:[NSString stringWithFormat:@"[%.1f秒]", v]];
                 DD_SetCellOption(optCell, o);
-                optCell.userInfo = @"DelayOption";
+                optCell.userInfo = o;
                 [section addCell:optCell];
             }
         }
 
         [section addCell:[cellCls switchCellForSel:@selector(autoReplySwitchChanged:)
                                           target:self
-                                           title:@"启用自动回复"
+                                           title:@"↳启用自动回复"
                                               on:[DDTRConfig shared].autoReplyEnabled]];
 
         if ([DDTRConfig shared].autoReplyEnabled) {
@@ -255,7 +250,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
             [self.contentField addTarget:self action:@selector(contentChanged:) forControlEvents:UIControlEventEditingChanged];
             [section addCell:[cellCls normalCellForSel:nil
                                               target:nil
-                                               title:@"自定义回复"
+                                               title:@"↳自定义回复"
                                             rightView:[self inputRowWithField:self.contentField action:@selector(contentConfirmed:)]]];
         }
     }
@@ -327,10 +322,10 @@ static id DD_CellOption(id cell) {
         [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
     }
     WCTableViewCellManager *cellInfo = (WCTableViewCellManager *)[self.tableViewMgr cellInfoAtIndexPath:indexPath];
-    if (cellInfo && [cellInfo.userInfo isEqualToString:@"DelayOption"]) {
-        if (cell.accessoryType == UITableViewCellAccessoryDisclosureIndicator) {
-            cell.accessoryType = UITableViewCellAccessoryNone;
-        }
+    if (cellInfo && [cellInfo.userInfo isKindOfClass:[NSNumber class]]) {
+        double v = [(NSNumber *)cellInfo.userInfo doubleValue];
+        double cur = [DDTRConfig shared].autoReceiveDelay;
+        cell.accessoryType = (fabs(v - cur) < 0.001) ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
     }
 }
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
