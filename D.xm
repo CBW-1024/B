@@ -73,8 +73,8 @@ static void WCBLog(NSString *fmt, ...) {
 // 关闭时顺带输出本窗口内官方包名命中次数，为零说明伪造没生效。
 //
 // 嵌套安全：登录/前后台类钩子是"包裹式"（进入开窗、%orig 后关窗），
-// 而人脸流程是"长窗口"。两者会互相嵌套——实测日志里人脸进行中
-// applicationDidBecomeActive: 触发并直接把人脸窗口关掉，
+// 而人脸流程是"长窗口"。两者会互相嵌套——人脸进行中 app 回到前台
+// 也会触发 applicationDidBecomeActive:，若此时无条件收口会提前收掉人脸的长窗口；
 // makeAutoAuth 内部又嵌套 startAutoAuth:。若包裹式钩子无条件置 NO，
 // 内层退出时会提前收掉外层的窗。因此这类钩子统一采用
 // "保存旧值 → 开窗 → %orig → 仅在自己开窗时才收口"的模式，
@@ -177,9 +177,9 @@ static void WCBHit(const char *where) {
 
 // Hook 5: MicroMessengerAppDelegate 前后台生命周期
 // 划掉后台再打开时，微信在这两个回调期间触发自动重连，因此打开
-// 鉴权窗口覆盖前台重连的包名读取。applicationDidEnterBackground 作为
-// 安全网：无论登录或人脸因异常未正常关闭窗口，进后台都强制关闭，
-// 防止 g_inAuthChain 卡在 YES 而污染后续 UI/推送。
+// 鉴权窗口覆盖前台重连的包名读取。这两个方法仅做登录链路的包裹式
+// 开关（WCBFlagBegin/WCBFlagEnd），不额外强制收口——人脸窗口的收口
+// 交给 FaceRecogBaseHandler 的 dealloc 兜底（微信切后台即关，dealloc 会触发）。
 %hook MicroMessengerAppDelegate
 - (void)applicationDidBecomeActive:(id)arg {
     WCBHit("MicroMessengerAppDelegate -applicationDidBecomeActive:");
@@ -192,11 +192,6 @@ static void WCBHit(const char *where) {
     BOOL prev = WCBFlagBegin("MicroMessengerAppDelegate.applicationWillEnterForeground:");
     %orig;
     WCBFlagEnd(prev, "MicroMessengerAppDelegate.applicationWillEnterForeground:");
-}
-- (void)applicationDidEnterBackground:(id)arg {
-    WCBHit("MicroMessengerAppDelegate -applicationDidEnterBackground:");
-    WCBSetFlag(NO, "MicroMessengerAppDelegate.applicationDidEnterBackground:");
-    %orig;
 }
 %end
 
