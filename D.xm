@@ -30,8 +30,6 @@
 @property (retain, nonatomic) NSString *m_nsContent;
 @property (retain, nonatomic) NSString *m_nsRealChatUsr;
 @property (assign, nonatomic) unsigned int m_uiMessageType;
-@property (assign, nonatomic) unsigned int m_uiIsSenderStatus; // CMessageWrap.h:381 发送方向标记（非0=我发出的）
-@property (assign, nonatomic) long long m_n64MesSvrID;
 - (id)initWithMsgType:(long long)arg1 nsFromUsr:(id)arg2;
 - (void)parseWCPayInfoItemIfNeed;
 + (BOOL)isSenderFromMsgWrap:(id)arg1; // CMessageWrap.h:249 微信官方"这条消息是不是我发出的"判定
@@ -391,7 +389,8 @@ static void DD_SendTransferReply(NSString *toUserName) {
 
 // 与 WCR 完全一致的转账识别（逆向 WCRefine 0x1b12d0-0x1b1314 得出）：
 //   条件 = m_c2cNativeUrl/m_c2cUrl 前缀为 "wechat://wcpay/transfer/transferquery?"  或  m_uiPaySubType == 1
-// 只查 transferID 非空会把“发送方视图 / 领取后状态更新”等消息一并放进来，导致我发出的转账被误处理
+// 这是“接收方视角”的转账；发送方视图 / 领取后状态更新消息的 URL 不是 transferquery，进不来
+// WCR 只做正向识别，没有红包反向排除（红包 URL 非该前缀、paySubType 非 1，天然被排除）
 static BOOL DD_IsTransfer(CMessageWrap *msg) {
     if (!msg) return NO;
     [msg parseWCPayInfoItemIfNeed];
@@ -399,13 +398,7 @@ static BOOL DD_IsTransfer(CMessageWrap *msg) {
     if (!info) return NO;
     if (info.m_nsTransferID.length == 0) return NO;
 
-    // 排除红包
     NSString *nativeUrl = info.m_c2cNativeUrl ?: @"";
-    NSString *content = msg.m_nsContent ?: @"";
-    if ([nativeUrl rangeOfString:@"receivehongbao" options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
-    if ([content rangeOfString:@"receivehongbao" options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
-
-    // 接收方视角的转账 URL：wechat://wcpay/transfer/transferquery?（发送方视图的 URL 不是这个）
     NSString *c2cUrl = info.m_c2cUrl ?: @"";
     if ([nativeUrl hasPrefix:@"wechat://wcpay/transfer/transferquery?"]) return YES;
     if ([c2cUrl hasPrefix:@"wechat://wcpay/transfer/transferquery?"]) return YES;
@@ -425,17 +418,6 @@ static NSCache *DD_ProcessedCache(void) {
     return cache;
 }
 
-// 记录“我发出的转账”的 transferID：发出时 m_nsFromUsr==我 写入，之后同 ID 被微信重投（对方领取）即跳过
-static NSCache *DD_MyTransferCache(void) {
-    static NSCache *cache;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        cache = [[NSCache alloc] init];
-        cache.countLimit = 1000;
-    });
-    return cache;
-}
-
 #pragma mark - 自动收款
 
 static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
@@ -443,8 +425,7 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     if (!sessionId.length || !wrap) return;
     if (!DD_IsTransfer(wrap)) return;
 
-    WCPayInfoItem *info = wrap.m_oWCPayInfoItem;
-    if (!info.m_nsTransferID.length) return;
+    WCPayInfoItem *info = wrap.m_oWCPayInfoItem; // DD_IsTransfer 已保证 transferID 非空
 
     unsigned int status = info.m_c2cPayReceiveStatus;
     if (status == 1 || status == 2) return;
@@ -452,22 +433,14 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     NSString *selfUser = DD_GetSelfUserName();
     if (!selfUser.length) return;
 
-    // 我发出的转账：用微信官方方向判定 +[CMessageWrap isSenderFromMsgWrap:]（CMessageWrap.h:249，与 WCR 同一思路）
-    // 用 objc_msgSend 调用，避免 [CMessageWrap xxx] 静态类引用产生 _OBJC_CLASS_$_CMessageWrap 链接错误
-    // 注意：绝不能用 m_nsFromUsr==我 判方向 —— 群聊里 m_nsFromUsr 是群 ID（xxx@chatroom），永远不等于我
+    // 我发出的转账 → 跳过（WCR 门控 #3；微信官方判定 CMessageWrap.h:249 +isSenderFromMsgWrap:）
+    // objc_msgSend 调用，避免静态类引用产生 _OBJC_CLASS_$_CMessageWrap 链接错误
+    // 不能用 m_nsFromUsr==我 判方向：群聊里 m_nsFromUsr 是群 ID（xxx@chatroom），永远不等于我
     Class cmwCls = objc_getClass("CMessageWrap");
-    BOOL isMySend = NO;
     if (cmwCls) {
         BOOL (*isSenderFn)(id, SEL, id) = (BOOL (*)(id, SEL, id))objc_msgSend;
-        isMySend = isSenderFn(cmwCls, @selector(isSenderFromMsgWrap:), wrap);
+        if (isSenderFn(cmwCls, @selector(isSenderFromMsgWrap:), wrap)) return;
     }
-    if (wrap.m_uiIsSenderStatus != 0) isMySend = YES; // CMessageWrap.h:381 字段兜底（官方方法漏判时补上）
-    if (isMySend) {
-        [DD_MyTransferCache() setObject:@(YES) forKey:info.m_nsTransferID];
-        return;
-    }
-    // 对方领取后微信用同 transferID 重投（伪装成转给我、收款人被改成我），命中缓存直接跳过
-    if ([DD_MyTransferCache() objectForKey:info.m_nsTransferID]) return;
 
     // 方向判定（参照 WCPayInfoItem.h:146-148 + WCR 多 key 提取逻辑）
     // 只处理“收款人是我、付款人是别人”的待收转账；收款人不是我、或付款人是我都跳过
@@ -475,10 +448,13 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     if (![recv isEqualToString:selfUser]) return;                  // 收款人不是我 → 跳过（别人转别人）
     if ([info.transfer_payer_username isEqualToString:selfUser]) return; // 付款人是我 → 跳过（自己转自己）
 
-    NSString *key = [NSString stringWithFormat:@"%@|%lld", info.m_nsTransferID, wrap.m_n64MesSvrID];
+    // 去重：同一 transferID 只处理一次（WCR 同款机制：autoParseLinkProcessedMessageKeys /
+    // screenRecordingFrameProcessedIds，配 NSCache + NSMutableSet + containsObject:）
+    // key 只用 transferID，不带 m_n64MesSvrID —— 同一条转账会被多次投递（确认收款后的状态回写、
+    // 断线重连补拉），若带上 msgSvrID，ID 一变就挡不住，会重复收款 + 重复回复
     NSCache *cache = DD_ProcessedCache();
-    if ([cache objectForKey:key]) return;
-    [cache setObject:@(YES) forKey:key];
+    if ([cache objectForKey:info.m_nsTransferID]) return;
+    [cache setObject:@(YES) forKey:info.m_nsTransferID];
 
     BOOL isGroup = [wrap.m_nsFromUsr rangeOfString:@"@chatroom"].location != NSNotFound;
     NSString *peer = isGroup ? (wrap.m_nsRealChatUsr ?: @"") : (wrap.m_nsFromUsr ?: @"");
@@ -503,7 +479,9 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
 
         [logic ConfirmTransferMoney:req];
         if ([DDTRConfig shared].autoReplyEnabled) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // 回复延迟 3.0 秒：与 WCR 硬编码常数一致（WCRefine 0x1b47bc-0x1b47c4 = 0xB2D05E00 = 3e9 ns）
+            // 目的：等“已收款”系统消息先落库，回复排在它之后才自然；1.5 秒在网络慢时会错序
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 DD_SendTransferReply(peer);
             });
         }
