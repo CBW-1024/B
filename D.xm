@@ -88,7 +88,6 @@
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 leftImage:(id)arg3 title:(id)arg4 badge:(id)arg5 rightValue:(id)arg6 rightImage:(id)arg7 withRightRedDot:(BOOL)arg8 selected:(BOOL)arg9;
 + (id)centerCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3;
 @property (nonatomic, retain) id userInfo;
 @end
@@ -420,16 +419,46 @@ static AVSpeechSynthesizer *DD_SharedSynth(void) {
     return synth;
 }
 
-// 拼播报文案：优先用转账金额（WCPayInfoItem.m_total_fee，WCPayInfoItem.h:185）
-// 微信历史该字段为「分」整数字符串（如 "6600"=¥66.00）；若已含小数点则视为「元」
-static NSString *DD_BroadcastText(WCPayInfoItem *info) {
-    NSString *raw = info.m_total_fee;
-    if (raw.length) {
-        double amt = [raw doubleValue];
-        if ([raw rangeOfString:@"."].location == NSNotFound) amt /= 100.0; // 分为单位 → 转元
-        return [NSString stringWithFormat:@"收款 %.2f 元", amt];
+// 拼播报文案：转账金额优先从 m_c2cNativeUrl / m_c2cUrl 的 transferquery? 链接 query 中取
+// （对象字段 m_total_fee 在收款瞬间常为 nil/空，URL 是消息自带的可靠来源；
+//  WCR 字符串含 total_fee 与 totalfee 两种参数名，见 WCRefine 62246/62247）。
+// WeChat Pay 的 total_fee 单位为「分」，故整数视为分、÷100；含小数点则当「元」直接读。
+static NSString *DD_ExtractAmountFromURL(NSString *url) {
+    if (url.length == 0) return nil;
+    NSString *query = url;
+    NSRange q = [url rangeOfString:@"?"];
+    if (q.location != NSNotFound) query = [url substringFromIndex:q.location + 1];
+    // 对齐 WCR 逆向（0x1b21b0–0x1b21e4 构造的 key 数组顺序）：feedesc / fee_desc / total_fee / totalfee / amount
+    NSArray *keys = @[@"feedesc", @"fee_desc", @"total_fee", @"totalfee", @"amount"];
+    for (NSString *pair in [query componentsSeparatedByString:@"&"]) {
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        NSString *k = [[pair substringToIndex:eq.location]
+                       stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSString *v = [pair substringFromIndex:eq.location + 1];
+        for (NSString *want in keys) {
+            if ([k caseInsensitiveCompare:want] == NSOrderedSame && v.length) return v;
+        }
     }
-    return @"收到微信转账";
+    return nil;
+}
+
+static double DD_YuanFromRaw(NSString *raw) {
+    double v = [raw doubleValue];
+    if ([raw rangeOfString:@"."].location == NSNotFound) v /= 100.0; // 整数视为「分」
+    return v;
+}
+
+static NSString *DD_BroadcastText(WCPayInfoItem *info) {
+    double amt = 0;
+    NSString *raw = DD_ExtractAmountFromURL(info.m_c2cNativeUrl)
+                 ?: DD_ExtractAmountFromURL(info.m_c2cUrl);
+    if (raw.length) {
+        amt = DD_YuanFromRaw(raw);
+    } else if (info.m_total_fee.length) {
+        amt = DD_YuanFromRaw(info.m_total_fee);
+    }
+    return [NSString stringWithFormat:@"收款 %.2f 元", amt];
 }
 
 // 主线程播报：去空白 → 非空才播 → 正在播先打断 → 中文语音、默认语速（对齐 WCR 逆向）
@@ -443,11 +472,9 @@ static void DD_Announce(NSString *text) {
         // CategoryPlayback + MixWithOthers（withOptions 传 0x1）+ setActive:YES。
         // Playback 忽略静音键，MixWithOthers 不与微信自身音频互斥。WCR 实测有效。
         AVAudioSession *session = [AVAudioSession sharedInstance];
-        if ([session respondsToSelector:@selector(setCategory:withOptions:error:)]) {
-            [session setCategory:AVAudioSessionCategoryPlayback
-                     withOptions:AVAudioSessionCategoryOptionMixWithOthers // WCR: withOptions=0x1
-                           error:nil];
-        }
+        [session setCategory:AVAudioSessionCategoryPlayback
+                 withOptions:AVAudioSessionCategoryOptionMixWithOthers // WCR: withOptions=0x1
+                       error:nil];
         [session setActive:YES error:nil]; // WCR: setActive:1
 
         AVSpeechSynthesizer *synth = DD_SharedSynth();
