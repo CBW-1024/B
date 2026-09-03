@@ -494,6 +494,9 @@ static id DD_CellOption(id cell) {
     return objc_getAssociatedObject(cell, kDDOptionValue);
 }
 
+// 仅给本插件创建的 MultiSelectContactsViewController 实例打标记，避免重标影响微信正常转发/建群页
+static const void *kDDBlackListPicker = &kDDBlackListPicker;
+
 - (void)onBlackListTapped {
     MultiSelectContactsViewController *picker = [[objc_getClass("MultiSelectContactsViewController") alloc] init];
     picker.m_scene = 0;
@@ -513,7 +516,9 @@ static id DD_CellOption(id cell) {
         }
     }
     MMUINavigationController *nav = [[objc_getClass("MMUINavigationController") alloc] initWithRootViewController:picker];
-    picker.navigationItem.leftBarButtonItem = nil;   // 去掉原生 × 按钮（关闭用下拉抓手条 / 完成）
+    // 标记本实例：viewDidAppear 里把原生左上角按钮（其 action 原生即「清空已选」）重标为文字「清空」，
+    // 只改外观消除「× 像关闭」的误会，action/target 完全沿用原生。
+    objc_setAssociatedObject(picker, kDDBlackListPicker, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // 非全屏：底部 sheet（可拖拽 + 抓手条 + 圆角）
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     UISheetPresentationController *sheet = nav.sheetPresentationController;
@@ -629,6 +634,21 @@ static NSString *DDCurrentSessionUserName = nil;
     reqParams[@"sendId"] = param.sendId ?: @"";
     WCRedEnvelopesLogicMgr *logicMgr = [ctx getService:objc_getClass("WCRedEnvelopesLogicMgr")];
     [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
+}
+%end
+
+%hook MultiSelectContactsViewController
+// 仅对本插件黑名单选择器实例生效：原生左上角按钮 action 本身就是「清空已选」（并非关闭窗口），
+// 只是图标是 × 容易被误认成关闭。这里只把它重标为文字「清空」，target/action 完全沿用原生，
+// 既消除误会、又原样保留微信的清空逻辑（含搜索态已选、历史群等所有边界情况）。
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (![objc_getAssociatedObject(self, kDDBlackListPicker) boolValue]) return;
+    UIBarButtonItem *left = self.navigationItem.leftBarButtonItem;
+    if (left) {
+        UIBarButtonItem *clear = [[UIBarButtonItem alloc] initWithTitle:@"清空" style:left.style target:left.target action:left.action];
+        self.navigationItem.leftBarButtonItem = clear;
+    }
 }
 %end
 
