@@ -419,26 +419,34 @@ static AVSpeechSynthesizer *DD_SharedSynth(void) {
     return synth;
 }
 
-// 拼播报文案：转账金额优先从 m_c2cNativeUrl / m_c2cUrl 的 transferquery? 链接 query 中取
-// （对象字段 m_total_fee 在收款瞬间常为 nil/空，URL 是消息自带的可靠来源；
-//  WCR 字符串含 total_fee 与 totalfee 两种参数名，见 WCRefine 62246/62247）。
+// 拼播报文案：转账金额从 m_nsContent（消息 XML 原文）提取。
+// 逆向实证：WCR 把 m_nsContent 传给金额解析器（0x1b2178 取 m_nsContent → 0x1bcdd0），
+// 金额就藏在 XML 里——<nativeurl>wechat://wcpay/transfer/transferquery?...&total_fee=6600</nativeurl>
+// 或 <total_fee>6600</total_fee>。m_c2cNativeUrl 的 query 并不带 total_fee，单独解析它取不到（即“收款 0元”的成因）。
 // WeChat Pay 的 total_fee 单位为「分」，故整数视为分、÷100；含小数点则当「元」直接读。
-static NSString *DD_ExtractAmountFromURL(NSString *url) {
-    if (url.length == 0) return nil;
-    NSString *query = url;
-    NSRange q = [url rangeOfString:@"?"];
-    if (q.location != NSNotFound) query = [url substringFromIndex:q.location + 1];
-    // 对齐 WCR 逆向（0x1b21b0–0x1b21e4 构造的 key 数组顺序）：feedesc / fee_desc / total_fee / totalfee / amount
-    NSArray *keys = @[@"feedesc", @"fee_desc", @"total_fee", @"totalfee", @"amount"];
-    for (NSString *pair in [query componentsSeparatedByString:@"&"]) {
-        NSRange eq = [pair rangeOfString:@"="];
-        if (eq.location == NSNotFound) continue;
-        NSString *k = [[pair substringToIndex:eq.location]
-                       stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        NSString *v = [pair substringFromIndex:eq.location + 1];
-        for (NSString *want in keys) {
-            if ([k caseInsensitiveCompare:want] == NSOrderedSame && v.length) return v;
-        }
+static NSString *DD_ExtractAmount(NSString *text) {
+    if (text.length == 0) return nil;
+    // XML 可能含 HTML 实体，先轻量解码，避免 < > & 干扰匹配
+    NSString *s = [text stringByReplacingOccurrencesOfString:@"&lt;" withString:@"<"];
+    s = [s stringByReplacingOccurrencesOfString:@"&gt;" withString:@">"];
+    s = [s stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+    s = [s stringByReplacingOccurrencesOfString:@"&quot;" withString:@"\""];
+    // 只取数值型 key（WCR 字符串含 total_fee 与 totalfee，见 WCRefine 62246/62247；amount 亦常见）。
+    // 不用 feedesc/fee_desc：它们是金额描述文本，抓到非数字会播成 0。
+    NSArray *keys = @[@"total_fee", @"totalfee", @"amount"];
+    NSCharacterSet *delim = [NSCharacterSet characterSetWithCharactersInString:@"&<>\"' \t\n\r"];
+    for (NSString *want in keys) {
+        // 形态1：key=value（URL query）  形态2：<key>value</key>（XML 节点）
+        NSRange eq  = [s rangeOfString:[NSString stringWithFormat:@"%@=", want] options:NSCaseInsensitiveSearch];
+        NSRange tag = [s rangeOfString:[NSString stringWithFormat:@"<%@>", want] options:NSCaseInsensitiveSearch];
+        NSRange start = eq;
+        if (start.location == NSNotFound || (tag.location != NSNotFound && tag.location < start.location)) start = tag;
+        if (start.location == NSNotFound) continue;
+        NSUInteger from = start.location + start.length;
+        NSRange end = [s rangeOfCharacterFromSet:delim options:0 range:NSMakeRange(from, s.length - from)];
+        NSUInteger to = (end.location == NSNotFound) ? s.length : end.location;
+        NSString *val = [s substringWithRange:NSMakeRange(from, to - from)];
+        if (val.length && [val doubleValue] > 0) return val; // 仅采用正数数值
     }
     return nil;
 }
@@ -449,10 +457,11 @@ static double DD_YuanFromRaw(NSString *raw) {
     return v;
 }
 
-static NSString *DD_BroadcastText(WCPayInfoItem *info) {
+static NSString *DD_BroadcastText(WCPayInfoItem *info, NSString *content) {
     double amt = 0;
-    NSString *raw = DD_ExtractAmountFromURL(info.m_c2cNativeUrl)
-                 ?: DD_ExtractAmountFromURL(info.m_c2cUrl);
+    NSString *raw = DD_ExtractAmount(content)             // 主源：m_nsContent（XML，含 total_fee）
+                 ?: DD_ExtractAmount(info.m_c2cNativeUrl) // 兜底：URL query（部分版本带）
+                 ?: DD_ExtractAmount(info.m_c2cUrl);
     if (raw.length) {
         amt = DD_YuanFromRaw(raw);
     } else if (info.m_total_fee.length) {
@@ -587,7 +596,7 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
 
         [logic ConfirmTransferMoney:req];
         if ([DDTRConfig shared].autoBroadcastEnabled) {
-            DD_Announce(DD_BroadcastText(info));
+            DD_Announce(DD_BroadcastText(info, wrap.m_nsContent));
         }
         if ([DDTRConfig shared].autoReplyEnabled) {
             // 回复延迟 3.0 秒：与 WCR 硬编码常数一致（WCRefine 0x1b47bc-0x1b47c4 = 0xB2D05E00 = 3e9 ns）
