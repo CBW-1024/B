@@ -305,6 +305,8 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
     if (self.nativeUrl) params[@"nativeUrl"] = self.nativeUrl;
     if (self.sessionUserName) params[@"sessionUserName"] = self.sessionUserName;
     if (self.timingIdentifier) params[@"timingIdentifier"] = self.timingIdentifier;
+    // 补齐 sign：对齐 WCR 拆包请求（反汇编 0x755a8c–0x755a9c 把 sign 放进 OpenRedEnvelopesRequest）
+    if (self.sign) params[@"sign"] = self.sign;
     return params;
 }
 @end
@@ -407,11 +409,22 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
     NSString *body = [NSString stringWithFormat:@"成功抢到红包：%.2f元，总额：%.2f元", amount/100.0, totalAmount/100.0];
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.title = title; content.body = body; content.sound = [UNNotificationSound defaultSound];
+    content.userInfo = @{@"DDHBSession": sessionUserName};   // 点击后据此跳转到对应会话
     UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:[NSUUID UUID].UUIDString content:content trigger:[UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.1 repeats:NO]];
     [UNUserNotificationCenter.currentNotificationCenter addNotificationRequest:request withCompletionHandler:nil];
 }
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center willPresentNotification:(UNNotification *)notification withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
     completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound);
+}
+// 点击系统通知：跳转到对应会话（与文件助手跳转同逻辑，msgToLocate:nil 即打开会话底部）
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response withCompletionHandler:(void (^)(void))completionHandler {
+    NSString *session = response.notification.request.content.userInfo[@"DDHBSession"];
+    if (session.length) {
+        MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
+        id mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
+        if (mgr) [mgr jumpToChat:session msgToLocate:nil];
+    }
+    completionHandler();
 }
 
 // 参考 WCR「文件传输助手」通知格式：构造富文本消息通过 CMessageMgr AddLocalMsg:MsgWrap: 插入 filehelper 会话
@@ -449,7 +462,7 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
     // 点击跳转：微信灰字消息自定义链接标签（对齐 WCR 反汇编 0x5e9f34/0x5ea028）
     //   <_wc_custom_link_ color="#%@" href="%@">%@</_wc_custom_link_>
     //   href 对齐 WCR 语义（WCRefineRedEnvelopSession://session=xxx → 跳到红包所在会话），
-    //   用自有 scheme 由下方 %hook UIApplication 拦截，再调 jumpToChat:msgToLocate: 定位到红包消息
+    //   用自有 scheme 由下方 %hook UIApplication 拦截，再调 jumpToChat:msgToLocate:nil 打开红包所在会话（对齐 WCR）
     if (sessionUserName.length) {
         [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转去感谢老板</_wc_custom_link_>", sessionUserName];
     } else {
@@ -484,8 +497,6 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
 
 // ========== Hook 红包逻辑 ==========
 static NSString *DDCurrentSessionUserName = nil;
-// 会话 -> 红包原始消息，用于点击通知跳转时定位到该条红包（jumpToChat:msgToLocate:）
-static NSMutableDictionary *DDHBMsgCache = nil;
 
 %hook WCRedEnvelopesLogicMgr
 - (void)OnWCToHongbaoCommonResponse:(HongBaoRes *)arg1 Request:(HongBaoReq *)arg2 {
@@ -592,13 +603,8 @@ static NSMutableDictionary *DDHBMsgCache = nil;
     param.senderName = getDisplayNameForSession(senderUsr);
     // 老板（发包人显示名）：来自红包卡片 XML <des>
     param.bossName = dd_firstXMLCDATAText(wrap.m_nsContent, @"des");
-    // 会话名：群红包且自己发的用 m_nsToUsr，否则 m_nsFromUsr（须在缓存前赋值）
+    // 会话名：群红包且自己发的用 m_nsToUsr，否则 m_nsFromUsr
     param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
-    // 缓存红包原始消息，供通知点击「去感谢老板」时 jumpToChat:msgToLocate: 定位到该条红包
-    if (param.sessionUserName.length && wrap) {
-        if (!DDHBMsgCache) DDHBMsgCache = [NSMutableDictionary dictionary];
-        DDHBMsgCache[param.sessionUserName] = wrap;
-    }
     // 8.0.76 无 m_nsHeadImgUrl 字段（CContact 仅含背景图 ID），头像 URL 不可取；headImg 保持默认 nil，仅展示用，不影响拆红包
     param.nativeUrl = nativeUrl;
     param.sign = [urlDict dd_stringForKey:@"sign"];
@@ -617,8 +623,8 @@ static NSMutableDictionary *DDHBMsgCache = nil;
 %end
 
 // 拦截通知里的跳转链接：DDHBRedEnvelopSession://session=xxx
-// 语义对齐 WCR（WCRefineRedEnvelopSession://session=xxx → 打开红包所在会话），
-// 但用微信原生 jumpToChat:msgToLocate:（8.0.76 CAppViewControllerManager.h L72）做到定位到该条红包消息
+// 语义对齐 WCR（WCRefineRedEnvelopSession://session=xxx → 只打开红包所在会话，不定位具体消息），
+// 用微信原生 jumpToChat:msgToLocate:（8.0.76 CAppViewControllerManager.h L72），msgToLocate 传 nil 即停在会话底部
 %hook UIApplication
 - (BOOL)openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenExternalURLOptionsKey, id> *)options completionHandler:(void (^)(BOOL))completion {
     NSString *abs = url.absoluteString ?: @"";
@@ -628,10 +634,9 @@ static NSMutableDictionary *DDHBMsgCache = nil;
         NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
         NSString *session = [q dd_stringForKey:@"session"];
         if (session.length) {
-            CMessageWrap *locateMsg = DDHBMsgCache[session];
             MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
             id mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
-            if (mgr) [mgr jumpToChat:session msgToLocate:locateMsg];
+            if (mgr) [mgr jumpToChat:session msgToLocate:nil];
         }
         return YES;   // 已处理，不交给系统/微信继续打开
     }
