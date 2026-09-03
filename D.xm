@@ -62,30 +62,19 @@
 + (NSDictionary *)dictionaryWithDecodedComponets:(NSString *)string separator:(NSString *)separator;
 @end
 
-// 微信原生会话选择器（转发页同款：取消/完成+搜索+分区，群聊分区在上、联系人分区在下）
-@protocol SessionSelectControllerDelegate <NSObject>
-- (void)OnSelectSession:(NSArray *)contacts SessionSelectController:(id)controller;
-- (void)OnSelectSessions:(NSArray *)contacts SessionSelectController:(id)controller;
-- (void)OnSelectSessionCancel:(id)controller;
+// 微信原生半屏多选选择器（图2 样式：半屏底部弹层 + 取消/完成 + 搜索 + 群聊/联系人分区）
+// 头文件证据 MultiSelectChatRoomHalfScreenViewController.h：
+//   - 继承 MMUIHalfScreenViewController（半屏弹层）
+//   - m_leftCloseButton(取消) / m_rightMakeSureButton(完成) / m_searchBar
+//   - isMultiSelectSessionNumberOfRowsInSection:(群聊) / isContactSessionNumberOfRowsInSection:(私聊) → 群聊+私聊都支持
+//   - initWithTipWord:choiseSessionWord:chatroomSessionWord:rightButtonWord:...:selectedUserNameList:... 自带预选回填
+@protocol MultiSelectChatRoomHalfScreenViewControllerDelegate;
+@interface MultiSelectChatRoomHalfScreenViewController : UIViewController
+- (id)initWithTipWord:(id)a0 choiseSessionWord:(id)a1 chatroomSessionWord:(id)a2 rightButtonWord:(id)a3 rightButtonLightColor:(id)a4 rightButtonDarkColor:(id)a5 selectedUserNameList:(id)a6 selectMaxCount:(unsigned int)a7 countExceedTipWord:(id)a8 forceLightMode:(BOOL)a9 canSelectOpenIM:(BOOL)a10;
 @end
 
-@interface SessionSelectController : UIViewController
-- (id)initWithSelectedContacts:(NSArray *)selectedContacts;
-@property (nonatomic, weak) id<SessionSelectControllerDelegate> m_delegate;
-@property (nonatomic, assign) BOOL m_bMultiSelect;
-@property (nonatomic, assign) BOOL m_bShowMultiSelectRightBtn;
-@property (nonatomic, assign) BOOL m_recentForwardHidden;
-@property (nonatomic, assign) BOOL m_hidesMultiSelectedCount;
-@property (copy, nonatomic) NSString *customTitle;
-@property (retain, nonatomic) NSObject *userData;
-- (void)updateView;
-- (void)onMultiDone;
-@end
-
-@interface SessionSelectController (DDBlackList)
-- (void)dd_clearSelection;
-- (void)dd_done;
-@end
+// 仅给本插件创建的实例打标记，避免 hook 影响到微信正常群选流程
+static const void *kDDBlackListPicker = &kDDBlackListPicker;
 
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
@@ -369,7 +358,7 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
 @end
 
 // ========== 设置界面 ==========
-@interface DDRedEnvelopSettingsViewController : UIViewController <UITableViewDelegate, SessionSelectControllerDelegate>
+@interface DDRedEnvelopSettingsViewController : UIViewController <UITableViewDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @property (nonatomic) BOOL delayExpanded;
 @end
@@ -504,52 +493,26 @@ static id DD_CellOption(id cell) {
 }
 
 - (void)onBlackListTapped {
-    // 已在黑名单的联系人回填为预选状态
-    NSMutableArray *preselected = [NSMutableArray new];
     NSArray *blackList = [DDRedEnvelopConfig sharedConfig].blackList;
-    if (blackList.count) {
-        MMContext *context = [objc_getClass("MMContext") activeUserContext];
-        CContactMgr *contactMgr = [context getService:objc_getClass("CContactMgr")];
-        for (NSString *name in blackList) {
-            CContact *contact = [contactMgr getContactByName:name];
-            if (contact) [preselected addObject:contact];
-        }
-    }
-    SessionSelectController *picker = [[objc_getClass("SessionSelectController") alloc] initWithSelectedContacts:preselected];
-    picker.m_bMultiSelect = YES;
-    picker.m_bShowMultiSelectRightBtn = YES;
-    picker.m_recentForwardHidden = YES;
-    picker.m_hidesMultiSelectedCount = YES;
-    picker.customTitle = @"选择群聊和联系人";
-    picker.userData = @"DDBlackList";
-    picker.m_delegate = self;
-    MMUINavigationController *nav = [[objc_getClass("MMUINavigationController") alloc] initWithRootViewController:picker];
-    nav.modalPresentationStyle = UIModalPresentationFullScreen;
-    [self presentViewController:nav animated:YES completion:nil];
+    MultiSelectChatRoomHalfScreenViewController *picker =
+        [[objc_getClass("MultiSelectChatRoomHalfScreenViewController") alloc]
+            initWithTipWord:@"选择不抢红包的群聊和联系人"
+            choiseSessionWord:@"群聊"
+            chatroomSessionWord:@"联系人"
+            rightButtonWord:@"完成"
+            rightButtonLightColor:@"#07C160"
+            rightButtonDarkColor:@"#1AAD19"
+            selectedUserNameList:(blackList.count ? blackList : nil)
+            selectMaxCount:9999
+            countExceedTipWord:nil
+            forceLightMode:NO
+            canSelectOpenIM:NO];
+    // 打标记：只让本插件实例走自定义结果提取，微信自身群选流程不受影响
+    objc_setAssociatedObject(picker, kDDBlackListPicker, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self presentViewController:picker animated:YES completion:nil];
 }
 
-#pragma mark - SessionSelectControllerDelegate
-- (void)OnSelectSessions:(NSArray *)contacts SessionSelectController:(id)controller {
-    NSMutableArray *black = [NSMutableArray new];
-    for (id contact in contacts) {
-        if ([contact isKindOfClass:objc_getClass("CContact")]) {
-            NSString *name = [contact valueForKey:@"m_nsUsrName"];
-            if (name.length) [black addObject:name];
-        }
-    }
-    [DDRedEnvelopConfig sharedConfig].blackList = black;
-    [self dismissViewControllerAnimated:YES completion:^{
-        [self buildTable];
-    }];
-}
-
-- (void)OnSelectSession:(NSArray *)contacts SessionSelectController:(id)controller {
-    [self OnSelectSessions:contacts SessionSelectController:controller];
-}
-
-- (void)OnSelectSessionCancel:(id)controller {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
+#pragma mark - 黑名单结果由 MultiSelectChatRoomHalfScreenViewController hook 提取
 @end
 
 // ========== Hook 红包逻辑 ==========
@@ -645,39 +608,48 @@ static NSString *DDCurrentSessionUserName = nil;
 }
 %end
 
-// ========== 黑名单选择器导航栏：左上「取消」+「清除」，右上「完成」==========
-%hook SessionSelectController
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    if (![self.userData isEqual:@"DDBlackList"]) return;
-    UIBarButtonItem *clearItem = [[UIBarButtonItem alloc] initWithTitle:@"清除"
-                                                                 style:UIBarButtonItemStylePlain
-                                                                target:self
-                                                                action:@selector(dd_clearSelection)];
-    UIBarButtonItem *cancelItem = self.navigationItem.leftBarButtonItem;
-    self.navigationItem.leftBarButtonItems = cancelItem ? @[cancelItem, clearItem] : @[clearItem];
-    if (self.navigationItem.rightBarButtonItem) {
-        self.navigationItem.rightBarButtonItem.title = @"完成";
-    } else {
-        self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"完成"
-                                                                                  style:UIBarButtonItemStyleDone
-                                                                                 target:self
-                                                                                 action:@selector(dd_done)];
+// ========== 黑名单选择器：微信原生半屏多选（图2，群聊 + 私聊）==========
+static NSString *DD_ExtractUserName(id obj);
+%hook MultiSelectChatRoomHalfScreenViewController
+- (void)onClickMakeSureButton {
+    if (![objc_getAssociatedObject(self, kDDBlackListPicker) boolValue]) { %orig; return; }
+    NSMutableArray *black = [NSMutableArray new];
+    // 结果在 m_dicMultiSelect（OrderedDictionary）：值即联系人对象，按多 key 兜底取用户名
+    id dic = [self valueForKey:@"m_dicMultiSelect"];
+    NSArray *entries = nil;
+    if ([dic respondsToSelector:@selector(allValues)]) entries = [dic allValues];
+    else if ([dic respondsToSelector:@selector(allKeys)]) entries = [dic allKeys];
+    for (id obj in (entries ?: @[])) {
+        NSString *name = DD_ExtractUserName(obj);
+        if (name.length) [black addObject:name];
     }
+    if (black.count == 0) {                           // 兜底：直接读选中用户名数组
+        id list = [self valueForKey:@"m_selectedUserNameList"];
+        for (id o in (list ?: @[])) if ([o isKindOfClass:[NSString class]]) [black addObject:o];
+    }
+    [DDRedEnvelopConfig sharedConfig].blackList = black;
+    UIViewController *presenter = self.presentingViewController;
+    [self dismissViewControllerAnimated:YES completion:^{
+        if ([presenter respondsToSelector:@selector(buildTable)]) [presenter performSelector:@selector(buildTable)];
+    }];
 }
 
-%new
-- (void)dd_clearSelection {
-    id selected = [self valueForKey:@"m_selectedContacts"];
-    if ([selected isKindOfClass:[NSMutableArray class]]) [selected removeAllObjects];
-    [self updateView];
-}
-
-%new
-- (void)dd_done {
-    [self onMultiDone];
+- (void)onClickLeftCloseButton {
+    if (![objc_getAssociatedObject(self, kDDBlackListPicker) boolValue]) { %orig; return; }
+    %orig;
 }
 %end
+
+// 从联系人对象按多个 key 兜底取用户名（对齐 WCR 反汇编：m_nsUsrName / m_nsUserName / username / userName / getContactUserName）
+static NSString *DD_ExtractUserName(id obj) {
+    if ([obj isKindOfClass:[NSString class]]) return obj;
+    NSArray *keys = @[@"m_nsUsrName", @"m_nsUserName", @"username", @"userName", @"getContactUserName"];
+    for (NSString *k in keys) {
+        id v = [obj valueForKey:k];
+        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return v;
+    }
+    return nil;
+}
 
 %ctor {
     @autoreleasepool {
