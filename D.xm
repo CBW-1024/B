@@ -404,9 +404,9 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
     NSString *displayName = getDisplayNameForSession(sessionUserName);
     NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
 
-    // 原格式：标题=来源，正文=抢到金额+总额
-    NSString *title = [NSString stringWithFormat:@"红包通知：%@", finalDisplayName];
-    NSString *body = [NSString stringWithFormat:@"成功抢到红包：%.2f元，总额：%.2f元", amount/100.0, totalAmount/100.0];
+    // 对齐微信原生推送样式：标题=聊天名，正文只留抢到金额（不再重复来源）
+    NSString *title = finalDisplayName;
+    NSString *body = [NSString stringWithFormat:@"💰 抢到红包：%.2f元", amount/100.0];
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.title = title; content.body = body; content.sound = [UNNotificationSound defaultSound];
     content.userInfo = @{@"DDHBSession": sessionUserName};   // 点击后据此跳转到对应会话
