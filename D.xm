@@ -33,6 +33,8 @@
 @interface CContact : NSObject
 // 8.0.76：用户名属性已从 m_nsUsrName 改名为 userName（只读 NSString，见 CContact.h L465）
 @property (nonatomic, retain) NSString *userName;
+// 群成员列表（成员用户名以 \x07 等分隔拼接，见 CContact.h L250），用于无群名时拼「成员1、成员2、成员3」
+@property (nonatomic, retain) NSString *m_nsChatRoomMemList;
 - (NSString *)getContactDisplayName;
 @end
 
@@ -270,27 +272,34 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     CContact *contact = [contactMgr getContactByName:sessionUserName];
     if (!contact) return nil;
     NSString *displayName = [contact getContactDisplayName];
-    return displayName.length ? displayName : nil;
+    if (displayName.length) return displayName;
+    // 无群名群聊兜底：getContactDisplayName 在懒加载 contact 上可能返回空，
+    // 此时用成员列表拼「成员1、成员2、成员3」（与微信聊天列表拼名逻辑一致，CContact.h L99-104 genChatRoomName）
+    if ([sessionUserName hasSuffix:@"@chatroom"]) {
+        NSString *mem = contact.m_nsChatRoomMemList;
+        if (mem.length) {
+            NSCharacterSet *sep = [NSCharacterSet characterSetWithCharactersInString:@"\x07\x1f,;"];
+            NSArray *members = [mem componentsSeparatedByCharactersInSet:sep];
+            NSMutableArray *names = [NSMutableArray array];
+            for (NSString *u in members) {
+                NSString *un = [u stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (!un.length) continue;
+                NSString *n = getDisplayNameForSession(un);   // 递归取成员昵称（私聊不会进此分支，无死循环）
+                if (n.length) [names addObject:n];
+                if (names.count >= 3) break;
+            }
+            if (names.count) return [names componentsJoinedByString:@"、"];
+        }
+    }
+    return nil;
 }
 
-// 从红包卡片消息 XML（wrap.m_nsContent）中提取 <tag><![CDATA[...]]></tag> 的首段文本
-// 用途：老板 = <des>（发包人显示名）、跳转链接 = <url>（红包详情页）
-static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
-    if (!xml.length || !tag.length) return nil;
-    NSString *pattern = [NSString stringWithFormat:@"<%@><!\\[CDATA\\[(.*?)\\]\\]></%@>", tag, tag];
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionDotMatchesLineSeparators error:nil];
-    NSTextCheckingResult *match = [re firstMatchInString:xml options:0 range:NSMakeRange(0, xml.length)];
-    if (!match || [match numberOfRanges] < 2) return nil;
-    NSRange r = [match rangeAtIndex:1];
-    if (r.location == NSNotFound || r.length == 0) return nil;
-    return [xml substringWithRange:r];
-}
 
 // ========== 红包参数模型 ==========
 @interface DDWeChatRedEnvelopParam : NSObject
-@property (strong, nonatomic) NSString *msgType, *sendId, *channelId, *nickName, *headImg, *nativeUrl, *sessionUserName, *sign, *timingIdentifier, *senderName;
-// 老板（发包人显示名，红包卡片 XML <des>）
-@property (strong, nonatomic) NSString *bossName;
+@property (strong, nonatomic) NSString *msgType, *sendId, *channelId, *nickName, *nativeUrl, *sessionUserName, *sign, *timingIdentifier, *senderName;
+// 总额（分）。查询响应必有，拆响应未必有；在查询阶段存入，保证通知在拆响应上弹出时总额也不丢
+@property (assign, nonatomic) NSInteger totalAmount;
 @property (assign, nonatomic) BOOL isGroupSender;
 - (NSDictionary *)toParams;
 @end
@@ -301,7 +310,6 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
     if (self.sendId) params[@"sendId"] = self.sendId;
     if (self.channelId) params[@"channelId"] = self.channelId;
     if (self.nickName) params[@"nickName"] = self.nickName;
-    if (self.headImg) params[@"headImg"] = self.headImg;
     if (self.nativeUrl) params[@"nativeUrl"] = self.nativeUrl;
     if (self.sessionUserName) params[@"sessionUserName"] = self.sessionUserName;
     if (self.timingIdentifier) params[@"timingIdentifier"] = self.timingIdentifier;
@@ -406,7 +414,12 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
 
     // 标题=微信原生聊天名；群聊（含无群名由成员拼成的）补（群聊）后缀以区分，私聊不加
     NSString *title = [sessionUserName hasSuffix:@"@chatroom"] ? [finalDisplayName stringByAppendingString:@"（群聊）"] : finalDisplayName;
-    NSString *body = [NSString stringWithFormat:@"💰 抢到红包：%.2f元", amount/100.0];
+    // 正文参考「转发到文件助手」：抢到金额（必然显示）+ 总额（totalAmount>0 即显示，未知/0 时才只显示抢到金额）。
+    // 注意：不能用 totalAmount != amount 抑制，否则普通红包/单包时 totalAmount==amount 会被吞掉，表现为「偶尔不显示总额」
+    NSMutableString *body = [NSMutableString stringWithFormat:@"💰 抢到红包：%.2f元", amount/100.0];
+    if (totalAmount > 0) {
+        [body appendFormat:@"，总额：%.2f元", totalAmount/100.0];
+    }
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.title = title; content.body = body; content.sound = [UNNotificationSound defaultSound];
     content.userInfo = @{@"DDHBSession": sessionUserName};   // 点击后据此跳转到对应会话
@@ -420,8 +433,13 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response withCompletionHandler:(void (^)(void))completionHandler {
     NSString *session = response.notification.request.content.userInfo[@"DDHBSession"];
     if (session.length) {
-        MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-        id mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
+        // CAppViewControllerManager 是单例（CAppViewControllerManager.h L43 +getAppViewControllerManager），
+        // 并非 service registry 成员，getService: 在 8.0.76 多返回 nil 导致跳转静默失败；优先取单例
+        id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
+        if (!mgr) {
+            MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
+            mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
+        }
         if (mgr) [mgr jumpToChat:session msgToLocate:nil];
     }
     completionHandler();
@@ -454,8 +472,9 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
     } else {
         [body appendFormat:@"🧧 类型： %@（%.2f元）\n", typeName, totalAmount / 100.0];
     }
-    // 老板：发包人显示名（红包卡片 XML <des>）
-    if (param.bossName.length) [body appendFormat:@"👨 老板： %@\n", param.bossName];
+    // 老板：发包人显示名，直取 AsyncOnAddMsg 已算好的 senderName（群消息 m_nsRealChatUsr、私聊 m_nsFromUsr，
+    // 经 getDisplayNameForSession→CContact.getContactDisplayName 取，见 CMessageWrap.h L435 / CContact.h L326），头文件确认可靠，不兜底
+    if (param.senderName.length) [body appendFormat:@"👨 老板： %@\n", param.senderName];
     // 备注：祝福语（对齐 WCR 取值链 wishing→wish→remark→blessing，反汇编 0x759da4-0x759edc）
     if (wishing.length) [body appendFormat:@"📝 备注： %@\n", wishing];
     [body appendFormat:@"⏰ 时间： %@\n", timeStr];
@@ -507,7 +526,8 @@ static NSString *DDCurrentSessionUserName = nil;
     // 保证下方通知显示的是「当前这条红包」所在会话，而非上一条（旧全局变量滞后问题）。
     // 注意：此处不能用 dequeue，否则首响取出后拆响取不到，红包拆不开。
     NSDictionary *responseDict = [[[NSString alloc] initWithData:arg1.retText.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
-    NSString *respSendId = [responseDict dd_stringForKey:@"sendid"] ?: [responseDict dd_stringForKey:@"sendId"];
+    // 直取服务端 hongbao CGI 契约键 sendid（小写，WCR 反汇编以 sendid 为首选出现 7 次、nativeUrl 同为 sendid；头文件模型属性是驼峰 sendId，属反序列化后属性名，不影响原始 JSON 键），不兜底
+    NSString *respSendId = [responseDict dd_stringForKey:@"sendid"];
     NSString *sessionUserName = DDCurrentSessionUserName;
     if (respSendId.length) {
         DDWeChatRedEnvelopParam *peekParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
@@ -520,27 +540,32 @@ static NSString *DDCurrentSessionUserName = nil;
         if (buffer.buffer) {
             NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
             NSInteger amount = [dict[@"amount"] integerValue];
+            // 总额：直取头文件确认字段 totalAmount（8.0.76 ForeignHbOpenResp.h L52 / OpenWxaHBResponse.h L35 / WARedEnvelopesDetailViewModel.h L46 均为 totalAmount），不要 total_amount 兜底
             NSInteger total = [dict[@"totalAmount"] integerValue];
+            // 查询响应必有 totalAmount，拆响应未必有；先把总额存进队列参数（仅在有值时覆盖），
+            // 这样通知在「拆响应」上弹出时也能拿到查询阶段的总额，不会偶发落 0
+            if (respSendId.length && total > 0) {
+                DDWeChatRedEnvelopParam *storeParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
+                if (storeParam) storeParam.totalAmount = total;
+            }
             if (amount > 0) {
                 NSString *redId = [NSString stringWithFormat:@"%@_%@", dict[@"sendId"]?:@"", dict[@"timingIdentifier"]?:@""];
                 if ([cfg shouldNotifyForRedEnvelopId:redId]) {
                     DDWeChatRedEnvelopParam *fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
+                    // 直接用查询阶段存进参数的值（对齐 WCR m_lTotalAmount，查询响应必有 totalAmount），拆响应不带的也失不了；
+                    // 仅 fhParam 为空时回退当前响应，属取值来源保护而非字段猜测
+                    NSInteger displayTotal = (fhParam && fhParam.totalAmount > 0) ? fhParam.totalAmount : total;
                     // 系统本地通知（受「抢到红包后通知」独立开关控制）
                     if (cfg.showNotification) {
-                        [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:total sessionUserName:sessionUserName];
+                        [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:displayTotal sessionUserName:sessionUserName];
                     }
                     // 文件传输助手通知（受「发送到文件传输助手」独立开关控制）
                     if (cfg.notifyFileHelper) {
-                        // 包数取法对齐 WCR 反汇编（0x7591bc 起）：totalNum → total_num → totalCnt，WCR 不用 num
+                        // 包数：直取头文件确认字段 totalNum（8.0.76 ForeignHbOpenResp.h L53 / OpenWxaHBResponse.h L36 / WARedEnvelopesDetailViewModel.h L47 均为 totalNum）
                         NSInteger packetCount = [dict[@"totalNum"] integerValue];
-                        if (packetCount == 0) packetCount = [dict[@"total_num"] integerValue];
-                        if (packetCount == 0) packetCount = [dict[@"totalCnt"] integerValue];
-                        // 备注取值链对齐 WCR 反汇编（0x759da4-0x759edc）：wishing→wish→remark→blessing，兜底 nativeUrl 的 wishing
-                        NSString *wishing = [dict dd_stringForKey:@"wishing"] ?: [dict dd_stringForKey:@"wish"];
-                        wishing = wishing ?: [dict dd_stringForKey:@"remark"];
-                        wishing = wishing ?: [dict dd_stringForKey:@"blessing"];
-                        wishing = wishing ?: [parseNativeUrl(fhParam.nativeUrl) dd_stringForKey:@"wishing"];
-                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:total param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount];
+                        // 祝福语：直取头文件确认字段 wishing（同上模型类 L54/L37/L43 均为 wishing），不要兜底链
+                        NSString *wishing = [dict dd_stringForKey:@"wishing"];
+                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount];
                     }
                 }
             }
@@ -601,11 +626,9 @@ static NSString *DDCurrentSessionUserName = nil;
     // 发送者昵称：群消息真实发送者在 m_nsRealChatUsr（8.0.76 CMessageWrap.h L435），私聊直接用 m_nsFromUsr
     NSString *senderUsr = isGroup ? wrap.m_nsRealChatUsr : wrap.m_nsFromUsr;
     param.senderName = getDisplayNameForSession(senderUsr);
-    // 老板（发包人显示名）：来自红包卡片 XML <des>
-    param.bossName = dd_firstXMLCDATAText(wrap.m_nsContent, @"des");
     // 会话名：群红包且自己发的用 m_nsToUsr，否则 m_nsFromUsr
     param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
-    // 8.0.76 无 m_nsHeadImgUrl 字段（CContact 仅含背景图 ID），头像 URL 不可取；headImg 保持默认 nil，仅展示用，不影响拆红包
+    // 8.0.76 无 m_nsHeadImgUrl 字段（CContact 仅含背景图 ID），头像 URL 不可取，不影响拆红包
     param.nativeUrl = nativeUrl;
     param.sign = [urlDict dd_stringForKey:@"sign"];
     param.isGroupSender = isGroupSender;
@@ -633,9 +656,15 @@ static NSString *DDCurrentSessionUserName = nil;
         NSString *query = [abs substringFromIndex:scheme.length];
         NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
         NSString *session = [q dd_stringForKey:@"session"];
+        // 微信经 openURL 传出时可能把 @chatroom 中的 @ 做 percent-encode（%40），解码还原用户名
+        session = [session stringByRemovingPercentEncoding] ?: session;
         if (session.length) {
-            MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-            id mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
+            // 同系统通知：CAppViewControllerManager 取单例（getService: 在 8.0.76 多返回 nil）
+            id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
+            if (!mgr) {
+                MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
+                mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
+            }
             if (mgr) [mgr jumpToChat:session msgToLocate:nil];
         }
         return YES;   // 已处理，不交给系统/微信继续打开
