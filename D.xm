@@ -66,7 +66,9 @@
 // 头文件证据 MultiSelectContactsViewController.h：
 //   - m_delegate (id<MultiSelectContactsViewControllerDelegate>) / m_scene / m_selectView(ivar) / updatePanelBtn / initData
 //   - m_onlyChatRoom(BOOL) 控制是否只显示群聊，默认 NO → 群聊和好友都出现
-@class DDContactCardTransitioningDelegate;
+// 自定义卡片转场代理（圆角卡片 + 下拉关闭）。完整接口前移，供 onBlackListTapped 使用
+@interface DDContactCardTransitioningDelegate : NSObject <UIViewControllerTransitioningDelegate>
+@end
 @protocol MultiSelectContactsViewControllerDelegate <NSObject>
 - (void)onMultiSelectContactReturn:(NSArray *)contacts;
 @end
@@ -523,7 +525,7 @@ static id DD_CellOption(id cell) {
     MMUINavigationController *nav = [[objc_getClass("MMUINavigationController") alloc] initWithRootViewController:picker];
     // 圆角卡片样式 + 下拉关闭（自定义呈现控制器）
     nav.modalPresentationStyle = UIModalPresentationCustom;
-    DDContactCardTransitioningDelegate *cardDelegate = [DDContactCardTransitioningDelegate new];
+    DDContactCardTransitioningDelegate *cardDelegate = [[DDContactCardTransitioningDelegate alloc] init];
     nav.transitioningDelegate = cardDelegate;
     objc_setAssociatedObject(nav, kDDContactCardDelegateKey, cardDelegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [self presentViewController:nav animated:YES completion:nil];
@@ -759,17 +761,15 @@ static CGRect DD_ContactCardFrame(CGRect containerBounds) {
 @end
 
 // 转场代理：把上面的呈现控制器 + 动画接到 nav 上
-@interface DDContactCardTransitioningDelegate : NSObject <UIViewControllerTransitioningDelegate>
-@end
 @implementation DDContactCardTransitioningDelegate
 - (UIPresentationController *)presentationControllerForPresentedViewController:(UIViewController *)presented presentingViewController:(UIViewController *)presenting sourceViewController:(UIViewController *)source {
     return [[DDContactCardPresentationController alloc] initWithPresentedViewController:presented presentingViewController:presenting];
 }
 - (id<UIViewControllerAnimatedTransitioning>)animationControllerForPresentedController:(UIViewController *)presented presentingController:(UIViewController *)presenting sourceController:(UIViewController *)source {
-    DDContactCardAnimator *a = [DDContactCardAnimator new]; a.presenting = YES; return a;
+    DDContactCardAnimator *a = [[DDContactCardAnimator alloc] init]; a.presenting = YES; return a;
 }
 - (id<UIViewControllerAnimatedTransitioning>)animationControllerForDismissedController:(UIViewController *)dismissed {
-    DDContactCardAnimator *a = [DDContactCardAnimator new]; a.presenting = NO; return a;
+    DDContactCardAnimator *a = [[DDContactCardAnimator alloc] init]; a.presenting = NO; return a;
 }
 @end
 
