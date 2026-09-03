@@ -65,6 +65,11 @@
 - (void)AsyncOnAddMsg:(NSString *)msg MsgWrap:(CMessageWrap *)wrap;
 @end
 
+// 8.0.76 CAppViewControllerManager.h L72：跳转会话并定位到指定消息（用于通知点击「去感谢老板」）
+@interface CAppViewControllerManager : NSObject
+- (void)jumpToChat:(id)session msgToLocate:(id)msgWrap;
+@end
+
 // CMessageMgr 扩展：向本地会话插入消息（不发送到服务器）
 // 8.0.76 CMessageMgr.h：L234 四参数版 / L236 两参数版
 // 对齐 WCR 反汇编 0x751928-0x751a64：优先四参数版，respondsToSelector 失败才回退两参数版
@@ -268,9 +273,24 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     return displayName.length ? displayName : nil;
 }
 
+// 从红包卡片消息 XML（wrap.m_nsContent）中提取 <tag><![CDATA[...]]></tag> 的首段文本
+// 用途：老板 = <des>（发包人显示名）、跳转链接 = <url>（红包详情页）
+static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
+    if (!xml.length || !tag.length) return nil;
+    NSString *pattern = [NSString stringWithFormat:@"<%@><!\\[CDATA\\[(.*?)\\]\\]></%@>", tag, tag];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionDotMatchesLineSeparators error:nil];
+    NSTextCheckingResult *match = [re firstMatchInString:xml options:0 range:NSMakeRange(0, xml.length)];
+    if (!match || [match numberOfRanges] < 2) return nil;
+    NSRange r = [match rangeAtIndex:1];
+    if (r.location == NSNotFound || r.length == 0) return nil;
+    return [xml substringWithRange:r];
+}
+
 // ========== 红包参数模型 ==========
 @interface DDWeChatRedEnvelopParam : NSObject
 @property (strong, nonatomic) NSString *msgType, *sendId, *channelId, *nickName, *headImg, *nativeUrl, *sessionUserName, *sign, *timingIdentifier, *senderName;
+// 老板（发包人显示名，红包卡片 XML <des>）
+@property (strong, nonatomic) NSString *bossName;
 @property (assign, nonatomic) BOOL isGroupSender;
 - (NSDictionary *)toParams;
 @end
@@ -364,7 +384,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 @interface DDNotificationManager : NSObject <UNUserNotificationCenterDelegate>
 + (instancetype)sharedManager;
 - (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName;
-- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName nickName:(NSString *)nickName sendId:(NSString *)sendId timingIdentifier:(NSString *)timingIdentifier packetCount:(NSInteger)packetCount;
+- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount;
 @end
 @implementation DDNotificationManager
 + (instancetype)sharedManager {
@@ -396,7 +416,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 
 // 参考 WCR「文件传输助手」通知格式：构造富文本消息通过 CMessageMgr AddLocalMsg:MsgWrap: 插入 filehelper 会话
 // 8.0.76 证据：CMessageMgr.h L236 AddLocalMsg:MsgWrap: / CMessageWrap.h L449-452 m_nsContent/m_nsFromUsr/m_nsToUsr/m_uiMessageType
-- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName nickName:(NSString *)nickName sendId:(NSString *)sendId timingIdentifier:(NSString *)timingIdentifier packetCount:(NSInteger)packetCount {
+- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount {
     if (![DDRedEnvelopConfig sharedConfig].notifyFileHelper || amount <= 0) return;
 
     NSString *displayName = getDisplayNameForSession(sessionUserName);
@@ -405,15 +425,36 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
     NSString *timeStr = [fmt stringFromDate:[NSDate date]];
 
-    // 参考截图格式构建消息体
+    // 对齐 WCR 截图格式：
+    //   来源分群聊/个人（群会话以 @chatroom 结尾）
+    BOOL srcIsGroup = [sessionUserName hasSuffix:@"@chatroom"];
+    //   类型分拼手气/普通（nativeUrl 的 msgtype 字段：1=拼手气红包，0=普通红包）
+    NSString *typeName = @"红包";
+    if ([param.msgType isEqualToString:@"1"]) typeName = @"拼手气红包";
+    else if ([param.msgType isEqualToString:@"0"]) typeName = @"普通红包";
+
     NSMutableString *body = [NSMutableString string];
     [body appendFormat:@"💰 叮咚，为您抢到 %.2f元\n", amount / 100.0];
-    [body appendFormat:@"📍 来源：%@\n", finalDisplayName];
-    [body appendFormat:@"🧧 类型：红包 (%ld包%.2f元)\n", (long)packetCount, totalAmount / 100.0];
-    if (nickName.length) [body appendFormat:@"😊 抢包人：%@\n", nickName];
-    if (sendId.length) [body appendFormat:@"🆔 ID：%@\n", sendId];
-    [body appendFormat:@"⏰ 时间：%@\n", timeStr];
-    [body appendString:@"\n点击跳转去感谢老板"];
+    [body appendFormat:@"📍 来源： %@（%@）\n", finalDisplayName, srcIsGroup ? @"群聊" : @"个人"];
+    if (packetCount > 0) {
+        [body appendFormat:@"🧧 类型： %@（%ld包%.2f元）\n", typeName, (long)packetCount, totalAmount / 100.0];
+    } else {
+        [body appendFormat:@"🧧 类型： %@（%.2f元）\n", typeName, totalAmount / 100.0];
+    }
+    // 老板：发包人显示名（红包卡片 XML <des>）
+    if (param.bossName.length) [body appendFormat:@"👨 老板： %@\n", param.bossName];
+    // 备注：祝福语（对齐 WCR 取值链 wishing→wish→remark→blessing，反汇编 0x759da4-0x759edc）
+    if (wishing.length) [body appendFormat:@"📝 备注： %@\n", wishing];
+    [body appendFormat:@"⏰ 时间： %@\n", timeStr];
+    // 点击跳转：微信灰字消息自定义链接标签（对齐 WCR 反汇编 0x5e9f34/0x5ea028）
+    //   <_wc_custom_link_ color="#%@" href="%@">%@</_wc_custom_link_>
+    //   href 对齐 WCR 语义（WCRefineRedEnvelopSession://session=xxx → 跳到红包所在会话），
+    //   用自有 scheme 由下方 %hook UIApplication 拦截，再调 jumpToChat:msgToLocate: 定位到红包消息
+    if (sessionUserName.length) {
+        [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转去感谢老板</_wc_custom_link_>", sessionUserName];
+    } else {
+        [body appendString:@"\n点击跳转去感谢老板"];
+    }
 
     // 构造 CMessageWrap 并插入 filehelper 会话（纯本地消息，不发送到服务器）
     // 严格对齐 WCR 反汇编 0x7516f8-0x751a64：
@@ -443,6 +484,8 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 
 // ========== Hook 红包逻辑 ==========
 static NSString *DDCurrentSessionUserName = nil;
+// 会话 -> 红包原始消息，用于点击通知跳转时定位到该条红包（jumpToChat:msgToLocate:）
+static NSMutableDictionary *DDHBMsgCache = nil;
 
 %hook WCRedEnvelopesLogicMgr
 - (void)OnWCToHongbaoCommonResponse:(HongBaoRes *)arg1 Request:(HongBaoReq *)arg2 {
@@ -481,7 +524,12 @@ static NSString *DDCurrentSessionUserName = nil;
                         NSInteger packetCount = [dict[@"totalNum"] integerValue];
                         if (packetCount == 0) packetCount = [dict[@"total_num"] integerValue];
                         if (packetCount == 0) packetCount = [dict[@"totalCnt"] integerValue];
-                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:total sessionUserName:sessionUserName nickName:fhParam.nickName sendId:respSendId timingIdentifier:dict[@"timingIdentifier"] packetCount:packetCount];
+                        // 备注取值链对齐 WCR 反汇编（0x759da4-0x759edc）：wishing→wish→remark→blessing，兜底 nativeUrl 的 wishing
+                        NSString *wishing = [dict dd_stringForKey:@"wishing"] ?: [dict dd_stringForKey:@"wish"];
+                        wishing = wishing ?: [dict dd_stringForKey:@"remark"];
+                        wishing = wishing ?: [dict dd_stringForKey:@"blessing"];
+                        wishing = wishing ?: [parseNativeUrl(fhParam.nativeUrl) dd_stringForKey:@"wishing"];
+                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:total param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount];
                     }
                 }
             }
@@ -542,9 +590,17 @@ static NSString *DDCurrentSessionUserName = nil;
     // 发送者昵称：群消息真实发送者在 m_nsRealChatUsr（8.0.76 CMessageWrap.h L435），私聊直接用 m_nsFromUsr
     NSString *senderUsr = isGroup ? wrap.m_nsRealChatUsr : wrap.m_nsFromUsr;
     param.senderName = getDisplayNameForSession(senderUsr);
+    // 老板（发包人显示名）：来自红包卡片 XML <des>
+    param.bossName = dd_firstXMLCDATAText(wrap.m_nsContent, @"des");
+    // 会话名：群红包且自己发的用 m_nsToUsr，否则 m_nsFromUsr（须在缓存前赋值）
+    param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
+    // 缓存红包原始消息，供通知点击「去感谢老板」时 jumpToChat:msgToLocate: 定位到该条红包
+    if (param.sessionUserName.length && wrap) {
+        if (!DDHBMsgCache) DDHBMsgCache = [NSMutableDictionary dictionary];
+        DDHBMsgCache[param.sessionUserName] = wrap;
+    }
     // 8.0.76 无 m_nsHeadImgUrl 字段（CContact 仅含背景图 ID），头像 URL 不可取；headImg 保持默认 nil，仅展示用，不影响拆红包
     param.nativeUrl = nativeUrl;
-    param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
     param.sign = [urlDict dd_stringForKey:@"sign"];
     param.isGroupSender = isGroupSender;
     [[DDRedEnvelopParamQueue sharedQueue] enqueue:param];
@@ -557,6 +613,29 @@ static NSString *DDCurrentSessionUserName = nil;
     reqParams[@"sendId"] = param.sendId ?: @"";
     WCRedEnvelopesLogicMgr *logicMgr = [ctx getService:objc_getClass("WCRedEnvelopesLogicMgr")];
     [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
+}
+%end
+
+// 拦截通知里的跳转链接：DDHBRedEnvelopSession://session=xxx
+// 语义对齐 WCR（WCRefineRedEnvelopSession://session=xxx → 打开红包所在会话），
+// 但用微信原生 jumpToChat:msgToLocate:（8.0.76 CAppViewControllerManager.h L72）做到定位到该条红包消息
+%hook UIApplication
+- (BOOL)openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenExternalURLOptionsKey, id> *)options completionHandler:(void (^)(BOOL))completion {
+    NSString *abs = url.absoluteString ?: @"";
+    NSString *scheme = @"DDHBRedEnvelopSession://";
+    if ([abs hasPrefix:scheme]) {
+        NSString *query = [abs substringFromIndex:scheme.length];
+        NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
+        NSString *session = [q dd_stringForKey:@"session"];
+        if (session.length) {
+            CMessageWrap *locateMsg = DDHBMsgCache[session];
+            MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
+            id mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
+            if (mgr) [mgr jumpToChat:session msgToLocate:locateMsg];
+        }
+        return YES;   // 已处理，不交给系统/微信继续打开
+    }
+    return %orig;
 }
 %end
 
@@ -645,10 +724,9 @@ static id DD_CellOption(id cell) {
         [redEnvelopSection addCell:blackCell];
         [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onEnableNotifySwitch:) target:self title:@"↳启用红包通知" on:cfg.enableNotify]];
         if (cfg.enableNotify) {
+            // 「抢到红包后通知」与「发送到文件传输助手」是两个独立功能，同级并列，均只受总开关控制
             [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifySwitch:) target:self title:@"↳↳抢到红包后通知" on:cfg.showNotification]];
-            if (cfg.showNotification) {
-                [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifyFileHelperSwitch:) target:self title:@"↳↳↳发送到文件传输助手" on:cfg.notifyFileHelper]];
-            }
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifyFileHelperSwitch:) target:self title:@"↳↳发送到文件传输助手" on:cfg.notifyFileHelper]];
         }
     }
     [_tableViewManager addSection:redEnvelopSection];
@@ -687,7 +765,7 @@ static id DD_CellOption(id cell) {
 - (void)onSkipPrivateSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipPrivateRedEnvelop = sender.on; }
 - (void)onSkipSelfSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipSelfRedEnvelop = sender.on; }
 - (void)onSerialSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].serialReceive = sender.on; }
-- (void)onNotifySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].showNotification = sender.on; [self buildTable]; }
+- (void)onNotifySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].showNotification = sender.on; }
 - (void)onNotifyFileHelperSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].notifyFileHelper = sender.on; }
 - (void)onEnableNotifySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].enableNotify = sender.on; [self buildTable]; }
 
