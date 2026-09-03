@@ -513,6 +513,7 @@ static id DD_CellOption(id cell) {
         }
     }
     MMUINavigationController *nav = [[objc_getClass("MMUINavigationController") alloc] initWithRootViewController:picker];
+    picker.navigationItem.leftBarButtonItem = nil;   // 去掉原生 × 按钮（关闭用下拉抓手条 / 完成）
     // 非全屏：底部 sheet（可拖拽 + 抓手条 + 圆角）
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     UISheetPresentationController *sheet = nav.sheetPresentationController;
@@ -630,7 +631,6 @@ static NSString *DDCurrentSessionUserName = nil;
     [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
 }
 %end
-
 
 %ctor {
     @autoreleasepool {
