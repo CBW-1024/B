@@ -62,31 +62,21 @@
 + (NSDictionary *)dictionaryWithDecodedComponets:(NSString *)string separator:(NSString *)separator;
 @end
 
-// 微信原生联系人选择器（群聊 + 私聊，m_onlyChatRoom 默认 NO → 两者都显示）
-// 头文件证据 MultiSelectContactsViewController.h：
-//   - m_delegate (id<MultiSelectContactsViewControllerDelegate>) / m_scene / m_selectView(ivar) / updatePanelBtn / initData
-//   - m_onlyChatRoom(BOOL) 控制是否只显示群聊，默认 NO → 群聊和好友都出现
-// 自定义卡片转场代理（圆角卡片 + 下拉关闭）。完整接口前移，供 onBlackListTapped 使用
-@interface DDContactCardTransitioningDelegate : NSObject <UIViewControllerTransitioningDelegate>
-@end
-@protocol MultiSelectContactsViewControllerDelegate <NSObject>
-- (void)onMultiSelectContactReturn:(NSArray *)contacts;
-@end
-
 @interface ContactSelectView : NSObject
 - (void)addSelect:(id)contact;
 @end
 
 @interface MultiSelectContactsViewController : UIViewController
-- (instancetype)init;
 @property (nonatomic, assign) unsigned long long m_scene;
-@property (nonatomic, weak) id<MultiSelectContactsViewControllerDelegate> m_delegate;
+@property (nonatomic, weak) id m_delegate;
 @property (nonatomic, retain) ContactSelectView *m_selectView;
 - (void)updatePanelBtn;
+- (void)loadViewIfNeeded;
 @end
 
-// 保留自定义卡片转场代理的强引用（transitioningDelegate 是 weak）
-static const void *kDDContactCardDelegateKey = &kDDContactCardDelegateKey;
+@protocol MultiSelectContactsViewControllerDelegate <NSObject>
+- (void)onMultiSelectContactReturn:(NSArray *)contacts;
+@end
 
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
@@ -523,11 +513,7 @@ static id DD_CellOption(id cell) {
         }
     }
     MMUINavigationController *nav = [[objc_getClass("MMUINavigationController") alloc] initWithRootViewController:picker];
-    // 圆角卡片样式 + 下拉关闭（自定义呈现控制器）
-    nav.modalPresentationStyle = UIModalPresentationCustom;
-    DDContactCardTransitioningDelegate *cardDelegate = [[DDContactCardTransitioningDelegate alloc] init];
-    nav.transitioningDelegate = cardDelegate;
-    objc_setAssociatedObject(nav, kDDContactCardDelegateKey, cardDelegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
     [self presentViewController:nav animated:YES completion:nil];
 }
 
@@ -640,138 +626,6 @@ static NSString *DDCurrentSessionUserName = nil;
 }
 %end
 
-// ========== 圆角卡片呈现（下拉关闭选择器）==========
-// 把包装 picker 的 MMUINavigationController 以自定义样式弹出：
-//   - 半透明遮罩（点击关闭）
-//   - 圆角卡片 + 顶部抓手条
-//   - 拖拽抓手条下拉关闭
-static CGRect DD_ContactCardFrame(CGRect containerBounds) {
-    CGFloat topInset = 64, sideInset = 16, bottomInset = 16;
-    CGFloat w = containerBounds.size.width - sideInset * 2;
-    CGFloat h = containerBounds.size.height - topInset - bottomInset;
-    return CGRectMake(sideInset, topInset, w, h);
-}
-
-@interface DDContactCardPresentationController : UIPresentationController
-@property (nonatomic, retain) UIView *dimView;
-@property (nonatomic, retain) UIView *grabber;
-@property (nonatomic, assign) CGPoint panStart;
-@property (nonatomic, assign) CGFloat cardStartY;
-@end
-
-@implementation DDContactCardPresentationController
-
-- (void)presentationTransitionWillBegin {
-    self.dimView = [[UIView alloc] initWithFrame:self.containerView.bounds];
-    self.dimView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
-    self.dimView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.containerView addSubview:self.dimView];
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dd_dimTapped)];
-    [self.dimView addGestureRecognizer:tap];
-    self.dimView.alpha = 0;
-    [self.presentedViewController.transitionCoordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> ctx){
-        self.dimView.alpha = 1;
-    } completion:nil];
-
-    self.grabber = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 40, 5)];
-    self.grabber.backgroundColor = [UIColor colorWithWhite:1 alpha:0.9];
-    self.grabber.layer.cornerRadius = 2.5;
-    self.grabber.userInteractionEnabled = YES;
-    [self.containerView addSubview:self.grabber];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dd_handlePan:)];
-    [self.grabber addGestureRecognizer:pan];
-}
-
-- (void)dd_dimTapped {
-    [self.presentedViewController dismissViewControllerAnimated:YES completion:nil];
-}
-
-- (void)dd_handlePan:(UIPanGestureRecognizer *)pan {
-    UIView *card = self.presentedView;
-    CGPoint t = [pan translationInView:self.containerView];
-    if (pan.state == UIGestureRecognizerStateBegan) {
-        self.panStart = t;
-        self.cardStartY = card.frame.origin.y;
-    } else if (pan.state == UIGestureRecognizerStateChanged) {
-        CGFloat dy = t.y - self.panStart.y;
-        if (dy < 0) dy *= 0.15;
-        CGRect f = card.frame; f.origin.y = self.cardStartY + dy; card.frame = f;
-        CGRect g = self.grabber.frame; g.origin.y = f.origin.y - 14; self.grabber.frame = g;
-        self.dimView.alpha = 0.45 * (1 - MIN(1, MAX(0, dy) / 300.0));
-    } else {
-        CGFloat dy = card.frame.origin.y - self.cardStartY;
-        CGPoint v = [pan velocityInView:self.containerView];
-        if (dy > 120 || v.y > 800) {
-            [self.presentedViewController dismissViewControllerAnimated:YES completion:nil];
-        } else {
-            [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-                CGRect f = card.frame; f.origin.y = self.cardStartY; card.frame = f;
-                CGRect g = self.grabber.frame; g.origin.y = f.origin.y - 14; self.grabber.frame = g;
-                self.dimView.alpha = 0.45;
-            } completion:nil];
-        }
-    }
-}
-
-- (void)containerViewWillLayoutSubviews {
-    [super containerViewWillLayoutSubviews];
-    UIView *card = self.presentedView;
-    card.frame = DD_ContactCardFrame(self.containerView.bounds);
-    card.layer.cornerRadius = 16;
-    card.layer.masksToBounds = YES;
-    self.grabber.center = CGPointMake(self.containerView.bounds.size.width / 2, card.frame.origin.y - 14);
-}
-
-- (void)dismissalTransitionWillBegin {
-    [self.presentedViewController.transitionCoordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> ctx){
-        self.dimView.alpha = 0;
-    } completion:nil];
-}
-
-- (void)dismissalTransitionDidEnd:(BOOL)completed {
-    if (completed) {
-        [self.dimView removeFromSuperview];
-        [self.grabber removeFromSuperview];
-    }
-}
-@end
-
-// 卡片滑入 / 滑出动画
-@interface DDContactCardAnimator : NSObject <UIViewControllerAnimatedTransitioning>
-@property (nonatomic, assign) BOOL presenting;
-@end
-@implementation DDContactCardAnimator
-- (NSTimeInterval)transitionDuration:(id<UIViewControllerAnimatedTransitioning>)t { return 0.32; }
-- (void)animateTransition:(id<UIViewControllerAnimatedTransitioning>)transitionContext {
-    id ctx = (id)transitionContext;
-    UIView *container = [ctx containerView];
-    if (self.presenting) {
-        UIView *v = [ctx viewControllerForKey:UITransitionContextToViewControllerKey].view;
-        CGRect final = DD_ContactCardFrame(container.bounds);
-        v.frame = CGRectMake(final.origin.x, container.bounds.size.height, final.size.width, final.size.height);
-        [container addSubview:v];
-        [UIView animateWithDuration:0.32 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{ v.frame = final; } completion:^(BOOL d){ [ctx completeTransition:YES]; }];
-    } else {
-        UIView *v = [ctx viewControllerForKey:UITransitionContextFromViewControllerKey].view;
-        [UIView animateWithDuration:0.28 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
-            v.frame = CGRectMake(v.frame.origin.x, container.bounds.size.height, v.frame.size.width, v.frame.size.height);
-        } completion:^(BOOL d){ [ctx completeTransition:YES]; }];
-    }
-}
-@end
-
-// 转场代理：把上面的呈现控制器 + 动画接到 nav 上
-@implementation DDContactCardTransitioningDelegate
-- (UIPresentationController *)presentationControllerForPresentedViewController:(UIViewController *)presented presentingViewController:(UIViewController *)presenting sourceViewController:(UIViewController *)source {
-    return [[DDContactCardPresentationController alloc] initWithPresentedViewController:presented presentingViewController:presenting];
-}
-- (id<UIViewControllerAnimatedTransitioning>)animationControllerForPresentedController:(UIViewController *)presented presentingController:(UIViewController *)presenting sourceController:(UIViewController *)source {
-    DDContactCardAnimator *a = [[DDContactCardAnimator alloc] init]; a.presenting = YES; return a;
-}
-- (id<UIViewControllerAnimatedTransitioning>)animationControllerForDismissedController:(UIViewController *)dismissed {
-    DDContactCardAnimator *a = [[DDContactCardAnimator alloc] init]; a.presenting = NO; return a;
-}
-@end
 
 %ctor {
     @autoreleasepool {
