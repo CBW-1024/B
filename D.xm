@@ -12,6 +12,8 @@
 
 @interface WCPayInfoItem : NSObject
 @property (retain, nonatomic) NSString *m_c2cNativeUrl;
+@property (retain, nonatomic) NSString *m_c2cUrl;        // WCPayInfoItem.h:194
+@property (nonatomic) unsigned int m_uiPaySubType;       // WCPayInfoItem.h:202 支付子类型（1=转账）
 @property (retain, nonatomic) NSString *m_nsTransferID;
 @property (nonatomic) unsigned int m_c2cPayReceiveStatus;
 @property (nonatomic) unsigned int m_uiInvalidTime;
@@ -387,6 +389,9 @@ static void DD_SendTransferReply(NSString *toUserName) {
 
 #pragma mark - 转账识别
 
+// 与 WCR 完全一致的转账识别（逆向 WCRefine 0x1b12d0-0x1b1314 得出）：
+//   条件 = m_c2cNativeUrl/m_c2cUrl 前缀为 "wechat://wcpay/transfer/transferquery?"  或  m_uiPaySubType == 1
+// 只查 transferID 非空会把“发送方视图 / 领取后状态更新”等消息一并放进来，导致我发出的转账被误处理
 static BOOL DD_IsTransfer(CMessageWrap *msg) {
     if (!msg) return NO;
     [msg parseWCPayInfoItemIfNeed];
@@ -394,11 +399,18 @@ static BOOL DD_IsTransfer(CMessageWrap *msg) {
     if (!info) return NO;
     if (info.m_nsTransferID.length == 0) return NO;
 
-    NSString *url = info.m_c2cNativeUrl ?: @"";
-    if ([url rangeOfString:@"receivehongbao" options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
+    // 排除红包
+    NSString *nativeUrl = info.m_c2cNativeUrl ?: @"";
     NSString *content = msg.m_nsContent ?: @"";
+    if ([nativeUrl rangeOfString:@"receivehongbao" options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
     if ([content rangeOfString:@"receivehongbao" options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
-    return YES;
+
+    // 接收方视角的转账 URL：wechat://wcpay/transfer/transferquery?（发送方视图的 URL 不是这个）
+    NSString *c2cUrl = info.m_c2cUrl ?: @"";
+    if ([nativeUrl hasPrefix:@"wechat://wcpay/transfer/transferquery?"]) return YES;
+    if ([c2cUrl hasPrefix:@"wechat://wcpay/transfer/transferquery?"]) return YES;
+    if (info.m_uiPaySubType == 1) return YES;
+    return NO;
 }
 
 #pragma mark - 去重
