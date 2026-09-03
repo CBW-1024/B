@@ -499,6 +499,10 @@ static id DD_CellOption(id cell) {
     picker.m_scene = 0;
     picker.m_delegate = self;
     [picker loadViewIfNeeded];
+    // 方案A：隐藏微信自绘的 headerBar（截图里那行「× 选择朋友」过宽过粗），
+    // 回落到系统 UINavigationBar 原生渲染（44pt / 系统 regular 字重）。
+    picker.headerBarView.hidden = YES;
+    picker.title = @"选择朋友";
     NSArray *blackList = [DDRedEnvelopConfig sharedConfig].blackList;
     if (blackList.count) {
         MMContext *context = [objc_getClass("MMContext") activeUserContext];
