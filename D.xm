@@ -1,7 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <UserNotifications/UserNotifications.h>
-#import <objc/message.h>
 #import <objc/runtime.h>
 
 // ========== 微信内部类声明 ==========
@@ -270,6 +269,7 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
 + (instancetype)sharedQueue;
 - (void)enqueue:(DDWeChatRedEnvelopParam *)param;
 - (DDWeChatRedEnvelopParam *)dequeueBySendId:(NSString *)sendId;
+- (DDWeChatRedEnvelopParam *)peekBySendId:(NSString *)sendId;
 @end
 @implementation DDRedEnvelopParamQueue { NSMutableArray<DDWeChatRedEnvelopParam *> *_queue; }
 + (instancetype)sharedQueue { static DDRedEnvelopParamQueue *queue; static dispatch_once_t onceToken; dispatch_once(&onceToken, ^{ queue = [DDRedEnvelopParamQueue new]; }); return queue; }
@@ -290,6 +290,15 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
     DDWeChatRedEnvelopParam *first = _queue.firstObject;
     [_queue removeObjectAtIndex:0];
     return first;
+}
+
+// 只读查询：按 sendId 找到对应参数但不出队（避免提前取出导致后续 dequeue 取不到，破坏拆包流程）
+- (DDWeChatRedEnvelopParam *)peekBySendId:(NSString *)sendId {
+    if (_queue.count == 0) return nil;
+    for (DDWeChatRedEnvelopParam *p in _queue) {
+        if ([p.sendId isEqualToString:sendId]) return p;
+    }
+    return nil;
 }
 @end
 
@@ -545,6 +554,18 @@ static NSString *DDCurrentSessionUserName = nil;
 - (void)OnWCToHongbaoCommonResponse:(HongBaoRes *)arg1 Request:(HongBaoReq *)arg2 {
     %orig;
     DDRedEnvelopConfig *cfg = [DDRedEnvelopConfig sharedConfig];
+
+    // 先按本次响应的 sendId 从队列 peek（只读、不出队）取最新的会话名，
+    // 保证下方通知显示的是「当前这条红包」所在会话，而非上一条（旧全局变量滞后问题）。
+    // 注意：此处不能用 dequeue，否则首响取出后拆响取不到，红包拆不开。
+    NSDictionary *responseDict = [[[NSString alloc] initWithData:arg1.retText.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
+    NSString *respSendId = [responseDict dd_stringForKey:@"sendid"] ?: [responseDict dd_stringForKey:@"sendId"];
+    NSString *sessionUserName = DDCurrentSessionUserName;
+    if (respSendId.length) {
+        DDWeChatRedEnvelopParam *peekParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
+        if (peekParam.sessionUserName.length) sessionUserName = peekParam.sessionUserName;
+    }
+
     if (cfg.showNotification && cfg.autoReceiveEnable) {
         SKBuiltinBuffer_t *buffer = arg1.retText;
         if (buffer.buffer) {
@@ -554,14 +575,12 @@ static NSString *DDCurrentSessionUserName = nil;
             if (amount > 0) {
                 NSString *redId = [NSString stringWithFormat:@"%@_%@", dict[@"sendId"]?:@"", dict[@"timingIdentifier"]?:@""];
                 if ([cfg shouldNotifyForRedEnvelopId:redId]) {
-                    [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:total sessionUserName:DDCurrentSessionUserName];
+                    [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:total sessionUserName:sessionUserName];
                 }
             }
         }
     }
     if (arg1.cgiCmdid != 3) return;
-    NSDictionary *responseDict = [[[NSString alloc] initWithData:arg1.retText.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
-    NSString *respSendId = [responseDict dd_stringForKey:@"sendid"] ?: [responseDict dd_stringForKey:@"sendId"];
     DDWeChatRedEnvelopParam *mgrParams = [[DDRedEnvelopParamQueue sharedQueue] dequeueBySendId:respSendId];
     DDCurrentSessionUserName = mgrParams.sessionUserName;
     if (!mgrParams) return;
@@ -613,7 +632,7 @@ static NSString *DDCurrentSessionUserName = nil;
     param.sendId = [urlDict dd_stringForKey:@"sendid"];
     param.channelId = [urlDict dd_stringForKey:@"channelid"];
     param.nickName = [selfContact getContactDisplayName];
-    param.headImg = nil;   // 8.0.76 无 m_nsHeadImgUrl 字段（CContact 仅含背景图 ID），头像 URL 不可取；仅展示用，不影响拆红包
+    // 8.0.76 无 m_nsHeadImgUrl 字段（CContact 仅含背景图 ID），头像 URL 不可取；headImg 保持默认 nil，仅展示用，不影响拆红包
     param.nativeUrl = nativeUrl;
     param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
     param.sign = [urlDict dd_stringForKey:@"sign"];
