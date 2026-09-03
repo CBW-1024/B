@@ -5,6 +5,7 @@
 // 回复内容为空时等于不自动回复；全部基于微信76 头文件核对
 
 #import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -16,6 +17,7 @@
 @property (nonatomic) unsigned int m_uiPaySubType;       // WCPayInfoItem.h:202 支付子类型（1=转账）
 @property (retain, nonatomic) NSString *m_nsTransferID;
 @property (nonatomic) unsigned int m_c2cPayReceiveStatus;
+@property (retain, nonatomic) NSString *m_total_fee;       // WCPayInfoItem.h:185 转账金额（微信历史为「分」整数字符串；含小数点则视为「元」）
 @property (nonatomic) unsigned int m_uiInvalidTime;
 @property (retain, nonatomic) NSString *transfer_attach;
 @property (retain, nonatomic) NSString *transfer_payer_username;
@@ -102,6 +104,7 @@ static NSString *const kDDReceiveEnabled = @"DDTransferAutoReceive";
 static NSString *const kDDReceiveDelay   = @"DDTransferAutoReceiveDelay";
 static NSString *const kDDReplyEnabled   = @"DDTransferAutoReplyEnabled";
 static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
+static NSString *const kDDBroadcastEnabled = @"DDTransferVoiceBroadcastEnabled";
 
 @interface DDTRConfig : NSObject
 + (instancetype)shared;
@@ -109,6 +112,7 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 @property (nonatomic) double autoReceiveDelay;
 @property (nonatomic) BOOL autoReplyEnabled;
 @property (nonatomic, copy) NSString *autoReplyContent;
+@property (nonatomic) BOOL autoBroadcastEnabled;
 @end
 
 @implementation DDTRConfig
@@ -123,8 +127,10 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 - (instancetype)init {
     if (self = [super init]) {
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        _autoReceiveEnabled = [ud objectForKey:kDDReceiveEnabled] ? [ud boolForKey:kDDReceiveEnabled] : YES;
+        _autoReceiveEnabled = [ud objectForKey:kDDReceiveEnabled] ? [ud boolForKey:kDDReceiveEnabled] : NO;
         [ud setBool:_autoReceiveEnabled forKey:kDDReceiveEnabled];
+        _autoBroadcastEnabled = [ud objectForKey:kDDBroadcastEnabled] ? [ud boolForKey:kDDBroadcastEnabled] : NO;
+        [ud setBool:_autoBroadcastEnabled forKey:kDDBroadcastEnabled];
         _autoReceiveDelay = [ud objectForKey:kDDReceiveDelay] ? [ud doubleForKey:kDDReceiveDelay] : 0.2;
         [ud setDouble:_autoReceiveDelay forKey:kDDReceiveDelay];
         _autoReplyEnabled = [ud objectForKey:kDDReplyEnabled] ? [ud boolForKey:kDDReplyEnabled] : NO;
@@ -139,6 +145,12 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 - (void)setAutoReceiveEnabled:(BOOL)v {
     _autoReceiveEnabled = v;
     [[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDReceiveEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setAutoBroadcastEnabled:(BOOL)v {
+    _autoBroadcastEnabled = v;
+    [[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDBroadcastEnabled];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
@@ -221,6 +233,12 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
                                           on:[DDTRConfig shared].autoReceiveEnabled]];
 
     if ([DDTRConfig shared].autoReceiveEnabled) {
+        // 语音播报：与 WCR autoAcceptTransferVoiceBroadcastEnabled 同组，紧跟总开关
+        [section addCell:[cellCls switchCellForSel:@selector(broadcastSwitchChanged:)
+                                          target:self
+                                           title:@"↳语音播报"
+                                              on:[DDTRConfig shared].autoBroadcastEnabled]];
+
         // 延迟收款秒数：表头显示当前值，点按展开下拉选项
         [section addCell:[cellCls normalCellForSel:@selector(delayHeaderTapped:)
                                           target:self
@@ -288,6 +306,11 @@ static NSString *const kDDReplyContent   = @"DDTransferAutoReplyContent";
 
 - (void)autoReplySwitchChanged:(UISwitch *)sender {
     [DDTRConfig shared].autoReplyEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)broadcastSwitchChanged:(UISwitch *)sender {
+    [DDTRConfig shared].autoBroadcastEnabled = sender.isOn;
     [self buildTable];
 }
 
@@ -385,6 +408,53 @@ static void DD_SendTransferReply(NSString *toUserName) {
     [msgMgr AddMsg:toUserName MsgWrap:replyMsg];
 }
 
+#pragma mark - 收款语音播报
+
+// 单例 synthesizer：复用避免并发/重复初始化（对齐 WCR 懒加载单例，存全局）
+static AVSpeechSynthesizer *DD_SharedSynth(void) {
+    static AVSpeechSynthesizer *synth;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        synth = [[AVSpeechSynthesizer alloc] init];
+    });
+    return synth;
+}
+
+// 拼播报文案：优先用转账金额（WCPayInfoItem.m_total_fee，WCPayInfoItem.h:185）
+// 微信历史该字段为「分」整数字符串（如 "6600"=¥66.00）；若已含小数点则视为「元」
+static NSString *DD_BroadcastText(WCPayInfoItem *info) {
+    NSString *raw = info.m_total_fee;
+    if (raw.length) {
+        double amt = [raw doubleValue];
+        if ([raw rangeOfString:@"."].location == NSNotFound) amt /= 100.0; // 分为单位 → 转元
+        return [NSString stringWithFormat:@"收款 %.2f 元", amt];
+    }
+    return @"收到微信转账";
+}
+
+// 主线程播报：去空白 → 非空才播 → 正在播先打断 → 中文语音、默认语速（对齐 WCR 逆向）
+static void DD_Announce(NSString *text) {
+    if (!text.length) return;
+    text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!text.length) return;
+
+    void (^speak)(void) = ^{
+        AVSpeechSynthesizer *synth = DD_SharedSynth();
+        if ([synth isSpeaking]) {
+            [synth stopSpeakingAtBoundary:AVSpeechBoundaryImmediate]; // WCR: stopSpeakingAtBoundary:0
+        }
+        AVSpeechUtterance *u = [AVSpeechUtterance speechUtteranceWithString:text];
+        u.rate = AVSpeechUtteranceDefaultSpeechRate;
+        u.pitchMultiplier = 1.0;
+        AVSpeechSynthesisVoice *voice = [AVSpeechSynthesisVoice voiceWithLanguage:@"zh-CN"];
+        if (voice) u.voice = voice;
+        [synth speakUtterance:u];
+    };
+
+    if ([NSThread isMainThread]) speak();
+    else dispatch_async(dispatch_get_main_queue(), speak);
+}
+
 #pragma mark - 转账识别
 
 // 与 WCR 完全一致的转账识别（逆向 WCRefine 0x1b12d0-0x1b1314 得出）：
@@ -478,6 +548,9 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
         req.m_nsTransferAttach = info.transfer_attach;
 
         [logic ConfirmTransferMoney:req];
+        if ([DDTRConfig shared].autoBroadcastEnabled) {
+            DD_Announce(DD_BroadcastText(info));
+        }
         if ([DDTRConfig shared].autoReplyEnabled) {
             // 回复延迟 3.0 秒：与 WCR 硬编码常数一致（WCRefine 0x1b47bc-0x1b47c4 = 0xB2D05E00 = 3e9 ns）
             // 目的：等“已收款”系统消息先落库，回复排在它之后才自然；1.5 秒在网络慢时会错序
