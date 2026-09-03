@@ -62,20 +62,29 @@
 + (NSDictionary *)dictionaryWithDecodedComponets:(NSString *)string separator:(NSString *)separator;
 @end
 
-@interface ContactSelectView : NSObject
-- (void)addSelect:(id)contact;
+// 微信原生会话选择器（转发页同款：取消/完成+搜索+分区，群聊分区在上、联系人分区在下）
+@protocol SessionSelectControllerDelegate <NSObject>
+- (void)OnSelectSession:(NSArray *)contacts SessionSelectController:(id)controller;
+- (void)OnSelectSessions:(NSArray *)contacts SessionSelectController:(id)controller;
+- (void)OnSelectSessionCancel:(id)controller;
 @end
 
-@interface MultiSelectContactsViewController : UIViewController
-@property (nonatomic, assign) unsigned long long m_scene;
-@property (nonatomic, weak) id m_delegate;
-@property (nonatomic, retain) ContactSelectView *m_selectView;
-- (void)updatePanelBtn;
-- (void)loadViewIfNeeded;
+@interface SessionSelectController : UIViewController
+- (id)initWithSelectedContacts:(NSArray *)selectedContacts;
+@property (nonatomic, weak) id<SessionSelectControllerDelegate> m_delegate;
+@property (nonatomic, assign) BOOL m_bMultiSelect;
+@property (nonatomic, assign) BOOL m_bShowMultiSelectRightBtn;
+@property (nonatomic, assign) BOOL m_recentForwardHidden;
+@property (nonatomic, assign) BOOL m_hidesMultiSelectedCount;
+@property (copy, nonatomic) NSString *customTitle;
+@property (retain, nonatomic) NSObject *userData;
+- (void)updateView;
+- (void)onMultiDone;
 @end
 
-@protocol MultiSelectContactsViewControllerDelegate <NSObject>
-- (void)onMultiSelectContactReturn:(NSArray *)contacts;
+@interface SessionSelectController (DDBlackList)
+- (void)dd_clearSelection;
+- (void)dd_done;
 @end
 
 @interface WCPluginsMgr : NSObject
@@ -360,7 +369,7 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
 @end
 
 // ========== 设置界面 ==========
-@interface DDRedEnvelopSettingsViewController : UIViewController <UITableViewDelegate, MultiSelectContactsViewControllerDelegate>
+@interface DDRedEnvelopSettingsViewController : UIViewController <UITableViewDelegate, SessionSelectControllerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @property (nonatomic) BOOL delayExpanded;
 @end
@@ -495,29 +504,32 @@ static id DD_CellOption(id cell) {
 }
 
 - (void)onBlackListTapped {
-    MultiSelectContactsViewController *picker = [[objc_getClass("MultiSelectContactsViewController") alloc] init];
-    picker.m_scene = 0;
-    picker.m_delegate = self;
-    [picker loadViewIfNeeded];
+    // 已在黑名单的联系人回填为预选状态
+    NSMutableArray *preselected = [NSMutableArray new];
     NSArray *blackList = [DDRedEnvelopConfig sharedConfig].blackList;
     if (blackList.count) {
         MMContext *context = [objc_getClass("MMContext") activeUserContext];
         CContactMgr *contactMgr = [context getService:objc_getClass("CContactMgr")];
-        id selectView = [picker valueForKey:@"m_selectView"];
-        if (selectView && [selectView respondsToSelector:@selector(addSelect:)]) {
-            for (NSString *name in blackList) {
-                CContact *contact = [contactMgr getContactByName:name];
-                if (contact) [selectView performSelector:@selector(addSelect:) withObject:contact];
-            }
-            if ([picker respondsToSelector:@selector(updatePanelBtn)]) [picker performSelector:@selector(updatePanelBtn)];
+        for (NSString *name in blackList) {
+            CContact *contact = [contactMgr getContactByName:name];
+            if (contact) [preselected addObject:contact];
         }
     }
+    SessionSelectController *picker = [[objc_getClass("SessionSelectController") alloc] initWithSelectedContacts:preselected];
+    picker.m_bMultiSelect = YES;
+    picker.m_bShowMultiSelectRightBtn = YES;
+    picker.m_recentForwardHidden = YES;
+    picker.m_hidesMultiSelectedCount = YES;
+    picker.customTitle = @"选择群聊和联系人";
+    picker.userData = @"DDBlackList";
+    picker.m_delegate = self;
     MMUINavigationController *nav = [[objc_getClass("MMUINavigationController") alloc] initWithRootViewController:picker];
     nav.modalPresentationStyle = UIModalPresentationFullScreen;
     [self presentViewController:nav animated:YES completion:nil];
 }
 
-- (void)onMultiSelectContactReturn:(NSArray *)contacts {
+#pragma mark - SessionSelectControllerDelegate
+- (void)OnSelectSessions:(NSArray *)contacts SessionSelectController:(id)controller {
     NSMutableArray *black = [NSMutableArray new];
     for (id contact in contacts) {
         if ([contact isKindOfClass:objc_getClass("CContact")]) {
@@ -529,6 +541,14 @@ static id DD_CellOption(id cell) {
     [self dismissViewControllerAnimated:YES completion:^{
         [self buildTable];
     }];
+}
+
+- (void)OnSelectSession:(NSArray *)contacts SessionSelectController:(id)controller {
+    [self OnSelectSessions:contacts SessionSelectController:controller];
+}
+
+- (void)OnSelectSessionCancel:(id)controller {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 @end
 
@@ -622,6 +642,40 @@ static NSString *DDCurrentSessionUserName = nil;
     reqParams[@"sendId"] = param.sendId ?: @"";
     WCRedEnvelopesLogicMgr *logicMgr = [ctx getService:objc_getClass("WCRedEnvelopesLogicMgr")];
     [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
+}
+%end
+
+// ========== 黑名单选择器导航栏：左上「取消」+「清除」，右上「完成」==========
+%hook SessionSelectController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (![self.userData isEqual:@"DDBlackList"]) return;
+    UIBarButtonItem *clearItem = [[UIBarButtonItem alloc] initWithTitle:@"清除"
+                                                                 style:UIBarButtonItemStylePlain
+                                                                target:self
+                                                                action:@selector(dd_clearSelection)];
+    UIBarButtonItem *cancelItem = self.navigationItem.leftBarButtonItem;
+    self.navigationItem.leftBarButtonItems = cancelItem ? @[cancelItem, clearItem] : @[clearItem];
+    if (self.navigationItem.rightBarButtonItem) {
+        self.navigationItem.rightBarButtonItem.title = @"完成";
+    } else {
+        self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"完成"
+                                                                                  style:UIBarButtonItemStyleDone
+                                                                                 target:self
+                                                                                 action:@selector(dd_done)];
+    }
+}
+
+%new
+- (void)dd_clearSelection {
+    id selected = [self valueForKey:@"m_selectedContacts"];
+    if ([selected isKindOfClass:[NSMutableArray class]]) [selected removeAllObjects];
+    [self updateView];
+}
+
+%new
+- (void)dd_done {
+    [self onMultiDone];
 }
 %end
 
