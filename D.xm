@@ -409,7 +409,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     // 构造 CMessageWrap 并插入 filehelper 会话（纯本地消息，不发送到服务器）
     MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
     CMessageMgr *msgMgr = [ctx getService:objc_getClass("CMessageMgr")];
-    CMessageWrap *wrap = [CMessageWrap new];
+    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] init];
     wrap.m_uiMessageType = 1;          // 文本消息类型
     wrap.m_nsFromUsr = @"filehelper";   // 发送者 = 文件传输助手
     wrap.m_nsToUsr = @"filehelper";     // 接收者 = 文件传输助手
