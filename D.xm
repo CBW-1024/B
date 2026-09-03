@@ -641,12 +641,44 @@ static NSString *DDCurrentSessionUserName = nil;
 // 仅对本插件黑名单选择器实例生效：原生左上角按钮 action 本身就是「清空已选」（并非关闭窗口），
 // 只是图标是 × 容易被误认成关闭。这里只把它重标为文字「清空」，target/action 完全沿用原生，
 // 既消除误会、又原样保留微信的清空逻辑（含搜索态已选、历史群等所有边界情况）。
+// 头文件无法静态判定该 × 是文本 item 还是图片/customView，故运行时两种都兜底：
+//   1) 原生 item 自带 action → 直接复制 target/action；
+//   2) 原生 item 用 customView 包 UIButton（action 在内部按钮上）→ 用 UIControl 公开 API 取出真实 target/action。
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     if (![objc_getAssociatedObject(self, kDDBlackListPicker) boolValue]) return;
     UIBarButtonItem *left = self.navigationItem.leftBarButtonItem;
-    if (left) {
-        UIBarButtonItem *clear = [[UIBarButtonItem alloc] initWithTitle:@"清空" style:left.style target:left.target action:left.action];
+    if (!left) return;
+
+    id target = left.target;
+    SEL action = left.action;
+
+    // 情况2：原生按钮用自定义 view（图片 ×），真实 handler 在内部 UIButton 上
+    if (!action && left.customView) {
+        UIButton *btn = nil;
+        UIView *cv = left.customView;
+        if ([cv isKindOfClass:[UIButton class]]) {
+            btn = (UIButton *)cv;
+        } else {
+            for (UIView *sub in cv.subviews) {
+                if ([sub isKindOfClass:[UIButton class]]) { btn = (UIButton *)sub; break; }
+            }
+        }
+        if (btn) {
+            for (id t in btn.allTargets) {
+                id realTarget = [t isKindOfClass:[NSNull class]] ? nil : t;
+                NSArray<NSString *> *acts = [btn actionsForTarget:realTarget forControlEvent:UIControlEventTouchUpInside];
+                if (acts.count) {
+                    target = realTarget;
+                    action = NSSelectorFromString(acts.firstObject);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (action) {
+        UIBarButtonItem *clear = [[UIBarButtonItem alloc] initWithTitle:@"清空" style:left.style target:target action:action];
         self.navigationItem.leftBarButtonItem = clear;
     }
 }
