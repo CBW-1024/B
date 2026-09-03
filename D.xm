@@ -5,7 +5,6 @@
 // 回复内容为空时等于不自动回复；全部基于微信76 头文件核对
 
 #import <UIKit/UIKit.h>
-#import <substrate.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
