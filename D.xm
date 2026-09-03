@@ -67,8 +67,9 @@
 - (void)AsyncOnAddMsg:(NSString *)msg MsgWrap:(CMessageWrap *)wrap;
 @end
 
-// 8.0.76 CAppViewControllerManager.h L72：跳转会话并定位到指定消息（用于通知点击「去感谢老板」）
+// 8.0.76 CAppViewControllerManager.h L72 jumpToChat:msgToLocate: / L43 +getAppViewControllerManager（单例，跳转用）
 @interface CAppViewControllerManager : NSObject
++ (id)getAppViewControllerManager;
 - (void)jumpToChat:(id)session msgToLocate:(id)msgWrap;
 @end
 
