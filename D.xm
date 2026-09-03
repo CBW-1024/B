@@ -439,15 +439,17 @@ static void DD_Announce(NSString *text) {
     if (!text.length) return;
 
     void (^speak)(void) = ^{
-        // 关键修复：宿主 App（微信）常把 AVAudioSession 设成不播放 / 被静音键压制的状态，
-        // 直接 speak 会“没声音”。先切到 Playback + 混音 + 压低其他音，忽略静音键再播。
+        // 对齐 WCR 逆向（播报函数 0x13affc8）：宿主 App（微信）常把 AVAudioSession 设成
+        // 不播放 / 被静音键压制的状态，直接 speak 会“没声音”。WCR 的处理是播前先切到
+        // CategoryPlayback + MixWithOthers（withOptions 传 0x1）+ setActive:YES，
+        // Playback 忽略静音键，MixWithOthers 不与微信自身音频互斥。
         AVAudioSession *session = [AVAudioSession sharedInstance];
         if ([session respondsToSelector:@selector(setCategory:withOptions:error:)]) {
             [session setCategory:AVAudioSessionCategoryPlayback
-                     withOptions:AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionDuckOthers
+                     withOptions:AVAudioSessionCategoryOptionMixWithOthers // WCR: withOptions=0x1
                            error:nil];
         }
-        [session setActive:YES error:nil];
+        [session setActive:YES error:nil]; // WCR: setActive:1
 
         AVSpeechSynthesizer *synth = DD_SharedSynth();
         if ([synth isSpeaking]) {
