@@ -404,8 +404,8 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
     NSString *displayName = getDisplayNameForSession(sessionUserName);
     NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
 
-    // 对齐微信原生推送样式：标题=聊天名，正文只留抢到金额（不再重复来源）
-    NSString *title = finalDisplayName;
+    // 标题=微信原生聊天名；群聊（含无群名由成员拼成的）补（群聊）后缀以区分，私聊不加
+    NSString *title = [sessionUserName hasSuffix:@"@chatroom"] ? [finalDisplayName stringByAppendingString:@"（群聊）"] : finalDisplayName;
     NSString *body = [NSString stringWithFormat:@"💰 抢到红包：%.2f元", amount/100.0];
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.title = title; content.body = body; content.sound = [UNNotificationSound defaultSound];
@@ -438,17 +438,17 @@ static NSString* dd_firstXMLCDATAText(NSString *xml, NSString *tag) {
     fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
     NSString *timeStr = [fmt stringFromDate:[NSDate date]];
 
-    // 对齐 WCR 截图格式：
-    //   来源分群聊/个人（群会话以 @chatroom 结尾）
-    BOOL srcIsGroup = [sessionUserName hasSuffix:@"@chatroom"];
-    //   类型分拼手气/普通（nativeUrl 的 msgtype 字段：1=拼手气红包，0=普通红包）
+    // 类型分拼手气/普通（nativeUrl 的 msgtype 字段：1=拼手气红包，0=普通红包）
     NSString *typeName = @"红包";
     if ([param.msgType isEqualToString:@"1"]) typeName = @"拼手气红包";
     else if ([param.msgType isEqualToString:@"0"]) typeName = @"普通红包";
 
+    // 来源用微信原生聊天名；群聊（@chatroom 结尾，含无群名、由成员拼成的）补（群聊）后缀以区分，私聊不加
+    BOOL srcIsGroup = [sessionUserName hasSuffix:@"@chatroom"];
+
     NSMutableString *body = [NSMutableString string];
     [body appendFormat:@"💰 叮咚，为您抢到 %.2f元\n", amount / 100.0];
-    [body appendFormat:@"📍 来源： %@（%@）\n", finalDisplayName, srcIsGroup ? @"群聊" : @"个人"];
+    [body appendFormat:@"📍 来源： %@%@\n", finalDisplayName, srcIsGroup ? @"（群聊）" : @""];
     if (packetCount > 0) {
         [body appendFormat:@"🧧 类型： %@（%ld包%.2f元）\n", typeName, (long)packetCount, totalAmount / 100.0];
     } else {
