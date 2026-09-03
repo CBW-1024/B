@@ -513,16 +513,12 @@ static id DD_CellOption(id cell) {
         }
     }
     MMUINavigationController *nav = [[objc_getClass("MMUINavigationController") alloc] initWithRootViewController:picker];
-    // 非全屏：底部 sheet（iOS15+ 可拖拽 + 抓手条；旧系统退化为 page sheet）
+    // 非全屏：底部 sheet（可拖拽 + 抓手条 + 圆角）
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    if (@available(iOS 15.0, *)) {
-        UISheetPresentationController *sheet = nav.sheetPresentationController;
-        if (sheet) {
-            sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
-            sheet.prefersGrabberVisible = YES;
-            sheet.preferredCornerRadius = 16;
-        }
-    }
+    UISheetPresentationController *sheet = nav.sheetPresentationController;
+    sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
+    sheet.prefersGrabberVisible = YES;
+    sheet.preferredCornerRadius = 16;
     [self presentViewController:nav animated:YES completion:nil];
 }
 
