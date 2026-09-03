@@ -567,14 +567,6 @@ static void DDHB_SendRedEnvelopReply(NSString *toSession, NSString *text) {
     });
 }
 
-// 记录插件自动拆包的 sendId，用于区分自动抢与手动抢（手动抢不推送文件助手/系统通知）
-static NSMutableSet *DDHBAutoOpenedSendIds(void) {
-    static NSMutableSet *s;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ s = [NSMutableSet set]; });
-    return s;
-}
-
 // ===== Hook 红包逻辑 =====
 static NSString *DDCurrentSessionUserName = nil;
 
@@ -604,15 +596,14 @@ static NSString *DDCurrentSessionUserName = nil;
                 if (storeParam) storeParam.totalAmount = total;
             }
             if (amount > 0) {
-                BOOL autoOpened = [DDHBAutoOpenedSendIds() containsObject:respSendId];
                 NSString *redId = [NSString stringWithFormat:@"%@_%@", dict[@"sendId"]?:@"", dict[@"timingIdentifier"]?:@""];
                 if ([cfg shouldNotifyForRedEnvelopId:redId]) {
                     DDWeChatRedEnvelopParam *fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
                     NSInteger displayTotal = (fhParam && fhParam.totalAmount > 0) ? fhParam.totalAmount : total;
-                    if (cfg.enableNotify && cfg.showNotification && autoOpened) {
+                    if (cfg.enableNotify && cfg.showNotification) {
                         [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:displayTotal sessionUserName:sessionUserName];
                     }
-                    if (cfg.enableNotify && cfg.notifyFileHelper && autoOpened) {
+                    if (cfg.enableNotify && cfg.notifyFileHelper) {
                         NSInteger packetCount = [dict[@"totalNum"] integerValue];
                         NSString *wishing = [dict dd_stringForKey:@"wishing"];
                         [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount];
@@ -652,7 +643,6 @@ static NSString *DDCurrentSessionUserName = nil;
         if (cfg.serialReceive) [[DDTaskManager sharedManager] addSerialTask:op];
         else [[DDTaskManager sharedManager] addNormalTask:op];
     } else {
-        [DDHBAutoOpenedSendIds() addObject:respSendId];
     [self OpenRedEnvelopesRequest:[mgrParams toParams]];
     }
 }
