@@ -44,6 +44,11 @@
 @property (nonatomic, retain) NSString *m_nsToUsr;
 @property (nonatomic, retain) NSString *m_nsRealChatUsr;
 @property (nonatomic, retain) id m_oWCPayInfoItem;
+// 8.0.76 CMessageWrap.h：L591 initWithMsgType: / L448 m_uiStatus / L445 m_uiCreateTime
+// 对齐 WCR 反汇编 0x751708（initWithMsgType:0x2710=10000）/ 0x751858（status=4）/ 0x75190c（createTime=now+1）
+@property (nonatomic, assign) unsigned int m_uiStatus;
+@property (nonatomic, assign) unsigned int m_uiCreateTime;
+- (id)initWithMsgType:(long long)msgType;
 @end
 
 @interface WCPayInfoItem : NSObject
@@ -61,8 +66,10 @@
 @end
 
 // CMessageMgr 扩展：向本地会话插入消息（不发送到服务器）
-// 8.0.76 CMessageMgr.h L236: AddLocalMsg:MsgWrap:
+// 8.0.76 CMessageMgr.h：L234 四参数版 / L236 两参数版
+// 对齐 WCR 反汇编 0x751928-0x751a64：优先四参数版，respondsToSelector 失败才回退两参数版
 @interface CMessageMgr (DDFileHelper)
+- (void)AddLocalMsg:(id)session MsgWrap:(CMessageWrap *)wrap fixTime:(BOOL)fixTime NewMsgArriveNotify:(BOOL)notify;
 - (void)AddLocalMsg:(id)session MsgWrap:(CMessageWrap *)wrap;
 @end
 
@@ -356,7 +363,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 // ========== 通知管理 ==========
 @interface DDNotificationManager : NSObject <UNUserNotificationCenterDelegate>
 + (instancetype)sharedManager;
-- (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName senderName:(NSString *)senderName;
+- (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName;
 - (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName nickName:(NSString *)nickName sendId:(NSString *)sendId timingIdentifier:(NSString *)timingIdentifier packetCount:(NSInteger)packetCount;
 @end
 @implementation DDNotificationManager
@@ -369,15 +376,15 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     });
     return manager;
 }
-- (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName senderName:(NSString *)senderName {
+- (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName {
     if (![DDRedEnvelopConfig sharedConfig].showNotification || amount <= 0) return;
     if (!sessionUserName.length) return;
     NSString *displayName = getDisplayNameForSession(sessionUserName);
     NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
 
-    // 格式对齐文件助手：标题=发送者+来源，正文=抢到金额+红包总金额
-    NSString *title = [NSString stringWithFormat:@"红包通知：%@，%@", senderName ?: @"", finalDisplayName];
-    NSString *body = [NSString stringWithFormat:@"抢到红包%.2f元，红包类型（%.2f元）", amount/100.0, totalAmount/100.0];
+    // 原格式：标题=来源，正文=抢到金额+总额
+    NSString *title = [NSString stringWithFormat:@"红包通知：%@", finalDisplayName];
+    NSString *body = [NSString stringWithFormat:@"成功抢到红包：%.2f元，总额：%.2f元", amount/100.0, totalAmount/100.0];
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.title = title; content.body = body; content.sound = [UNNotificationSound defaultSound];
     UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:[NSUUID UUID].UUIDString content:content trigger:[UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.1 repeats:NO]];
@@ -409,14 +416,28 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     [body appendString:@"\n点击跳转去感谢老板"];
 
     // 构造 CMessageWrap 并插入 filehelper 会话（纯本地消息，不发送到服务器）
+    // 严格对齐 WCR 反汇编 0x7516f8-0x751a64：
+    //   initWithMsgType:10000（0x2710）→ m_uiStatus=4 → m_uiCreateTime=now+1
+    //   优先四参数 AddLocalMsg（fixTime=NO, NewMsgArriveNotify=NO），否则回退两参数
     MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
     CMessageMgr *msgMgr = [ctx getService:objc_getClass("CMessageMgr")];
-    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] init];
-    wrap.m_uiMessageType = 1;          // 文本消息类型
-    wrap.m_nsFromUsr = @"filehelper";   // 发送者 = 文件传输助手
-    wrap.m_nsToUsr = @"filehelper";     // 接收者 = 文件传输助手
-    wrap.m_nsContent = body;            // 格式化通知内容
-    [msgMgr AddLocalMsg:@"filehelper" MsgWrap:wrap];
+    if (!msgMgr) return;
+
+    NSString *session = @"filehelper";
+    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:10000];
+    if (!wrap) return;
+    wrap.m_nsFromUsr = session;                 // 对齐 WCR setM_nsFromUsr: = session
+    wrap.m_nsToUsr = session;                   // 对齐 WCR setM_nsToUsr: = sessionID（无配置项时同 session）
+    wrap.m_nsContent = body;                    // 对齐 WCR setM_nsContent:
+    wrap.m_uiStatus = 4;                        // 对齐 WCR 0x751858: mov w2, #0x4
+    wrap.m_uiCreateTime = (unsigned int)([[NSDate date] timeIntervalSince1970] + 1);  // 对齐 WCR 0x7518e4: +1
+
+    SEL fourArgSel = NSSelectorFromString(@"AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:");
+    if ([msgMgr respondsToSelector:fourArgSel]) {
+        [msgMgr AddLocalMsg:session MsgWrap:wrap fixTime:NO NewMsgArriveNotify:NO];
+    } else {
+        [msgMgr AddLocalMsg:session MsgWrap:wrap];
+    }
 }
 @end
 
@@ -452,7 +473,7 @@ static NSString *DDCurrentSessionUserName = nil;
                     DDWeChatRedEnvelopParam *fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
                     // 系统本地通知（受「抢到红包后通知」独立开关控制）
                     if (cfg.showNotification) {
-                        [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:total sessionUserName:sessionUserName senderName:fhParam.senderName];
+                        [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:total sessionUserName:sessionUserName];
                     }
                     // 文件传输助手通知（受「发送到文件传输助手」独立开关控制）
                     if (cfg.notifyFileHelper) {
