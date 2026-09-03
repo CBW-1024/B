@@ -439,6 +439,16 @@ static void DD_Announce(NSString *text) {
     if (!text.length) return;
 
     void (^speak)(void) = ^{
+        // 关键修复：宿主 App（微信）常把 AVAudioSession 设成不播放 / 被静音键压制的状态，
+        // 直接 speak 会“没声音”。先切到 Playback + 混音 + 压低其他音，忽略静音键再播。
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        if ([session respondsToSelector:@selector(setCategory:withOptions:error:)]) {
+            [session setCategory:AVAudioSessionCategoryPlayback
+                     withOptions:AVAudioSessionCategoryOptionMixWithOthers | AVAudioSessionCategoryOptionDuckOthers
+                           error:nil];
+        }
+        [session setActive:YES error:nil];
+
         AVSpeechSynthesizer *synth = DD_SharedSynth();
         if ([synth isSpeaking]) {
             [synth stopSpeakingAtBoundary:AVSpeechBoundaryImmediate]; // WCR: stopSpeakingAtBoundary:0
