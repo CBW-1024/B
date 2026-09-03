@@ -36,11 +36,17 @@
 @end
 
 @interface CMessageWrap : NSObject
+// 8.0.76 CMessageWrap.h L17-18 / L449-452 / L973
 @property (nonatomic, assign) unsigned int m_uiMessageType;
 @property (nonatomic, retain) NSString *m_nsContent;
 @property (nonatomic, retain) NSString *m_nsFromUsr;
 @property (nonatomic, retain) NSString *m_nsToUsr;
 @property (nonatomic, retain) id m_oWCPayInfoItem;
+@end
+
+// 8.0.76 CMessageMgr.h L236: AddLocalMsg:MsgWrap: — 向本地会话插入消息（不发送到服务器）
+@interface CMessageMgr (DDFileHelper)
+- (void)AddLocalMsg:(id)session MsgWrap:(CMessageWrap *)wrap;
 @end
 
 @interface WCPayInfoItem : NSObject
@@ -174,6 +180,8 @@ static NSString * const kBlackListKey = @"DDBlackListKey";
 static NSString * const kDelayEnabledKey = @"DDDelayEnabledKey";
 static NSString * const kShowNotificationKey = @"DDShowNotificationKey";
 static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey";
+static NSString * const kNotifyFileHelperKey = @"DDNotifyFileHelperKey";
+static NSString * const kEnableNotifyKey = @"DDEnableNotifyKey";
 
 // ========== 配置管理类 ==========
 @interface DDRedEnvelopConfig : NSObject
@@ -187,6 +195,8 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
 @property (strong, nonatomic) NSArray *blackList;
 @property (assign, nonatomic) BOOL delayEnabled;
 @property (assign, nonatomic) BOOL showNotification;
+@property (assign, nonatomic) BOOL notifyFileHelper;
+@property (assign, nonatomic) BOOL enableNotify;
 - (BOOL)shouldNotifyForRedEnvelopId:(NSString *)redEnvelopId;
 @end
 
@@ -213,6 +223,8 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
         _blackList = [ud objectForKey:kBlackListKey];
         _delayEnabled = [ud boolForKey:kDelayEnabledKey];
         _showNotification = [ud boolForKey:kShowNotificationKey];
+        _notifyFileHelper = [ud boolForKey:kNotifyFileHelperKey];
+        _enableNotify = [ud boolForKey:kEnableNotifyKey];
         NSArray *savedIds = [ud arrayForKey:kNotifiedRedEnvelopIdsKey];
         _notifiedRedEnvelopIds = savedIds ? [NSMutableSet setWithArray:savedIds] : [NSMutableSet set];
     }
@@ -227,6 +239,8 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
 - (void)setDelayEnabled:(BOOL)delayEnabled { _delayEnabled = delayEnabled; [NSUserDefaults.standardUserDefaults setBool:delayEnabled forKey:kDelayEnabledKey]; }
 - (void)setBlackList:(NSArray *)blackList { _blackList = blackList; [NSUserDefaults.standardUserDefaults setObject:blackList forKey:kBlackListKey]; }
 - (void)setShowNotification:(BOOL)showNotification { _showNotification = showNotification; [NSUserDefaults.standardUserDefaults setBool:showNotification forKey:kShowNotificationKey]; }
+- (void)setNotifyFileHelper:(BOOL)notifyFileHelper { _notifyFileHelper = notifyFileHelper; [NSUserDefaults.standardUserDefaults setBool:notifyFileHelper forKey:kNotifyFileHelperKey]; }
+- (void)setEnableNotify:(BOOL)enableNotify { _enableNotify = enableNotify; [NSUserDefaults.standardUserDefaults setBool:enableNotify forKey:kEnableNotifyKey]; }
 - (BOOL)shouldNotifyForRedEnvelopId:(NSString *)redEnvelopId {
     if (redEnvelopId.length == 0) return NO;
     @synchronized (_notifiedRedEnvelopIds) {
@@ -339,6 +353,7 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
 @interface DDNotificationManager : NSObject <UNUserNotificationCenterDelegate>
 + (instancetype)sharedManager;
 - (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName;
+- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName nickName:(NSString *)nickName sendId:(NSString *)sendId timingIdentifier:(NSString *)timingIdentifier;
 @end
 @implementation DDNotificationManager
 + (instancetype)sharedManager {
@@ -365,6 +380,38 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
 }
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center willPresentNotification:(UNNotification *)notification withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
     completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound);
+}
+
+// 参考 WCR「文件传输助手」通知格式：构造富文本消息通过 CMessageMgr AddLocalMsg:MsgWrap: 插入 filehelper 会话
+// 8.0.76 证据：CMessageMgr.h L236 AddLocalMsg:MsgWrap: / CMessageWrap.h L449-452 m_nsContent/m_nsFromUsr/m_nsToUsr/m_uiMessageType
+- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName nickName:(NSString *)nickName sendId:(NSString *)sendId timingIdentifier:(NSString *)timingIdentifier {
+    if (![DDRedEnvelopConfig sharedConfig].notifyFileHelper || amount <= 0) return;
+
+    NSString *displayName = getDisplayNameForSession(sessionUserName);
+    NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    NSString *timeStr = [fmt stringFromDate:[NSDate date]];
+
+    // 参考截图格式构建消息体
+    NSMutableString *body = [NSMutableString string];
+    [body appendFormat:@"💰 叮咚，为您抢到 %.2f元\n", amount / 100.0];
+    [body appendFormat:@"📍 来源：%@\n", finalDisplayName];
+    [body appendFormat:@"🧧 类型：红包 (%.2f元)\n", totalAmount / 100.0];
+    if (nickName.length) [body appendFormat:@"😊 抢包人：%@\n", nickName];
+    if (sendId.length) [body appendFormat:@"🆔 ID：%@\n", sendId];
+    [body appendFormat:@"⏰ 时间：%@\n", timeStr];
+    [body appendString:@"\n点击跳转去感谢老板"];
+
+    // 构造 CMessageWrap 并插入 filehelper 会话（纯本地消息，不发送到服务器）
+    MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
+    CMessageMgr *msgMgr = [ctx getService:objc_getClass("CMessageMgr")];
+    CMessageWrap *wrap = [CMessageWrap new];
+    wrap.m_uiMessageType = 1;          // 文本消息类型
+    wrap.m_nsFromUsr = @"filehelper";   // 发送者 = 文件传输助手
+    wrap.m_nsToUsr = @"filehelper";     // 接收者 = 文件传输助手
+    wrap.m_nsContent = body;            // 格式化通知内容
+    [msgMgr AddLocalMsg:@"filehelper" MsgWrap:wrap];
 }
 @end
 
@@ -442,7 +489,13 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
         WCTableViewCellManager *blackCell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(onBlackListTapped) target:self title:@"↳过滤全局黑名单" rightValue:blackCount ? [NSString stringWithFormat:@"已选 %ld 个", (long)blackCount] : @"已关闭"];
         blackCell.userInfo = @"BlackListCell";
         [redEnvelopSection addCell:blackCell];
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifySwitch:) target:self title:@"↳抢到红包后通知" on:cfg.showNotification]];
+        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onEnableNotifySwitch:) target:self title:@"↳启用红包通知" on:cfg.enableNotify]];
+        if (cfg.enableNotify) {
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifySwitch:) target:self title:@"↳↳抢到红包后通知" on:cfg.showNotification]];
+            if (cfg.showNotification) {
+                [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifyFileHelperSwitch:) target:self title:@"↳↳↳发送到文件传输助手" on:cfg.notifyFileHelper]];
+            }
+        }
     }
     [_tableViewManager addSection:redEnvelopSection];
 
@@ -480,7 +533,9 @@ static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey
 - (void)onSkipPrivateSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipPrivateRedEnvelop = sender.on; }
 - (void)onSkipSelfSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipSelfRedEnvelop = sender.on; }
 - (void)onSerialSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].serialReceive = sender.on; }
-- (void)onNotifySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].showNotification = sender.on; }
+- (void)onNotifySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].showNotification = sender.on; [self buildTable]; }
+- (void)onNotifyFileHelperSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].notifyFileHelper = sender.on; }
+- (void)onEnableNotifySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].enableNotify = sender.on; [self buildTable]; }
 
 - (void)delayHeaderTapped:(id)sender {
     self.delayExpanded = !self.delayExpanded;
@@ -566,7 +621,8 @@ static NSString *DDCurrentSessionUserName = nil;
         if (peekParam.sessionUserName.length) sessionUserName = peekParam.sessionUserName;
     }
 
-    if (cfg.showNotification && cfg.autoReceiveEnable) {
+    // 启用红包通知（总开关）开启时才处理两类通知；两类各自仍受独立开关控制
+    if (cfg.enableNotify && cfg.autoReceiveEnable) {
         SKBuiltinBuffer_t *buffer = arg1.retText;
         if (buffer.buffer) {
             NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
@@ -575,7 +631,15 @@ static NSString *DDCurrentSessionUserName = nil;
             if (amount > 0) {
                 NSString *redId = [NSString stringWithFormat:@"%@_%@", dict[@"sendId"]?:@"", dict[@"timingIdentifier"]?:@""];
                 if ([cfg shouldNotifyForRedEnvelopId:redId]) {
-                    [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:total sessionUserName:sessionUserName];
+                    // 系统本地通知（受「抢到红包后通知」独立开关控制）
+                    if (cfg.showNotification) {
+                        [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:total sessionUserName:sessionUserName];
+                    }
+                    // 文件传输助手通知（受「发送到文件传输助手」独立开关控制）
+                    if (cfg.notifyFileHelper) {
+                        DDWeChatRedEnvelopParam *fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
+                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:total sessionUserName:sessionUserName nickName:fhParam.nickName sendId:respSendId timingIdentifier:dict[@"timingIdentifier"]];
+                    }
                 }
             }
         }
