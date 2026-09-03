@@ -28,6 +28,7 @@
 @property (retain, nonatomic) NSString *m_nsContent;
 @property (retain, nonatomic) NSString *m_nsRealChatUsr;
 @property (assign, nonatomic) unsigned int m_uiMessageType;
+@property (assign, nonatomic) unsigned int m_uiIsSenderStatus; // CMessageWrap.h:381 发送方向标记（非0=我发出的）
 @property (assign, nonatomic) long long m_n64MesSvrID;
 - (id)initWithMsgType:(long long)arg1 nsFromUsr:(id)arg2;
 - (void)parseWCPayInfoItemIfNeed;
@@ -438,11 +439,13 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     NSString *selfUser = DD_GetSelfUserName();
     if (!selfUser.length) return;
 
-    // 我发出的转账：m_nsFromUsr==我 时记下 transferID 并跳过；对方领取后微信用同 ID 重投（伪装成转给我）也跳过
-    if ([wrap.m_nsFromUsr isEqualToString:selfUser]) {
+    // 我发出的转账：用微信自带的发送方向判定（CMessageWrap.h:381 m_uiIsSenderStatus）
+    // 注意：不能用 m_nsFromUsr==我 判方向 —— 群聊里 m_nsFromUsr 是群 ID（xxx@chatroom），永远不等于我，群转账必然漏判
+    if (wrap.m_uiIsSenderStatus != 0) {
         [DD_MyTransferCache() setObject:@(YES) forKey:info.m_nsTransferID];
         return;
     }
+    // 对方领取后微信用同 transferID 重投（伪装成转给我、收款人被改成我），命中缓存直接跳过
     if ([DD_MyTransferCache() objectForKey:info.m_nsTransferID]) return;
 
     // 方向判定（参照 WCPayInfoItem.h:146-148 + WCR 多 key 提取逻辑）
