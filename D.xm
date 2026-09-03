@@ -31,8 +31,8 @@
 @end
 
 @interface CContact : NSObject
-@property (nonatomic, retain) NSString *m_nsUsrName;
-@property (nonatomic, retain) NSString *m_nsHeadImgUrl;
+// 8.0.76：用户名属性已从 m_nsUsrName 改名为 userName（只读 NSString，见 CContact.h L465）
+@property (nonatomic, retain) NSString *userName;
 - (NSString *)getContactDisplayName;
 @end
 
@@ -499,10 +499,6 @@ static id DD_CellOption(id cell) {
     picker.m_scene = 0;
     picker.m_delegate = self;
     [picker loadViewIfNeeded];
-    // 方案A：隐藏微信自绘的 headerBar（截图里那行「× 选择朋友」过宽过粗），
-    // 回落到系统 UINavigationBar 原生渲染（44pt / 系统 regular 字重）。
-    picker.headerBarView.hidden = YES;
-    picker.title = @"选择朋友";
     NSArray *blackList = [DDRedEnvelopConfig sharedConfig].blackList;
     if (blackList.count) {
         MMContext *context = [objc_getClass("MMContext") activeUserContext];
@@ -530,7 +526,7 @@ static id DD_CellOption(id cell) {
     NSMutableArray *black = [NSMutableArray new];
     for (id contact in contacts) {
         if ([contact isKindOfClass:objc_getClass("CContact")]) {
-            NSString *name = [contact valueForKey:@"m_nsUsrName"];
+            NSString *name = [contact valueForKey:@"userName"];   // 8.0.76: m_nsUsrName → userName
             if (name.length) [black addObject:name];
         }
     }
@@ -598,7 +594,7 @@ static NSString *DDCurrentSessionUserName = nil;
     MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
     CContactMgr *contactMgr = [ctx getService:objc_getClass("CContactMgr")];
     CContact *selfContact = [contactMgr getSelfContact];
-    BOOL isSender = [wrap.m_nsFromUsr isEqualToString:selfContact.m_nsUsrName];
+    BOOL isSender = [wrap.m_nsFromUsr isEqualToString:selfContact.userName];   // 8.0.76: m_nsUsrName → userName
     BOOL isGroup = ([wrap.m_nsFromUsr rangeOfString:@"@chatroom"].location != NSNotFound) || ([wrap.m_nsToUsr rangeOfString:@"@chatroom"].location != NSNotFound);
     DDRedEnvelopConfig *cfg = [DDRedEnvelopConfig sharedConfig];
     if (!cfg.autoReceiveEnable) return;
@@ -617,7 +613,7 @@ static NSString *DDCurrentSessionUserName = nil;
     param.sendId = [urlDict dd_stringForKey:@"sendid"];
     param.channelId = [urlDict dd_stringForKey:@"channelid"];
     param.nickName = [selfContact getContactDisplayName];
-    param.headImg = selfContact.m_nsHeadImgUrl;
+    param.headImg = nil;   // 8.0.76 无 m_nsHeadImgUrl 字段（CContact 仅含背景图 ID），头像 URL 不可取；仅展示用，不影响拆红包
     param.nativeUrl = nativeUrl;
     param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
     param.sign = [urlDict dd_stringForKey:@"sign"];
