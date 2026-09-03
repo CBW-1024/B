@@ -411,6 +411,17 @@ static NSCache *DD_ProcessedCache(void) {
     return cache;
 }
 
+// 记录“我发出的转账”的 transferID：发出时 m_nsFromUsr==我 写入，之后同 ID 被微信重投（对方领取）即跳过
+static NSCache *DD_MyTransferCache(void) {
+    static NSCache *cache;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 1000;
+    });
+    return cache;
+}
+
 #pragma mark - 自动收款
 
 static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
@@ -424,14 +435,21 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     unsigned int status = info.m_c2cPayReceiveStatus;
     if (status == 1 || status == 2) return;
 
-    // 方向判定（参照 WCPayInfoItem.h:146-148 + WCR 多 key 提取逻辑）
-    // 只处理“收款人是我、付款人是别人”的待收转账；收款人不是我、或付款人是我都跳过
     NSString *selfUser = DD_GetSelfUserName();
     if (!selfUser.length) return;
 
+    // 我发出的转账：m_nsFromUsr==我 时记下 transferID 并跳过；对方领取后微信用同 ID 重投（伪装成转给我）也跳过
+    if ([wrap.m_nsFromUsr isEqualToString:selfUser]) {
+        [DD_MyTransferCache() setObject:@(YES) forKey:info.m_nsTransferID];
+        return;
+    }
+    if ([DD_MyTransferCache() objectForKey:info.m_nsTransferID]) return;
+
+    // 方向判定（参照 WCPayInfoItem.h:146-148 + WCR 多 key 提取逻辑）
+    // 只处理“收款人是我、付款人是别人”的待收转账；收款人不是我、或付款人是我都跳过
     NSString *recv = info.transfer_receiver_username.length ? info.transfer_receiver_username : info.exclusive_recv_username;
-    if (![recv isEqualToString:selfUser]) return;                  // 收款人不是我 → 跳过（别人转别人、或我发出的转账被别人领取）
-    if ([info.transfer_payer_username isEqualToString:selfUser]) return; // 付款人是我 → 跳过（我发出的转账、自己转自己）
+    if (![recv isEqualToString:selfUser]) return;                  // 收款人不是我 → 跳过（别人转别人）
+    if ([info.transfer_payer_username isEqualToString:selfUser]) return; // 付款人是我 → 跳过（自己转自己）
 
     NSString *key = [NSString stringWithFormat:@"%@|%lld", info.m_nsTransferID, wrap.m_n64MesSvrID];
     NSCache *cache = DD_ProcessedCache();
