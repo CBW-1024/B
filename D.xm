@@ -1,4 +1,4 @@
-// DDTR - 转账自动收款 + 语音播报 + 自动回复
+// DDTR - 转账自动收款 + 自动回复
 
 // 延迟收款秒数：点击展开下拉选择（centerCellForSel: 居中、无右侧箭头），4个秒数选项 [x.x秒]；父级行（延迟收款秒数/启用自动回复/自定义回复）
 // 自定义回复：输入框 + 确认按钮（rightView，无箭头）
@@ -232,7 +232,7 @@ static NSString *const kDDBroadcastEnabled = @"DDTransferVoiceBroadcastEnabled";
                                           on:[DDTRConfig shared].autoReceiveEnabled]];
 
     if ([DDTRConfig shared].autoReceiveEnabled) {
-        // 语音播报
+        // 语音播报：与 WCR autoAcceptTransferVoiceBroadcastEnabled 同组，紧跟总开关
         [section addCell:[cellCls switchCellForSel:@selector(broadcastSwitchChanged:)
                                           target:self
                                            title:@"↳语音播报"
@@ -409,7 +409,7 @@ static void DD_SendTransferReply(NSString *toUserName) {
 
 #pragma mark - 收款语音播报
 
-// 单例 synthesizer：复用避免并发/重复初始化（懒加载单例，存全局）
+// 单例 synthesizer：复用避免并发/重复初始化（对齐 WCR 懒加载单例，存全局）
 static AVSpeechSynthesizer *DD_SharedSynth(void) {
     static AVSpeechSynthesizer *synth;
     static dispatch_once_t onceToken;
@@ -430,31 +430,32 @@ static double DD_AmountFromDesc(NSString *desc) {
 }
 
 // 播报文案：金额取自 m_nsFeeDesc（WCPayInfoItem.h:201 正式属性，由 parseWCPayInfoItemIfNeed
-// 从消息 XML 的 feedesc 解析所得，已是「元」）。
+// 从消息 XML 的 feedesc 解析所得，已是「元」）。DD_IsTransfer 已调用该解析并以 m_nsTransferID
+// 非空为门禁，故走到此处时 m_nsFeeDesc 必然就绪，无需再回退解析原始 XML。
 static NSString *DD_BroadcastText(WCPayInfoItem *info) {
     double amt = DD_AmountFromDesc(info.m_nsFeeDesc);
     return [NSString stringWithFormat:@"收到微信转账 %.2f 元", amt];
 }
 
-// 主线程播报：去空白 → 非空才播 → 正在播先打断 → 中文语音、默认语速
+// 主线程播报：去空白 → 非空才播 → 正在播先打断 → 中文语音、默认语速（对齐 WCR 逆向）
 static void DD_Announce(NSString *text) {
     if (!text.length) return;
     text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!text.length) return;
 
     void (^speak)(void) = ^{
-        // 微信内播报前先把 AVAudioSession 切到
+        // 对齐 WCR 逆向（播报函数 0x13affc8）：微信内播报前先把 AVAudioSession 切到
         // CategoryPlayback + MixWithOthers（withOptions 传 0x1）+ setActive:YES。
-        // Playback 忽略静音键，MixWithOthers 不与微信自身音频互斥。
+        // Playback 忽略静音键，MixWithOthers 不与微信自身音频互斥。WCR 实测有效。
         AVAudioSession *session = [AVAudioSession sharedInstance];
         [session setCategory:AVAudioSessionCategoryPlayback
-                 withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                 withOptions:AVAudioSessionCategoryOptionMixWithOthers // WCR: withOptions=0x1
                        error:nil];
-        [session setActive:YES error:nil];
+        [session setActive:YES error:nil]; // WCR: setActive:1
 
         AVSpeechSynthesizer *synth = DD_SharedSynth();
         if ([synth isSpeaking]) {
-            [synth stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
+            [synth stopSpeakingAtBoundary:AVSpeechBoundaryImmediate]; // WCR: stopSpeakingAtBoundary:0
         }
         AVSpeechUtterance *u = [AVSpeechUtterance speechUtteranceWithString:text];
         u.rate = AVSpeechUtteranceDefaultSpeechRate;
@@ -470,9 +471,10 @@ static void DD_Announce(NSString *text) {
 
 #pragma mark - 转账识别
 
+// 与 WCR 完全一致的转账识别（逆向 WCRefine 0x1b12d0-0x1b1314 得出）：
 //   条件 = m_c2cNativeUrl/m_c2cUrl 前缀为 "wechat://wcpay/transfer/transferquery?"  或  m_uiPaySubType == 1
 // 这是“接收方视角”的转账；发送方视图 / 领取后状态更新消息的 URL 不是 transferquery，进不来
-// 做正向识别，没有红包反向排除
+// WCR 只做正向识别，没有红包反向排除（红包 URL 非该前缀、paySubType 非 1，天然被排除）
 static BOOL DD_IsTransfer(CMessageWrap *msg) {
     if (!msg) return NO;
     [msg parseWCPayInfoItemIfNeed];
@@ -507,7 +509,7 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     if (!sessionId.length || !wrap) return;
     if (!DD_IsTransfer(wrap)) return;
 
-    WCPayInfoItem *info = wrap.m_oWCPayInfoItem;
+    WCPayInfoItem *info = wrap.m_oWCPayInfoItem; // DD_IsTransfer 已保证 transferID 非空
 
     unsigned int status = info.m_c2cPayReceiveStatus;
     if (status == 1 || status == 2) return;
@@ -515,7 +517,7 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     NSString *selfUser = DD_GetSelfUserName();
     if (!selfUser.length) return;
 
-    // 我发出的转账 → 跳过（微信官方判定 CMessageWrap.h:249 +isSenderFromMsgWrap:）
+    // 我发出的转账 → 跳过（WCR 门控 #3；微信官方判定 CMessageWrap.h:249 +isSenderFromMsgWrap:）
     // objc_msgSend 调用，避免静态类引用产生 _OBJC_CLASS_$_CMessageWrap 链接错误
     // 不能用 m_nsFromUsr==我 判方向：群聊里 m_nsFromUsr 是群 ID（xxx@chatroom），永远不等于我
     Class cmwCls = objc_getClass("CMessageWrap");
@@ -524,13 +526,13 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
         if (isSenderFn(cmwCls, @selector(isSenderFromMsgWrap:), wrap)) return;
     }
 
-    // 方向判定（参照 WCPayInfoItem.h:146-148 ）
+    // 方向判定（参照 WCPayInfoItem.h:146-148 + WCR 多 key 提取逻辑）
     // 只处理“收款人是我、付款人是别人”的待收转账；收款人不是我、或付款人是我都跳过
     NSString *recv = info.transfer_receiver_username.length ? info.transfer_receiver_username : info.exclusive_recv_username;
     if (![recv isEqualToString:selfUser]) return;                  // 收款人不是我 → 跳过（别人转别人）
     if ([info.transfer_payer_username isEqualToString:selfUser]) return; // 付款人是我 → 跳过（自己转自己）
 
-    // 去重：同一 transferID 只处理一次（机制：autoParseLinkProcessedMessageKeys /
+    // 去重：同一 transferID 只处理一次（WCR 同款机制：autoParseLinkProcessedMessageKeys /
     // screenRecordingFrameProcessedIds，配 NSCache + NSMutableSet + containsObject:）
     // key 只用 transferID，不带 m_n64MesSvrID —— 同一条转账会被多次投递（确认收款后的状态回写、
     // 断线重连补拉），若带上 msgSvrID，ID 一变就挡不住，会重复收款 + 重复回复
@@ -564,8 +566,8 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
             DD_Announce(DD_BroadcastText(info));
         }
         if ([DDTRConfig shared].autoReplyEnabled) {
-            // 回复延迟 3.0 秒
-            // 目的：等“已收款”系统消息先落库
+            // 回复延迟 3.0 秒：与 WCR 硬编码常数一致（WCRefine 0x1b47bc-0x1b47c4 = 0xB2D05E00 = 3e9 ns）
+            // 目的：等“已收款”系统消息先落库，回复排在它之后才自然；1.5 秒在网络慢时会错序
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 DD_SendTransferReply(peer);
             });
