@@ -7,6 +7,7 @@
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 #pragma mark - 微信类声明
 
@@ -32,6 +33,7 @@
 @property (assign, nonatomic) long long m_n64MesSvrID;
 - (id)initWithMsgType:(long long)arg1 nsFromUsr:(id)arg2;
 - (void)parseWCPayInfoItemIfNeed;
++ (BOOL)isSenderFromMsgWrap:(id)arg1; // CMessageWrap.h:249 微信官方"这条消息是不是我发出的"判定
 @end
 
 @interface CMessageMgr : NSObject
@@ -439,9 +441,17 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     NSString *selfUser = DD_GetSelfUserName();
     if (!selfUser.length) return;
 
-    // 我发出的转账：用微信自带的发送方向判定（CMessageWrap.h:381 m_uiIsSenderStatus）
-    // 注意：不能用 m_nsFromUsr==我 判方向 —— 群聊里 m_nsFromUsr 是群 ID（xxx@chatroom），永远不等于我，群转账必然漏判
-    if (wrap.m_uiIsSenderStatus != 0) {
+    // 我发出的转账：用微信官方方向判定 +[CMessageWrap isSenderFromMsgWrap:]（CMessageWrap.h:249，与 WCR 同一思路）
+    // 用 objc_msgSend 调用，避免 [CMessageWrap xxx] 静态类引用产生 _OBJC_CLASS_$_CMessageWrap 链接错误
+    // 注意：绝不能用 m_nsFromUsr==我 判方向 —— 群聊里 m_nsFromUsr 是群 ID（xxx@chatroom），永远不等于我
+    Class cmwCls = objc_getClass("CMessageWrap");
+    BOOL isMySend = NO;
+    if (cmwCls) {
+        BOOL (*isSenderFn)(id, SEL, id) = (BOOL (*)(id, SEL, id))objc_msgSend;
+        isMySend = isSenderFn(cmwCls, @selector(isSenderFromMsgWrap:), wrap);
+    }
+    if (wrap.m_uiIsSenderStatus != 0) isMySend = YES; // CMessageWrap.h:381 字段兜底（官方方法漏判时补上）
+    if (isMySend) {
         [DD_MyTransferCache() setObject:@(YES) forKey:info.m_nsTransferID];
         return;
     }
