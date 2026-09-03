@@ -538,10 +538,9 @@ static void DDHBAnnounce(NSString *text) {
     else dispatch_async(dispatch_get_main_queue(), speak);
 }
 
-static NSString *DDHBRedEnvelopBroadcastText(NSInteger amount, NSString *senderName) {
+static NSString *DDHBRedEnvelopBroadcastText(NSInteger amount) {
     double yuan = amount / 100.0;
-    if (senderName.length) return [NSString stringWithFormat:@"收到 %@ 的红包 %.2f 元", senderName, yuan];
-    return [NSString stringWithFormat:@"抢到红包 %.2f 元", yuan];
+    return [NSString stringWithFormat:@"收到微信红包 %.2f 元", yuan];
 }
 
 static NSString *const kDDRedEnvelopDefaultReply = @"谢谢老板，红包已收下🧧";
@@ -617,7 +616,7 @@ static NSString *DDCurrentSessionUserName = nil;
                         [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount];
                     }
                     if (cfg.voiceBroadcast) {
-                        DDHBAnnounce(DDHBRedEnvelopBroadcastText(amount, fhParam.senderName));
+                        DDHBAnnounce(DDHBRedEnvelopBroadcastText(amount));
                     }
                     if (cfg.autoReply && !fhParam.isSender) {
                         BOOL isGroup = [sessionUserName hasSuffix:@"@chatroom"];
