@@ -494,9 +494,6 @@ static id DD_CellOption(id cell) {
     return objc_getAssociatedObject(cell, kDDOptionValue);
 }
 
-// 仅给本插件创建的 MultiSelectContactsViewController 实例打标记，避免重标影响微信正常转发/建群页
-static const void *kDDBlackListPicker = &kDDBlackListPicker;
-
 - (void)onBlackListTapped {
     MultiSelectContactsViewController *picker = [[objc_getClass("MultiSelectContactsViewController") alloc] init];
     picker.m_scene = 0;
@@ -516,9 +513,6 @@ static const void *kDDBlackListPicker = &kDDBlackListPicker;
         }
     }
     MMUINavigationController *nav = [[objc_getClass("MMUINavigationController") alloc] initWithRootViewController:picker];
-    // 标记本实例：viewDidAppear 里把原生左上角按钮（其 action 原生即「清空已选」）重标为文字「清空」，
-    // 只改外观消除「× 像关闭」的误会，action/target 完全沿用原生。
-    objc_setAssociatedObject(picker, kDDBlackListPicker, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     // 非全屏：底部 sheet（可拖拽 + 抓手条 + 圆角）
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     UISheetPresentationController *sheet = nav.sheetPresentationController;
@@ -634,53 +628,6 @@ static NSString *DDCurrentSessionUserName = nil;
     reqParams[@"sendId"] = param.sendId ?: @"";
     WCRedEnvelopesLogicMgr *logicMgr = [ctx getService:objc_getClass("WCRedEnvelopesLogicMgr")];
     [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
-}
-%end
-
-%hook MultiSelectContactsViewController
-// 仅对本插件黑名单选择器实例生效：原生左上角按钮 action 本身就是「清空已选」（并非关闭窗口），
-// 只是图标是 × 容易被误认成关闭。这里只把它重标为文字「清空」，target/action 完全沿用原生，
-// 既消除误会、又原样保留微信的清空逻辑（含搜索态已选、历史群等所有边界情况）。
-// 头文件无法静态判定该 × 是文本 item 还是图片/customView，故运行时两种都兜底：
-//   1) 原生 item 自带 action → 直接复制 target/action；
-//   2) 原生 item 用 customView 包 UIButton（action 在内部按钮上）→ 用 UIControl 公开 API 取出真实 target/action。
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    if (![objc_getAssociatedObject(self, kDDBlackListPicker) boolValue]) return;
-    UIBarButtonItem *left = self.navigationItem.leftBarButtonItem;
-    if (!left) return;
-
-    id target = left.target;
-    SEL action = left.action;
-
-    // 情况2：原生按钮用自定义 view（图片 ×），真实 handler 在内部 UIButton 上
-    if (!action && left.customView) {
-        UIButton *btn = nil;
-        UIView *cv = left.customView;
-        if ([cv isKindOfClass:[UIButton class]]) {
-            btn = (UIButton *)cv;
-        } else {
-            for (UIView *sub in cv.subviews) {
-                if ([sub isKindOfClass:[UIButton class]]) { btn = (UIButton *)sub; break; }
-            }
-        }
-        if (btn) {
-            for (id t in btn.allTargets) {
-                id realTarget = [t isKindOfClass:[NSNull class]] ? nil : t;
-                NSArray<NSString *> *acts = [btn actionsForTarget:realTarget forControlEvent:UIControlEventTouchUpInside];
-                if (acts.count) {
-                    target = realTarget;
-                    action = NSSelectorFromString(acts.firstObject);
-                    break;
-                }
-            }
-        }
-    }
-
-    if (action) {
-        UIBarButtonItem *clear = [[UIBarButtonItem alloc] initWithTitle:@"清空" style:left.style target:target action:action];
-        self.navigationItem.leftBarButtonItem = clear;
-    }
 }
 %end
 
