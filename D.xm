@@ -433,21 +433,15 @@ static NSString *DD_BroadcastText(WCPayInfoItem *info) {
 }
 
 // 主线程播报：去空白 → 非空才播 → 正在播先打断 → 中文语音、默认语速（对齐 WCR 逆向）
-// 播报窗口标志。开启期间，AVAudioSession 的所有 setCategory/setActive 都会被我们的 hook 强制成
-// Playback 活跃态，绕过微信 AVAudioSession+Swizzle（见微信头文件 AVAudioSession-Swizzle.h，+load 里
-// hook 了 AVAudioSession）把会话改回自己的类别、从而压掉 TTS 导致的“没声音”。
-static BOOL DD_Broadcasting = NO;
-
 static void DD_Announce(NSString *text) {
     if (!text.length) return;
     text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!text.length) return;
 
     void (^speak)(void) = ^{
-        // 打开“播报窗口”：期间 AVAudioSession 的任何 setCategory/setActive 都会被我们的
-        // %hook 强制成 Playback 活跃态，挡掉微信 AVAudioSession+Swizzle 的回改（真因见上）。
-        DD_Broadcasting = YES;
-
+        // 对齐 WCR 逆向（播报函数 0x13affc8）：微信内播报前先把 AVAudioSession 切到
+        // CategoryPlayback + MixWithOthers（withOptions 传 0x1）+ setActive:YES。
+        // Playback 忽略静音键，MixWithOthers 不与微信自身音频互斥。WCR 实测有效。
         AVAudioSession *session = [AVAudioSession sharedInstance];
         if ([session respondsToSelector:@selector(setCategory:withOptions:error:)]) {
             [session setCategory:AVAudioSessionCategoryPlayback
@@ -466,11 +460,6 @@ static void DD_Announce(NSString *text) {
         AVSpeechSynthesisVoice *voice = [AVSpeechSynthesisVoice voiceWithLanguage:@"zh-CN"];
         if (voice) u.voice = voice;
         [synth speakUtterance:u];
-
-        // 播报窗口在短时（3s，覆盖一句简短播报）后关闭，避免长时间占用会话影响微信自身音频。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            DD_Broadcasting = NO;
-        });
     };
 
     if ([NSThread isMainThread]) speak();
@@ -591,25 +580,6 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
     if (wrap.m_uiMessageType == 49 && [msg isKindOfClass:[NSString class]] && msg.length > 0) {
         DD_TryAutoReceive(msg, wrap);
     }
-}
-%end
-
-// 绕过微信 AVAudioSession+Swizzle（头文件 AVAudioSession-Swizzle.h，+load 中 hook 了 AVAudioSession）。
-// 微信会强制把音频会话类别改成自己的（语音/通话/提示音用），导致我们和 WCR 的 TTS 切到 Playback
-// 后被压回、表现“没声音”。播报窗口（DD_Broadcasting）内拦截所有 setCategory/setActive，强制
-// Playback + MixWithOthers + 活跃态落库，让微信的回改无效，TTS 才能真的出声。
-%hook AVAudioSession
-- (BOOL)setCategory:(NSString *)category withOptions:(NSUInteger)options error:(NSError **)outError {
-    if (DD_Broadcasting) {
-        return %orig(AVAudioSessionCategoryPlayback, AVAudioSessionCategoryOptionMixWithOthers, outError);
-    }
-    return %orig(category, options, outError);
-}
-- (BOOL)setActive:(BOOL)active error:(NSError **)outError {
-    if (DD_Broadcasting) {
-        return %orig(YES, outError);
-    }
-    return %orig(active, outError);
 }
 %end
 
