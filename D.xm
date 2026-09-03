@@ -3,9 +3,9 @@
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
 
-// ========== 微信内部类声明 ==========
+// ========== 微信内部类声明（按职责分组）==========
 
-// Protobuf 模型（真实类继承自微信 WXPBGeneratedMessage，此处直接 NSObject 即可）
+// --- Proto 模型（真实类继承自微信 WXPBGeneratedMessage，此处以 NSObject 占位）---
 @interface SKBuiltinBuffer_t : NSObject
 @property (nonatomic, retain) NSData *buffer;
 @end
@@ -19,6 +19,7 @@
 @property (nonatomic, retain) SKBuiltinBuffer_t *retText;
 @end
 
+// --- 业务 / 服务类 ---
 @interface MMContext : NSObject
 + (instancetype)activeUserContext;
 - (id)getService:(Class)serviceClass;
@@ -44,11 +45,6 @@
 @property (nonatomic, retain) id m_oWCPayInfoItem;
 @end
 
-// 8.0.76 CMessageMgr.h L236: AddLocalMsg:MsgWrap: — 向本地会话插入消息（不发送到服务器）
-@interface CMessageMgr (DDFileHelper)
-- (void)AddLocalMsg:(id)session MsgWrap:(CMessageWrap *)wrap;
-@end
-
 @interface WCPayInfoItem : NSObject
 @property (nonatomic, retain) NSString *m_c2cNativeUrl;
 @end
@@ -63,10 +59,17 @@
 - (void)AsyncOnAddMsg:(NSString *)msg MsgWrap:(CMessageWrap *)wrap;
 @end
 
+// CMessageMgr 扩展：向本地会话插入消息（不发送到服务器）
+// 8.0.76 CMessageMgr.h L236: AddLocalMsg:MsgWrap:
+@interface CMessageMgr (DDFileHelper)
+- (void)AddLocalMsg:(id)session MsgWrap:(CMessageWrap *)wrap;
+@end
+
 @interface WCBizUtil : NSObject
 + (NSDictionary *)dictionaryWithDecodedComponets:(NSString *)string separator:(NSString *)separator;
 @end
 
+// --- UI / 表格类 ---
 @interface ContactSelectView : NSObject
 - (void)addSelect:(id)contact;
 @end
@@ -139,35 +142,6 @@
     return [jsonObject isKindOfClass:[NSDictionary class]] ? jsonObject : nil;
 }
 @end
-
-// ========== 红包解析辅助 ==========
-static NSDictionary* parseNativeUrl(NSString *nativeUrl) {
-    NSString *prefix = @"wxpay://c2cbizmessagehandler/hongbao/receivehongbao?";
-    if (![nativeUrl hasPrefix:prefix]) return nil;
-    NSString *query = [nativeUrl substringFromIndex:prefix.length];
-    return [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
-}
-
-static NSString* extractSignFromRequest(HongBaoReq *req) {
-    NSString *requestString = [[NSString alloc] initWithData:req.reqText.buffer encoding:NSUTF8StringEncoding];
-    NSDictionary *requestDict = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:requestString separator:@"&"];
-    NSString *nativeUrl = [requestDict dd_stringForKey:@"nativeUrl"];
-    if (!nativeUrl) return nil;
-    nativeUrl = [nativeUrl stringByRemovingPercentEncoding];
-    NSDictionary *nativeUrlDict = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:nativeUrl separator:@"&"];
-    return [nativeUrlDict dd_stringForKey:@"sign"];
-}
-
-static NSString* getDisplayNameForSession(NSString *sessionUserName) {
-    if (!sessionUserName.length) return nil;
-    MMContext *context = [objc_getClass("MMContext") activeUserContext];
-    CContactMgr *contactMgr = [context getService:objc_getClass("CContactMgr")];
-    if (!contactMgr) return nil;
-    CContact *contact = [contactMgr getContactByName:sessionUserName];
-    if (!contact) return nil;
-    NSString *displayName = [contact getContactDisplayName];
-    return displayName.length ? displayName : nil;
-}
 
 // ========== 配置常量 ==========
 static NSString * const kDelaySecondsKey = @"DDDelaySecondsKey";
@@ -256,6 +230,35 @@ static NSString * const kEnableNotifyKey = @"DDEnableNotifyKey";
     }
 }
 @end
+
+// ========== 红包解析辅助 ==========
+static NSDictionary* parseNativeUrl(NSString *nativeUrl) {
+    NSString *prefix = @"wxpay://c2cbizmessagehandler/hongbao/receivehongbao?";
+    if (![nativeUrl hasPrefix:prefix]) return nil;
+    NSString *query = [nativeUrl substringFromIndex:prefix.length];
+    return [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
+}
+
+static NSString* extractSignFromRequest(HongBaoReq *req) {
+    NSString *requestString = [[NSString alloc] initWithData:req.reqText.buffer encoding:NSUTF8StringEncoding];
+    NSDictionary *requestDict = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:requestString separator:@"&"];
+    NSString *nativeUrl = [requestDict dd_stringForKey:@"nativeUrl"];
+    if (!nativeUrl) return nil;
+    nativeUrl = [nativeUrl stringByRemovingPercentEncoding];
+    NSDictionary *nativeUrlDict = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:nativeUrl separator:@"&"];
+    return [nativeUrlDict dd_stringForKey:@"sign"];
+}
+
+static NSString* getDisplayNameForSession(NSString *sessionUserName) {
+    if (!sessionUserName.length) return nil;
+    MMContext *context = [objc_getClass("MMContext") activeUserContext];
+    CContactMgr *contactMgr = [context getService:objc_getClass("CContactMgr")];
+    if (!contactMgr) return nil;
+    CContact *contact = [contactMgr getContactByName:sessionUserName];
+    if (!contact) return nil;
+    NSString *displayName = [contact getContactDisplayName];
+    return displayName.length ? displayName : nil;
+}
 
 // ========== 红包参数模型 ==========
 @interface DDWeChatRedEnvelopParam : NSObject
@@ -415,6 +418,118 @@ static NSString * const kEnableNotifyKey = @"DDEnableNotifyKey";
 }
 @end
 
+// ========== Hook 红包逻辑 ==========
+static NSString *DDCurrentSessionUserName = nil;
+
+%hook WCRedEnvelopesLogicMgr
+- (void)OnWCToHongbaoCommonResponse:(HongBaoRes *)arg1 Request:(HongBaoReq *)arg2 {
+    %orig;
+    DDRedEnvelopConfig *cfg = [DDRedEnvelopConfig sharedConfig];
+
+    // 先按本次响应的 sendId 从队列 peek（只读、不出队）取最新的会话名，
+    // 保证下方通知显示的是「当前这条红包」所在会话，而非上一条（旧全局变量滞后问题）。
+    // 注意：此处不能用 dequeue，否则首响取出后拆响取不到，红包拆不开。
+    NSDictionary *responseDict = [[[NSString alloc] initWithData:arg1.retText.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
+    NSString *respSendId = [responseDict dd_stringForKey:@"sendid"] ?: [responseDict dd_stringForKey:@"sendId"];
+    NSString *sessionUserName = DDCurrentSessionUserName;
+    if (respSendId.length) {
+        DDWeChatRedEnvelopParam *peekParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
+        if (peekParam.sessionUserName.length) sessionUserName = peekParam.sessionUserName;
+    }
+
+    // 启用红包通知（总开关）开启时才处理两类通知；两类各自仍受独立开关控制
+    if (cfg.enableNotify && cfg.autoReceiveEnable) {
+        SKBuiltinBuffer_t *buffer = arg1.retText;
+        if (buffer.buffer) {
+            NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
+            NSInteger amount = [dict[@"amount"] integerValue];
+            NSInteger total = [dict[@"totalAmount"] integerValue];
+            if (amount > 0) {
+                NSString *redId = [NSString stringWithFormat:@"%@_%@", dict[@"sendId"]?:@"", dict[@"timingIdentifier"]?:@""];
+                if ([cfg shouldNotifyForRedEnvelopId:redId]) {
+                    // 系统本地通知（受「抢到红包后通知」独立开关控制）
+                    if (cfg.showNotification) {
+                        [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:total sessionUserName:sessionUserName];
+                    }
+                    // 文件传输助手通知（受「发送到文件传输助手」独立开关控制）
+                    if (cfg.notifyFileHelper) {
+                        DDWeChatRedEnvelopParam *fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
+                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:total sessionUserName:sessionUserName nickName:fhParam.nickName sendId:respSendId timingIdentifier:dict[@"timingIdentifier"]];
+                    }
+                }
+            }
+        }
+    }
+    if (arg1.cgiCmdid != 3) return;
+    DDWeChatRedEnvelopParam *mgrParams = [[DDRedEnvelopParamQueue sharedQueue] dequeueBySendId:respSendId];
+    DDCurrentSessionUserName = mgrParams.sessionUserName;
+    if (!mgrParams) return;
+    if ([responseDict[@"receiveStatus"] integerValue] == 2) return;
+    if ([responseDict[@"hbStatus"] integerValue] == 4) return;
+    if (!responseDict[@"timingIdentifier"]) return;
+    if (!cfg.autoReceiveEnable) return;
+    if (!mgrParams.isGroupSender) {
+        NSString *sign = extractSignFromRequest(arg2);
+        if (![sign isEqualToString:mgrParams.sign]) return;
+    }
+    mgrParams.timingIdentifier = responseDict[@"timingIdentifier"];
+    unsigned int delay = cfg.delayEnabled ? (unsigned int)cfg.delaySeconds : 0;
+    if (cfg.serialReceive && ![DDTaskManager sharedManager].serialQueueIsEmpty) delay = 2;
+    if (delay > 0) {
+        DDReceiveRedEnvelopOperation *op = [[DDReceiveRedEnvelopOperation alloc] initWithRedEnvelopParam:mgrParams delay:delay];
+        if (cfg.serialReceive) [[DDTaskManager sharedManager] addSerialTask:op];
+        else [[DDTaskManager sharedManager] addNormalTask:op];
+    } else {
+        [self OpenRedEnvelopesRequest:[mgrParams toParams]];
+    }
+}
+%end
+
+%hook CMessageMgr
+- (void)AsyncOnAddMsg:(NSString *)msg MsgWrap:(CMessageWrap *)wrap {
+    %orig;
+    if (wrap.m_uiMessageType != 49) return;
+    if ([wrap.m_nsContent rangeOfString:@"wxpay://"].location == NSNotFound) return;
+    MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
+    CContactMgr *contactMgr = [ctx getService:objc_getClass("CContactMgr")];
+    CContact *selfContact = [contactMgr getSelfContact];
+    BOOL isSender = [wrap.m_nsFromUsr isEqualToString:selfContact.userName];   // 8.0.76: m_nsUsrName → userName
+    BOOL isGroup = ([wrap.m_nsFromUsr rangeOfString:@"@chatroom"].location != NSNotFound) || ([wrap.m_nsToUsr rangeOfString:@"@chatroom"].location != NSNotFound);
+    DDRedEnvelopConfig *cfg = [DDRedEnvelopConfig sharedConfig];
+    if (!cfg.autoReceiveEnable) return;
+    if ([cfg.blackList containsObject:wrap.m_nsFromUsr]) return;
+    if (isSender && cfg.skipSelfRedEnvelop) return;
+    if (isGroup && cfg.skipGroupRedEnvelop) return;
+    if (!isGroup && cfg.skipPrivateRedEnvelop) return;
+    WCPayInfoItem *payInfo = (WCPayInfoItem *)wrap.m_oWCPayInfoItem;
+    NSString *nativeUrl = payInfo.m_c2cNativeUrl;
+    if (!nativeUrl) return;
+    NSDictionary *urlDict = parseNativeUrl(nativeUrl);
+    if (!urlDict) return;
+    BOOL isGroupSender = isGroup && isSender;
+    DDWeChatRedEnvelopParam *param = [DDWeChatRedEnvelopParam new];
+    param.msgType = [urlDict dd_stringForKey:@"msgtype"];
+    param.sendId = [urlDict dd_stringForKey:@"sendid"];
+    param.channelId = [urlDict dd_stringForKey:@"channelid"];
+    param.nickName = [selfContact getContactDisplayName];
+    // 8.0.76 无 m_nsHeadImgUrl 字段（CContact 仅含背景图 ID），头像 URL 不可取；headImg 保持默认 nil，仅展示用，不影响拆红包
+    param.nativeUrl = nativeUrl;
+    param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
+    param.sign = [urlDict dd_stringForKey:@"sign"];
+    param.isGroupSender = isGroupSender;
+    [[DDRedEnvelopParamQueue sharedQueue] enqueue:param];
+    NSMutableDictionary *reqParams = [NSMutableDictionary dictionary];
+    reqParams[@"agreeDuty"] = @"0";
+    reqParams[@"channelId"] = param.channelId ?: @"";
+    reqParams[@"inWay"] = @"0";
+    reqParams[@"msgType"] = param.msgType ?: @"";
+    reqParams[@"nativeUrl"] = nativeUrl;
+    reqParams[@"sendId"] = param.sendId ?: @"";
+    WCRedEnvelopesLogicMgr *logicMgr = [ctx getService:objc_getClass("WCRedEnvelopesLogicMgr")];
+    [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
+}
+%end
+
 // ========== 设置界面 ==========
 @interface DDRedEnvelopSettingsViewController : UIViewController <UITableViewDelegate, MultiSelectContactsViewControllerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
@@ -423,6 +538,15 @@ static NSString * const kEnableNotifyKey = @"DDEnableNotifyKey";
 
 @implementation DDRedEnvelopSettingsViewController {
     id<UITableViewDelegate> _originalDelegate;
+}
+
+// 把下拉项对应的值挂到 cell 上，点击时回读（对齐 DDTR.txt 实现）
+static const void *kDDOptionValue = &kDDOptionValue;
+static void DD_SetCellOption(id cell, id value) {
+    objc_setAssociatedObject(cell, kDDOptionValue, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static id DD_CellOption(id cell) {
+    return objc_getAssociatedObject(cell, kDDOptionValue);
 }
 
 - (void)ensureTableViewMgr {
@@ -549,15 +673,6 @@ static NSString * const kEnableNotifyKey = @"DDEnableNotifyKey";
     [self buildTable];
 }
 
-// 把下拉项对应的值挂到 cell 上，点击时回读（对齐 DDTR.txt 实现）
-static const void *kDDOptionValue = &kDDOptionValue;
-static void DD_SetCellOption(id cell, id value) {
-    objc_setAssociatedObject(cell, kDDOptionValue, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-static id DD_CellOption(id cell) {
-    return objc_getAssociatedObject(cell, kDDOptionValue);
-}
-
 - (void)onBlackListTapped {
     MultiSelectContactsViewController *picker = [[objc_getClass("MultiSelectContactsViewController") alloc] init];
     picker.m_scene = 0;
@@ -602,118 +717,6 @@ static id DD_CellOption(id cell) {
 
 @end
 
-// ========== Hook 红包逻辑 ==========
-static NSString *DDCurrentSessionUserName = nil;
-
-%hook WCRedEnvelopesLogicMgr
-- (void)OnWCToHongbaoCommonResponse:(HongBaoRes *)arg1 Request:(HongBaoReq *)arg2 {
-    %orig;
-    DDRedEnvelopConfig *cfg = [DDRedEnvelopConfig sharedConfig];
-
-    // 先按本次响应的 sendId 从队列 peek（只读、不出队）取最新的会话名，
-    // 保证下方通知显示的是「当前这条红包」所在会话，而非上一条（旧全局变量滞后问题）。
-    // 注意：此处不能用 dequeue，否则首响取出后拆响取不到，红包拆不开。
-    NSDictionary *responseDict = [[[NSString alloc] initWithData:arg1.retText.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
-    NSString *respSendId = [responseDict dd_stringForKey:@"sendid"] ?: [responseDict dd_stringForKey:@"sendId"];
-    NSString *sessionUserName = DDCurrentSessionUserName;
-    if (respSendId.length) {
-        DDWeChatRedEnvelopParam *peekParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
-        if (peekParam.sessionUserName.length) sessionUserName = peekParam.sessionUserName;
-    }
-
-    // 启用红包通知（总开关）开启时才处理两类通知；两类各自仍受独立开关控制
-    if (cfg.enableNotify && cfg.autoReceiveEnable) {
-        SKBuiltinBuffer_t *buffer = arg1.retText;
-        if (buffer.buffer) {
-            NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
-            NSInteger amount = [dict[@"amount"] integerValue];
-            NSInteger total = [dict[@"totalAmount"] integerValue];
-            if (amount > 0) {
-                NSString *redId = [NSString stringWithFormat:@"%@_%@", dict[@"sendId"]?:@"", dict[@"timingIdentifier"]?:@""];
-                if ([cfg shouldNotifyForRedEnvelopId:redId]) {
-                    // 系统本地通知（受「抢到红包后通知」独立开关控制）
-                    if (cfg.showNotification) {
-                        [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:total sessionUserName:sessionUserName];
-                    }
-                    // 文件传输助手通知（受「发送到文件传输助手」独立开关控制）
-                    if (cfg.notifyFileHelper) {
-                        DDWeChatRedEnvelopParam *fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
-                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:total sessionUserName:sessionUserName nickName:fhParam.nickName sendId:respSendId timingIdentifier:dict[@"timingIdentifier"]];
-                    }
-                }
-            }
-        }
-    }
-    if (arg1.cgiCmdid != 3) return;
-    DDWeChatRedEnvelopParam *mgrParams = [[DDRedEnvelopParamQueue sharedQueue] dequeueBySendId:respSendId];
-    DDCurrentSessionUserName = mgrParams.sessionUserName;
-    if (!mgrParams) return;
-    if ([responseDict[@"receiveStatus"] integerValue] == 2) return;
-    if ([responseDict[@"hbStatus"] integerValue] == 4) return;
-    if (!responseDict[@"timingIdentifier"]) return;
-    if (!cfg.autoReceiveEnable) return;
-    if (!mgrParams.isGroupSender) {
-        NSString *sign = extractSignFromRequest(arg2);
-        if (![sign isEqualToString:mgrParams.sign]) return;
-    }
-    mgrParams.timingIdentifier = responseDict[@"timingIdentifier"];
-    unsigned int delay = cfg.delayEnabled ? (unsigned int)cfg.delaySeconds : 0;
-    if (cfg.serialReceive && ![DDTaskManager sharedManager].serialQueueIsEmpty) delay = 2;
-    if (delay > 0) {
-        DDReceiveRedEnvelopOperation *op = [[DDReceiveRedEnvelopOperation alloc] initWithRedEnvelopParam:mgrParams delay:delay];
-        if (cfg.serialReceive) [[DDTaskManager sharedManager] addSerialTask:op];
-        else [[DDTaskManager sharedManager] addNormalTask:op];
-    } else {
-        [self OpenRedEnvelopesRequest:[mgrParams toParams]];
-    }
-}
-%end
-
-%hook CMessageMgr
-- (void)AsyncOnAddMsg:(NSString *)msg MsgWrap:(CMessageWrap *)wrap {
-    %orig;
-    if (wrap.m_uiMessageType != 49) return;
-    if ([wrap.m_nsContent rangeOfString:@"wxpay://"].location == NSNotFound) return;
-    MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-    CContactMgr *contactMgr = [ctx getService:objc_getClass("CContactMgr")];
-    CContact *selfContact = [contactMgr getSelfContact];
-    BOOL isSender = [wrap.m_nsFromUsr isEqualToString:selfContact.userName];   // 8.0.76: m_nsUsrName → userName
-    BOOL isGroup = ([wrap.m_nsFromUsr rangeOfString:@"@chatroom"].location != NSNotFound) || ([wrap.m_nsToUsr rangeOfString:@"@chatroom"].location != NSNotFound);
-    DDRedEnvelopConfig *cfg = [DDRedEnvelopConfig sharedConfig];
-    if (!cfg.autoReceiveEnable) return;
-    if ([cfg.blackList containsObject:wrap.m_nsFromUsr]) return;
-    if (isSender && cfg.skipSelfRedEnvelop) return;
-    if (isGroup && cfg.skipGroupRedEnvelop) return;
-    if (!isGroup && cfg.skipPrivateRedEnvelop) return;
-    WCPayInfoItem *payInfo = (WCPayInfoItem *)wrap.m_oWCPayInfoItem;
-    NSString *nativeUrl = payInfo.m_c2cNativeUrl;
-    if (!nativeUrl) return;
-    NSDictionary *urlDict = parseNativeUrl(nativeUrl);
-    if (!urlDict) return;
-    BOOL isGroupSender = isGroup && isSender;
-    DDWeChatRedEnvelopParam *param = [DDWeChatRedEnvelopParam new];
-    param.msgType = [urlDict dd_stringForKey:@"msgtype"];
-    param.sendId = [urlDict dd_stringForKey:@"sendid"];
-    param.channelId = [urlDict dd_stringForKey:@"channelid"];
-    param.nickName = [selfContact getContactDisplayName];
-    // 8.0.76 无 m_nsHeadImgUrl 字段（CContact 仅含背景图 ID），头像 URL 不可取；headImg 保持默认 nil，仅展示用，不影响拆红包
-    param.nativeUrl = nativeUrl;
-    param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
-    param.sign = [urlDict dd_stringForKey:@"sign"];
-    param.isGroupSender = isGroupSender;
-    [[DDRedEnvelopParamQueue sharedQueue] enqueue:param];
-    NSMutableDictionary *reqParams = [NSMutableDictionary dictionary];
-    reqParams[@"agreeDuty"] = @"0";
-    reqParams[@"channelId"] = param.channelId ?: @"";
-    reqParams[@"inWay"] = @"0";
-    reqParams[@"msgType"] = param.msgType ?: @"";
-    reqParams[@"nativeUrl"] = nativeUrl;
-    reqParams[@"sendId"] = param.sendId ?: @"";
-    WCRedEnvelopesLogicMgr *logicMgr = [ctx getService:objc_getClass("WCRedEnvelopesLogicMgr")];
-    [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
-}
-%end
-
 %ctor {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
@@ -724,3 +727,4 @@ static NSString *DDCurrentSessionUserName = nil;
         }
     }
 }
+
