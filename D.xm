@@ -17,7 +17,7 @@
 @property (nonatomic) unsigned int m_uiPaySubType;       // WCPayInfoItem.h:202 支付子类型（1=转账）
 @property (retain, nonatomic) NSString *m_nsTransferID;
 @property (nonatomic) unsigned int m_c2cPayReceiveStatus;
-@property (retain, nonatomic) NSString *m_total_fee;       // WCPayInfoItem.h:185 转账金额（微信历史为「分」整数字符串；含小数点则视为「元」）
+@property (retain, nonatomic) NSString *m_nsFeeDesc;        // WCPayInfoItem.h:200 金额展示文案（如 “¥66.00”），feedesc/fee_desc 对应的对象字段
 @property (nonatomic) unsigned int m_uiInvalidTime;
 @property (retain, nonatomic) NSString *transfer_attach;
 @property (retain, nonatomic) NSString *transfer_payer_username;
@@ -419,55 +419,22 @@ static AVSpeechSynthesizer *DD_SharedSynth(void) {
     return synth;
 }
 
-// 拼播报文案：转账金额从 m_nsContent（消息 XML 原文）提取。
-// 逆向实证：WCR 把 m_nsContent 传给金额解析器（0x1b2178 取 m_nsContent → 0x1bcdd0），
-// 金额就藏在 XML 里——<nativeurl>wechat://wcpay/transfer/transferquery?...&total_fee=6600</nativeurl>
-// 或 <total_fee>6600</total_fee>。m_c2cNativeUrl 的 query 并不带 total_fee，单独解析它取不到（即“收款 0元”的成因）。
-// WeChat Pay 的 total_fee 单位为「分」，故整数视为分、÷100；含小数点则当「元」直接读。
-static NSString *DD_ExtractAmount(NSString *text) {
-    if (text.length == 0) return nil;
-    // XML 可能含 HTML 实体，先轻量解码，避免 < > & 干扰匹配
-    NSString *s = [text stringByReplacingOccurrencesOfString:@"&lt;" withString:@"<"];
-    s = [s stringByReplacingOccurrencesOfString:@"&gt;" withString:@">"];
-    s = [s stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-    s = [s stringByReplacingOccurrencesOfString:@"&quot;" withString:@"\""];
-    // 只取数值型 key（WCR 字符串含 total_fee 与 totalfee，见 WCRefine 62246/62247；amount 亦常见）。
-    // 不用 feedesc/fee_desc：它们是金额描述文本，抓到非数字会播成 0。
-    NSArray *keys = @[@"total_fee", @"totalfee", @"amount"];
-    NSCharacterSet *delim = [NSCharacterSet characterSetWithCharactersInString:@"&<>\"' \t\n\r"];
-    for (NSString *want in keys) {
-        // 形态1：key=value（URL query）  形态2：<key>value</key>（XML 节点）
-        NSRange eq  = [s rangeOfString:[NSString stringWithFormat:@"%@=", want] options:NSCaseInsensitiveSearch];
-        NSRange tag = [s rangeOfString:[NSString stringWithFormat:@"<%@>", want] options:NSCaseInsensitiveSearch];
-        NSRange start = eq;
-        if (start.location == NSNotFound || (tag.location != NSNotFound && tag.location < start.location)) start = tag;
-        if (start.location == NSNotFound) continue;
-        NSUInteger from = start.location + start.length;
-        NSRange end = [s rangeOfCharacterFromSet:delim options:0 range:NSMakeRange(from, s.length - from)];
-        NSUInteger to = (end.location == NSNotFound) ? s.length : end.location;
-        NSString *val = [s substringWithRange:NSMakeRange(from, to - from)];
-        if (val.length && [val doubleValue] > 0) return val; // 仅采用正数数值
-    }
-    return nil;
+// 从展示文案（如“¥66.00”/“66.00元”）抽金额数字，已是「元」直接用
+static double DD_AmountFromDesc(NSString *desc) {
+    if (desc.length == 0) return 0;
+    NSString *digits = [[desc componentsSeparatedByCharactersInSet:
+        [[NSCharacterSet characterSetWithCharactersInString:@"0123456789."] invertedSet]]
+        componentsJoinedByString:@""];
+    double v = [digits doubleValue];
+    return v > 0 ? v : 0;
 }
 
-static double DD_YuanFromRaw(NSString *raw) {
-    double v = [raw doubleValue];
-    if ([raw rangeOfString:@"."].location == NSNotFound) v /= 100.0; // 整数视为「分」
-    return v;
-}
-
-static NSString *DD_BroadcastText(WCPayInfoItem *info, NSString *content) {
-    double amt = 0;
-    NSString *raw = DD_ExtractAmount(content)             // 主源：m_nsContent（XML，含 total_fee）
-                 ?: DD_ExtractAmount(info.m_c2cNativeUrl) // 兜底：URL query（部分版本带）
-                 ?: DD_ExtractAmount(info.m_c2cUrl);
-    if (raw.length) {
-        amt = DD_YuanFromRaw(raw);
-    } else if (info.m_total_fee.length) {
-        amt = DD_YuanFromRaw(info.m_total_fee);
-    }
-    return [NSString stringWithFormat:@"收款 %.2f 元", amt];
+// 播报文案：金额取自 m_nsFeeDesc（WCPayInfoItem.h:201 正式属性，由 parseWCPayInfoItemIfNeed
+// 从消息 XML 的 feedesc 解析所得，已是「元」）。DD_IsTransfer 已调用该解析并以 m_nsTransferID
+// 非空为门禁，故走到此处时 m_nsFeeDesc 必然就绪，无需再回退解析原始 XML。
+static NSString *DD_BroadcastText(WCPayInfoItem *info) {
+    double amt = DD_AmountFromDesc(info.m_nsFeeDesc);
+    return [NSString stringWithFormat:@"收到微信转账 %.2f 元", amt];
 }
 
 // 主线程播报：去空白 → 非空才播 → 正在播先打断 → 中文语音、默认语速（对齐 WCR 逆向）
@@ -596,7 +563,7 @@ static void DD_TryAutoReceive(NSString *sessionId, CMessageWrap *wrap) {
 
         [logic ConfirmTransferMoney:req];
         if ([DDTRConfig shared].autoBroadcastEnabled) {
-            DD_Announce(DD_BroadcastText(info, wrap.m_nsContent));
+            DD_Announce(DD_BroadcastText(info));
         }
         if ([DDTRConfig shared].autoReplyEnabled) {
             // 回复延迟 3.0 秒：与 WCR 硬编码常数一致（WCRefine 0x1b47bc-0x1b47c4 = 0xB2D05E00 = 3e9 ns）
