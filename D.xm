@@ -90,6 +90,7 @@
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
++ (id)centerCellForSel:(SEL)a0 target:(id)a1 title:(id)a2;
 @property (nonatomic, retain) id userInfo;
 @end
 
