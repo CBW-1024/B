@@ -39,8 +39,6 @@
 @property (nonatomic, retain) NSString *m_nsContent;
 @property (nonatomic, retain) NSString *m_nsFromUsr;
 @property (nonatomic, retain) NSString *m_nsToUsr;
-// 群消息真实发送者（群内显示名来源）
-@property (nonatomic, retain) NSString *m_nsRealChatUsr;
 @property (nonatomic, retain) id m_oWCPayInfoItem;
 @property (nonatomic, assign) unsigned int m_uiStatus;
 @property (nonatomic, assign) unsigned int m_uiCreateTime;
@@ -67,6 +65,10 @@
 @interface CAppViewControllerManager : NSObject
 + (id)getAppViewControllerManager;
 - (void)jumpToChat:(id)session msgToLocate:(id)msgWrap;
+@end
+
+@interface BaseMsgContentViewController : UIViewController
+- (void)tagLink:(id)link messageWrap:(id)wrap;
 @end
 
 @interface CMessageMgr (DDFileHelper)
@@ -297,7 +299,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 
 // ===== 红包参数模型 =====
 @interface DDWeChatRedEnvelopParam : NSObject
-@property (strong, nonatomic) NSString *msgType, *sendId, *channelId, *nickName, *nativeUrl, *sessionUserName, *sign, *timingIdentifier, *senderName;
+@property (strong, nonatomic) NSString *msgType, *sendId, *channelId, *nickName, *nativeUrl, *sessionUserName, *sign, *timingIdentifier;
 // 总额（分）：查询响应必含，拆响应未必；查询阶段存入参数，确保通知在拆响应弹出时总额不丢
 @property (assign, nonatomic) NSInteger totalAmount;
 @property (assign, nonatomic) BOOL isGroupSender;
@@ -393,7 +395,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 @interface DDNotificationManager : NSObject <UNUserNotificationCenterDelegate>
 + (instancetype)sharedManager;
 - (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName;
-- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType;
+- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType senderName:(NSString *)senderName senderAccount:(NSString *)senderAccount;
 @end
 @implementation DDNotificationManager
 + (instancetype)sharedManager {
@@ -438,7 +440,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 }
 
 // 转发到文件传输助手：构造富文本消息经 CMessageMgr 本地插入 filehelper 会话
-- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType {
+- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType senderName:(NSString *)senderName senderAccount:(NSString *)senderAccount {
     if (![DDRedEnvelopConfig sharedConfig].notifyFileHelper || amount <= 0) return;
     if (!sessionUserName.length) return;
 
@@ -461,10 +463,16 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     } else {
         [body appendFormat:@"🧧 类型： %@（%.2f元）\n", typeName, totalAmount / 100.0];
     }
-    if (param.senderName.length) [body appendFormat:@"👨 老板： %@\n", param.senderName];
+    if (senderName.length) {
+        [body appendFormat:@"👨 老板： %@\n", senderName];
+        // WCR 老板行同时展示发包者名字与微信账号；账号行仅在名字与账号不同（联系人在本地有昵称）时显示，避免冗余
+        if (senderAccount.length && ![senderName isEqualToString:senderAccount]) {
+            [body appendFormat:@"🆔 账号： %@\n", senderAccount];
+        }
+    }
     if (wishing.length) [body appendFormat:@"📝 备注： %@\n", wishing];
     [body appendFormat:@"⏰ 时间： %@\n", timeStr];
-    // 微信灰字自定义链接标签，点击经 %hook UIApplication 拦截跳转会话
+    // 微信灰字自定义链接标签，点击经 %hook BaseMsgContentViewController 拦截跳转会话
     if (sessionUserName.length) {
         [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转去感谢老板</_wc_custom_link_>", sessionUserName];
     } else {
@@ -599,7 +607,9 @@ static NSString *DDCurrentSessionUserName = nil;
                         NSInteger packetCount = [dict[@"totalNum"] integerValue];
                         NSInteger hbType = [dict[@"hbType"] integerValue];
                         NSString *wishing = [dict dd_stringForKey:@"wishing"];
-                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount hbType:hbType];
+                        NSString *sendUserName = [dict dd_stringForKey:@"sendUserName"];
+                        NSString *senderName = getDisplayNameForSession(sendUserName);
+                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount hbType:hbType senderName:senderName senderAccount:sendUserName];
                     }
                     if (cfg.voiceBroadcast) {
                         DDHBAnnounce(DDHBRedEnvelopBroadcastText(amount));
@@ -668,8 +678,6 @@ static NSString *DDCurrentSessionUserName = nil;
     param.sendId = [urlDict dd_stringForKey:@"sendid"];
     param.channelId = [urlDict dd_stringForKey:@"channelid"];
     param.nickName = [selfContact getContactDisplayName];
-    NSString *senderUsr = isGroup ? wrap.m_nsRealChatUsr : wrap.m_nsFromUsr;
-    param.senderName = getDisplayNameForSession(senderUsr);
     param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
     param.nativeUrl = nativeUrl;
     param.sign = [urlDict dd_stringForKey:@"sign"];
@@ -688,29 +696,22 @@ static NSString *DDCurrentSessionUserName = nil;
 }
 %end
 
-// 解析 DDHBRedEnvelopSession://session=xxx 并跳转会话
-static BOOL DDHBHandleSessionURL(NSURL *url) {
-    NSString *abs = url.absoluteString ?: @"";
+// 微信点击 <_wc_custom_link_> 走 tagLink:messageWrap:，不经过 UIApplication openURL:
+%hook BaseMsgContentViewController
+- (void)tagLink:(NSString *)link messageWrap:(CMessageWrap *)wrap {
     NSString *scheme = @"DDHBRedEnvelopSession://";
-    if (![abs hasPrefix:scheme]) return NO;
-    NSString *query = [abs substringFromIndex:scheme.length];
-    NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
-    NSString *session = [q dd_stringForKey:@"session"];
-    session = [session stringByRemovingPercentEncoding] ?: session;
-    if (!session.length) return YES;
-    id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
-    if (mgr) [mgr jumpToChat:session msgToLocate:nil];
-    return YES;
-}
-
-%hook UIApplication
-- (BOOL)openURL:(NSURL *)url {
-    if (DDHBHandleSessionURL(url)) return YES;
-    return %orig;
-}
-- (BOOL)openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenExternalURLOptionsKey, id> *)options completionHandler:(void (^)(BOOL))completion {
-    if (DDHBHandleSessionURL(url)) return YES;
-    return %orig;
+    if ([link hasPrefix:scheme]) {
+        NSString *query = [link substringFromIndex:scheme.length];
+        NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
+        NSString *session = [q dd_stringForKey:@"session"];
+        session = [session stringByRemovingPercentEncoding] ?: session;
+        if (session.length) {
+            id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
+            if (mgr) [mgr jumpToChat:session msgToLocate:nil];
+        }
+        return;
+    }
+    %orig;
 }
 %end
 
