@@ -331,7 +331,6 @@ static void DDHBJumpToChat(NSString *session) {
 @property (assign, nonatomic) NSInteger totalAmount;
 @property (assign, nonatomic) BOOL isGroupSender;
 @property (assign, nonatomic) BOOL isSender;
-@property (assign, nonatomic) BOOL isPluginAutoOpen;   // 标记本红包由插件自动抢触发，用于通知/回复的 per-message 区分（对齐 WCR）
 - (NSDictionary *)toParams;
 @end
 @implementation DDWeChatRedEnvelopParam
@@ -437,7 +436,6 @@ static void DDHBJumpToChat(NSString *session) {
 }
 - (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName {
     if (![DDRedEnvelopConfig sharedConfig].showNotification || amount <= 0) return;
-    if (!sessionUserName.length) return;
     NSString *displayName = getDisplayNameForSession(sessionUserName);
     NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
     NSString *title = [sessionUserName hasSuffix:@"@chatroom"] ? [finalDisplayName stringByAppendingString:@"（群聊）"] : finalDisplayName;
@@ -463,7 +461,6 @@ static void DDHBJumpToChat(NSString *session) {
 // 转发到文件传输助手：构造富文本消息经 CMessageMgr 本地插入 filehelper 会话
 - (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType senderName:(NSString *)senderName senderAccount:(NSString *)senderAccount {
     if (![DDRedEnvelopConfig sharedConfig].notifyFileHelper || amount <= 0) return;
-    if (!sessionUserName.length) return;
 
     NSString *displayName = getDisplayNameForSession(sessionUserName);
     NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
@@ -601,14 +598,16 @@ static NSString *DDCurrentSessionUserName = nil;
     // 服务端契约键为 sendid（小写）
     NSString *respSendId = [responseDict dd_stringForKey:@"sendid"];
     NSString *sessionUserName = DDCurrentSessionUserName;
+    NSString *respTiming = [responseDict dd_stringForKey:@"timingIdentifier"];
     DDWeChatRedEnvelopParam *fhParam = nil;
     if (respSendId.length) {
         fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
         if (fhParam.sessionUserName.length) sessionUserName = fhParam.sessionUserName;
     }
 
-    // 仅插件自动抢的拆包才触发通知/回复/播报；手动抢（队列无对应插件 param）不触发，对齐 WCR 的 per-message 区分
-    if (fhParam.isPluginAutoOpen) {
+    // WCR 式 per-message gate：仅当响应 timingIdentifier 与队列 param 中插件生成的凭证一致，才视为插件自动抢，触发通知/回复/播报；手动抢（响应 timingIdentifier 与凭证不匹配）不触发
+    BOOL isPluginAutoOpen = (fhParam && respTiming.length && [fhParam.timingIdentifier isEqualToString:respTiming]);
+    if (isPluginAutoOpen) {
         SKBuiltinBuffer_t *buffer = arg1.retText;
         if (buffer.buffer) {
             NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
@@ -706,7 +705,7 @@ static NSString *DDCurrentSessionUserName = nil;
     param.sign = [urlDict dd_stringForKey:@"sign"];
     param.isGroupSender = isGroupSender;
     param.isSender = isSender;
-    param.isPluginAutoOpen = YES;   // 走到入队即代表插件决定自动抢本红包
+    param.timingIdentifier = [NSUUID UUID].UUIDString;   // 插件生成自动抢凭证，贯穿拆包请求/响应用于匹配（WCR 式 per-message gate）
     [[DDRedEnvelopParamQueue sharedQueue] enqueue:param];
     NSMutableDictionary *reqParams = [NSMutableDictionary dictionary];
     reqParams[@"agreeDuty"] = @"0";
