@@ -773,11 +773,19 @@ static id DD_CellOption(id cell) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"红包助手设置";
-    // 微信原生观感：WCPluginsMgr 默认导航栏为半透明 UINavigationBar（仅 translucent=NO 会得到系统纯白，与微信原生灰不一致）。
-    // 故关半透明避免透出内容，并把 barTintColor 设为微信设置页原生灰(#F2F2F2)，对齐 WCR 对导航栏外观的处理方式。入口仍走 WCPluginsMgr，未改。
-    UINavigationBar *navBar = self.navigationController.navigationBar;
-    navBar.translucent = NO;
-    if ([navBar respondsToSelector:@selector(setBarTintColor:)]) {
+    // 仅针对本设置页的导航栏外观，不污染微信全局导航栏。
+    // 注意：直接改 self.navigationController.navigationBar 会因微信共用同一导航栈（bar 单例）而扩散到其他页面，
+    // 导致其他页导航栏布局错乱/异常变大。故用 navigationItem.standardAppearance 做按 VC 隔离，pop 后自动恢复微信原生外观。
+    if (@available(iOS 13.0, *)) {
+        UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+        [appearance configureWithOpaqueBackground];
+        appearance.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.949 alpha:1.0];
+        self.navigationItem.standardAppearance = appearance;
+        self.navigationItem.scrollEdgeAppearance = appearance;
+        self.navigationItem.compactAppearance = appearance;
+    } else {
+        UINavigationBar *navBar = self.navigationController.navigationBar;
+        navBar.translucent = NO;
         navBar.barTintColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.949 alpha:1.0];
     }
     [self ensureTableViewMgr];
