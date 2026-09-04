@@ -822,9 +822,6 @@ static id DD_CellOption(id cell) {
 
         [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onAutoReplySwitch:) target:self title:@"↳自动回复设置" on:cfg.autoReply]];
         if (cfg.autoReply) {
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipGroupReplySwitch:) target:self title:@"   ↳群聊红包不回复" on:cfg.skipGroupReply]];
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipPrivateReplySwitch:) target:self title:@"   ↳私聊红包不回复" on:cfg.skipPrivateReply]];
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipSelfReplySwitch:) target:self title:@"   ↳自发红包不回复" on:cfg.skipSelfReply]];
             [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onCustomReplySwitch:) target:self title:@"   ↳回复内容设置" on:cfg.customReplyEnabled]];
             if (cfg.customReplyEnabled) {
                 self.contentField = [[UITextField alloc] init];
@@ -837,6 +834,9 @@ static id DD_CellOption(id cell) {
                                                                                               title:@"     ↳自定义内容"
                                                                                           rightView:[self inputRowWithField:self.contentField action:@selector(contentConfirmed:)]]];
             }
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipGroupReplySwitch:) target:self title:@"   ↳群聊红包不回复" on:cfg.skipGroupReply]];
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipPrivateReplySwitch:) target:self title:@"   ↳私聊红包不回复" on:cfg.skipPrivateReply]];
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipSelfReplySwitch:) target:self title:@"   ↳自发红包不回复" on:cfg.skipSelfReply]];
         }
 
         [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onVoiceBroadcastSwitch:) target:self title:@"↳红包语音播报" on:cfg.voiceBroadcast]];
