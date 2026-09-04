@@ -104,9 +104,14 @@
 @end
 
 // 仅重写方法、不访问 property/ivar 的类：前向声明即可满足 Logos category 生成
-@class NewMainFrameViewController, WCTimeLineViewController, WCTimeLineCellView,
-       WCMicroMerchantFeedsMgr, MicroMerchantFoldInterceptor, FakeHeadImageView,
-       TextMessageViewModel, NewSettingViewController;
+@class NewMainFrameViewController;   // 功能1 禁用首页下拉小程序: initTableHeaderTopView(:425)/showTableHeaderTopViewByPullDown:(:439)
+@class WCTimeLineViewController;     // 功能2 禁用朋友圈视频自动播放: _canAutoPlayVideoForCellView:(:493)
+@class WCTimeLineCellView;           // 功能3/4 隐私图标+文字折叠: m_privacyButton(:26)/shouldShowFullTextButtonWithDataItem:(:98)
+@class WCMicroMerchantFeedsMgr;      // 功能5 余下N条折叠: foldSectionSize(:27)/isFeedIDFoldInGroup:(:48)
+@class MicroMerchantFoldInterceptor; // 功能5 余下N条折叠: intercept:(:16)
+@class FakeHeadImageView;            // 功能7 自定义头像: m_headImageView(:11)/getRealUserName:(:26)
+@class TextMessageViewModel;        // 功能9 聊天文字折叠: shouldFoldText(:117)/foldText(:64)
+@class NewSettingViewController;     // 功能11 隐藏自己微信号(兜底): m_tableViewMgr(:11)/reloadTableData(:55)
 
 #pragma mark - 配置管理 (锚定 NSUserDefaults，结构同 D.txt 的 DDRedEnvelopConfig)
 #define kDDWAPullDown          @"kDDWA_disableHomePullDownMiniProgram"
