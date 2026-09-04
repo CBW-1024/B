@@ -32,6 +32,7 @@
 @property (nonatomic, retain) NSString *userName;
 - (NSString *)getContactDisplayName;
 - (NSString *)m_nsNickName;
+- (NSString *)m_nsAliasName;   // CBaseContact 上的用户自定义微信号（真实 ID），见 CBaseContact.h:131
 @end
 
 @interface CMessageWrap : NSObject
@@ -295,6 +296,19 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     NSString *nickName = [contact m_nsNickName];
     if (nickName.length) return nickName;
     return nil;
+}
+
+// 取发包者对外微信号（真实 ID）：优先 CContact.m_nsAliasName，本地未同步/无自定义微信号时回退原始 wxid
+static NSString* getAccountForSession(NSString *sessionUserName) {
+    if (!sessionUserName.length) return nil;
+    MMContext *context = [objc_getClass("MMContext") activeUserContext];
+    CContactMgr *contactMgr = [context getService:objc_getClass("CContactMgr")];
+    if (!contactMgr) return sessionUserName;
+    CContact *contact = [contactMgr getContactByName:sessionUserName];
+    if (!contact) return sessionUserName;
+    NSString *alias = [contact m_nsAliasName];
+    if (alias.length) return alias;
+    return sessionUserName;
 }
 
 // ===== 红包参数模型 =====
@@ -609,7 +623,8 @@ static NSString *DDCurrentSessionUserName = nil;
                         NSString *wishing = [dict dd_stringForKey:@"wishing"];
                         NSString *sendUserName = [dict dd_stringForKey:@"sendUserName"];
                         NSString *senderName = getDisplayNameForSession(sendUserName);
-                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount hbType:hbType senderName:senderName senderAccount:sendUserName];
+                        NSString *senderAccount = getAccountForSession(sendUserName);
+                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount hbType:hbType senderName:senderName senderAccount:senderAccount];
                     }
                     if (cfg.voiceBroadcast) {
                         DDHBAnnounce(DDHBRedEnvelopBroadcastText(amount));
