@@ -331,6 +331,7 @@ static void DDHBJumpToChat(NSString *session) {
 @property (assign, nonatomic) NSInteger totalAmount;
 @property (assign, nonatomic) BOOL isGroupSender;
 @property (assign, nonatomic) BOOL isSender;
+@property (assign, nonatomic) BOOL isPluginAutoOpen;   // 标记本红包由插件自动抢触发，用于通知/回复的 per-message 区分（对齐 WCR 功能）
 - (NSDictionary *)toParams;
 @end
 @implementation DDWeChatRedEnvelopParam
@@ -598,16 +599,14 @@ static NSString *DDCurrentSessionUserName = nil;
     // 服务端契约键为 sendid（小写）
     NSString *respSendId = [responseDict dd_stringForKey:@"sendid"];
     NSString *sessionUserName = DDCurrentSessionUserName;
-    NSString *respTiming = [responseDict dd_stringForKey:@"timingIdentifier"];
     DDWeChatRedEnvelopParam *fhParam = nil;
     if (respSendId.length) {
         fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
         if (fhParam.sessionUserName.length) sessionUserName = fhParam.sessionUserName;
     }
 
-    // WCR 式 per-message gate：仅当响应 timingIdentifier 与队列 param 中插件生成的凭证一致，才视为插件自动抢，触发通知/回复/播报；手动抢（响应 timingIdentifier 与凭证不匹配）不触发
-    BOOL isPluginAutoOpen = (fhParam && respTiming.length && [fhParam.timingIdentifier isEqualToString:respTiming]);
-    if (isPluginAutoOpen) {
+    // 仅插件自动抢的拆包才触发通知/回复/播报；手动抢（队列无对应插件 param）不触发，对齐 WCR 的 per-message 区分
+    if (fhParam.isPluginAutoOpen) {
         SKBuiltinBuffer_t *buffer = arg1.retText;
         if (buffer.buffer) {
             NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
@@ -705,7 +704,7 @@ static NSString *DDCurrentSessionUserName = nil;
     param.sign = [urlDict dd_stringForKey:@"sign"];
     param.isGroupSender = isGroupSender;
     param.isSender = isSender;
-    param.timingIdentifier = [NSUUID UUID].UUIDString;   // 插件生成自动抢凭证，贯穿拆包请求/响应用于匹配（WCR 式 per-message gate）
+    param.isPluginAutoOpen = YES;   // 走到入队即代表插件决定自动抢本红包
     [[DDRedEnvelopParamQueue sharedQueue] enqueue:param];
     NSMutableDictionary *reqParams = [NSMutableDictionary dictionary];
     reqParams[@"agreeDuty"] = @"0";
