@@ -33,9 +33,6 @@
 // 群成员列表（用户名以 \x07\x1f,; 等字符分隔拼接），无群名时用于拼成员昵称
 @property (nonatomic, retain) NSString *m_nsChatRoomMemList;
 - (NSString *)getContactDisplayName;
-// 群名拼装（无名群自动拼成员昵称）与群内成员昵称
-+ (id)genChatRoomName:(id)arg1;
-- (id)getChatRoomMemberDisplayName:(id)arg1;
 @end
 
 @interface CMessageWrap : NSObject
@@ -295,15 +292,27 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     NSString *displayName = [contact getContactDisplayName];
     if (displayName.length) return displayName;
     if ([sessionUserName hasSuffix:@"@chatroom"]) {
-        NSString *gn = [objc_getClass("CContact") genChatRoomName:sessionUserName];
-        if (gn.length) return gn;
+        NSString *mem = contact.m_nsChatRoomMemList;
+        if (mem.length) {
+            NSCharacterSet *sep = [NSCharacterSet characterSetWithCharactersInString:@"\x07\x1f,;"];
+            NSArray *members = [mem componentsSeparatedByCharactersInSet:sep];
+            NSMutableArray *names = [NSMutableArray array];
+            for (NSString *u in members) {
+                NSString *un = [u stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (!un.length) continue;
+                NSString *n = getDisplayNameForSession(un);
+                if (n.length) [names addObject:n];
+                if (names.count >= 3) break;
+            }
+            if (names.count) return [names componentsJoinedByString:@"、"];
+        }
     }
     return nil;
 }
 
 // ===== 红包参数模型 =====
 @interface DDWeChatRedEnvelopParam : NSObject
-@property (strong, nonatomic) NSString *msgType, *sendId, *channelId, *nickName, *nativeUrl, *sessionUserName, *senderUserName, *sign, *timingIdentifier, *senderName;
+@property (strong, nonatomic) NSString *msgType, *sendId, *channelId, *nickName, *nativeUrl, *sessionUserName, *sign, *timingIdentifier, *senderName;
 // 总额（分）：查询响应必含，拆响应未必；查询阶段存入参数，确保通知在拆响应弹出时总额不丢
 @property (assign, nonatomic) NSInteger totalAmount;
 @property (assign, nonatomic) BOOL isGroupSender;
@@ -446,7 +455,6 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 // 转发到文件传输助手：构造富文本消息经 CMessageMgr 本地插入 filehelper 会话
 - (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount {
     if (![DDRedEnvelopConfig sharedConfig].notifyFileHelper || amount <= 0) return;
-    if (!sessionUserName.length) return;
 
     NSString *displayName = getDisplayNameForSession(sessionUserName);
     NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
@@ -471,10 +479,9 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     if (param.senderName.length) [body appendFormat:@"👨 老板： %@\n", param.senderName];
     if (wishing.length) [body appendFormat:@"📝 备注： %@\n", wishing];
     [body appendFormat:@"⏰ 时间： %@\n", timeStr];
-    // 微信灰字自定义链接标签，点击经 %hook UIApplication 拦截跳转会话（跳转到发包者个人聊天）
-    NSString *jumpSession = param.senderUserName.length ? param.senderUserName : sessionUserName;
-    if (jumpSession.length) {
-        [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转去感谢老板</_wc_custom_link_>", jumpSession];
+    // 微信灰字自定义链接标签，点击经 %hook UIApplication 拦截跳转会话
+    if (sessionUserName.length) {
+        [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转去感谢老板</_wc_custom_link_>", sessionUserName];
     } else {
         [body appendString:@"\n点击跳转去感谢老板"];
     }
@@ -551,7 +558,7 @@ static NSString *DDHB_SelfUserName(void) {
 static void DDHB_SendRedEnvelopReply(NSString *toSession, NSString *text) {
     if (!toSession.length || !text.length) return;
     if (![DDRedEnvelopConfig sharedConfig].autoReply) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (![DDRedEnvelopConfig sharedConfig].autoReply) return;
         NSString *selfUser = DDHB_SelfUserName();
         if (!selfUser.length) return;
@@ -643,7 +650,7 @@ static NSString *DDCurrentSessionUserName = nil;
         if (cfg.serialReceive) [[DDTaskManager sharedManager] addSerialTask:op];
         else [[DDTaskManager sharedManager] addNormalTask:op];
     } else {
-    [self OpenRedEnvelopesRequest:[mgrParams toParams]];
+        [self OpenRedEnvelopesRequest:[mgrParams toParams]];
     }
 }
 %end
@@ -676,14 +683,7 @@ static NSString *DDCurrentSessionUserName = nil;
     param.channelId = [urlDict dd_stringForKey:@"channelid"];
     param.nickName = [selfContact getContactDisplayName];
     NSString *senderUsr = isGroup ? wrap.m_nsRealChatUsr : wrap.m_nsFromUsr;
-    param.senderUserName = senderUsr;
-    NSString *bossName = nil;
-    if (isGroup && senderUsr.length) {
-        CContact *groupContact = [contactMgr getContactByName:wrap.m_nsFromUsr];
-        if (groupContact) bossName = [groupContact getChatRoomMemberDisplayName:senderUsr];
-    }
-    if (!bossName.length) bossName = getDisplayNameForSession(senderUsr);
-    param.senderName = bossName;
+    param.senderName = getDisplayNameForSession(senderUsr);
     param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
     param.nativeUrl = nativeUrl;
     param.sign = [urlDict dd_stringForKey:@"sign"];
@@ -702,33 +702,26 @@ static NSString *DDCurrentSessionUserName = nil;
 }
 %end
 
-// 拦截跳转链接 DDHBRedEnvelopSession://session=xxx，跳转到目标会话（含文件助手内点击）
-static BOOL DDHBHandleSessionURL(NSString *abs) {
-    NSString *scheme = @"DDHBRedEnvelopSession://";
-    if (![abs hasPrefix:scheme]) return NO;
-    NSString *query = [abs substringFromIndex:scheme.length];
-    NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
-    NSString *session = [q dd_stringForKey:@"session"];
-    session = [session stringByRemovingPercentEncoding] ?: session;
-    if (session.length) {
-        id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
-        if (!mgr) {
-            MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-            mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
-        }
-        if (mgr) [mgr jumpToChat:session msgToLocate:nil];
-        return YES;
-    }
-    return NO;
-}
-
+// 拦截通知内跳转链接 DDHBRedEnvelopSession://session=xxx，跳转红包所在会话
 %hook UIApplication
 - (BOOL)openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenExternalURLOptionsKey, id> *)options completionHandler:(void (^)(BOOL))completion {
-    if (DDHBHandleSessionURL(url.absoluteString ?: @"")) return YES;
-    return %orig;
-}
-- (BOOL)openURL:(NSURL *)url {
-    if (DDHBHandleSessionURL(url.absoluteString ?: @"")) return YES;
+    NSString *abs = url.absoluteString ?: @"";
+    NSString *scheme = @"DDHBRedEnvelopSession://";
+    if ([abs hasPrefix:scheme]) {
+        NSString *query = [abs substringFromIndex:scheme.length];
+        NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
+        NSString *session = [q dd_stringForKey:@"session"];
+        session = [session stringByRemovingPercentEncoding] ?: session;
+        if (session.length) {
+            id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
+            if (!mgr) {
+                MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
+                mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
+            }
+            if (mgr) [mgr jumpToChat:session msgToLocate:nil];
+        }
+        return YES;
+    }
     return %orig;
 }
 %end
