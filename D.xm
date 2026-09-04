@@ -774,7 +774,7 @@ static id DD_CellOption(id cell) {
     [super viewDidLoad];
     self.title = @"红包助手设置";
     
-    // 导航栏外观：WCPluginsMgr 外观渲染
+    // WCPluginsMgr 导航栏外观渲染
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
     appearance.shadowColor = nil;   // 去掉导航栏底部分割线
