@@ -127,6 +127,25 @@
 #define kDDWAHideMyWxid        @"kDDWA_hideMyWxid"
 #define kDDWAHideChatName      @"kDDWA_hideChatName"
 
+// ---- 开关默认状态常量：与配置组同处一地集中定义 ----
+// YES = 首次安装（用户从未改过）时该开关默认开启；NO = 默认关闭。
+// 目前 12 项全部为 NO，即装好后微信行为与原生一致，需用户手动开启。
+// 想让某项默认开启，把对应行的 NO 改成 YES 即可，无需改动 init / setter / 设置页。
+// 生效方式：下方 +initialize 把这些值注册到 NSUserDefaults 的注册域，
+//           用户一旦手动改过开关，用户值优先，注册域默认值自动让位。
+static const BOOL kDDDefaultPullDown          = NO;   // 禁用首页下拉小程序
+static const BOOL kDDDefaultVideoAutoPlay     = NO;   // 禁用朋友圈视频自动播放
+static const BOOL kDDDefaultPrivacyIcon       = NO;   // 禁用朋友圈谁可以见图标
+static const BOOL kDDDefaultTextFold          = NO;   // 禁用朋友圈文字自动折叠
+static const BOOL kDDDefaultGroupFold         = NO;   // 禁用朋友圈余下N条折叠
+static const BOOL kDDDefaultAntiDelete        = NO;   // 朋友圈评论防删
+static const BOOL kDDDefaultCustomAvatar      = NO;   // 启用自定义头像(聊天详情)
+static const BOOL kDDDefaultVideoTapClose     = NO;   // 禁用朋友圈视频点击关闭
+static const BOOL kDDDefaultChatTextFold      = NO;   // 禁用聊天文字折叠
+static const BOOL kDDDefaultHideFriendWxid    = NO;   // 隐藏好友微信号(资料页)
+static const BOOL kDDDefaultHideMyWxid        = NO;   // 隐藏自己微信号(我界面)
+static const BOOL kDDDefaultHideChatName      = NO;   // 隐藏聊天顶栏名字
+
 @interface DDWeChatConfig : NSObject
 + (instancetype)sharedConfig;
 @property (assign, nonatomic) BOOL disableHomePullDownMiniProgram;
@@ -149,6 +168,25 @@
     static dispatch_once_t once;
     dispatch_once(&once, ^{ c = [DDWeChatConfig new]; });
     return c;
+}
+// 把上面的「默认状态常量」注册到 NSUserDefaults 注册域。
+// 注册域优先级最低：key 从未被设置过时读取返回默认值；用户手动改过开关后以其值为准。
++ (void)initialize {
+    if (self != [DDWeChatConfig class]) return;
+    [NSUserDefaults.standardUserDefaults registerDefaults:@{
+        kDDWAPullDown:       @(kDDDefaultPullDown),
+        kDDWAVideoAutoPlay:  @(kDDDefaultVideoAutoPlay),
+        kDDWAPrivacyIcon:    @(kDDDefaultPrivacyIcon),
+        kDDWATextFold:       @(kDDDefaultTextFold),
+        kDDWAGroupFold:      @(kDDDefaultGroupFold),
+        kDDWADeletedComment: @(kDDDefaultAntiDelete),
+        kDDWACustomAvatar:   @(kDDDefaultCustomAvatar),
+        kDDWAVideoTapClose:  @(kDDDefaultVideoTapClose),
+        kDDWAChatTextFold:   @(kDDDefaultChatTextFold),
+        kDDWAHideFriendWxid: @(kDDDefaultHideFriendWxid),
+        kDDWAHideMyWxid:     @(kDDDefaultHideMyWxid),
+        kDDWAHideChatName:   @(kDDDefaultHideChatName),
+    }];
 }
 - (instancetype)init {
     if (self = [super init]) {
