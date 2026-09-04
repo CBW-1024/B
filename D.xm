@@ -172,6 +172,7 @@ static NSString * const kAutoReplyKey = @"DDHBAutoReplyKey";
 static NSString * const kVoiceBroadcastKey = @"DDHBVoiceBroadcastKey";
 static NSString * const kSkipGroupReplyKey = @"DDHBSkipGroupReplyKey";
 static NSString * const kSkipPrivateReplyKey = @"DDHBSkipPrivateReplyKey";
+static NSString * const kSkipSelfReplyKey = @"DDHBSkipSelfReplyKey";
 static NSString * const kCustomReplyEnabledKey = @"DDHBCustomReplyEnabledKey";
 static NSString * const kCustomReplyContentKey = @"DDHBCustomReplyContentKey";
 
@@ -193,6 +194,7 @@ static NSString * const kCustomReplyContentKey = @"DDHBCustomReplyContentKey";
 @property (assign, nonatomic) BOOL voiceBroadcast;
 @property (assign, nonatomic) BOOL skipGroupReply;
 @property (assign, nonatomic) BOOL skipPrivateReply;
+@property (assign, nonatomic) BOOL skipSelfReply;
 @property (assign, nonatomic) BOOL customReplyEnabled;
 @property (strong, nonatomic) NSString *customReplyContent;
 - (BOOL)shouldNotifyForRedEnvelopId:(NSString *)redEnvelopId;
@@ -226,6 +228,8 @@ static NSString * const kCustomReplyContentKey = @"DDHBCustomReplyContentKey";
         _voiceBroadcast = [ud boolForKey:kVoiceBroadcastKey];
         _skipGroupReply = [ud boolForKey:kSkipGroupReplyKey];
         _skipPrivateReply = [ud boolForKey:kSkipPrivateReplyKey];
+        id savedSkipSelfReply = [ud objectForKey:kSkipSelfReplyKey];
+        _skipSelfReply = (savedSkipSelfReply != nil) ? [savedSkipSelfReply boolValue] : YES;
         _customReplyEnabled = [ud boolForKey:kCustomReplyEnabledKey];
         _customReplyContent = [ud stringForKey:kCustomReplyContentKey] ?: @"谢谢老板，红包已收下🧧";
         NSArray *savedIds = [ud arrayForKey:kNotifiedRedEnvelopIdsKey];
@@ -248,6 +252,7 @@ static NSString * const kCustomReplyContentKey = @"DDHBCustomReplyContentKey";
 - (void)setVoiceBroadcast:(BOOL)voiceBroadcast { _voiceBroadcast = voiceBroadcast; [NSUserDefaults.standardUserDefaults setBool:voiceBroadcast forKey:kVoiceBroadcastKey]; }
 - (void)setSkipGroupReply:(BOOL)skipGroupReply { _skipGroupReply = skipGroupReply; [NSUserDefaults.standardUserDefaults setBool:skipGroupReply forKey:kSkipGroupReplyKey]; }
 - (void)setSkipPrivateReply:(BOOL)skipPrivateReply { _skipPrivateReply = skipPrivateReply; [NSUserDefaults.standardUserDefaults setBool:skipPrivateReply forKey:kSkipPrivateReplyKey]; }
+- (void)setSkipSelfReply:(BOOL)skipSelfReply { _skipSelfReply = skipSelfReply; [NSUserDefaults.standardUserDefaults setBool:skipSelfReply forKey:kSkipSelfReplyKey]; }
 - (void)setCustomReplyEnabled:(BOOL)customReplyEnabled { _customReplyEnabled = customReplyEnabled; [NSUserDefaults.standardUserDefaults setBool:customReplyEnabled forKey:kCustomReplyEnabledKey]; }
 - (void)setCustomReplyContent:(NSString *)customReplyContent { _customReplyContent = customReplyContent; [NSUserDefaults.standardUserDefaults setObject:customReplyContent forKey:kCustomReplyContentKey]; }
 - (BOOL)shouldNotifyForRedEnvelopId:(NSString *)redEnvelopId {
@@ -471,7 +476,7 @@ static void DDHBJumpToChat(NSString *session) {
     BOOL srcIsGroup = [sessionUserName hasSuffix:@"@chatroom"];
 
     NSMutableString *body = [NSMutableString string];
-    [body appendFormat:@"💰 叮咚：为您抢到 %.2f元\n", amount / 100.0];
+    [body appendFormat:@"💰 叮咚，为您抢到 %.2f元\n", amount / 100.0];
     [body appendFormat:@"📍 来源： %@%@\n", finalDisplayName, srcIsGroup ? @"（群聊）" : @""];
     if (packetCount > 0) {
         [body appendFormat:@"🧧 类型： %@（%ld包%.2f元）\n", typeName, (long)packetCount, totalAmount / 100.0];
@@ -479,8 +484,8 @@ static void DDHBJumpToChat(NSString *session) {
         [body appendFormat:@"🧧 类型： %@（%.2f元）\n", typeName, totalAmount / 100.0];
     }
     if (senderName.length) {
-        [body appendFormat:@"😊 发包者： %@\n", senderName];
-        // 发包者行同时展示发包者名字与微信账号；账号行仅在名字与账号不同（联系人在本地有昵称）时显示，避免冗余
+        [body appendFormat:@"👨 老板： %@\n", senderName];
+        // WCR 老板行同时展示发包者名字与微信账号；账号行仅在名字与账号不同（联系人在本地有昵称）时显示，避免冗余
         if (senderAccount.length && ![senderName isEqualToString:senderAccount]) {
             [body appendFormat:@"🆔 账号： %@\n", senderAccount];
         }
@@ -489,9 +494,9 @@ static void DDHBJumpToChat(NSString *session) {
     [body appendFormat:@"⏰ 时间： %@\n", timeStr];
     // 微信灰字自定义链接标签，点击经 %hook BaseMsgContentViewController 拦截跳转会话
     if (sessionUserName.length) {
-        [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转红包会话</_wc_custom_link_>", sessionUserName];
+        [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转去感谢老板</_wc_custom_link_>", sessionUserName];
     } else {
-        [body appendString:@"\n点击跳转红包会话"];
+        [body appendString:@"\n点击跳转去感谢老板"];
     }
 
     MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
@@ -566,7 +571,7 @@ static NSString *DDHB_SelfUserName(void) {
 static void DDHB_SendRedEnvelopReply(NSString *toSession, NSString *text) {
     if (!toSession.length || !text.length) return;
     if (![DDRedEnvelopConfig sharedConfig].autoReply) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (![DDRedEnvelopConfig sharedConfig].autoReply) return;
         NSString *selfUser = DDHB_SelfUserName();
         if (!selfUser.length) return;
@@ -630,9 +635,10 @@ static NSString *DDCurrentSessionUserName = nil;
                     if (cfg.voiceBroadcast) {
                         DDHBAnnounce(DDHBRedEnvelopBroadcastText(amount));
                     }
-                    if (cfg.autoReply && !fhParam.isSender) {
+                    if (cfg.autoReply) {
                         BOOL isGroup = [sessionUserName hasSuffix:@"@chatroom"];
-                        BOOL blocked = (isGroup && cfg.skipGroupReply) || (!isGroup && cfg.skipPrivateReply);
+                        BOOL isSelf = fhParam.isSender;
+                        BOOL blocked = (isGroup && cfg.skipGroupReply) || (!isGroup && cfg.skipPrivateReply) || (isSelf && cfg.skipSelfReply);
                         if (!blocked) {
                             NSString *text = (cfg.customReplyEnabled && cfg.customReplyContent.length) ? cfg.customReplyContent : kDDRedEnvelopDefaultReply;
                             DDHB_SendRedEnvelopReply(sessionUserName, text);
@@ -816,9 +822,10 @@ static id DD_CellOption(id cell) {
 
         [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onAutoReplySwitch:) target:self title:@"↳抢红包自动回复" on:cfg.autoReply]];
         if (cfg.autoReply) {
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipGroupReplySwitch:) target:self title:@"   ↳群聊红包不回复" on:cfg.skipGroupReply]];
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipPrivateReplySwitch:) target:self title:@"   ↳私聊红包不回复" on:cfg.skipPrivateReply]];
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onCustomReplySwitch:) target:self title:@"   ↳自定义回复内容" on:cfg.customReplyEnabled]];
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipGroupReplySwitch:) target:self title:@"↳↳群聊红包不回复" on:cfg.skipGroupReply]];
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipPrivateReplySwitch:) target:self title:@"↳↳私聊红包不回复" on:cfg.skipPrivateReply]];
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipSelfReplySwitch:) target:self title:@"↳↳自发红包不回复" on:cfg.skipSelfReply]];
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onCustomReplySwitch:) target:self title:@"↳↳启用自定义回复" on:cfg.customReplyEnabled]];
             if (cfg.customReplyEnabled) {
                 self.contentField = [[UITextField alloc] init];
                 self.contentField.placeholder = @"请输入回复内容";
@@ -827,17 +834,17 @@ static id DD_CellOption(id cell) {
                 [self.contentField addTarget:self action:@selector(contentChanged:) forControlEvents:UIControlEventEditingChanged];
                 [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") normalCellForSel:nil
                                                                                              target:nil
-                                                                                              title:@"     ↳自定义内容"
+                                                                                              title:@"↳↳↳自定义内容"
                                                                                           rightView:[self inputRowWithField:self.contentField action:@selector(contentConfirmed:)]]];
             }
         }
 
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onVoiceBroadcastSwitch:) target:self title:@"↳红包语音播报" on:cfg.voiceBroadcast]];
+        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onVoiceBroadcastSwitch:) target:self title:@"↳抢红包语音播报" on:cfg.voiceBroadcast]];
 
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onEnableNotifySwitch:) target:self title:@"↳抢到红包通知" on:cfg.enableNotify]];
+        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onEnableNotifySwitch:) target:self title:@"↳启用红包通知" on:cfg.enableNotify]];
         if (cfg.enableNotify) {
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifySwitch:) target:self title:@"   ↳使用系统通知" on:cfg.showNotification]];
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifyFileHelperSwitch:) target:self title:@"   ↳文件助手提示" on:cfg.notifyFileHelper]];
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifySwitch:) target:self title:@"↳↳抢到红包后通知" on:cfg.showNotification]];
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifyFileHelperSwitch:) target:self title:@"↳↳发送到文件传输助手" on:cfg.notifyFileHelper]];
         }
     }
     [_tableViewManager addSection:redEnvelopSection];
@@ -882,6 +889,7 @@ static id DD_CellOption(id cell) {
 - (void)onAutoReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].autoReply = sender.on; [self buildTable]; }
 - (void)onSkipGroupReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipGroupReply = sender.on; }
 - (void)onSkipPrivateReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipPrivateReply = sender.on; }
+- (void)onSkipSelfReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipSelfReply = sender.on; }
 - (void)onCustomReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].customReplyEnabled = sender.on; [self buildTable]; }
 - (void)onVoiceBroadcastSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].voiceBroadcast = sender.on; }
 
