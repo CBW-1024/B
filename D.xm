@@ -110,8 +110,12 @@
 @end
 
 // 隐藏好友微信号：WAProfileHeaderView.h:19/27 descLabel
+//   真实类型 MMUILabel，见 MMUILabel.h:11 @interface MMUILabel : UILabel
+//   必须声明成 UILabel，不能图省事写成 id：Objective-C 不允许对 id 使用点语法，
+//   否则 self.descLabel.text / .hidden 会报
+//   "property 'text'/'hidden' not found on object of type 'id'"（CI 实测踩过一次）
 @interface WAProfileHeaderView : UIView
-@property (nonatomic, retain) id descLabel;
+@property (nonatomic, retain) UILabel *descLabel;
 @end
 
 // 隐藏自己微信号：WASettingAccountCell.h:13/20 _detailLabel
