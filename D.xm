@@ -773,7 +773,7 @@ static id DD_CellOption(id cell) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"红包助手设置";
-    
+
     // WCPluginsMgr 导航栏外观渲染
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
@@ -781,7 +781,7 @@ static id DD_CellOption(id cell) {
     self.navigationItem.standardAppearance = appearance;
     self.navigationItem.scrollEdgeAppearance = appearance;
     self.navigationItem.compactAppearance = appearance;
-    
+
     [self ensureTableViewMgr];
     if (!_tableViewManager) return;
     [self buildTable];
