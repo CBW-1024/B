@@ -392,7 +392,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 @interface DDNotificationManager : NSObject <UNUserNotificationCenterDelegate>
 + (instancetype)sharedManager;
 - (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName;
-- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount;
+- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType;
 @end
 @implementation DDNotificationManager
 + (instancetype)sharedManager {
@@ -437,7 +437,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 }
 
 // 转发到文件传输助手：构造富文本消息经 CMessageMgr 本地插入 filehelper 会话
-- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount {
+- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType {
     if (![DDRedEnvelopConfig sharedConfig].notifyFileHelper || amount <= 0) return;
     if (!sessionUserName.length) return;
 
@@ -447,9 +447,8 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
     NSString *timeStr = [fmt stringFromDate:[NSDate date]];
 
-    NSString *typeName = @"红包";
-    if ([param.msgType isEqualToString:@"1"]) typeName = @"拼手气红包";
-    else if ([param.msgType isEqualToString:@"0"]) typeName = @"普通红包";
+    // hbType 取自拆包响应（ForeignHbOpenResp.hbType）：1 拼手气红包，0 普通红包
+    NSString *typeName = (hbType == 1) ? @"拼手气红包" : @"普通红包";
 
     BOOL srcIsGroup = [sessionUserName hasSuffix:@"@chatroom"];
 
@@ -597,8 +596,9 @@ static NSString *DDCurrentSessionUserName = nil;
                     }
                     if (cfg.enableNotify && cfg.notifyFileHelper) {
                         NSInteger packetCount = [dict[@"totalNum"] integerValue];
+                        NSInteger hbType = [dict[@"hbType"] integerValue];
                         NSString *wishing = [dict dd_stringForKey:@"wishing"];
-                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount];
+                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount hbType:hbType];
                     }
                     if (cfg.voiceBroadcast) {
                         DDHBAnnounce(DDHBRedEnvelopBroadcastText(amount));
