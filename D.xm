@@ -311,15 +311,11 @@ static NSString* getAccountForSession(NSString *sessionUserName) {
     return sessionUserName;
 }
 
-// 统一会话跳转：优先 +getAppViewControllerManager 单例，nil 时回退 MMContext getService:，最终 jumpToChat:msgToLocate:
-// 文件助手 <_wc_custom_link_> 点击（tagLink:messageWrap:）与系统通知点击共用此处，避免两处重复实现兜底不一致
+// 统一会话跳转：经头文件声明的单例访问器 +getAppViewControllerManager（CAppViewControllerManager.h:43）取管理器，再 jumpToChat:msgToLocate:
+// 文件助手 <_wc_custom_link_> 点击（tagLink:messageWrap:）与系统通知点击共用此处
 static void DDHBJumpToChat(NSString *session) {
     if (!session.length) return;
     id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
-    if (!mgr) {
-        MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-        if (ctx) mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
-    }
     if (mgr) [mgr jumpToChat:session msgToLocate:nil];
 }
 
@@ -563,7 +559,7 @@ static NSString *DDHB_SelfUserName(void) {
     CContactMgr *mgr = [ctx getService:objc_getClass("CContactMgr")];
     if (!mgr) return nil;
     CContact *selfContact = [mgr getSelfContact];
-    return selfContact.userName ?: nil;
+    return selfContact.userName;
 }
 
 // 主线程延时发送文本回复，目标为红包所在会话（群聊即群、私聊即发送方）
