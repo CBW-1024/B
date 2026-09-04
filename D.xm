@@ -10,7 +10,7 @@
 //    5. 禁用朋友圈余下N条折叠      -> WCMicroMerchantFeedsMgr isFeedIDFoldInGroup: + MicroMerchantFoldInterceptor intercept:
 //    6. 朋友圈评论防删            -> WCSNSMessage.upgradeDataIfNeeded (重置 delStatus / 评论删除标记)
 //    7. 启用自定义头像(聊天详情)   -> ContactInfoViewController 注入开关 + FakeHeadImageView 渲染
-//    8. 禁用朋友圈视频点击关闭     -> WAVideoPlayerView._disableTapGesture / onGestureTap:
+//    8. 禁用朋友圈视频点击关闭     -> WAVideoPlayerView.disableTapGesture / onGestureTap:
 //    9. 禁用聊天文字折叠          -> TextMessageViewModel.shouldFoldText (返回 NO, 长文不折叠)
 //   10. 隐藏好友微信号(资料页)     -> WAProfileHeaderView.descLabel -updateContact: (单方法, 对齐 WCR m_descLabel KVC 隐藏: 清空文本+hidden)
 //   11. 隐藏自己微信号(我界面)     -> WASettingAccountCell.detailLabel(账户卡片副标题=微信号行)
@@ -34,8 +34,27 @@
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-// 设置页用到的微信表管理器(仅前向声明，运行时通过 objc_getClass 取)
-@class WCTableViewManager, WCTableViewSectionManager, WCTableViewCellManager;
+// 设置页用到的微信表管理器：依据 8.0.76 头文件手动声明(仅声明实际调用的接口, 不 import 完整头文件)
+//   WCTableViewManager.h:12  @interface WCTableViewManager : NSObject
+//   WCTableViewSectionManager.h:11 @interface WCTableViewSectionManager : NSObject
+//   WCTableViewCellManager.h:11   @interface WCTableViewCellManager : NSObject
+@interface WCTableViewManager : NSObject
+- (id)initWithFrame:(struct CGRect)arg1 style:(long long)arg2;
+- (id)getTableView;
+- (void)clearAllSection;
+- (void)addSection:(id)arg1;
+- (void)reloadTableView;
+@property (nonatomic, weak) id delegate;
+@end
+
+@interface WCTableViewSectionManager : NSObject
++ (id)defaultSection;
+- (void)addCell:(id)arg1;
+@end
+
+@interface WCTableViewCellManager : NSObject
++ (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(_Bool)arg4;
+@end
 
 #pragma mark - 配置管理 (锚定 NSUserDefaults，结构同 D.txt 的 DDRedEnvelopConfig)
 #define kDDWAPullDown          @"kDDWA_disableHomePullDownMiniProgram"
@@ -386,16 +405,16 @@ static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: �
 %end
 
 #pragma mark - 8. 禁用朋友圈视频点击关闭
-// 证据: WAVideoPlayerView.h:189 @property _disableTapGesture (内置"禁用点击手势"开关)
+// 证据: WAVideoPlayerView.h:189 @property(nonatomic) _Bool disableTapGesture (内置"禁用点击手势"开关)
 //       :324 -onGestureTap: (单击手势处理方法，含关闭/控制栏切换逻辑)
 //       :83  UITapGestureRecognizer *tabGes (点击手势识别器)
 // WCR 佐证: /tmp/wcr_dis.txt 含 "WAVideoPlayerView" 类名字面量(L76bd2c)
 //           以及 "momentsDisableVideoTapCloseEnabled" config key(L676fbc/194bfc0/1966884)
 //
 // 原理: 朋友圈视频播放时，点击画面默认会触发 onGestureTap: → 关闭/退出播放器。
-//       微信内置了 _disableTapGesture 属性来禁用此行为(可能用于特殊场景)。
-//       方案: 直接设 _disableTapGesture = YES，利用微信原生能力禁用点击关闭。
-//       兜底: 若 _disableTapGesture 不生效，再 hook onGestureTap: 拦截。
+//       微信内置了 disableTapGesture 属性来禁用此行为(可能用于特殊场景)。
+//       方案: 直接设 disableTapGesture = YES，利用微信原生能力禁用点击关闭(原生 property 访问, 非 KVC)。
+//       兜底: 若 disableTapGesture 不生效，再 hook onGestureTap: 拦截。
 %hook WAVideoPlayerView
 - (void)layoutSubviews {
     %orig;
@@ -405,7 +424,7 @@ static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: �
         self.disableTapGesture = YES;
     }
 }
-// 兜底：若 _disableTapGesture 不影响已创建的手势识别器，直接拦截 tap 回调
+// 兜底：若 disableTapGesture 不影响已创建的手势识别器，直接拦截 tap 回调
 - (void)onGestureTap:(id)arg1 {
     if ([DDWeChatConfig sharedConfig].disableSnsVideoTapClose) return; // 拦截点击
     %orig;
