@@ -291,22 +291,6 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     if (!contact) return nil;
     NSString *displayName = [contact getContactDisplayName];
     if (displayName.length) return displayName;
-    if ([sessionUserName hasSuffix:@"@chatroom"]) {
-        NSString *mem = contact.m_nsChatRoomMemList;
-        if (mem.length) {
-            NSCharacterSet *sep = [NSCharacterSet characterSetWithCharactersInString:@"\x07\x1f,;"];
-            NSArray *members = [mem componentsSeparatedByCharactersInSet:sep];
-            NSMutableArray *names = [NSMutableArray array];
-            for (NSString *u in members) {
-                NSString *un = [u stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                if (!un.length) continue;
-                NSString *n = getDisplayNameForSession(un);
-                if (n.length) [names addObject:n];
-                if (names.count >= 3) break;
-            }
-            if (names.count) return [names componentsJoinedByString:@"、"];
-        }
-    }
     return nil;
 }
 
