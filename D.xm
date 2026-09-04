@@ -471,7 +471,7 @@ static void DDHBJumpToChat(NSString *session) {
     BOOL srcIsGroup = [sessionUserName hasSuffix:@"@chatroom"];
 
     NSMutableString *body = [NSMutableString string];
-    [body appendFormat:@"💰 叮咚，为您抢到 %.2f元\n", amount / 100.0];
+    [body appendFormat:@"💰 叮咚：为您抢到 %.2f元\n", amount / 100.0];
     [body appendFormat:@"📍 来源： %@%@\n", finalDisplayName, srcIsGroup ? @"（群聊）" : @""];
     if (packetCount > 0) {
         [body appendFormat:@"🧧 类型： %@（%ld包%.2f元）\n", typeName, (long)packetCount, totalAmount / 100.0];
@@ -479,8 +479,8 @@ static void DDHBJumpToChat(NSString *session) {
         [body appendFormat:@"🧧 类型： %@（%.2f元）\n", typeName, totalAmount / 100.0];
     }
     if (senderName.length) {
-        [body appendFormat:@"👨 老板： %@\n", senderName];
-        // WCR 老板行同时展示发包者名字与微信账号；账号行仅在名字与账号不同（联系人在本地有昵称）时显示，避免冗余
+        [body appendFormat:@"😊 发包者： %@\n", senderName];
+        // 发包者行同时展示发包者名字与微信账号；账号行仅在名字与账号不同（联系人在本地有昵称）时显示，避免冗余
         if (senderAccount.length && ![senderName isEqualToString:senderAccount]) {
             [body appendFormat:@"🆔 账号： %@\n", senderAccount];
         }
@@ -489,9 +489,9 @@ static void DDHBJumpToChat(NSString *session) {
     [body appendFormat:@"⏰ 时间： %@\n", timeStr];
     // 微信灰字自定义链接标签，点击经 %hook BaseMsgContentViewController 拦截跳转会话
     if (sessionUserName.length) {
-        [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转去感谢老板</_wc_custom_link_>", sessionUserName];
+        [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转红包会话</_wc_custom_link_>", sessionUserName];
     } else {
-        [body appendString:@"\n点击跳转去感谢老板"];
+        [body appendString:@"\n点击跳转红包会话"];
     }
 
     MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
@@ -566,7 +566,7 @@ static NSString *DDHB_SelfUserName(void) {
 static void DDHB_SendRedEnvelopReply(NSString *toSession, NSString *text) {
     if (!toSession.length || !text.length) return;
     if (![DDRedEnvelopConfig sharedConfig].autoReply) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (![DDRedEnvelopConfig sharedConfig].autoReply) return;
         NSString *selfUser = DDHB_SelfUserName();
         if (!selfUser.length) return;
