@@ -56,6 +56,58 @@
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(_Bool)arg4;
 @end
 
+// ---- 被 hook 微信类的手动声明(基于 8.0.76 dump 真实签名；不 import 微信头文件) ----
+// Logos %hook 会生成 category，要求被 hook 类至少可见。凡访问 property/ivar 之处
+// 必须给出完整 @interface，否则报 "property cannot be found in forward class object" /
+// "cannot find interface declaration"。仅重写方法、不碰 property/ivar 的类用 @class 即可。
+
+@class CContact;
+
+// 朋友圈评论防删：WCSNSMessage.h:19/28 delStatus, :30 comment, :31 refComment, :36 upgradeDataIfNeeded
+//              WCUserComment.h:119 bDeleted, :112 deletedByFeedOwner
+@interface WCUserComment : NSObject
+@property (nonatomic) _Bool bDeleted;
+@property (nonatomic) _Bool deletedByFeedOwner;
+@end
+
+@interface WCSNSMessage : NSObject
+@property (nonatomic) unsigned int delStatus;
+@property (nonatomic, retain) WCUserComment *comment;
+@property (nonatomic, retain) WCUserComment *refComment;
+- (void)upgradeDataIfNeeded;
+@end
+
+// 自定义头像：ContactInfoViewController.h:123 m_contact, :81 frontTableView
+@interface ContactInfoViewController : UIViewController
+@property (nonatomic, retain) CContact *m_contact;
+@property (nonatomic, weak) UITableView *frontTableView;
+@end
+
+// 禁用视频点击关闭：WAVideoPlayerView.h:189 disableTapGesture
+@interface WAVideoPlayerView : UIView
+@property (nonatomic) _Bool disableTapGesture;
+@end
+
+// 隐藏好友微信号：WAProfileHeaderView.h:19/27 descLabel
+@interface WAProfileHeaderView : UIView
+@property (nonatomic, retain) id descLabel;
+@end
+
+// 隐藏自己微信号：WASettingAccountCell.h:13/20 _detailLabel
+@interface WASettingAccountCell : UITableViewCell
+@property (nonatomic, retain) UILabel *detailLabel;
+@end
+
+// 隐藏聊天顶栏名字：MMUIViewController.h:520 -titleView
+@interface BaseMsgContentViewController : UIViewController
+- (id)titleView;
+@end
+
+// 仅重写方法、不访问 property/ivar 的类：前向声明即可满足 Logos category 生成
+@class NewMainFrameViewController, WCTimeLineViewController, WCTimeLineCellView,
+       WCMicroMerchantFeedsMgr, MicroMerchantFoldInterceptor, FakeHeadImageView,
+       TextMessageViewModel, NewSettingViewController;
+
 #pragma mark - 配置管理 (锚定 NSUserDefaults，结构同 D.txt 的 DDRedEnvelopConfig)
 #define kDDWAPullDown          @"kDDWA_disableHomePullDownMiniProgram"
 #define kDDWAVideoAutoPlay     @"kDDWA_disableSnsVideoAutoPlay"
@@ -292,8 +344,10 @@ static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: �
     %orig;
     if ([DDWeChatConfig sharedConfig].enableCustomAvatar) {
         // 证据: m_contact 是真实属性(ContactInfoViewController.h:123), userName 是 CContact.h:465 真实属性
+        // 用 performSelector: 取 userName, 规避 NSProcessInfo.userName (API_UNAVAILABLE(ios)) 与
+        // CContact.userName 同名导致的 "'userName' is unavailable: not available on iOS" 编译错误
         NSString *usr = nil;
-        if ([contact respondsToSelector:@selector(userName)]) usr = [contact userName];
+        if ([contact respondsToSelector:@selector(userName)]) usr = [contact performSelector:@selector(userName)];
         if (usr.length) objc_setAssociatedObject(self, kDDAvatarUsr, usr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
@@ -306,7 +360,7 @@ static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: �
         NSString *usr = objc_getAssociatedObject(self, kDDAvatarUsr);
         if (!usr.length) {
             id c = self.m_contact;  // 兜底: 直接读真实属性(:123)
-            if ([c respondsToSelector:@selector(userName)]) usr = [c userName];
+            if ([c respondsToSelector:@selector(userName)]) usr = [c performSelector:@selector(userName)];
         }
         if (!usr.length) return;
 
@@ -362,7 +416,7 @@ static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: �
     NSString *usr = objc_getAssociatedObject(self, kDDAvatarUsr);
     if (!usr.length) {
         id c = self.m_contact;
-        if ([c respondsToSelector:@selector(userName)]) usr = [c userName];
+        if ([c respondsToSelector:@selector(userName)]) usr = [c performSelector:@selector(userName)];
     }
     if (!usr.length) return;
     if (s.on) {
