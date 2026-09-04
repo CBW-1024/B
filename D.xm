@@ -331,7 +331,8 @@ static void DDHBJumpToChat(NSString *session) {
 @property (assign, nonatomic) NSInteger totalAmount;
 @property (assign, nonatomic) BOOL isGroupSender;
 @property (assign, nonatomic) BOOL isSender;
-@property (assign, nonatomic) BOOL isPluginAutoOpen;   // 标记本红包由插件自动抢触发，用于通知/回复的 per-message 区分（对齐 WCR 功能）
+@property (strong, nonatomic) NSString *autoOpenToken;     // 插件生成的自动抢凭证，贯穿查询请求/响应用于匹配（WCR 式 per-message gate）
+@property (assign, nonatomic) BOOL autoOpenVerified;        // 查询响应阶段用 timingIdentifier 匹配凭证后置位，拆包响应阶段据此 gate 通知/回复
 - (NSDictionary *)toParams;
 @end
 @implementation DDWeChatRedEnvelopParam
@@ -606,7 +607,7 @@ static NSString *DDCurrentSessionUserName = nil;
     }
 
     // 仅插件自动抢的拆包才触发通知/回复/播报；手动抢（队列无对应插件 param）不触发，对齐 WCR 的 per-message 区分
-    if (fhParam.isPluginAutoOpen) {
+    if (fhParam.autoOpenVerified) {
         SKBuiltinBuffer_t *buffer = arg1.retText;
         if (buffer.buffer) {
             NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
@@ -660,6 +661,8 @@ static NSString *DDCurrentSessionUserName = nil;
         if (![sign isEqualToString:mgrParams.sign]) return;
     }
     mgrParams.timingIdentifier = responseDict[@"timingIdentifier"];
+    // WCR 式决策：查询响应回显的 timingIdentifier 应与插件生成的凭证一致，才视为插件自动抢（手动抢时微信原生 timingIdentifier 与凭证不符）
+    mgrParams.autoOpenVerified = [mgrParams.autoOpenToken isEqualToString:[responseDict dd_stringForKey:@"timingIdentifier"] ?: @""];
     unsigned int delay = cfg.delayEnabled ? (unsigned int)cfg.delaySeconds : 0;
     if (cfg.serialReceive && ![DDTaskManager sharedManager].serialQueueIsEmpty) delay = 2;
     if (delay > 0) {
@@ -704,7 +707,7 @@ static NSString *DDCurrentSessionUserName = nil;
     param.sign = [urlDict dd_stringForKey:@"sign"];
     param.isGroupSender = isGroupSender;
     param.isSender = isSender;
-    param.isPluginAutoOpen = YES;   // 走到入队即代表插件决定自动抢本红包
+    param.autoOpenToken = [NSUUID UUID].UUIDString;   // 插件生成自动抢凭证，贯穿查询请求/响应用于匹配（WCR 式）
     [[DDRedEnvelopParamQueue sharedQueue] enqueue:param];
     NSMutableDictionary *reqParams = [NSMutableDictionary dictionary];
     reqParams[@"agreeDuty"] = @"0";
@@ -713,6 +716,7 @@ static NSString *DDCurrentSessionUserName = nil;
     reqParams[@"msgType"] = param.msgType ?: @"";
     reqParams[@"nativeUrl"] = nativeUrl;
     reqParams[@"sendId"] = param.sendId ?: @"";
+    reqParams[@"timingIdentifier"] = param.autoOpenToken ?: @"";   // 凭证贯穿查询请求，供响应回显匹配
     WCRedEnvelopesLogicMgr *logicMgr = [ctx getService:objc_getClass("WCRedEnvelopesLogicMgr")];
     [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
 }
