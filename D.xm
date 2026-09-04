@@ -455,6 +455,7 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
 // 转发到文件传输助手：构造富文本消息经 CMessageMgr 本地插入 filehelper 会话
 - (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount {
     if (![DDRedEnvelopConfig sharedConfig].notifyFileHelper || amount <= 0) return;
+    if (!sessionUserName.length) return;
 
     NSString *displayName = getDisplayNameForSession(sessionUserName);
     NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
