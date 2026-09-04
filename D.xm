@@ -319,7 +319,7 @@ static NSString* getAccountForSession(NSString *sessionUserName) {
 // 统一会话跳转：经头文件声明的单例访问器 +getAppViewControllerManager（CAppViewControllerManager.h:43）取管理器，再 jumpToChat:msgToLocate:
 // 文件助手 <_wc_custom_link_> 点击（tagLink:messageWrap:）与系统通知点击共用此处
 static void DDHBJumpToChat(NSString *session) {
-    if (!session.length) return;   // 过滤手动抢包不回复
+    if (!session.length) return;   // 空会话保护：session 为空时不跳转
     id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
     if (mgr) [mgr jumpToChat:session msgToLocate:nil];
 }
@@ -331,6 +331,7 @@ static void DDHBJumpToChat(NSString *session) {
 @property (assign, nonatomic) NSInteger totalAmount;
 @property (assign, nonatomic) BOOL isGroupSender;
 @property (assign, nonatomic) BOOL isSender;
+@property (assign, nonatomic) BOOL isPluginAutoOpen;   // 标记本红包由插件自动抢触发，用于通知/回复的 per-message 区分（对齐 WCR）
 - (NSDictionary *)toParams;
 @end
 @implementation DDWeChatRedEnvelopParam
@@ -600,25 +601,25 @@ static NSString *DDCurrentSessionUserName = nil;
     // 服务端契约键为 sendid（小写）
     NSString *respSendId = [responseDict dd_stringForKey:@"sendid"];
     NSString *sessionUserName = DDCurrentSessionUserName;
+    DDWeChatRedEnvelopParam *fhParam = nil;
     if (respSendId.length) {
-        DDWeChatRedEnvelopParam *peekParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
-        if (peekParam.sessionUserName.length) sessionUserName = peekParam.sessionUserName;
+        fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
+        if (fhParam.sessionUserName.length) sessionUserName = fhParam.sessionUserName;
     }
 
-    if (cfg.autoReceiveEnable) {
+    // 仅插件自动抢的拆包才触发通知/回复/播报；手动抢（队列无对应插件 param）不触发，对齐 WCR 的 per-message 区分
+    if (fhParam.isPluginAutoOpen) {
         SKBuiltinBuffer_t *buffer = arg1.retText;
         if (buffer.buffer) {
             NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
             NSInteger amount = [dict[@"amount"] integerValue];
             NSInteger total = [dict[@"totalAmount"] integerValue];
-            if (respSendId.length && total > 0) {
-                DDWeChatRedEnvelopParam *storeParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
-                if (storeParam) storeParam.totalAmount = total;
-            }
+        if (respSendId.length && total > 0 && fhParam) {
+            fhParam.totalAmount = total;
+        }
             if (amount > 0) {
                 NSString *redId = [NSString stringWithFormat:@"%@_%@", dict[@"sendId"]?:@"", dict[@"timingIdentifier"]?:@""];
                 if ([cfg shouldNotifyForRedEnvelopId:redId]) {
-                    DDWeChatRedEnvelopParam *fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
                     NSInteger displayTotal = (fhParam && fhParam.totalAmount > 0) ? fhParam.totalAmount : total;
                     if (cfg.enableNotify && cfg.showNotification) {
                         [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:displayTotal sessionUserName:sessionUserName];
@@ -705,6 +706,7 @@ static NSString *DDCurrentSessionUserName = nil;
     param.sign = [urlDict dd_stringForKey:@"sign"];
     param.isGroupSender = isGroupSender;
     param.isSender = isSender;
+    param.isPluginAutoOpen = YES;   // 走到入队即代表插件决定自动抢本红包
     [[DDRedEnvelopParamQueue sharedQueue] enqueue:param];
     NSMutableDictionary *reqParams = [NSMutableDictionary dictionary];
     reqParams[@"agreeDuty"] = @"0";
