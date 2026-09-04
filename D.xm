@@ -773,6 +773,8 @@ static id DD_CellOption(id cell) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"红包助手设置";
+    // 微信原生样式：关闭导航栏半透明，由系统渲染为不透明（复用微信原生导航栈外观，不手动涂色，对齐 WCR 不做 barTintColor/translucent 处理的方式）
+    self.navigationController.navigationBar.translucent = NO;
     [self ensureTableViewMgr];
     if (!_tableViewManager) return;
     [self buildTable];
