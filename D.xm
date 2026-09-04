@@ -30,9 +30,8 @@
 
 @interface CContact : NSObject
 @property (nonatomic, retain) NSString *userName;
-// 群成员列表（用户名以 \x07\x1f,; 等字符分隔拼接），无群名时用于拼成员昵称
-@property (nonatomic, retain) NSString *m_nsChatRoomMemList;
 - (NSString *)getContactDisplayName;
+- (NSString *)m_nsNickName;
 @end
 
 @interface CMessageWrap : NSObject
@@ -291,6 +290,8 @@ static NSString* getDisplayNameForSession(NSString *sessionUserName) {
     if (!contact) return nil;
     NSString *displayName = [contact getContactDisplayName];
     if (displayName.length) return displayName;
+    NSString *nickName = [contact m_nsNickName];
+    if (nickName.length) return nickName;
     return nil;
 }
 
@@ -687,26 +688,28 @@ static NSString *DDCurrentSessionUserName = nil;
 }
 %end
 
-// 拦截通知内跳转链接 DDHBRedEnvelopSession://session=xxx，跳转红包所在会话
-%hook UIApplication
-- (BOOL)openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenExternalURLOptionsKey, id> *)options completionHandler:(void (^)(BOOL))completion {
+// 解析 DDHBRedEnvelopSession://session=xxx 并跳转会话
+static BOOL DDHBHandleSessionURL(NSURL *url) {
     NSString *abs = url.absoluteString ?: @"";
     NSString *scheme = @"DDHBRedEnvelopSession://";
-    if ([abs hasPrefix:scheme]) {
-        NSString *query = [abs substringFromIndex:scheme.length];
-        NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
-        NSString *session = [q dd_stringForKey:@"session"];
-        session = [session stringByRemovingPercentEncoding] ?: session;
-        if (session.length) {
-            id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
-            if (!mgr) {
-                MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-                mgr = [ctx getService:objc_getClass("CAppViewControllerManager")];
-            }
-            if (mgr) [mgr jumpToChat:session msgToLocate:nil];
-        }
-        return YES;
-    }
+    if (![abs hasPrefix:scheme]) return NO;
+    NSString *query = [abs substringFromIndex:scheme.length];
+    NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
+    NSString *session = [q dd_stringForKey:@"session"];
+    session = [session stringByRemovingPercentEncoding] ?: session;
+    if (!session.length) return YES;
+    id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
+    if (mgr) [mgr jumpToChat:session msgToLocate:nil];
+    return YES;
+}
+
+%hook UIApplication
+- (BOOL)openURL:(NSURL *)url {
+    if (DDHBHandleSessionURL(url)) return YES;
+    return %orig;
+}
+- (BOOL)openURL:(NSURL *)url options:(NSDictionary<UIApplicationOpenExternalURLOptionsKey, id> *)options completionHandler:(void (^)(BOOL))completion {
+    if (DDHBHandleSessionURL(url)) return YES;
     return %orig;
 }
 %end
