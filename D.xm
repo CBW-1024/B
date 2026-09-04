@@ -10,7 +10,7 @@
 //    5. 禁用朋友圈余下N条折叠      -> WCMicroMerchantFeedsMgr isFeedIDFoldInGroup: + MicroMerchantFoldInterceptor intercept:
 //    6. 朋友圈评论防删            -> WCSNSMessage.upgradeDataIfNeeded (重置 delStatus / 评论删除标记)
 //    7. 启用自定义头像(聊天详情)   -> ContactInfoViewController 注入开关 + FakeHeadImageView 渲染
-//    8. 禁用朋友圈视频点击关闭     -> WAVideoPlayerView.disableTapGesture / onGestureTap:
+//    8. 禁用朋友圈视频点击关闭     -> WAVideoPlayerView._disableTapGesture / onGestureTap:
 //    9. 禁用聊天文字折叠          -> TextMessageViewModel.shouldFoldText (返回 NO, 长文不折叠)
 //   10. 隐藏好友微信号(资料页)     -> WAProfileHeaderView.descLabel -updateContact: (单方法, 对齐 WCR m_descLabel KVC 隐藏: 清空文本+hidden)
 //   11. 隐藏自己微信号(我界面)     -> WASettingAccountCell.detailLabel(账户卡片副标题=微信号行)
@@ -23,13 +23,10 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <substrate.h>
 
-// 兼容纯 ObjC(.m/.txt) 编译：用 runtime 读 ivar，避免依赖 MSHookIvar(C++ 模板)
-static inline id DDGetIvar(id obj, const char *name) {
-    if (!obj || !name) return nil;
-    Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
-    return iv ? object_getIvar(obj, iv) : nil;
-}
+// 无需导入微信头文件：用 theos 内置 MSHookIvar 按头文件中的 ivar 名读取
+// (ivar 名来自 8.0.76 dump, 非猜测; MSHookIvar 即 substrate 提供的 ivar 读取, 比自写 helper 更标准)
 
 // 微信插件注册入口(同 D.txt)
 @interface WCPluginsMgr : NSObject
@@ -154,8 +151,8 @@ static inline id DDGetIvar(id obj, const char *name) {
     %orig;
     if ([DDWeChatConfig sharedConfig].disableSnsPrivacyIcon) {
         // 每次布局时强制隐藏可见性图标(覆盖复用/重设)
-        // 证据 WCTimeLineCellView.h:26 MMUIButton *m_privacyButton (无对应 @property，故用 runtime 读 ivar)
-        id btn = DDGetIvar(self, "m_privacyButton");
+        // 证据 WCTimeLineCellView.h:26 MMUIButton *m_privacyButton (无对应 @property，故用 MSHookIvar 读 ivar)
+        id btn = MSHookIvar<id>(self, "m_privacyButton");
         if (btn) [(UIView *)btn setHidden:YES];
     }
 }
@@ -380,7 +377,7 @@ static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: �
         NSData *imgData = [NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(orig)];
         if (imgData) {
             UIImage *customImg = [UIImage imageWithData:imgData];
-            UIImageView *headImg = DDGetIvar(self, "m_headImageView");  // 真实 ivar(FakeHeadImageView.h:11)
+            UIImageView *headImg = MSHookIvar<UIImageView *>(self, "m_headImageView");  // 真实 ivar(FakeHeadImageView.h:11)
             if (headImg && customImg) headImg.image = customImg;
         }
     } @catch (NSException *e) { /* 安全回退 */ }
@@ -389,16 +386,16 @@ static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: �
 %end
 
 #pragma mark - 8. 禁用朋友圈视频点击关闭
-// 证据: WAVideoPlayerView.h:189 @property(nonatomic) _Bool disableTapGesture (内置"禁用点击手势"开关)
+// 证据: WAVideoPlayerView.h:189 @property _disableTapGesture (内置"禁用点击手势"开关)
 //       :324 -onGestureTap: (单击手势处理方法，含关闭/控制栏切换逻辑)
 //       :83  UITapGestureRecognizer *tabGes (点击手势识别器)
 // WCR 佐证: /tmp/wcr_dis.txt 含 "WAVideoPlayerView" 类名字面量(L76bd2c)
 //           以及 "momentsDisableVideoTapCloseEnabled" config key(L676fbc/194bfc0/1966884)
 //
 // 原理: 朋友圈视频播放时，点击画面默认会触发 onGestureTap: → 关闭/退出播放器。
-//       微信内置了 disableTapGesture 属性来禁用此行为(可能用于特殊场景)。
-//       方案: 直接设 disableTapGesture = YES，利用微信原生能力禁用点击关闭(原生 property 访问, 非 KVC)。
-//       兜底: 若 disableTapGesture 不生效，再 hook onGestureTap: 拦截。
+//       微信内置了 _disableTapGesture 属性来禁用此行为(可能用于特殊场景)。
+//       方案: 直接设 _disableTapGesture = YES，利用微信原生能力禁用点击关闭。
+//       兜底: 若 _disableTapGesture 不生效，再 hook onGestureTap: 拦截。
 %hook WAVideoPlayerView
 - (void)layoutSubviews {
     %orig;
@@ -408,7 +405,7 @@ static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: �
         self.disableTapGesture = YES;
     }
 }
-// 兜底：若 disableTapGesture 不影响已创建的手势识别器，直接拦截 tap 回调
+// 兜底：若 _disableTapGesture 不影响已创建的手势识别器，直接拦截 tap 回调
 - (void)onGestureTap:(id)arg1 {
     if ([DDWeChatConfig sharedConfig].disableSnsVideoTapClose) return; // 拦截点击
     %orig;
@@ -477,7 +474,7 @@ static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: �
     %orig;
     if (![DDWeChatConfig sharedConfig].hideMyWxid) return;
     // 兜底: 直接定位"我"页账户卡片 cell 清空副标题(微信号行), 不依赖任何字符串匹配
-    id mgr = DDGetIvar(self, "m_tableViewMgr"); // 真实 ivar(:11)
+    id mgr = MSHookIvar<id>(self, "m_tableViewMgr"); // 真实 ivar(:11)
     UITableView *tv = nil;
     if (mgr && [mgr respondsToSelector:@selector(getTableView)]) tv = [mgr getTableView];
     if (!tv) return;
