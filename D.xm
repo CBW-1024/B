@@ -319,7 +319,7 @@ static NSString* getAccountForSession(NSString *sessionUserName) {
 // 统一会话跳转：经头文件声明的单例访问器 +getAppViewControllerManager（CAppViewControllerManager.h:43）取管理器，再 jumpToChat:msgToLocate:
 // 文件助手 <_wc_custom_link_> 点击（tagLink:messageWrap:）与系统通知点击共用此处
 static void DDHBJumpToChat(NSString *session) {
-    if (!session.length) return;   // 空会话保护：session 为空时不跳转
+    if (!session.length) return;   // 过滤手动抢包不回复
     id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
     if (mgr) [mgr jumpToChat:session msgToLocate:nil];
 }
@@ -331,8 +331,6 @@ static void DDHBJumpToChat(NSString *session) {
 @property (assign, nonatomic) NSInteger totalAmount;
 @property (assign, nonatomic) BOOL isGroupSender;
 @property (assign, nonatomic) BOOL isSender;
-@property (strong, nonatomic) NSString *autoOpenToken;     // 插件生成的自动抢凭证，贯穿查询请求/响应用于匹配（WCR 式 per-message gate）
-@property (assign, nonatomic) BOOL autoOpenVerified;        // 查询响应阶段用 timingIdentifier 匹配凭证后置位，拆包响应阶段据此 gate 通知/回复
 - (NSDictionary *)toParams;
 @end
 @implementation DDWeChatRedEnvelopParam
@@ -438,6 +436,7 @@ static void DDHBJumpToChat(NSString *session) {
 }
 - (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName {
     if (![DDRedEnvelopConfig sharedConfig].showNotification || amount <= 0) return;
+    if (!sessionUserName.length) return;
     NSString *displayName = getDisplayNameForSession(sessionUserName);
     NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
     NSString *title = [sessionUserName hasSuffix:@"@chatroom"] ? [finalDisplayName stringByAppendingString:@"（群聊）"] : finalDisplayName;
@@ -463,6 +462,7 @@ static void DDHBJumpToChat(NSString *session) {
 // 转发到文件传输助手：构造富文本消息经 CMessageMgr 本地插入 filehelper 会话
 - (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType senderName:(NSString *)senderName senderAccount:(NSString *)senderAccount {
     if (![DDRedEnvelopConfig sharedConfig].notifyFileHelper || amount <= 0) return;
+    if (!sessionUserName.length) return;
 
     NSString *displayName = getDisplayNameForSession(sessionUserName);
     NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
@@ -600,25 +600,25 @@ static NSString *DDCurrentSessionUserName = nil;
     // 服务端契约键为 sendid（小写）
     NSString *respSendId = [responseDict dd_stringForKey:@"sendid"];
     NSString *sessionUserName = DDCurrentSessionUserName;
-    DDWeChatRedEnvelopParam *fhParam = nil;
     if (respSendId.length) {
-        fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
-        if (fhParam.sessionUserName.length) sessionUserName = fhParam.sessionUserName;
+        DDWeChatRedEnvelopParam *peekParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
+        if (peekParam.sessionUserName.length) sessionUserName = peekParam.sessionUserName;
     }
 
-    // 仅插件自动抢的拆包才触发通知/回复/播报；手动抢（队列无对应插件 param）不触发，对齐 WCR 的 per-message 区分
-    if (fhParam.autoOpenVerified) {
+    if (cfg.autoReceiveEnable) {
         SKBuiltinBuffer_t *buffer = arg1.retText;
         if (buffer.buffer) {
             NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
             NSInteger amount = [dict[@"amount"] integerValue];
             NSInteger total = [dict[@"totalAmount"] integerValue];
-        if (respSendId.length && total > 0 && fhParam) {
-            fhParam.totalAmount = total;
-        }
+            if (respSendId.length && total > 0) {
+                DDWeChatRedEnvelopParam *storeParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
+                if (storeParam) storeParam.totalAmount = total;
+            }
             if (amount > 0) {
                 NSString *redId = [NSString stringWithFormat:@"%@_%@", dict[@"sendId"]?:@"", dict[@"timingIdentifier"]?:@""];
                 if ([cfg shouldNotifyForRedEnvelopId:redId]) {
+                    DDWeChatRedEnvelopParam *fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
                     NSInteger displayTotal = (fhParam && fhParam.totalAmount > 0) ? fhParam.totalAmount : total;
                     if (cfg.enableNotify && cfg.showNotification) {
                         [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:displayTotal sessionUserName:sessionUserName];
@@ -661,8 +661,6 @@ static NSString *DDCurrentSessionUserName = nil;
         if (![sign isEqualToString:mgrParams.sign]) return;
     }
     mgrParams.timingIdentifier = responseDict[@"timingIdentifier"];
-    // WCR 式决策：查询响应回显的 timingIdentifier 应与插件生成的凭证一致，才视为插件自动抢（手动抢时微信原生 timingIdentifier 与凭证不符）
-    mgrParams.autoOpenVerified = [mgrParams.autoOpenToken isEqualToString:[responseDict dd_stringForKey:@"timingIdentifier"] ?: @""];
     unsigned int delay = cfg.delayEnabled ? (unsigned int)cfg.delaySeconds : 0;
     if (cfg.serialReceive && ![DDTaskManager sharedManager].serialQueueIsEmpty) delay = 2;
     if (delay > 0) {
@@ -707,7 +705,6 @@ static NSString *DDCurrentSessionUserName = nil;
     param.sign = [urlDict dd_stringForKey:@"sign"];
     param.isGroupSender = isGroupSender;
     param.isSender = isSender;
-    param.autoOpenToken = [NSUUID UUID].UUIDString;   // 插件生成自动抢凭证，贯穿查询请求/响应用于匹配（WCR 式）
     [[DDRedEnvelopParamQueue sharedQueue] enqueue:param];
     NSMutableDictionary *reqParams = [NSMutableDictionary dictionary];
     reqParams[@"agreeDuty"] = @"0";
@@ -716,7 +713,6 @@ static NSString *DDCurrentSessionUserName = nil;
     reqParams[@"msgType"] = param.msgType ?: @"";
     reqParams[@"nativeUrl"] = nativeUrl;
     reqParams[@"sendId"] = param.sendId ?: @"";
-    reqParams[@"timingIdentifier"] = param.autoOpenToken ?: @"";   // 凭证贯穿查询请求，供响应回显匹配
     WCRedEnvelopesLogicMgr *logicMgr = [ctx getService:objc_getClass("WCRedEnvelopesLogicMgr")];
     [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
 }
@@ -777,8 +773,13 @@ static id DD_CellOption(id cell) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"红包助手设置";
-    // 微信原生样式：关闭导航栏半透明，由系统渲染为不透明（复用微信原生导航栈外观，不手动涂色，对齐 WCR 不做 barTintColor/translucent 处理的方式）
-    self.navigationController.navigationBar.translucent = NO;
+    // 微信原生观感：WCPluginsMgr 默认导航栏为半透明 UINavigationBar（仅 translucent=NO 会得到系统纯白，与微信原生灰不一致）。
+    // 故关半透明避免透出内容，并把 barTintColor 设为微信设置页原生灰(#F2F2F2)，对齐 WCR 对导航栏外观的处理方式。入口仍走 WCPluginsMgr，未改。
+    UINavigationBar *navBar = self.navigationController.navigationBar;
+    navBar.translucent = NO;
+    if ([navBar respondsToSelector:@selector(setBarTintColor:)]) {
+        navBar.barTintColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.949 alpha:1.0];
+    }
     [self ensureTableViewMgr];
     if (!_tableViewManager) return;
     [self buildTable];
