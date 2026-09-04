@@ -1,758 +1,530 @@
+// =============================================================================
+//  DD微信助手 (DD WeChat Assistant)  v1.0.0
+//  单文件 iOS 越狱插件 (Theos / Logos)，目标微信 8.0.76
+//
+//  功能(提取自 WCR，重写为独立插件，每个 hook 均锚定微信头文件 dump 真实证据)：
+//    1. 禁用首页下拉小程序        -> NewMainFrameViewController (仅禁主界面下拉露出, 不动发现页入口)
+//    2. 禁用朋友圈视频自动播放     -> WCTimeLineViewController._canAutoPlayVideoForCellView:
+//    3. 禁用朋友圈谁可以见图标     -> WCTimeLineCellView.m_privacyButton
+//    4. 禁用朋友圈文字自动折叠     -> WCTimeLineCellView +shouldShowFullTextButtonWithDataItem:
+//    5. 禁用朋友圈余下N条折叠      -> WCMicroMerchantFeedsMgr isFeedIDFoldInGroup: + MicroMerchantFoldInterceptor intercept:
+//    6. 朋友圈评论防删            -> WCSNSMessage.upgradeDataIfNeeded (重置 delStatus / 评论删除标记)
+//    7. 启用自定义头像(聊天详情)   -> ContactInfoViewController 注入开关 + FakeHeadImageView 渲染
+//    8. 禁用朋友圈视频点击关闭     -> WAVideoPlayerView.disableTapGesture / onGestureTap:
+//    9. 禁用聊天文字折叠          -> TextMessageViewModel.shouldFoldText (返回 NO, 长文不折叠)
+//   10. 隐藏好友微信号(资料页)     -> WAProfileHeaderView.descLabel -updateContact: (单方法, 对齐 WCR m_descLabel KVC 隐藏: 清空文本+hidden)
+//   11. 隐藏自己微信号(我界面)     -> WASettingAccountCell.detailLabel(账户卡片副标题=微信号行)
+//   12. 隐藏聊天名字(顶栏标题)     -> BaseMsgContentViewController.updateTitleView: (%orig 后取 MMUIViewController.titleView 隐藏; 覆盖个人"陈某人"/群聊"群聊(N)")
+//
+//  设置界面与插件入口参考 D.txt：WCPluginsMgr 注册 + WCTableViewManager 自绘设置页 + 导航栏按 VC 隔离。
+//  头文件证据目录：/tmp/wechat76_dump/微信/
+//  WCR 佐证：/tmp/wcr_dis.txt (Logos 编译后类名/selector 作为字符串保留)
+// =============================================================================
+
 #import <UIKit/UIKit.h>
-#import <Foundation/Foundation.h>
-#import <UserNotifications/UserNotifications.h>
-#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 
-// ===== 微信类声明 =====
+// 兼容纯 ObjC(.m/.txt) 编译：用 runtime 读 ivar，避免依赖 MSHookIvar(C++ 模板)
+static inline id DDGetIvar(id obj, const char *name) {
+    if (!obj || !name) return nil;
+    Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
+    return iv ? object_getIvar(obj, iv) : nil;
+}
+
+// 微信插件注册入口(同 D.txt)
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-@interface SKBuiltinBuffer_t : NSObject
-@property (nonatomic, retain) NSData *buffer;
-@end
+// 设置页用到的微信表管理器(仅前向声明，运行时通过 objc_getClass 取)
+@class WCTableViewManager, WCTableViewSectionManager, WCTableViewCellManager;
 
-@interface HongBaoReq : NSObject
-@property (nonatomic, retain) SKBuiltinBuffer_t *reqText;
-@end
+#pragma mark - 配置管理 (锚定 NSUserDefaults，结构同 D.txt 的 DDRedEnvelopConfig)
+#define kDDWAPullDown          @"kDDWA_disableHomePullDownMiniProgram"
+#define kDDWAVideoAutoPlay     @"kDDWA_disableSnsVideoAutoPlay"
+#define kDDWAPrivacyIcon       @"kDDWA_disableSnsPrivacyIcon"
+#define kDDWATextFold          @"kDDWA_disableSnsTextFold"
+#define kDDWAGroupFold         @"kDDWA_disableSnsGroupFold"
+#define kDDWADeletedComment    @"kDDWA_antiDeleteSnsComment"
+#define kDDWACustomAvatar      @"kDDWA_enableCustomAvatar"
+#define kDDWAVideoTapClose     @"kDDWA_disableSnsVideoTapClose"
+#define kDDWAChatTextFold      @"kDDWA_disableChatTextFold"
+#define kDDWAHideFriendWxid    @"kDDWA_hideFriendWxid"
+#define kDDWAHideMyWxid        @"kDDWA_hideMyWxid"
+#define kDDWAHideChatName      @"kDDWA_hideChatName"
 
-@interface HongBaoRes : NSObject
-@property (nonatomic, assign) int cgiCmdid;
-@property (nonatomic, retain) SKBuiltinBuffer_t *retText;
-@end
-
-@interface MMContext : NSObject
-+ (instancetype)activeUserContext;
-- (id)getService:(Class)serviceClass;
-@end
-
-@interface CContactMgr : NSObject
-- (id)getContactByName:(NSString *)userName;
-- (id)getSelfContact;
-@end
-
-@interface CContact : NSObject
-@property (nonatomic, retain) NSString *userName;
-- (NSString *)getContactDisplayName;
-- (NSString *)m_nsNickName;
-- (NSString *)m_nsAliasName;   // CBaseContact 上的用户自定义微信号（真实 ID），见 CBaseContact.h:131
-@end
-
-@interface CMessageWrap : NSObject
-@property (nonatomic, assign) unsigned int m_uiMessageType;
-@property (nonatomic, retain) NSString *m_nsContent;
-@property (nonatomic, retain) NSString *m_nsFromUsr;
-@property (nonatomic, retain) NSString *m_nsToUsr;
-@property (nonatomic, retain) id m_oWCPayInfoItem;
-@property (nonatomic, assign) unsigned int m_uiStatus;
-@property (nonatomic, assign) unsigned int m_uiCreateTime;
-- (id)initWithMsgType:(long long)msgType;
-- (id)initWithMsgType:(long long)arg1 nsFromUsr:(id)arg2;
-@end
-
-@interface WCPayInfoItem : NSObject
-@property (nonatomic, retain) NSString *m_c2cNativeUrl;
-@end
-
-@interface WCRedEnvelopesLogicMgr : NSObject
-- (void)ReceiverQueryRedEnvelopesRequest:(NSDictionary *)params;
-- (void)OpenRedEnvelopesRequest:(NSDictionary *)params;
-- (void)OnWCToHongbaoCommonResponse:(HongBaoRes *)arg1 Request:(HongBaoReq *)arg2;
-@end
-
-@interface CMessageMgr : NSObject
-- (void)AsyncOnAddMsg:(NSString *)msg MsgWrap:(CMessageWrap *)wrap;
-- (void)AddMsg:(id)arg1 MsgWrap:(id)arg2;
-@end
-
-// CAppViewControllerManager 为单例，跳转会话需取 +getAppViewControllerManager
-@interface CAppViewControllerManager : NSObject
-+ (id)getAppViewControllerManager;
-- (void)jumpToChat:(id)session msgToLocate:(id)msgWrap;
-@end
-
-@interface BaseMsgContentViewController : UIViewController
-- (void)tagLink:(id)link messageWrap:(id)wrap;
-@end
-
-@interface CMessageMgr (DDFileHelper)
-- (void)AddLocalMsg:(id)session MsgWrap:(CMessageWrap *)wrap fixTime:(BOOL)fixTime NewMsgArriveNotify:(BOOL)notify;
-- (void)AddLocalMsg:(id)session MsgWrap:(CMessageWrap *)wrap;
-@end
-
-@interface WCBizUtil : NSObject
-+ (NSDictionary *)dictionaryWithDecodedComponets:(NSString *)string separator:(NSString *)separator;
-@end
-
-@interface ContactSelectView : NSObject
-- (void)addSelect:(id)contact;
-@end
-
-@interface MultiSelectContactsViewController : UIViewController
-@property (nonatomic, assign) unsigned long long m_scene;
-@property (nonatomic, weak) id m_delegate;
-@property (nonatomic, retain) ContactSelectView *m_selectView;
-- (void)updatePanelBtn;
-- (void)loadViewIfNeeded;
-@end
-
-@protocol MultiSelectContactsViewControllerDelegate <NSObject>
-- (void)onMultiSelectContactReturn:(NSArray *)contacts;
-@end
-
-@interface MMUINavigationController : UINavigationController
-- (instancetype)initWithRootViewController:(UIViewController *)rootViewController;
-@end
-
-@interface WCTableViewCellManager : NSObject
-+ (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;
-+ (id)centerCellForSel:(SEL)a0 target:(id)a1 title:(id)a2;
-@property (nonatomic, retain) id userInfo;
-@end
-
-@interface WCTableViewSectionManager : NSObject
-+ (id)defaultSection;
-- (void)addCell:(id)arg1;
-@end
-
-@interface WCTableViewManager : NSObject
-- (instancetype)initWithFrame:(CGRect)frame style:(NSInteger)style;
-- (void)clearAllSection;
-- (id)getTableView;
-- (id)cellInfoAtIndexPath:(NSIndexPath *)indexPath;
-- (void)addSection:(id)arg1;
-- (void)reloadTableView;
-@property (nonatomic, weak) id delegate;
-@end
-
-// ===== 辅助扩展 =====
-@interface NSDictionary (DDSafeAccess)
-- (NSString *)dd_stringForKey:(NSString *)key;
-@end
-@implementation NSDictionary (DDSafeAccess)
-- (NSString *)dd_stringForKey:(NSString *)key {
-    id value = self[key];
-    if ([value isKindOfClass:[NSString class]]) return value;
-    if ([value isKindOfClass:[NSNumber class]]) return [value stringValue];
-    return nil;
-}
-@end
-
-@interface NSString (DDJSON)
-- (id)dd_JSONDictionary;
-@end
-@implementation NSString (DDJSON)
-- (id)dd_JSONDictionary {
-    NSData *jsonData = [self dataUsingEncoding:NSUTF8StringEncoding];
-    if (!jsonData) return nil;
-    NSError *error = nil;
-    id jsonObject = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&error];
-    return [jsonObject isKindOfClass:[NSDictionary class]] ? jsonObject : nil;
-}
-@end
-
-// ===== 配置常量 =====
-static NSString * const kDelaySecondsKey = @"DDDelaySecondsKey";
-static NSString * const kAutoReceiveRedEnvelopKey = @"DDAutoReceiveRedEnvelopKey";
-static NSString * const kSkipGroupRedEnvelopKey = @"DDSkipGroupRedEnvelopKey";
-static NSString * const kSkipPrivateRedEnvelopKey = @"DDSkipPrivateRedEnvelopKey";
-static NSString * const kSkipSelfRedEnvelopKey = @"DDSkipSelfRedEnvelopKey";
-static NSString * const kSerialReceiveKey = @"DDSerialReceiveKey";
-static NSString * const kBlackListKey = @"DDBlackListKey";
-static NSString * const kDelayEnabledKey = @"DDDelayEnabledKey";
-static NSString * const kShowNotificationKey = @"DDShowNotificationKey";
-static NSString * const kNotifiedRedEnvelopIdsKey = @"DDNotifiedRedEnvelopIdsKey";
-static NSString * const kNotifyFileHelperKey = @"DDNotifyFileHelperKey";
-static NSString * const kEnableNotifyKey = @"DDEnableNotifyKey";
-static NSString * const kAutoReplyKey = @"DDHBAutoReplyKey";
-static NSString * const kVoiceBroadcastKey = @"DDHBVoiceBroadcastKey";
-static NSString * const kSkipGroupReplyKey = @"DDHBSkipGroupReplyKey";
-static NSString * const kSkipPrivateReplyKey = @"DDHBSkipPrivateReplyKey";
-static NSString * const kSkipSelfReplyKey = @"DDHBSkipSelfReplyKey";
-static NSString * const kCustomReplyEnabledKey = @"DDHBCustomReplyEnabledKey";
-static NSString * const kCustomReplyContentKey = @"DDHBCustomReplyContentKey";
-
-// ===== 配置管理 =====
-@interface DDRedEnvelopConfig : NSObject
+@interface DDWeChatConfig : NSObject
 + (instancetype)sharedConfig;
-@property (assign, nonatomic) BOOL autoReceiveEnable;
-@property (assign, nonatomic) NSInteger delaySeconds;
-@property (assign, nonatomic) BOOL skipGroupRedEnvelop;
-@property (assign, nonatomic) BOOL skipPrivateRedEnvelop;
-@property (assign, nonatomic) BOOL skipSelfRedEnvelop;
-@property (assign, nonatomic) BOOL serialReceive;
-@property (strong, nonatomic) NSArray *blackList;
-@property (assign, nonatomic) BOOL delayEnabled;
-@property (assign, nonatomic) BOOL showNotification;
-@property (assign, nonatomic) BOOL notifyFileHelper;
-@property (assign, nonatomic) BOOL enableNotify;
-@property (assign, nonatomic) BOOL autoReply;
-@property (assign, nonatomic) BOOL voiceBroadcast;
-@property (assign, nonatomic) BOOL skipGroupReply;
-@property (assign, nonatomic) BOOL skipPrivateReply;
-@property (assign, nonatomic) BOOL skipSelfReply;
-@property (assign, nonatomic) BOOL customReplyEnabled;
-@property (strong, nonatomic) NSString *customReplyContent;
-- (BOOL)shouldNotifyForRedEnvelopId:(NSString *)redEnvelopId;
+@property (assign, nonatomic) BOOL disableHomePullDownMiniProgram;
+@property (assign, nonatomic) BOOL disableSnsVideoAutoPlay;
+@property (assign, nonatomic) BOOL disableSnsPrivacyIcon;
+@property (assign, nonatomic) BOOL disableSnsTextFold;
+@property (assign, nonatomic) BOOL disableSnsGroupFold;
+@property (assign, nonatomic) BOOL antiDeleteSnsComment;
+@property (assign, nonatomic) BOOL enableCustomAvatar;
+@property (assign, nonatomic) BOOL disableSnsVideoTapClose;
+@property (assign, nonatomic) BOOL disableChatTextFold;
+@property (assign, nonatomic) BOOL hideFriendWxid;
+@property (assign, nonatomic) BOOL hideMyWxid;
+@property (assign, nonatomic) BOOL hideChatName;
 @end
 
-@implementation DDRedEnvelopConfig {
-    NSMutableSet *_notifiedRedEnvelopIds;
-}
+@implementation DDWeChatConfig
 + (instancetype)sharedConfig {
-    static DDRedEnvelopConfig *config = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ config = [DDRedEnvelopConfig new]; });
-    return config;
+    static DDWeChatConfig *c = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ c = [DDWeChatConfig new]; });
+    return c;
 }
 - (instancetype)init {
     if (self = [super init]) {
         NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-        id savedDelay = [ud objectForKey:kDelaySecondsKey];
-        _delaySeconds = (savedDelay && [savedDelay isKindOfClass:[NSNumber class]]) ? [savedDelay integerValue] : 1;
-        _autoReceiveEnable = [ud boolForKey:kAutoReceiveRedEnvelopKey];
-        _skipGroupRedEnvelop = [ud boolForKey:kSkipGroupRedEnvelopKey];
-        _skipPrivateRedEnvelop = [ud boolForKey:kSkipPrivateRedEnvelopKey];
-        _skipSelfRedEnvelop = [ud boolForKey:kSkipSelfRedEnvelopKey];
-        _serialReceive = [ud boolForKey:kSerialReceiveKey];
-        _blackList = [ud objectForKey:kBlackListKey];
-        _delayEnabled = [ud boolForKey:kDelayEnabledKey];
-        _showNotification = [ud boolForKey:kShowNotificationKey];
-        _notifyFileHelper = [ud boolForKey:kNotifyFileHelperKey];
-        _enableNotify = [ud boolForKey:kEnableNotifyKey];
-        _autoReply = [ud boolForKey:kAutoReplyKey];
-        _voiceBroadcast = [ud boolForKey:kVoiceBroadcastKey];
-        _skipGroupReply = [ud boolForKey:kSkipGroupReplyKey];
-        _skipPrivateReply = [ud boolForKey:kSkipPrivateReplyKey];
-        id savedSkipSelfReply = [ud objectForKey:kSkipSelfReplyKey];
-        _skipSelfReply = (savedSkipSelfReply != nil) ? [savedSkipSelfReply boolValue] : YES;
-        _customReplyEnabled = [ud boolForKey:kCustomReplyEnabledKey];
-        _customReplyContent = [ud stringForKey:kCustomReplyContentKey] ?: @"红包已收下🧧，感谢❤️";
-        NSArray *savedIds = [ud arrayForKey:kNotifiedRedEnvelopIdsKey];
-        _notifiedRedEnvelopIds = savedIds ? [NSMutableSet setWithArray:savedIds] : [NSMutableSet set];
+        _disableHomePullDownMiniProgram = [ud boolForKey:kDDWAPullDown];
+        _disableSnsVideoAutoPlay        = [ud boolForKey:kDDWAVideoAutoPlay];
+        _disableSnsPrivacyIcon          = [ud boolForKey:kDDWAPrivacyIcon];
+        _disableSnsTextFold             = [ud boolForKey:kDDWATextFold];
+        _disableSnsGroupFold            = [ud boolForKey:kDDWAGroupFold];
+        _antiDeleteSnsComment           = [ud boolForKey:kDDWADeletedComment];
+        _enableCustomAvatar             = [ud boolForKey:kDDWACustomAvatar];
+        _disableSnsVideoTapClose        = [ud boolForKey:kDDWAVideoTapClose];
+        _disableChatTextFold            = [ud boolForKey:kDDWAChatTextFold];
+        _hideFriendWxid                 = [ud boolForKey:kDDWAHideFriendWxid];
+        _hideMyWxid                     = [ud boolForKey:kDDWAHideMyWxid];
+        _hideChatName                   = [ud boolForKey:kDDWAHideChatName];
     }
     return self;
 }
-- (void)setDelaySeconds:(NSInteger)delaySeconds { _delaySeconds = delaySeconds; [NSUserDefaults.standardUserDefaults setInteger:delaySeconds forKey:kDelaySecondsKey]; }
-- (void)setAutoReceiveEnable:(BOOL)autoReceiveEnable { _autoReceiveEnable = autoReceiveEnable; [NSUserDefaults.standardUserDefaults setBool:autoReceiveEnable forKey:kAutoReceiveRedEnvelopKey]; }
-- (void)setSkipGroupRedEnvelop:(BOOL)skipGroupRedEnvelop { _skipGroupRedEnvelop = skipGroupRedEnvelop; [NSUserDefaults.standardUserDefaults setBool:skipGroupRedEnvelop forKey:kSkipGroupRedEnvelopKey]; }
-- (void)setSkipPrivateRedEnvelop:(BOOL)skipPrivateRedEnvelop { _skipPrivateRedEnvelop = skipPrivateRedEnvelop; [NSUserDefaults.standardUserDefaults setBool:skipPrivateRedEnvelop forKey:kSkipPrivateRedEnvelopKey]; }
-- (void)setSkipSelfRedEnvelop:(BOOL)skipSelfRedEnvelop { _skipSelfRedEnvelop = skipSelfRedEnvelop; [NSUserDefaults.standardUserDefaults setBool:skipSelfRedEnvelop forKey:kSkipSelfRedEnvelopKey]; }
-- (void)setSerialReceive:(BOOL)serialReceive { _serialReceive = serialReceive; [NSUserDefaults.standardUserDefaults setBool:serialReceive forKey:kSerialReceiveKey]; }
-- (void)setDelayEnabled:(BOOL)delayEnabled { _delayEnabled = delayEnabled; [NSUserDefaults.standardUserDefaults setBool:delayEnabled forKey:kDelayEnabledKey]; }
-- (void)setBlackList:(NSArray *)blackList { _blackList = blackList; [NSUserDefaults.standardUserDefaults setObject:blackList forKey:kBlackListKey]; }
-- (void)setShowNotification:(BOOL)showNotification { _showNotification = showNotification; [NSUserDefaults.standardUserDefaults setBool:showNotification forKey:kShowNotificationKey]; }
-- (void)setNotifyFileHelper:(BOOL)notifyFileHelper { _notifyFileHelper = notifyFileHelper; [NSUserDefaults.standardUserDefaults setBool:notifyFileHelper forKey:kNotifyFileHelperKey]; }
-- (void)setEnableNotify:(BOOL)enableNotify { _enableNotify = enableNotify; [NSUserDefaults.standardUserDefaults setBool:enableNotify forKey:kEnableNotifyKey]; }
-- (void)setAutoReply:(BOOL)autoReply { _autoReply = autoReply; [NSUserDefaults.standardUserDefaults setBool:autoReply forKey:kAutoReplyKey]; }
-- (void)setVoiceBroadcast:(BOOL)voiceBroadcast { _voiceBroadcast = voiceBroadcast; [NSUserDefaults.standardUserDefaults setBool:voiceBroadcast forKey:kVoiceBroadcastKey]; }
-- (void)setSkipGroupReply:(BOOL)skipGroupReply { _skipGroupReply = skipGroupReply; [NSUserDefaults.standardUserDefaults setBool:skipGroupReply forKey:kSkipGroupReplyKey]; }
-- (void)setSkipPrivateReply:(BOOL)skipPrivateReply { _skipPrivateReply = skipPrivateReply; [NSUserDefaults.standardUserDefaults setBool:skipPrivateReply forKey:kSkipPrivateReplyKey]; }
-- (void)setSkipSelfReply:(BOOL)skipSelfReply { _skipSelfReply = skipSelfReply; [NSUserDefaults.standardUserDefaults setBool:skipSelfReply forKey:kSkipSelfReplyKey]; }
-- (void)setCustomReplyEnabled:(BOOL)customReplyEnabled { _customReplyEnabled = customReplyEnabled; [NSUserDefaults.standardUserDefaults setBool:customReplyEnabled forKey:kCustomReplyEnabledKey]; }
-- (void)setCustomReplyContent:(NSString *)customReplyContent { _customReplyContent = customReplyContent; [NSUserDefaults.standardUserDefaults setObject:customReplyContent forKey:kCustomReplyContentKey]; }
-- (BOOL)shouldNotifyForRedEnvelopId:(NSString *)redEnvelopId {
-    if (redEnvelopId.length == 0) return NO;
-    @synchronized (_notifiedRedEnvelopIds) {
-        if ([_notifiedRedEnvelopIds containsObject:redEnvelopId]) return NO;
-        [_notifiedRedEnvelopIds addObject:redEnvelopId];
-        if (_notifiedRedEnvelopIds.count > 100) {
-            NSArray *all = _notifiedRedEnvelopIds.allObjects;
-            _notifiedRedEnvelopIds = [NSMutableSet setWithArray:[all subarrayWithRange:NSMakeRange(all.count - 100, 100)]];
-        }
-        [NSUserDefaults.standardUserDefaults setObject:_notifiedRedEnvelopIds.allObjects forKey:kNotifiedRedEnvelopIdsKey];
-        [NSUserDefaults.standardUserDefaults synchronize];
-        return YES;
-    }
-}
+- (void)setDisableHomePullDownMiniProgram:(BOOL)v { _disableHomePullDownMiniProgram = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAPullDown]; }
+- (void)setDisableSnsVideoAutoPlay:(BOOL)v { _disableSnsVideoAutoPlay = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAVideoAutoPlay]; }
+- (void)setDisableSnsPrivacyIcon:(BOOL)v { _disableSnsPrivacyIcon = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAPrivacyIcon]; }
+- (void)setDisableSnsTextFold:(BOOL)v { _disableSnsTextFold = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWATextFold]; }
+- (void)setDisableSnsGroupFold:(BOOL)v { _disableSnsGroupFold = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAGroupFold]; }
+- (void)setAntiDeleteSnsComment:(BOOL)v { _antiDeleteSnsComment = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWADeletedComment]; }
+- (void)setEnableCustomAvatar:(BOOL)v { _enableCustomAvatar = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWACustomAvatar]; }
+- (void)setDisableSnsVideoTapClose:(BOOL)v { _disableSnsVideoTapClose = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAVideoTapClose]; }
+- (void)setDisableChatTextFold:(BOOL)v { _disableChatTextFold = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAChatTextFold]; }
+- (void)setHideFriendWxid:(BOOL)v { _hideFriendWxid = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideFriendWxid]; }
+- (void)setHideMyWxid:(BOOL)v { _hideMyWxid = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideMyWxid]; }
+- (void)setHideChatName:(BOOL)v { _hideChatName = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideChatName]; }
 @end
 
-// ===== 红包链接解析 =====
-static NSDictionary* parseNativeUrl(NSString *nativeUrl) {
-    NSString *prefix = @"wxpay://c2cbizmessagehandler/hongbao/receivehongbao?";
-    if (![nativeUrl hasPrefix:prefix]) return nil;
-    NSString *query = [nativeUrl substringFromIndex:prefix.length];
-    return [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
-}
-
-static NSString* extractSignFromRequest(HongBaoReq *req) {
-    NSString *requestString = [[NSString alloc] initWithData:req.reqText.buffer encoding:NSUTF8StringEncoding];
-    NSDictionary *requestDict = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:requestString separator:@"&"];
-    NSString *nativeUrl = [requestDict dd_stringForKey:@"nativeUrl"];
-    if (!nativeUrl) return nil;
-    nativeUrl = [nativeUrl stringByRemovingPercentEncoding];
-    NSDictionary *nativeUrlDict = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:nativeUrl separator:@"&"];
-    return [nativeUrlDict dd_stringForKey:@"sign"];
-}
-
-static NSString* getDisplayNameForSession(NSString *sessionUserName) {
-    if (!sessionUserName.length) return nil;
-    MMContext *context = [objc_getClass("MMContext") activeUserContext];
-    CContactMgr *contactMgr = [context getService:objc_getClass("CContactMgr")];
-    if (!contactMgr) return nil;
-    CContact *contact = [contactMgr getContactByName:sessionUserName];
-    if (!contact) return nil;
-    NSString *displayName = [contact getContactDisplayName];
-    if (displayName.length) return displayName;
-    NSString *nickName = [contact m_nsNickName];
-    if (nickName.length) return nickName;
-    return nil;
-}
-
-// 取发包者对外微信号（真实 ID）：优先 CContact.m_nsAliasName，本地未同步/无自定义微信号时回退原始 wxid
-static NSString* getAccountForSession(NSString *sessionUserName) {
-    if (!sessionUserName.length) return nil;
-    MMContext *context = [objc_getClass("MMContext") activeUserContext];
-    CContactMgr *contactMgr = [context getService:objc_getClass("CContactMgr")];
-    if (!contactMgr) return sessionUserName;
-    CContact *contact = [contactMgr getContactByName:sessionUserName];
-    if (!contact) return sessionUserName;
-    NSString *alias = [contact m_nsAliasName];
-    if (alias.length) return alias;
-    return sessionUserName;
-}
-
-// 统一会话跳转：经头文件声明的单例访问器 +getAppViewControllerManager（CAppViewControllerManager.h:43）取管理器，再 jumpToChat:msgToLocate:
-// 文件助手 <_wc_custom_link_> 点击（tagLink:messageWrap:）与系统通知点击共用此处
-static void DDHBJumpToChat(NSString *session) {
-    if (!session.length) return;   // 过滤手动抢包不回复
-    id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
-    if (mgr) [mgr jumpToChat:session msgToLocate:nil];
-}
-
-// ===== 红包参数模型 =====
-@interface DDWeChatRedEnvelopParam : NSObject
-@property (strong, nonatomic) NSString *msgType, *sendId, *channelId, *nickName, *nativeUrl, *sessionUserName, *sign, *timingIdentifier;
-// 总额（分）：查询响应必含，拆响应未必；查询阶段存入参数，确保通知在拆响应弹出时总额不丢
-@property (assign, nonatomic) NSInteger totalAmount;
-@property (assign, nonatomic) BOOL isGroupSender;
-@property (assign, nonatomic) BOOL isSender;
-- (NSDictionary *)toParams;
-@end
-@implementation DDWeChatRedEnvelopParam
-- (NSDictionary *)toParams {
-    NSMutableDictionary *params = [NSMutableDictionary dictionary];
-    if (self.msgType) params[@"msgType"] = self.msgType;
-    if (self.sendId) params[@"sendId"] = self.sendId;
-    if (self.channelId) params[@"channelId"] = self.channelId;
-    if (self.nickName) params[@"nickName"] = self.nickName;
-    if (self.nativeUrl) params[@"nativeUrl"] = self.nativeUrl;
-    if (self.sessionUserName) params[@"sessionUserName"] = self.sessionUserName;
-    if (self.timingIdentifier) params[@"timingIdentifier"] = self.timingIdentifier;
-    if (self.sign) params[@"sign"] = self.sign;
-    return params;
-}
-@end
-
-// ===== 红包参数队列 =====
-@interface DDRedEnvelopParamQueue : NSObject
-+ (instancetype)sharedQueue;
-- (void)enqueue:(DDWeChatRedEnvelopParam *)param;
-- (DDWeChatRedEnvelopParam *)dequeueBySendId:(NSString *)sendId;
-- (DDWeChatRedEnvelopParam *)peekBySendId:(NSString *)sendId;
-@end
-@implementation DDRedEnvelopParamQueue { NSMutableArray<DDWeChatRedEnvelopParam *> *_queue; }
-+ (instancetype)sharedQueue { static DDRedEnvelopParamQueue *queue; static dispatch_once_t onceToken; dispatch_once(&onceToken, ^{ queue = [DDRedEnvelopParamQueue new]; }); return queue; }
-- (instancetype)init { if (self = [super init]) _queue = [NSMutableArray array]; return self; }
-- (void)enqueue:(DDWeChatRedEnvelopParam *)param { if (param) [_queue addObject:param]; }
-- (DDWeChatRedEnvelopParam *)dequeueBySendId:(NSString *)sendId {
-    if (_queue.count == 0) return nil;
-    if (sendId.length) {
-        for (NSUInteger i = 0; i < _queue.count; i++) {
-            if ([_queue[i].sendId isEqualToString:sendId]) {
-                DDWeChatRedEnvelopParam *matched = _queue[i];
-                [_queue removeObjectAtIndex:i];
-                return matched;
-            }
-        }
-        return nil;
-    }
-    DDWeChatRedEnvelopParam *first = _queue.firstObject;
-    [_queue removeObjectAtIndex:0];
-    return first;
-}
-// 只读查询：按 sendId 取出参数但不出队，避免拆包流程中提前出队导致后序取不到
-- (DDWeChatRedEnvelopParam *)peekBySendId:(NSString *)sendId {
-    if (_queue.count == 0) return nil;
-    for (DDWeChatRedEnvelopParam *p in _queue) {
-        if ([p.sendId isEqualToString:sendId]) return p;
-    }
-    return nil;
-}
-@end
-
-// ===== 拆红包操作 =====
-@interface DDReceiveRedEnvelopOperation : NSOperation { BOOL _finished; BOOL _executing; }
-- (instancetype)initWithRedEnvelopParam:(DDWeChatRedEnvelopParam *)param delay:(unsigned int)delaySeconds;
-@end
-@implementation DDReceiveRedEnvelopOperation { DDWeChatRedEnvelopParam *_param; unsigned int _delay; }
-- (instancetype)initWithRedEnvelopParam:(DDWeChatRedEnvelopParam *)param delay:(unsigned int)delaySeconds {
-    if (self = [super init]) { _param = param; _delay = delaySeconds; _finished = NO; _executing = NO; }
-    return self;
-}
-- (void)start { if (self.isCancelled) { self.finished = YES; self.executing = NO; return; } self.executing = YES; [self main]; }
-- (void)main { if (_delay > 0) sleep(_delay); MMContext *context = [objc_getClass("MMContext") activeUserContext]; WCRedEnvelopesLogicMgr *logicMgr = [context getService:objc_getClass("WCRedEnvelopesLogicMgr")]; [logicMgr OpenRedEnvelopesRequest:[_param toParams]]; self.finished = YES; self.executing = NO; }
-- (void)setFinished:(BOOL)finished { [self willChangeValueForKey:@"isFinished"]; _finished = finished; [self didChangeValueForKey:@"isFinished"]; }
-- (void)setExecuting:(BOOL)executing { [self willChangeValueForKey:@"isExecuting"]; _executing = executing; [self didChangeValueForKey:@"isExecuting"]; }
-- (BOOL)isFinished { return _finished; }
-- (BOOL)isExecuting { return _executing; }
-- (BOOL)isAsynchronous { return YES; }
-@end
-
-// ===== 任务管理 =====
-@interface DDTaskManager : NSObject
-+ (instancetype)sharedManager;
-- (void)addNormalTask:(DDReceiveRedEnvelopOperation *)task;
-- (void)addSerialTask:(DDReceiveRedEnvelopOperation *)task;
-- (BOOL)serialQueueIsEmpty;
-@end
-@implementation DDTaskManager { NSOperationQueue *_normalQueue, *_serialQueue; }
-+ (instancetype)sharedManager { static DDTaskManager *manager; static dispatch_once_t onceToken; dispatch_once(&onceToken, ^{ manager = [DDTaskManager new]; }); return manager; }
-- (instancetype)init { if (self = [super init]) { _serialQueue = [NSOperationQueue new]; _serialQueue.maxConcurrentOperationCount = 1; _normalQueue = [NSOperationQueue new]; _normalQueue.maxConcurrentOperationCount = 5; } return self; }
-- (void)addNormalTask:(DDReceiveRedEnvelopOperation *)task { [_normalQueue addOperation:task]; }
-- (void)addSerialTask:(DDReceiveRedEnvelopOperation *)task { [_serialQueue addOperation:task]; }
-- (BOOL)serialQueueIsEmpty { return _serialQueue.operationCount == 0; }
-@end
-
-// ===== 通知管理 =====
-@interface DDNotificationManager : NSObject <UNUserNotificationCenterDelegate>
-+ (instancetype)sharedManager;
-- (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName;
-- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType senderName:(NSString *)senderName senderAccount:(NSString *)senderAccount;
-@end
-@implementation DDNotificationManager
-+ (instancetype)sharedManager {
-    static DDNotificationManager *manager; static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        manager = [DDNotificationManager new];
-        [UNUserNotificationCenter.currentNotificationCenter requestAuthorizationWithOptions:(UNAuthorizationOptionAlert|UNAuthorizationOptionSound) completionHandler:^(BOOL granted, NSError *error) {}];
-        UNUserNotificationCenter.currentNotificationCenter.delegate = manager;
-    });
-    return manager;
-}
-- (void)showLocalNotificationWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount sessionUserName:(NSString *)sessionUserName {
-    if (![DDRedEnvelopConfig sharedConfig].showNotification || amount <= 0) return;
-    if (!sessionUserName.length) return;
-    NSString *displayName = getDisplayNameForSession(sessionUserName);
-    NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
-    NSString *title = [sessionUserName hasSuffix:@"@chatroom"] ? [finalDisplayName stringByAppendingString:@"（群聊）"] : finalDisplayName;
-    NSMutableString *body = [NSMutableString stringWithFormat:@"💰 抢到红包：%.2f元", amount/100.0];
-    if (totalAmount > 0) {
-        [body appendFormat:@"，总额：%.2f元", totalAmount/100.0];
-    }
-    UNMutableNotificationContent *content = [UNMutableNotificationContent new];
-    content.title = title; content.body = body; content.sound = [UNNotificationSound defaultSound];
-    content.userInfo = @{@"DDHBSession": sessionUserName};
-    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:[NSUUID UUID].UUIDString content:content trigger:[UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.1 repeats:NO]];
-    [UNUserNotificationCenter.currentNotificationCenter addNotificationRequest:request withCompletionHandler:nil];
-}
-- (void)userNotificationCenter:(UNUserNotificationCenter *)center willPresentNotification:(UNNotification *)notification withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
-    completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound);
-}
-- (void)userNotificationCenter:(UNUserNotificationCenter *)center didReceiveNotificationResponse:(UNNotificationResponse *)response withCompletionHandler:(void (^)(void))completionHandler {
-    NSString *session = response.notification.request.content.userInfo[@"DDHBSession"];
-    DDHBJumpToChat(session);
-    completionHandler();
-}
-
-// 转发到文件传输助手：构造富文本消息经 CMessageMgr 本地插入 filehelper 会话
-- (void)notifyFileHelperWithAmount:(NSInteger)amount totalAmount:(NSInteger)totalAmount param:(DDWeChatRedEnvelopParam *)param sessionUserName:(NSString *)sessionUserName timingIdentifier:(NSString *)timingIdentifier wishing:(NSString *)wishing packetCount:(NSInteger)packetCount hbType:(NSInteger)hbType senderName:(NSString *)senderName senderAccount:(NSString *)senderAccount {
-    if (![DDRedEnvelopConfig sharedConfig].notifyFileHelper || amount <= 0) return;
-    if (!sessionUserName.length) return;
-
-    NSString *displayName = getDisplayNameForSession(sessionUserName);
-    NSString *finalDisplayName = displayName.length ? displayName : sessionUserName;
-    NSDateFormatter *fmt = [NSDateFormatter new];
-    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    NSString *timeStr = [fmt stringFromDate:[NSDate date]];
-
-    // hbType 取自拆包响应（ForeignHbOpenResp.hbType）：1 拼手气红包，0 普通红包
-    NSString *typeName = (hbType == 1) ? @"拼手气红包" : @"普通红包";
-
-    BOOL srcIsGroup = [sessionUserName hasSuffix:@"@chatroom"];
-
-    NSMutableString *body = [NSMutableString string];
-    [body appendFormat:@"💰 叮咚：抢到红包 %.2f元\n", amount / 100.0];
-    [body appendFormat:@"📍 来源： %@%@\n", finalDisplayName, srcIsGroup ? @"（群聊）" : @""];
-    if (packetCount > 0) {
-        [body appendFormat:@"🧧 类型： %@（%ld包%.2f元）\n", typeName, (long)packetCount, totalAmount / 100.0];
-    } else {
-        [body appendFormat:@"🧧 类型： %@（%.2f元）\n", typeName, totalAmount / 100.0];
-    }
-    if (senderName.length) {
-        [body appendFormat:@"😊 发包者： %@\n", senderName];
-        // 发包者行同时展示发包者名字与微信账号；账号行仅在名字与账号不同（联系人在本地有昵称）时显示，避免冗余
-        if (senderAccount.length && ![senderName isEqualToString:senderAccount]) {
-            [body appendFormat:@"🆔 账号： %@\n", senderAccount];
-        }
-    }
-    if (wishing.length) [body appendFormat:@"📝 备注： %@\n", wishing];
-    [body appendFormat:@"⏰ 时间： %@\n", timeStr];
-    // 微信自定义链接标签，点击经 %hook BaseMsgContentViewController 拦截跳转会话
-    if (sessionUserName.length) {
-        [body appendFormat:@"\n<_wc_custom_link_ color=\"#576B95\" href=\"DDHBRedEnvelopSession://session=%@\">点击跳转红包会话</_wc_custom_link_>", sessionUserName];
-    } else {
-        [body appendString:@"\n点击跳转红包会话"];
-    }
-
-    MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-    CMessageMgr *msgMgr = [ctx getService:objc_getClass("CMessageMgr")];
-    if (!msgMgr) return;
-
-    NSString *session = @"filehelper";
-    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:10000];
-    if (!wrap) return;
-    wrap.m_nsFromUsr = session;
-    wrap.m_nsToUsr = session;
-    wrap.m_nsContent = body;
-    wrap.m_uiStatus = 4;
-    wrap.m_uiCreateTime = (unsigned int)([[NSDate date] timeIntervalSince1970] + 1);
-
-    SEL fourArgSel = NSSelectorFromString(@"AddLocalMsg:MsgWrap:fixTime:NewMsgArriveNotify:");
-    if ([msgMgr respondsToSelector:fourArgSel]) {
-        [msgMgr AddLocalMsg:session MsgWrap:wrap fixTime:NO NewMsgArriveNotify:NO];
-    } else {
-        [msgMgr AddLocalMsg:session MsgWrap:wrap];
-    }
-}
-@end
-
-// ===== 语音播报 / 自动回复 =====
-static AVSpeechSynthesizer *DDHB_SharedSynth(void) {
-    static AVSpeechSynthesizer *synth;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ synth = [[AVSpeechSynthesizer alloc] init]; });
-    return synth;
-}
-
-// 主线程播报：切到 Playback+MixWithOthers（忽略静音键、不与微信音频互斥），中文语音
-static void DDHBAnnounce(NSString *text) {
-    if (!text.length) return;
-    text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (!text.length) return;
-    void (^speak)(void) = ^{
-        AVAudioSession *session = [AVAudioSession sharedInstance];
-        [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
-        [session setActive:YES error:nil];
-        AVSpeechSynthesizer *synth = DDHB_SharedSynth();
-        if ([synth isSpeaking]) [synth stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
-        AVSpeechUtterance *u = [AVSpeechUtterance speechUtteranceWithString:text];
-        u.rate = AVSpeechUtteranceDefaultSpeechRate;
-        u.pitchMultiplier = 1.0;
-        AVSpeechSynthesisVoice *voice = [AVSpeechSynthesisVoice voiceWithLanguage:@"zh-CN"];
-        if (voice) u.voice = voice;
-        [synth speakUtterance:u];
-    };
-    if ([NSThread isMainThread]) speak();
-    else dispatch_async(dispatch_get_main_queue(), speak);
-}
-
-static NSString *DDHBRedEnvelopBroadcastText(NSInteger amount) {
-    double yuan = amount / 100.0;
-    return [NSString stringWithFormat:@"收到微信红包 %.2f 元", yuan];
-}
-
-static NSString *const kDDRedEnvelopDefaultReply = @"红包已收下🧧，感谢❤️";
-
-static NSString *DDHB_SelfUserName(void) {
-    MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-    if (!ctx) return nil;
-    CContactMgr *mgr = [ctx getService:objc_getClass("CContactMgr")];
-    if (!mgr) return nil;
-    CContact *selfContact = [mgr getSelfContact];
-    return selfContact.userName;
-}
-
-// 主线程延时发送文本回复，目标为红包所在会话（群聊即群、私聊即发送方）
-static void DDHB_SendRedEnvelopReply(NSString *toSession, NSString *text) {
-    if (!toSession.length || !text.length) return;
-    if (![DDRedEnvelopConfig sharedConfig].autoReply) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (![DDRedEnvelopConfig sharedConfig].autoReply) return;
-        NSString *selfUser = DDHB_SelfUserName();
-        if (!selfUser.length) return;
-        MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-        CMessageMgr *msgMgr = [ctx getService:objc_getClass("CMessageMgr")];
-        if (!msgMgr) return;
-        CMessageWrap *reply = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:1 nsFromUsr:toSession];
-        if (!reply) return;
-        reply.m_nsContent = text;
-        reply.m_nsFromUsr = selfUser;
-        reply.m_nsToUsr = toSession;
-        [msgMgr AddMsg:toSession MsgWrap:reply];
-    });
-}
-
-// ===== Hook 红包逻辑 =====
-static NSString *DDCurrentSessionUserName = nil;
-
-%hook WCRedEnvelopesLogicMgr
-- (void)OnWCToHongbaoCommonResponse:(HongBaoRes *)arg1 Request:(HongBaoReq *)arg2 {
+#pragma mark - 1. 禁用首页下拉小程序
+// 证据: NewMainFrameViewController.h:31 m_tableHeaderTopView(WAMainFrameTopHeaderView*)
+//       :406 -mainPullDown:, :414 -beginSetShowTableHeaderTopView, :425 -initTableHeaderTopView,
+//       :439 -showTableHeaderTopViewByPullDown:
+// WCR 佐证: /tmp/wcr_dis.txt 保留 selector "initTableHeaderTopView"/"mainPullDown:"/"showTableHeaderTopViewByPullDown:"
+// 注意: 仅禁用"微信主界面(聊天列表页)顶部下拉露出的小程序面板"，不动"发现"页里的小程序入口。
+%hook NewMainFrameViewController
+- (void)initTableHeaderTopView {
+    if ([DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram) return; // 不创建下拉露出视图
     %orig;
-    DDRedEnvelopConfig *cfg = [DDRedEnvelopConfig sharedConfig];
+}
+- (void)beginSetShowTableHeaderTopView {
+    if ([DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram) return;
+    %orig;
+}
+- (void)mainPullDown:(_Bool)arg1 {
+    if ([DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram) return;
+    %orig;
+}
+- (void)showTableHeaderTopViewByPullDown:(unsigned long long)arg1 {
+    if ([DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram) return;
+    %orig;
+}
+%end
 
-    // 按本次响应的 sendId 只读 peek 取会话名，确保通知显示当前红包所在会话
-    NSDictionary *responseDict = [[[NSString alloc] initWithData:arg1.retText.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
-    // 服务端契约键为 sendid（小写）
-    NSString *respSendId = [responseDict dd_stringForKey:@"sendid"];
-    NSString *sessionUserName = DDCurrentSessionUserName;
-    if (respSendId.length) {
-        DDWeChatRedEnvelopParam *peekParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
-        if (peekParam.sessionUserName.length) sessionUserName = peekParam.sessionUserName;
-    }
+#pragma mark - 2. 禁用朋友圈视频自动播放
+// 证据: WCTimeLineViewController.h:493 -_canAutoPlayVideoForCellView:, :494 -realAutoPlayVideo
+//       WCTimeLineCellView.h:274 -canAutoPlayVideoWithoutSound
+%hook WCTimeLineViewController
+- (_Bool)_canAutoPlayVideoForCellView:(id)arg1 {
+    if ([DDWeChatConfig sharedConfig].disableSnsVideoAutoPlay) return NO;
+    return %orig;
+}
+%end
 
-    if (cfg.autoReceiveEnable) {
-        SKBuiltinBuffer_t *buffer = arg1.retText;
-        if (buffer.buffer) {
-            NSDictionary *dict = [[[NSString alloc] initWithData:buffer.buffer encoding:NSUTF8StringEncoding] dd_JSONDictionary];
-            NSInteger amount = [dict[@"amount"] integerValue];
-            NSInteger total = [dict[@"totalAmount"] integerValue];
-            if (respSendId.length && total > 0) {
-                DDWeChatRedEnvelopParam *storeParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
-                if (storeParam) storeParam.totalAmount = total;
-            }
-            if (amount > 0) {
-                NSString *redId = [NSString stringWithFormat:@"%@_%@", dict[@"sendId"]?:@"", dict[@"timingIdentifier"]?:@""];
-                if ([cfg shouldNotifyForRedEnvelopId:redId]) {
-                    DDWeChatRedEnvelopParam *fhParam = [[DDRedEnvelopParamQueue sharedQueue] peekBySendId:respSendId];
-                    NSInteger displayTotal = (fhParam && fhParam.totalAmount > 0) ? fhParam.totalAmount : total;
-                    if (cfg.enableNotify && cfg.showNotification) {
-                        [[DDNotificationManager sharedManager] showLocalNotificationWithAmount:amount totalAmount:displayTotal sessionUserName:sessionUserName];
-                    }
-                    if (cfg.enableNotify && cfg.notifyFileHelper) {
-                        NSInteger packetCount = [dict[@"totalNum"] integerValue];
-                        NSInteger hbType = [dict[@"hbType"] integerValue];
-                        NSString *wishing = [dict dd_stringForKey:@"wishing"];
-                        NSString *sendUserName = [dict dd_stringForKey:@"sendUserName"];
-                        NSString *senderName = getDisplayNameForSession(sendUserName);
-                        NSString *senderAccount = getAccountForSession(sendUserName);
-                        [[DDNotificationManager sharedManager] notifyFileHelperWithAmount:amount totalAmount:displayTotal param:fhParam sessionUserName:sessionUserName timingIdentifier:dict[@"timingIdentifier"] wishing:wishing packetCount:packetCount hbType:hbType senderName:senderName senderAccount:senderAccount];
-                    }
-                    if (cfg.voiceBroadcast) {
-                        DDHBAnnounce(DDHBRedEnvelopBroadcastText(amount));
-                    }
-                    if (cfg.autoReply) {
-                        BOOL isGroup = [sessionUserName hasSuffix:@"@chatroom"];
-                        BOOL isSelf = fhParam.isSender;
-                        BOOL blocked = (isGroup && cfg.skipGroupReply) || (!isGroup && cfg.skipPrivateReply) || (isSelf && cfg.skipSelfReply);
-                        if (!blocked) {
-                            NSString *text = (cfg.customReplyEnabled && cfg.customReplyContent.length) ? cfg.customReplyContent : kDDRedEnvelopDefaultReply;
-                            DDHB_SendRedEnvelopReply(sessionUserName, text);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if (arg1.cgiCmdid != 3) return;
-    DDWeChatRedEnvelopParam *mgrParams = [[DDRedEnvelopParamQueue sharedQueue] dequeueBySendId:respSendId];
-    DDCurrentSessionUserName = mgrParams.sessionUserName;
-    if (!mgrParams) return;
-    if ([responseDict[@"receiveStatus"] integerValue] == 2) return;
-    if ([responseDict[@"hbStatus"] integerValue] == 4) return;
-    if (!responseDict[@"timingIdentifier"]) return;
-    if (!cfg.autoReceiveEnable) return;
-    if (!mgrParams.isGroupSender) {
-        NSString *sign = extractSignFromRequest(arg2);
-        if (![sign isEqualToString:mgrParams.sign]) return;
-    }
-    mgrParams.timingIdentifier = responseDict[@"timingIdentifier"];
-    unsigned int delay = cfg.delayEnabled ? (unsigned int)cfg.delaySeconds : 0;
-    if (cfg.serialReceive && ![DDTaskManager sharedManager].serialQueueIsEmpty) delay = 2;
-    if (delay > 0) {
-        DDReceiveRedEnvelopOperation *op = [[DDReceiveRedEnvelopOperation alloc] initWithRedEnvelopParam:mgrParams delay:delay];
-        if (cfg.serialReceive) [[DDTaskManager sharedManager] addSerialTask:op];
-        else [[DDTaskManager sharedManager] addNormalTask:op];
-    } else {
-        [self OpenRedEnvelopesRequest:[mgrParams toParams]];
+#pragma mark - 3. 禁用朋友圈谁可以见图标
+// 证据: WCTimeLineCellView.h:26 MMUIButton *m_privacyButton (实例变量)
+//       :286 -initPrivacyButton:  (按 visibilityType 生成可见性图标)
+//       SnsObject.h:63 @property visibilityType  (数据来源)
+// WCR 佐证: /tmp/wcr_dis.txt 含 "m_privacyButton" 字面量(2处)
+%hook WCTimeLineCellView
+- (void)layoutSubviews {
+    %orig;
+    if ([DDWeChatConfig sharedConfig].disableSnsPrivacyIcon) {
+        // 每次布局时强制隐藏可见性图标(覆盖复用/重设)
+        // 证据 WCTimeLineCellView.h:26 MMUIButton *m_privacyButton (无对应 @property，故用 runtime 读 ivar)
+        id btn = DDGetIvar(self, "m_privacyButton");
+        if (btn) [(UIView *)btn setHidden:YES];
     }
 }
 %end
 
-%hook CMessageMgr
-- (void)AsyncOnAddMsg:(NSString *)msg MsgWrap:(CMessageWrap *)wrap {
-    %orig;
-    if (wrap.m_uiMessageType != 49) return;
-    if ([wrap.m_nsContent rangeOfString:@"wxpay://"].location == NSNotFound) return;
-    MMContext *ctx = [objc_getClass("MMContext") activeUserContext];
-    CContactMgr *contactMgr = [ctx getService:objc_getClass("CContactMgr")];
-    CContact *selfContact = [contactMgr getSelfContact];
-    BOOL isSender = [wrap.m_nsFromUsr isEqualToString:selfContact.userName];
-    BOOL isGroup = ([wrap.m_nsFromUsr rangeOfString:@"@chatroom"].location != NSNotFound) || ([wrap.m_nsToUsr rangeOfString:@"@chatroom"].location != NSNotFound);
-    DDRedEnvelopConfig *cfg = [DDRedEnvelopConfig sharedConfig];
-    if (!cfg.autoReceiveEnable) return;
-    if ([cfg.blackList containsObject:wrap.m_nsFromUsr]) return;
-    if (isSender && cfg.skipSelfRedEnvelop) return;
-    if (isGroup && cfg.skipGroupRedEnvelop) return;
-    if (!isGroup && cfg.skipPrivateRedEnvelop) return;
-    WCPayInfoItem *payInfo = (WCPayInfoItem *)wrap.m_oWCPayInfoItem;
-    NSString *nativeUrl = payInfo.m_c2cNativeUrl;
-    if (!nativeUrl) return;
-    NSDictionary *urlDict = parseNativeUrl(nativeUrl);
-    if (!urlDict) return;
-    BOOL isGroupSender = isGroup && isSender;
-    DDWeChatRedEnvelopParam *param = [DDWeChatRedEnvelopParam new];
-    param.msgType = [urlDict dd_stringForKey:@"msgtype"];
-    param.sendId = [urlDict dd_stringForKey:@"sendid"];
-    param.channelId = [urlDict dd_stringForKey:@"channelid"];
-    param.nickName = [selfContact getContactDisplayName];
-    param.sessionUserName = isGroupSender ? wrap.m_nsToUsr : wrap.m_nsFromUsr;
-    param.nativeUrl = nativeUrl;
-    param.sign = [urlDict dd_stringForKey:@"sign"];
-    param.isGroupSender = isGroupSender;
-    param.isSender = isSender;
-    [[DDRedEnvelopParamQueue sharedQueue] enqueue:param];
-    NSMutableDictionary *reqParams = [NSMutableDictionary dictionary];
-    reqParams[@"agreeDuty"] = @"0";
-    reqParams[@"channelId"] = param.channelId ?: @"";
-    reqParams[@"inWay"] = @"0";
-    reqParams[@"msgType"] = param.msgType ?: @"";
-    reqParams[@"nativeUrl"] = nativeUrl;
-    reqParams[@"sendId"] = param.sendId ?: @"";
-    WCRedEnvelopesLogicMgr *logicMgr = [ctx getService:objc_getClass("WCRedEnvelopesLogicMgr")];
-    [logicMgr ReceiverQueryRedEnvelopesRequest:reqParams];
+#pragma mark - 4. 禁用朋友圈文字自动折叠
+// 证据: WCTimeLineCellView.h:98 +shouldShowFullTextButtonWithDataItem: (决定是否显示"全文"按钮/折叠)
+//       :39/:152 m_showFullTextView (全文按钮)  :329 -onShowFullText
+// 返回 NO -> 不显示"全文"按钮，内容按全文展示(标准做法)
+%hook WCTimeLineCellView
++ (_Bool)shouldShowFullTextButtonWithDataItem:(id)arg1 {
+    if ([DDWeChatConfig sharedConfig].disableSnsTextFold) return NO;
+    return %orig;
 }
 %end
 
-// 微信点击 <_wc_custom_link_> 走 tagLink:messageWrap:，不经过 UIApplication openURL:
+#pragma mark - 5. 禁用朋友圈"余下N条"折叠
+// 证据: WCMicroMerchantFeedsMgr.h:27 @property foldSectionSize (每组最多平铺条数，超出则折叠成"余下N条")
+//       :48 -isFeedIDFoldInGroup: (逐条判断该 feed 是否处于折叠态)
+//       :40 -unfoldTimelineFromUsername: (强制展开某用户的所有折叠)
+//       MicroMerchantFoldInterceptor.h:16 -intercept: (注入折叠逻辑的拦截器入口)
+//       WCTimeLineViewController.h:591 -genFoldMessageCell:indexPath: (生成"余下N条"cell)
+//       :219 -onSubTimelineClickedUnfold  :218 -onSubTimelineConfirmedUnfold (点击/确认展开)
+//       :122 @property hasChangedFoldedState
+//
+// "余下N条"是微信的"微商折叠"(MicroMerchant Fold)子系统：同一好友连续多条朋友圈
+// 超过 foldSectionSize 阈值后，多余的被收进"余下N条 >"组，点击才展开子时间线。
+//
+// Hook 方案(双保险):
+//   A) isFeedIDFoldInGroup: 返回 NO → 每条 feed 都不被判定为折叠态，不生成折叠 cell
+//   B) MicroMerchantFoldInterceptor.intercept: 空实现 → 整个折叠拦截器不注入逻辑
+%hook WCMicroMerchantFeedsMgr
+- (_Bool)isFeedIDFoldInGroup:(id)arg1 {
+    if ([DDWeChatConfig sharedConfig].disableSnsGroupFold) return NO;
+    return %orig;
+}
+%end
+
+%hook MicroMerchantFoldInterceptor
+- (void)intercept:(id)arg1 {
+    if ([DDWeChatConfig sharedConfig].disableSnsGroupFold) return; // 跳过整个折叠注入
+    %orig;
+}
+%end
+
+#pragma mark - 6. 朋友圈评论防删
+// 证据: WCSNSMessage.h:19 unsigned int delStatus (删除状态, !=0 即被标记删除)
+//       :28 @property(nonatomic) unsigned int delStatus;
+//       :30 @property(retain) WCUserComment *comment;     (本消息对应的评论)
+//       :31 @property(retain) WCUserComment *refComment;  (被回复的评论)
+//       :36 - (void)upgradeDataIfNeeded;                  (数据升级/装配时调用)
+//       WCUserComment.h:119 @property(nonatomic) _Bool bDeleted;        (评论自身删除标记)
+//       :112 @property(nonatomic) _Bool deletedByFeedOwner;            (被发布者删除标记)
+// WCR 佐证: /tmp/wcr_dis.txt 在 60eb28 段对 WCSNSMessage 做 MSHookMessageEx，
+//           实装的 hook 方法正是 -upgradeDataIfNeeded，且:
+//           (1) 引用 isWCMessageDeleted / delStatus / setDelStatus: → 判定并重置删除状态
+//           (2) 引用 WCUserComment 的 bDeleted / deletedByFeedOwner → 一并复位评论删除标记
+//           即当开关(momentsShowDeletedComment)开启且 delStatus!=0 时，调 setDelStatus:0
+//           并把 comment/refComment 的 bDeleted、deletedByFeedOwner 置 NO。(两种分支都先调原方法)
+//
+// 行为(对齐用户描述):
+//   开启后，朋友圈中已删除的评论仍然显示原文(不消失/不显示"评论已被删除"占位)，
+//   删除操作仅在"消息通知"中正常提示([已删除] 无聊)。
+//
+// 实现原理(对齐 WCR): hook WCSNSMessage 的 -upgradeDataIfNeeded。
+//   先 %orig 完成正常装配；若开关开启且本消息被标记为删除(delStatus!=0)，
+//   则把 delStatus 归零，并把 comment / refComment 的删除标记复位，
+//   后续渲染即按"未删除"处理，原文得以保留。
+%hook WCSNSMessage
+- (void)upgradeDataIfNeeded {
+    %orig;
+    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return;
+    if (self.delStatus != 0) self.delStatus = 0;  // 解除消息级删除标记(对齐 WCR setDelStatus:0)
+    // 复位评论自身删除标记，确保原文可被渲染
+    WCUserComment *c = self.comment;
+    if (c) {
+        if ([c respondsToSelector:@selector(setBDeleted:)]) c.bDeleted = NO;
+        if ([c respondsToSelector:@selector(setDeletedByFeedOwner:)]) c.deletedByFeedOwner = NO;
+    }
+    WCUserComment *rc = self.refComment;
+    if (rc) {
+        if ([rc respondsToSelector:@selector(setBDeleted:)]) rc.bDeleted = NO;
+        if ([rc respondsToSelector:@selector(setDeletedByFeedOwner:)]) rc.deletedByFeedOwner = NO;
+    }
+}
+%end
+
+#pragma mark - 7. 启用自定义头像(聊天详情页, 每聊独立)
+// 证据(均来自头文件 dump):
+//   ContactInfoViewController.h:13/123 CContact *m_contact (当前聊天联系人, 真实 ivar/属性)
+//   :243 -viewDidAppear:, :232 -viewDidLoad (生命周期, 真实方法)
+//   :81 @property(nonatomic,__weak) UITableView *frontTableView (普通 UITableView, 非 WCTableViewManager)
+//   CContact.h:465 @property(nonatomic,readonly) NSString *userName (每聊唯一标识, 真实属性)
+//   FakeHeadImageView.h:11 UIImageView *m_headImageView (头像视图 ivar)
+//   :26 -getRealUserName:, :27 -updateWithUserName: (头像渲染映射入口)
+// WCR 佐证: /tmp/wcr_dis.txt 8b3c6c 段对 ContactInfoViewController 做 MSHookMessageEx，
+//           实装 hook = setM_contact: + viewDidLoad + viewWillAppear: + viewDidAppear:
+//           (用 objc_setAssociatedObject 把当前联系人挂在 VC 上); 自定义图路径以 customAvatarPath 存入
+//           按 contact 分的字典(customAvatarContactEnabledIDs)。FakeHeadImageView 负责最终渲染。
+//
+// 原理(对齐 WCR, 全部锚定真实方法/属性, 无猜测):
+//   1) hook setM_contact: 把当前联系人 userName 存到关联对象(每聊标识, 早于 viewDidLoad 即可用)。
+//   2) hook viewDidAppear: 在 frontTableView.tableFooterView 注入开关, 样式做成微信原生"分组卡片"单行 cell
+//      (左右内缩 + 圆角白卡 + 右侧绿色开关 + 底部发丝线, 系统语义色自适应深色模式, 视觉隐蔽),
+//      状态按 userName 读取(每聊独立); 开启时弹相册选图。不依赖微信私有表管理器。
+//   3) hook FakeHeadImageView getRealUserName:: 返回 userName 后, 若本地有该聊天的自定义图,
+//      直接写入 m_headImageView.image 显示假头像(纯本地渲染, 对方不可见)。
+
+static NSString *ddCustomAvatarKey(NSString *userName) {
+    return [NSString stringWithFormat:@"dd_customAvatar_%@", userName ?: @""];
+}
+static const void *kDDAvatarUsr      = &kDDAvatarUsr;        // 关联对象: 当前 VC 对应的 userName
+static const void *kDDAvatarPicking  = &kDDAvatarPicking;    // 关联对象: 正在选图的 userName
+static const void *kDDAvatarInjected = &kDDAvatarInjected;   // 关联对象: 开关是否已注入(只注入一次)
+
+%hook ContactInfoViewController
+- (void)setM_contact:(id)contact {
+    %orig;
+    if ([DDWeChatConfig sharedConfig].enableCustomAvatar) {
+        // 证据: m_contact 是真实属性(ContactInfoViewController.h:123), userName 是 CContact.h:465 真实属性
+        NSString *usr = nil;
+        if ([contact respondsToSelector:@selector(userName)]) usr = [contact userName];
+        if (usr.length) objc_setAssociatedObject(self, kDDAvatarUsr, usr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+- (void)viewDidAppear:(_Bool)arg1 {
+    %orig;
+    if (![DDWeChatConfig sharedConfig].enableCustomAvatar) return;
+    if ([objc_getAssociatedObject(self, kDDAvatarInjected) boolValue]) return; // 只注入一次
+    objc_setAssociatedObject(self, kDDAvatarInjected, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    @try {
+        NSString *usr = objc_getAssociatedObject(self, kDDAvatarUsr);
+        if (!usr.length) {
+            id c = self.m_contact;  // 兜底: 直接读真实属性(:123)
+            if ([c respondsToSelector:@selector(userName)]) usr = [c userName];
+        }
+        if (!usr.length) return;
+
+        UITableView *tv = self.frontTableView;  // 真实属性(:81)
+        if (!tv) return;
+
+        // 用 UITableView.tableFooterView(公开 API) 注入开关, 不碰微信私有表结构。
+        // 视觉做成微信原生"分组卡片"单行 cell: 左右内缩 + 圆角白卡 + 右侧绿色开关 + 底部发丝线,
+        // 与微信设置页 cell 样式一致(更隐蔽)。全部用系统语义色, 自动适配深色模式。
+        CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
+        CGFloat inset   = 16.0;            // 分组左右内缩(对齐微信)
+        CGFloat cardW   = screenW - inset * 2;
+        CGFloat rowH    = 44.0;            // 标准 cell 高度
+        CGFloat gap     = 8.0;             // 卡片上下间距(分组间隔)
+        CGFloat cardH   = rowH;
+
+        UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, screenW, cardH + gap * 2)];
+        footer.backgroundColor = [UIColor clearColor];
+
+        UIView *card = [[UIView alloc] initWithFrame:CGRectMake(inset, gap, cardW, cardH)];
+        if (@available(iOS 13.0, *)) {
+            card.backgroundColor = [UIColor secondarySystemBackgroundColor]; // 白卡(深色模式自适应)
+            card.layer.cornerRadius = 10.0;
+            card.layer.masksToBounds = YES;
+        } else {
+            card.backgroundColor = [UIColor whiteColor];
+        }
+        [footer addSubview:card];
+
+        // 底部发丝分隔线(对齐微信 cell 分隔)
+        UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(16, cardH - 0.5, cardW - 16, 0.5)];
+        if (@available(iOS 13.0, *)) sep.backgroundColor = [UIColor separatorColor];
+        else sep.backgroundColor = [UIColor colorWithWhite:0.88 alpha:1];
+        [card addSubview:sep];
+
+        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(16, 0, cardW - 16 - 70, rowH)];
+        lab.text = @"自定义头像";
+        lab.font = [UIFont systemFontOfSize:17];
+        if (@available(iOS 13.0, *)) lab.textColor = [UIColor labelColor];
+        else lab.textColor = [UIColor blackColor];
+        [card addSubview:lab];
+
+        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(cardW - 67, (rowH - 31) / 2.0, 51, 31)];
+        sw.on = ([NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(usr)] != nil);
+        [sw addTarget:self action:@selector(dd_onCustomAvatarSwitch:) forControlEvents:UIControlEventValueChanged];
+        [card addSubview:sw];
+
+        tv.tableFooterView = footer;
+    } @catch (NSException *e) { /* 安全跳过 */ }
+}
+%new
+- (void)dd_onCustomAvatarSwitch:(UISwitch *)s {
+    NSString *usr = objc_getAssociatedObject(self, kDDAvatarUsr);
+    if (!usr.length) {
+        id c = self.m_contact;
+        if ([c respondsToSelector:@selector(userName)]) usr = [c userName];
+    }
+    if (!usr.length) return;
+    if (s.on) {
+        UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+        picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+        picker.delegate = (id<UINavigationControllerDelegate, UIImagePickerControllerDelegate>)self;
+        objc_setAssociatedObject(self, kDDAvatarPicking, usr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [self presentViewController:picker animated:YES completion:nil];
+    } else {
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:ddCustomAvatarKey(usr)];
+    }
+}
+%new
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
+    UIImage *image = info[UIImagePickerControllerOriginalImage];
+    NSString *usr = objc_getAssociatedObject(self, kDDAvatarPicking);
+    if (image && usr.length) {
+        NSData *imgData = UIImagePNGRepresentation(image);  // 每聊独立存 NSData
+        [NSUserDefaults.standardUserDefaults setObject:imgData forKey:ddCustomAvatarKey(usr)];
+    }
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+%end
+
+// 自定义头像渲染：加载用户名对应头像时，替换为本地存储的自定义图片
+%hook FakeHeadImageView
+- (id)getRealUserName:(id)arg1 {
+    id orig = %orig;
+    if (![DDWeChatConfig sharedConfig].enableCustomAvatar || !orig) return orig;
+    @try {
+        NSData *imgData = [NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(orig)];
+        if (imgData) {
+            UIImage *customImg = [UIImage imageWithData:imgData];
+            UIImageView *headImg = DDGetIvar(self, "m_headImageView");  // 真实 ivar(FakeHeadImageView.h:11)
+            if (headImg && customImg) headImg.image = customImg;
+        }
+    } @catch (NSException *e) { /* 安全回退 */ }
+    return orig;
+}
+%end
+
+#pragma mark - 8. 禁用朋友圈视频点击关闭
+// 证据: WAVideoPlayerView.h:189 @property(nonatomic) _Bool disableTapGesture (内置"禁用点击手势"开关)
+//       :324 -onGestureTap: (单击手势处理方法，含关闭/控制栏切换逻辑)
+//       :83  UITapGestureRecognizer *tabGes (点击手势识别器)
+// WCR 佐证: /tmp/wcr_dis.txt 含 "WAVideoPlayerView" 类名字面量(L76bd2c)
+//           以及 "momentsDisableVideoTapCloseEnabled" config key(L676fbc/194bfc0/1966884)
+//
+// 原理: 朋友圈视频播放时，点击画面默认会触发 onGestureTap: → 关闭/退出播放器。
+//       微信内置了 disableTapGesture 属性来禁用此行为(可能用于特殊场景)。
+//       方案: 直接设 disableTapGesture = YES，利用微信原生能力禁用点击关闭(原生 property 访问, 非 KVC)。
+//       兜底: 若 disableTapGesture 不生效，再 hook onGestureTap: 拦截。
+%hook WAVideoPlayerView
+- (void)layoutSubviews {
+    %orig;
+    if ([DDWeChatConfig sharedConfig].disableSnsVideoTapClose) {
+        // 利用微信内置属性禁用点击手势(最干净的方式, 原生 property 访问, 非 KVC)
+        // 证据 WAVideoPlayerView.h:189 @property(nonatomic) _Bool disableTapGesture
+        self.disableTapGesture = YES;
+    }
+}
+// 兜底：若 disableTapGesture 不影响已创建的手势识别器，直接拦截 tap 回调
+- (void)onGestureTap:(id)arg1 {
+    if ([DDWeChatConfig sharedConfig].disableSnsVideoTapClose) return; // 拦截点击
+    %orig;
+}
+%end
+
+#pragma mark - 9. 禁用聊天文字折叠
+// 证据: TextMessageViewModel.h:117 - (_Bool)shouldFoldText (是否对聊天长文做折叠)
+//       :64 @property(nonatomic) _Bool foldText (折叠开关)
+//       :57 @property(nonatomic) long long foldMaxLineNumber (折叠阈值行数)
+//       :100 - (struct CGRect)moreButtonFrameForFoldText (折叠"全文"按钮位置)
+//       :116 - (id)getFoldContentText (折叠态展示文本)
+// WCR 佐证: /tmp/wcr_dis.txt 8238e8 段对 TextMessageViewModel 做 MSHookMessageEx,
+//           实装 hook = -shouldFoldText (与朋友圈文字折叠 shouldShowFullTextButtonWithDataItem: 同批 hook)。
+//
+// 原理: 聊天中超长文本默认按 foldMaxLineNumber 行数折叠, 超出部分用"..."+"全文"展开。
+//       hook shouldFoldText 返回 NO → 该条文本不被判定为需折叠, 长文直接完整展示。
+%hook TextMessageViewModel
+- (_Bool)shouldFoldText {
+    if ([DDWeChatConfig sharedConfig].disableChatTextFold) return NO; // 长文不折叠
+    return %orig;
+}
+%end
+
+#pragma mark - 10. 隐藏好友微信号(资料页) — 单方法实现(锚定头文件)
+// 证据: WAProfileHeaderView.h:19/27 MMUILabel *descLabel (头部副标题=微信号行, 真实属性)
+//       :34 -updateContact: (装配联系人时给 descLabel 赋值 — 微信号文本唯一写入点)
+//       NewWAProfileViewController.h:13 WAProfileHeaderView *_headerView (资料页头部, 真实 ivar)
+// WCR 佐证: /tmp/wcr_dis.txt 在 2c9320 段对 WAProfileHeaderView 做 KVC valueForKey:@"m_descLabel",
+//           取出 descLabel 后执行隐藏(对齐 WCR 的"隐藏资料页好友微信号"实现)。
+// 单方法(用户要求只用一种方法, 直接锚定头文件):
+//   微信号文本在 WAProfileHeaderView -updateContact: 中写入 descLabel(头文件 :34 明确该方法"给 descLabel 赋值")。
+//   故只 hook 这一个方法: %orig 完成装配后, 把 descLabel 清空并隐藏即可。
+//   (layoutSubviews 仅做布局、不重设文本, 一次清空即持续生效, 无需再 hook 其他类/方法。)
+%hook WAProfileHeaderView
+- (void)updateContact:(id)arg1 {
+    %orig;
+    if (![DDWeChatConfig sharedConfig].hideFriendWxid) return;
+    // 头部副标题=微信号行(WAProfileHeaderView.h:19/27 descLabel), 装配完成即清空隐藏
+    self.descLabel.text = @"";
+    self.descLabel.hidden = YES;
+}
+%end
+#pragma mark - 11. 隐藏自己微信号(我界面)
+// 证据: NewSettingViewController.h:11 WCTableViewManager *m_tableViewMgr (我界面表管理器, 真实 ivar)
+//       :55 - (void)reloadTableData (刷新"我"页)
+//       WASettingAccountCell.h:13/20 UILabel *_detailLabel (账户卡片副标题, 即"微信号"行)
+//       :25 - (void)setViewDataModel: (装配账户数据模型时给 detailLabel 赋值)
+// 原理(双保险):
+//   A) 精确: hook WASettingAccountCell -setViewDataModel:, 装配完成后把 detailLabel(微信号行)清空并隐藏。
+//   B) 兜底: hook NewSettingViewController -reloadTableData, 遍历可见 cell, 凡 WASettingAccountCell
+//           直接清空其 detailLabel, 覆盖 cell 复用导致副标题被重设的边界情况。
+//   两点都只动"微信号"那一行副标题, 不碰昵称(主标题 nameLabel)。
+%hook WASettingAccountCell
+- (void)setViewDataModel:(id)arg1 {
+    %orig;
+    if (![DDWeChatConfig sharedConfig].hideMyWxid) return;
+    // 账户卡片副标题即微信号行(WASettingAccountCell.h:13/20 _detailLabel)
+    self.detailLabel.text = @"";
+    self.detailLabel.hidden = YES;
+}
+%end
+
+%hook NewSettingViewController
+- (void)reloadTableData {
+    %orig;
+    if (![DDWeChatConfig sharedConfig].hideMyWxid) return;
+    // 兜底: 直接定位"我"页账户卡片 cell 清空副标题(微信号行), 不依赖任何字符串匹配
+    id mgr = DDGetIvar(self, "m_tableViewMgr"); // 真实 ivar(:11)
+    UITableView *tv = nil;
+    if (mgr && [mgr respondsToSelector:@selector(getTableView)]) tv = [mgr getTableView];
+    if (!tv) return;
+    Class accCls = objc_getClass("WASettingAccountCell");
+    for (UITableViewCell *cell in tv.visibleCells) {
+        if (accCls && [cell isKindOfClass:accCls]) {
+            UILabel *d = [(id)cell detailLabel]; // 真实属性(:20)
+            if (d) { d.text = @""; d.hidden = YES; }
+        }
+    }
+}
+%end
+
+#pragma mark - 12. 隐藏聊天名字(聊天界面顶栏标题)
+// 证据: BaseMsgContentViewController.h:986 - (void)updateTitleView:(id)arg1   (顶栏标题刷新入口, 个人/群聊共用此 VC)
+//       :983 - (void)setTitleView:(id)arg1
+//       MMUIViewController.h:12  @interface MMUIViewController : UIViewController (标准 UIKit 导航, navigationItem 类型可靠)
+//       :26  MMTitleView *m_baseTitleView  (标题视图 ivar, MMTitleView 为视图类型)
+//       :520 - (id)titleView  (标题视图 getter, 取到 m_baseTitleView)
+// 佐证: WCR 反汇编 /tmp/wcr_dis.txt 同样调用 selector
+//       updateTitleView: (L589230 / 1739881 / 1788956)
+//       与 updateTitleView:ignoreAnimation: (L1739889 / 1788964)，证明聊天顶栏标题经此方法设置/刷新。
+// 原理: 进入聊天时(个人"陈某人" / 群聊"群聊(2)")，微信经 updateTitleView: 装配并刷新顶栏标题视图；
+//       群成员数变化("群聊(2)"->"群聊(3)")亦经此方法刷新。
+//       单方法(用户要求同一功能只用一种方法): 只 hook updateTitleView:，%orig 完成后通过基类
+//       MMUIViewController 的 -titleView getter (MMUIViewController.h:520, 底层 MMTitleView *m_baseTitleView)
+//       取到已安装的标题视图, hidden=YES 即隐藏顶栏名字；刷新时再次隐藏，状态一致。
+//       关键: 不依赖对 updateTitleView: 参数 arg1 的"类型猜测"——改用头文件明证的 titleView getter，
+//       并以 isKindOfClass:[UIView class] 守卫, 即使返回非视图也不会崩溃。
+// 注意: 此处隐藏的是导航栏"顶栏标题"，与气泡发送者名字(chatRoomDisplayName)无关，故不 hook BaseMessageViewModel。
 %hook BaseMsgContentViewController
-- (void)tagLink:(NSString *)link messageWrap:(CMessageWrap *)wrap {
-    NSString *scheme = @"DDHBRedEnvelopSession://";
-    if ([link hasPrefix:scheme]) {
-        NSString *query = [link substringFromIndex:scheme.length];
-        NSDictionary *q = [objc_getClass("WCBizUtil") dictionaryWithDecodedComponets:query separator:@"&"];
-        NSString *session = [q dd_stringForKey:@"session"];
-        session = [session stringByRemovingPercentEncoding] ?: session;
-        if (session.length) {
-            DDHBJumpToChat(session);
-        }
-        return;
-    }
+- (void)updateTitleView:(id)arg1 {
     %orig;
+    if ([DDWeChatConfig sharedConfig].hideChatName) {
+        UIView *tv = [self titleView];   // MMUIViewController -titleView (L520), 返回 MMTitleView(视图)
+        if ([tv isKindOfClass:[UIView class]]) tv.hidden = YES;
+    }
 }
 %end
 
-// ===== 设置界面 =====
-@interface DDRedEnvelopSettingsViewController : UIViewController <UITableViewDelegate, MultiSelectContactsViewControllerDelegate>
+#pragma mark - 设置界面 (构造参考 D.txt)
+@interface DDWeChatSettingsViewController : UIViewController <UITableViewDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
-@property (nonatomic) BOOL delayExpanded;
-@property (nonatomic, strong) UITextField *contentField;
 @end
 
-@implementation DDRedEnvelopSettingsViewController {
+@implementation DDWeChatSettingsViewController {
     id<UITableViewDelegate> _originalDelegate;
-}
-
-static const void *kDDOptionValue = &kDDOptionValue;
-static void DD_SetCellOption(id cell, id value) {
-    objc_setAssociatedObject(cell, kDDOptionValue, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-static id DD_CellOption(id cell) {
-    return objc_getAssociatedObject(cell, kDDOptionValue);
 }
 
 - (void)ensureTableViewMgr {
@@ -772,16 +544,15 @@ static id DD_CellOption(id cell) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"红包助手设置";
-
-    // WCPluginsMgr 导航栏外观渲染
+    self.title = @"DD微信助手";
+    // 必须显式设本页导航栏外观：WCPluginsMgr 给非微信 VC 的导航栏默认半透明(透出状态栏)。
+    // 用 navigationItem 按 VC 隔离(不污染微信全局导航栏)，configureWithDefaultBackground 设为半透明(带模糊，与微信原生一致)，不手动渲染色。
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
-    appearance.shadowColor = nil;   // 去掉导航栏底部分割线
+    appearance.shadowColor = nil;   // 去掉导航栏底部分割线(默认阴影)
     self.navigationItem.standardAppearance = appearance;
     self.navigationItem.scrollEdgeAppearance = appearance;
     self.navigationItem.compactAppearance = appearance;
-
     [self ensureTableViewMgr];
     if (!_tableViewManager) return;
     [self buildTable];
@@ -796,81 +567,49 @@ static id DD_CellOption(id cell) {
 
 - (void)buildTable {
     [_tableViewManager clearAllSection];
-    DDRedEnvelopConfig *cfg = [DDRedEnvelopConfig sharedConfig];
+    DDWeChatConfig *cfg = [DDWeChatConfig sharedConfig];
+    Class cellMgr = objc_getClass("WCTableViewCellManager");
+    Class secMgr = objc_getClass("WCTableViewSectionManager");
 
-    WCTableViewSectionManager *redEnvelopSection = [objc_getClass("WCTableViewSectionManager") defaultSection];
-    [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onAutoReceiveSwitch:) target:self title:@"启用自动抢红包" on:cfg.autoReceiveEnable]];
-    if (cfg.autoReceiveEnable) {
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onDelayEnabledSwitch:) target:self title:@"↳自定义延迟时间" on:cfg.delayEnabled]];
-        if (cfg.delayEnabled) {
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(delayHeaderTapped:)
-                                                                                        target:self
-                                                                                         title:@"   ↳延迟秒数设置"
-                                                                                     rightValue:[NSString stringWithFormat:@"[%ld秒]", (long)cfg.delaySeconds]]];
-            if (self.delayExpanded) {
-                NSArray *opts = @[@0, @1, @3, @8];
-                for (NSNumber *o in opts) {
-                    NSInteger v = o.integerValue;
-                    WCTableViewCellManager *optCell = [objc_getClass("WCTableViewCellManager") centerCellForSel:@selector(delayOptionTapped:)
-                                                                                                       target:self
-                                                                                                        title:[NSString stringWithFormat:@"[%ld秒]", (long)v]];
-                    DD_SetCellOption(optCell, o);
-                    optCell.userInfo = o;
-                    [redEnvelopSection addCell:optCell];
-                }
-            }
-        }
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipGroupSwitch:) target:self title:@"↳禁止抢群聊红包" on:cfg.skipGroupRedEnvelop]];
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipPrivateSwitch:) target:self title:@"↳禁止抢私聊红包" on:cfg.skipPrivateRedEnvelop]];
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipSelfSwitch:) target:self title:@"↳禁止抢自发红包" on:cfg.skipSelfRedEnvelop]];
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSerialSwitch:) target:self title:@"↳防止同时抢红包" on:cfg.serialReceive]];
-        NSInteger blackCount = cfg.blackList.count;
-        WCTableViewCellManager *blackCell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(onBlackListTapped) target:self title:@"↳过滤全局黑名单" rightValue:blackCount ? [NSString stringWithFormat:@"已选 %ld 个", (long)blackCount] : @"已关闭"];
-        blackCell.userInfo = @"BlackListCell";
-        [redEnvelopSection addCell:blackCell];
+    // 首页
+    WCTableViewSectionManager *home = [secMgr defaultSection];
+    [home addCell:[cellMgr switchCellForSel:@selector(onPullDownSwitch:) target:self title:@"禁用首页下拉小程序" on:cfg.disableHomePullDownMiniProgram]];
+    [_tableViewManager addSection:home];
 
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onAutoReplySwitch:) target:self title:@"↳自动回复设置" on:cfg.autoReply]];
-        if (cfg.autoReply) {
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onCustomReplySwitch:) target:self title:@"   ↳回复内容设置" on:cfg.customReplyEnabled]];
-            if (cfg.customReplyEnabled) {
-                self.contentField = [[UITextField alloc] init];
-                self.contentField.placeholder = @"请输入回复内容";
-                self.contentField.text = cfg.customReplyContent;
-                self.contentField.textAlignment = NSTextAlignmentRight;
-                [self.contentField addTarget:self action:@selector(contentChanged:) forControlEvents:UIControlEventEditingChanged];
-                [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") normalCellForSel:nil
-                                                                                             target:nil
-                                                                                              title:@"     ↳自定义内容"
-                                                                                          rightView:[self inputRowWithField:self.contentField action:@selector(contentConfirmed:)]]];
-            }
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipGroupReplySwitch:) target:self title:@"   ↳群聊红包不回复" on:cfg.skipGroupReply]];
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipPrivateReplySwitch:) target:self title:@"   ↳私聊红包不回复" on:cfg.skipPrivateReply]];
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipSelfReplySwitch:) target:self title:@"   ↳自发红包不回复" on:cfg.skipSelfReply]];
-        }
+    // 朋友圈
+    WCTableViewSectionManager *sns = [secMgr defaultSection];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onVideoSwitch:) target:self title:@"禁用朋友圈视频自动播放" on:cfg.disableSnsVideoAutoPlay]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onPrivacySwitch:) target:self title:@"禁用朋友圈谁可以见图标" on:cfg.disableSnsPrivacyIcon]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onTextFoldSwitch:) target:self title:@"禁用朋友圈文字自动折叠" on:cfg.disableSnsTextFold]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onGroupFoldSwitch:) target:self title:@"禁用朋友圈余下N条折叠" on:cfg.disableSnsGroupFold]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onAntiDeleteSwitch:) target:self title:@"朋友圈评论防删" on:cfg.antiDeleteSnsComment]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onVideoTapCloseSwitch:) target:self title:@"禁用朋友圈视频点击关闭" on:cfg.disableSnsVideoTapClose]];
+    [_tableViewManager addSection:sns];
 
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onVoiceBroadcastSwitch:) target:self title:@"↳红包语音播报" on:cfg.voiceBroadcast]];
+    // 聊天
+    WCTableViewSectionManager *chat = [secMgr defaultSection];
+    [chat addCell:[cellMgr switchCellForSel:@selector(onChatTextFoldSwitch:) target:self title:@"禁用聊天文字折叠" on:cfg.disableChatTextFold]];
+    [chat addCell:[cellMgr switchCellForSel:@selector(onHideChatNameSwitch:) target:self title:@"隐藏聊天顶栏名字" on:cfg.hideChatName]];
+    [_tableViewManager addSection:chat];
 
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onEnableNotifySwitch:) target:self title:@"↳启用红包通知" on:cfg.enableNotify]];
-        if (cfg.enableNotify) {
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifySwitch:) target:self title:@"   ↳使用系统通知" on:cfg.showNotification]];
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onNotifyFileHelperSwitch:) target:self title:@"   ↳文件助手提示" on:cfg.notifyFileHelper]];
-        }
-    }
-    [_tableViewManager addSection:redEnvelopSection];
+    // 隐私(微信号隐藏)
+    WCTableViewSectionManager *privacy = [secMgr defaultSection];
+    [privacy addCell:[cellMgr switchCellForSel:@selector(onHideFriendWxidSwitch:) target:self title:@"隐藏好友微信号(资料页)" on:cfg.hideFriendWxid]];
+    [privacy addCell:[cellMgr switchCellForSel:@selector(onHideMyWxidSwitch:) target:self title:@"隐藏自己微信号(我界面)" on:cfg.hideMyWxid]];
+    [_tableViewManager addSection:privacy];
+
+    // 通用
+    WCTableViewSectionManager *general = [secMgr defaultSection];
+    [general addCell:[cellMgr switchCellForSel:@selector(onAvatarSwitch:) target:self title:@"启用自定义头像(聊天详情)" on:cfg.enableCustomAvatar]];
+    [_tableViewManager addSection:general];
 
     [_tableViewManager reloadTableView];
 }
 
-#pragma mark - UITableViewDelegate 转发
+#pragma mark - UITableViewDelegate 转发(同 D.txt)
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
     if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)]) {
         [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
-    }
-    WCTableViewCellManager *cellInfo = (WCTableViewCellManager *)[self.tableViewManager cellInfoAtIndexPath:indexPath];
-    if (cellInfo && [cellInfo.userInfo isKindOfClass:[NSNumber class]]) {
-        NSInteger v = [(NSNumber *)cellInfo.userInfo integerValue];
-        NSInteger cur = [DDRedEnvelopConfig sharedConfig].delaySeconds;
-        cell.accessoryType = (v == cur) ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
     }
 }
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -885,106 +624,30 @@ static id DD_CellOption(id cell) {
     return UITableViewAutomaticDimension;
 }
 
-#pragma mark - 事件处理
-- (void)onAutoReceiveSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].autoReceiveEnable = sender.on; [self buildTable]; }
-- (void)onDelayEnabledSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].delayEnabled = sender.on; [self buildTable]; }
-- (void)onSkipGroupSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipGroupRedEnvelop = sender.on; }
-- (void)onSkipPrivateSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipPrivateRedEnvelop = sender.on; }
-- (void)onSkipSelfSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipSelfRedEnvelop = sender.on; }
-- (void)onSerialSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].serialReceive = sender.on; }
-- (void)onNotifySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].showNotification = sender.on; }
-- (void)onNotifyFileHelperSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].notifyFileHelper = sender.on; }
-- (void)onEnableNotifySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].enableNotify = sender.on; [self buildTable]; }
-- (void)onAutoReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].autoReply = sender.on; [self buildTable]; }
-- (void)onSkipGroupReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipGroupReply = sender.on; }
-- (void)onSkipPrivateReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipPrivateReply = sender.on; }
-- (void)onSkipSelfReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].skipSelfReply = sender.on; }
-- (void)onCustomReplySwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].customReplyEnabled = sender.on; [self buildTable]; }
-- (void)onVoiceBroadcastSwitch:(UISwitch *)sender { [DDRedEnvelopConfig sharedConfig].voiceBroadcast = sender.on; }
-
-- (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action {
-    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 200, 30)];
-    field.frame = CGRectMake(0, 0, 150, 30);
-    field.borderStyle = UITextBorderStyleRoundedRect;
-    [container addSubview:field];
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(158, 0, 42, 30);
-    [btn setTitle:@"确认" forState:UIControlStateNormal];
-    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    [container addSubview:btn];
-    return container;
-}
-- (void)contentChanged:(UITextField *)field {
-    [DDRedEnvelopConfig sharedConfig].customReplyContent = field.text;
-}
-- (void)contentConfirmed:(id)sender {
-    [DDRedEnvelopConfig sharedConfig].customReplyContent = self.contentField.text;
-    [self.contentField resignFirstResponder];
-}
-
-- (void)delayHeaderTapped:(id)sender {
-    self.delayExpanded = !self.delayExpanded;
-    [self buildTable];
-}
-
-- (void)delayOptionTapped:(id)sender {
-    NSNumber *o = DD_CellOption(sender);
-    if (o) [DDRedEnvelopConfig sharedConfig].delaySeconds = o.integerValue;
-    self.delayExpanded = NO;
-    [self buildTable];
-}
-
-- (void)onBlackListTapped {
-    MultiSelectContactsViewController *picker = [[objc_getClass("MultiSelectContactsViewController") alloc] init];
-    picker.m_scene = 0;
-    picker.m_delegate = self;
-    [picker loadViewIfNeeded];
-    NSArray *blackList = [DDRedEnvelopConfig sharedConfig].blackList;
-    if (blackList.count) {
-        MMContext *context = [objc_getClass("MMContext") activeUserContext];
-        CContactMgr *contactMgr = [context getService:objc_getClass("CContactMgr")];
-        id selectView = [picker valueForKey:@"m_selectView"];
-        if (selectView && [selectView respondsToSelector:@selector(addSelect:)]) {
-            for (NSString *name in blackList) {
-                CContact *contact = [contactMgr getContactByName:name];
-                if (contact) [selectView performSelector:@selector(addSelect:) withObject:contact];
-            }
-            if ([picker respondsToSelector:@selector(updatePanelBtn)]) [picker performSelector:@selector(updatePanelBtn)];
-        }
-    }
-    MMUINavigationController *nav = [[objc_getClass("MMUINavigationController") alloc] initWithRootViewController:picker];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    UISheetPresentationController *sheet = nav.sheetPresentationController;
-    sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
-    sheet.prefersGrabberVisible = YES;
-    sheet.preferredCornerRadius = 16;
-    [self presentViewController:nav animated:YES completion:nil];
-}
-
-- (void)onMultiSelectContactReturn:(NSArray *)contacts {
-    NSMutableArray *black = [NSMutableArray new];
-    for (id contact in contacts) {
-        if ([contact isKindOfClass:objc_getClass("CContact")]) {
-            NSString *name = [contact valueForKey:@"userName"];
-            if (name.length) [black addObject:name];
-        }
-    }
-    [DDRedEnvelopConfig sharedConfig].blackList = black;
-    [self dismissViewControllerAnimated:YES completion:^{
-        [self buildTable];
-    }];
-}
+#pragma mark - 开关事件
+- (void)onPullDownSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram = s.on; }
+- (void)onVideoSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableSnsVideoAutoPlay = s.on; }
+- (void)onPrivacySwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableSnsPrivacyIcon = s.on; }
+- (void)onTextFoldSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableSnsTextFold = s.on; }
+- (void)onGroupFoldSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableSnsGroupFold = s.on; }
+- (void)onAntiDeleteSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].antiDeleteSnsComment = s.on; }
+- (void)onAvatarSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].enableCustomAvatar = s.on; }
+- (void)onVideoTapCloseSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableSnsVideoTapClose = s.on; }
+- (void)onChatTextFoldSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableChatTextFold = s.on; }
+- (void)onHideFriendWxidSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].hideFriendWxid = s.on; }
+- (void)onHideMyWxidSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].hideMyWxid = s.on; }
+- (void)onHideChatNameSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].hideChatName = s.on; }
 
 @end
 
-// ===== 插件注册 =====
+#pragma mark - 插件注册
 %ctor {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD红包助手"
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD微信助手"
                                                       version:@"1.0.0"
-                                                   controller:@"DDRedEnvelopSettingsViewController"];
+                                                   controller:@"DDWeChatSettingsViewController"];
         }
     }
 }
