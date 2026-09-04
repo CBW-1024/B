@@ -59,9 +59,30 @@
 // ---- 被 hook 微信类的手动声明(基于 8.0.76 dump 真实签名；不 import 微信头文件) ----
 // Logos %hook 会生成 category，要求被 hook 类至少可见。凡访问 property/ivar 之处
 // 必须给出完整 @interface，否则报 "property cannot be found in forward class object" /
-// "cannot find interface declaration"。仅重写方法、不碰 property/ivar 的类用 @class 即可。
+// "cannot find interface declaration"。
+//
+// 因此本文件 15 个被 hook 类全部按头文件手写完整 @interface，不再使用任何 @class 前向声明。
+//
+// 【关于父类】dump 里 NewMainFrameViewController / WCTimeLineViewController / WCTimeLineCellView /
+//   FakeHeadImageView / TextMessageViewModel / NewSettingViewController / CContact 这 7 个类的
+//   @interface 行是 "@interface X" 后直接跟 "{"，未导出父类；WCMicroMerchantFeedsMgr、
+//   MicroMerchantFoldInterceptor 则明确导出 ": NSObject"。
+//   对未导出父类的类，这里按其真实类型族选用已确证的 UIKit/Foundation 基类
+//   （UIViewController / UIView / NSObject）来满足编译，并在注释里如实标注。
+//   这不构成"猜测"、也不影响功能：Logos 以 category 方式 hook，声明父类不参与运行时派发，
+//   方法钩子靠 SEL 绑定，与所声明的父类无关。
+//
+// 【关于 ivar】m_privacyButton / m_headImageView / m_tableViewMgr 三个 ivar 不在此声明，
+//   仍用 MSHookIvar 按名字在运行时取偏移。原因：若在此手写 ivar，编译器会按本地声明算出固定
+//   偏移，与真机类布局不一致就会读崩；MSHookIvar 运行时查偏移才是安全的。
 
-@class CContact;
+// 功能7 用 CContact.userName 作每聊唯一标识
+//   CContact.h:465 @property(nonatomic, readonly) NSString *userName
+//   dump 未导出父类(@interface CContact 后直接 "{")，按数据模型声明为 NSObject
+//   注: 代码里仍用 performSelector: 取 userName，以规避 NSProcessInfo.userName 同名冲突
+@interface CContact : NSObject
+@property (nonatomic, readonly) NSString *userName;   // CContact.h:465
+@end
 
 // 朋友圈评论防删：WCSNSMessage.h:19/28 delStatus, :30 comment, :31 refComment, :36 upgradeDataIfNeeded
 //              WCUserComment.h:119 bDeleted, :112 deletedByFeedOwner
@@ -103,15 +124,67 @@
 - (id)titleView;
 @end
 
-// 仅重写方法、不访问 property/ivar 的类：前向声明即可满足 Logos category 生成
-@class NewMainFrameViewController;   // 功能1 禁用首页下拉小程序: initTableHeaderTopView(:425)/showTableHeaderTopViewByPullDown:(:439)
-@class WCTimeLineViewController;     // 功能2 禁用朋友圈视频自动播放: _canAutoPlayVideoForCellView:(:493)
-@class WCTimeLineCellView;           // 功能3/4 隐私图标+文字折叠: m_privacyButton(:26)/shouldShowFullTextButtonWithDataItem:(:98)
-@class WCMicroMerchantFeedsMgr;      // 功能5 余下N条折叠: foldSectionSize(:27)/isFeedIDFoldInGroup:(:48)
-@class MicroMerchantFoldInterceptor; // 功能5 余下N条折叠: intercept:(:16)
-@class FakeHeadImageView;            // 功能7 自定义头像: m_headImageView(:11)/getRealUserName:(:26)
-@class TextMessageViewModel;        // 功能9 聊天文字折叠: shouldFoldText(:117)/foldText(:64)
-@class NewSettingViewController;     // 功能11 隐藏自己微信号(兜底): m_tableViewMgr(:11)/reloadTableData(:55)
+// 以下 8 个类只重写方法、不直接访问 property/ivar（ivar 走 MSHookIvar），
+// 但同样按头文件手写完整 @interface，保持全文件声明风格统一。
+
+// 功能1 禁用首页下拉小程序（只禁主界面下拉露出，不动发现页入口）
+//   NewMainFrameViewController.h:406 -mainPullDown:, :414 -beginSetShowTableHeaderTopView,
+//   :425 -initTableHeaderTopView, :439 -showTableHeaderTopViewByPullDown:,
+//   :31 m_tableHeaderTopView(下拉露出的面板视图, 开关开启时根本不创建)
+@interface NewMainFrameViewController : UIViewController
+- (void)mainPullDown:(_Bool)arg1;
+- (void)beginSetShowTableHeaderTopView;
+- (void)initTableHeaderTopView;
+- (void)showTableHeaderTopViewByPullDown:(unsigned long long)arg1;
+@end
+
+// 功能2 禁用朋友圈视频自动播放
+//   WCTimeLineViewController.h:493 -_canAutoPlayVideoForCellView:, :494 -realAutoPlayVideo
+@interface WCTimeLineViewController : UIViewController
+- (_Bool)_canAutoPlayVideoForCellView:(id)arg1;
+@end
+
+// 功能3 禁用朋友圈谁可以见图标 / 功能4 禁用朋友圈文字自动折叠
+//   WCTimeLineCellView.h:260 -layoutSubviews, :98 +shouldShowFullTextButtonWithDataItem:,
+//   :26 m_privacyButton(ivar, MSHookIvar 运行时读取), :286 -initPrivacyButton:,
+//   :39/:152 m_showFullTextView, :329 -onShowFullText, :274 -canAutoPlayVideoWithoutSound
+@interface WCTimeLineCellView : UIView
+- (void)layoutSubviews;
++ (_Bool)shouldShowFullTextButtonWithDataItem:(id)arg1;
+@end
+
+// 功能5 禁用朋友圈"余下N条"折叠（判定侧）
+//   WCMicroMerchantFeedsMgr.h:12 @interface ... : NSObject（父类为 dump 真证）,
+//   :27 foldSectionSize, :48 -isFeedIDFoldInGroup:, :40 -unfoldTimelineFromUsername:
+@interface WCMicroMerchantFeedsMgr : NSObject
+- (_Bool)isFeedIDFoldInGroup:(id)arg1;
+@end
+
+// 功能5 禁用朋友圈"余下N条"折叠（注入侧）
+//   MicroMerchantFoldInterceptor.h:11 @interface ... : NSObject（父类为 dump 真证）, :16 -intercept:
+@interface MicroMerchantFoldInterceptor : NSObject
+- (void)intercept:(id)arg1;
+@end
+
+// 功能7 启用自定义头像（渲染侧）
+//   FakeHeadImageView.h:26 -getRealUserName:, :27 -updateWithUserName:,
+//   :11 m_headImageView(ivar, MSHookIvar 运行时读取)
+@interface FakeHeadImageView : UIView
+- (id)getRealUserName:(id)arg1;
+@end
+
+// 功能9 禁用聊天文字折叠
+//   TextMessageViewModel.h:117 -shouldFoldText, :64 foldText, :57 foldMaxLineNumber,
+//   :116 -getFoldContentText, :100 -moreButtonFrameForFoldText
+@interface TextMessageViewModel : NSObject
+- (_Bool)shouldFoldText;
+@end
+
+// 功能11 隐藏自己微信号(我界面)兜底：刷新时遍历可见 cell 清副标题
+//   NewSettingViewController.h:55 -reloadTableData, :11 m_tableViewMgr(ivar, MSHookIvar 运行时读取)
+@interface NewSettingViewController : UIViewController
+- (void)reloadTableData;
+@end
 
 #pragma mark - 配置管理 (锚定 NSUserDefaults，结构同 D.txt 的 DDRedEnvelopConfig)
 #define kDDWAPullDown          @"kDDWA_disableHomePullDownMiniProgram"
