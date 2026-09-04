@@ -319,7 +319,7 @@ static NSString* getAccountForSession(NSString *sessionUserName) {
 // 统一会话跳转：经头文件声明的单例访问器 +getAppViewControllerManager（CAppViewControllerManager.h:43）取管理器，再 jumpToChat:msgToLocate:
 // 文件助手 <_wc_custom_link_> 点击（tagLink:messageWrap:）与系统通知点击共用此处
 static void DDHBJumpToChat(NSString *session) {
-    if (!session.length) return;
+    if (!session.length) return;   // 过滤手动抢包不回复
     id mgr = [objc_getClass("CAppViewControllerManager") getAppViewControllerManager];
     if (mgr) [mgr jumpToChat:session msgToLocate:nil];
 }
@@ -476,7 +476,7 @@ static void DDHBJumpToChat(NSString *session) {
     BOOL srcIsGroup = [sessionUserName hasSuffix:@"@chatroom"];
 
     NSMutableString *body = [NSMutableString string];
-    [body appendFormat:@"💰 叮咚，为您抢到 %.2f元\n", amount / 100.0];
+    [body appendFormat:@"💰 叮咚：抢到红包 %.2f元\n", amount / 100.0];
     [body appendFormat:@"📍 来源： %@%@\n", finalDisplayName, srcIsGroup ? @"（群聊）" : @""];
     if (packetCount > 0) {
         [body appendFormat:@"🧧 类型： %@（%ld包%.2f元）\n", typeName, (long)packetCount, totalAmount / 100.0];
@@ -772,7 +772,7 @@ static id DD_CellOption(id cell) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD红包助手";
+    self.title = @"红包助手设置";
     [self ensureTableViewMgr];
     if (!_tableViewManager) return;
     [self buildTable];
@@ -796,7 +796,7 @@ static id DD_CellOption(id cell) {
         if (cfg.delayEnabled) {
             [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(delayHeaderTapped:)
                                                                                         target:self
-                                                                                         title:@"   ↳选择延迟秒数"
+                                                                                         title:@"   ↳延迟秒数设置"
                                                                                      rightValue:[NSString stringWithFormat:@"[%ld秒]", (long)cfg.delaySeconds]]];
             if (self.delayExpanded) {
                 NSArray *opts = @[@0, @1, @3, @8];
@@ -811,21 +811,21 @@ static id DD_CellOption(id cell) {
                 }
             }
         }
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipGroupSwitch:) target:self title:@"↳禁用抢群聊红包" on:cfg.skipGroupRedEnvelop]];
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipPrivateSwitch:) target:self title:@"↳禁用抢私聊红包" on:cfg.skipPrivateRedEnvelop]];
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipSelfSwitch:) target:self title:@"↳不抢自己的红包" on:cfg.skipSelfRedEnvelop]];
+        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipGroupSwitch:) target:self title:@"↳禁止抢群聊红包" on:cfg.skipGroupRedEnvelop]];
+        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipPrivateSwitch:) target:self title:@"↳禁止抢私聊红包" on:cfg.skipPrivateRedEnvelop]];
+        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipSelfSwitch:) target:self title:@"↳禁止抢自发红包" on:cfg.skipSelfRedEnvelop]];
         [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSerialSwitch:) target:self title:@"↳防止同时抢红包" on:cfg.serialReceive]];
         NSInteger blackCount = cfg.blackList.count;
         WCTableViewCellManager *blackCell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(onBlackListTapped) target:self title:@"↳过滤全局黑名单" rightValue:blackCount ? [NSString stringWithFormat:@"已选 %ld 个", (long)blackCount] : @"已关闭"];
         blackCell.userInfo = @"BlackListCell";
         [redEnvelopSection addCell:blackCell];
 
-        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onAutoReplySwitch:) target:self title:@"↳抢红包自动回复" on:cfg.autoReply]];
+        [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onAutoReplySwitch:) target:self title:@"↳自动回复设置" on:cfg.autoReply]];
         if (cfg.autoReply) {
             [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipGroupReplySwitch:) target:self title:@"   ↳群聊红包不回复" on:cfg.skipGroupReply]];
             [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipPrivateReplySwitch:) target:self title:@"   ↳私聊红包不回复" on:cfg.skipPrivateReply]];
             [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onSkipSelfReplySwitch:) target:self title:@"   ↳自发红包不回复" on:cfg.skipSelfReply]];
-            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onCustomReplySwitch:) target:self title:@"   ↳红包自定义回复" on:cfg.customReplyEnabled]];
+            [redEnvelopSection addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onCustomReplySwitch:) target:self title:@"   ↳回复内容设置" on:cfg.customReplyEnabled]];
             if (cfg.customReplyEnabled) {
                 self.contentField = [[UITextField alloc] init];
                 self.contentField.placeholder = @"请输入回复内容";
