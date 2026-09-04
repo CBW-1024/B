@@ -774,12 +774,11 @@ static id DD_CellOption(id cell) {
     [super viewDidLoad];
     self.title = @"红包助手设置";
     // 仅针对本设置页的导航栏外观，不污染微信全局导航栏。
-    // 注意：直接改 self.navigationController.navigationBar 会因微信共用同一导航栈（bar 单例）而扩散到其他页面，
-    // 导致其他页导航栏布局错乱/异常变大。故用 navigationItem.standardAppearance 做按 VC 隔离，pop 后自动恢复微信原生外观。
-    // 微信 8.0.76 最低 iOS 13，无需兼容旧系统。
+    // 之前所有问题（透明/纯白/其他页变大）根因是改在了全局 navigationBar 上、未在当前页生效，并非必须渲染颜色。
+    // 现在用 navigationItem.standardAppearance 按 VC 隔离，只需 configureWithOpaqueBackground 让当前页导航栏不透明（不透出状态栏），
+    // 颜色交给系统默认外观，不手动渲染。pop 后微信其他页自动恢复原生外观。微信 8.0.76 最低 iOS 13，无需兼容旧系统。
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithOpaqueBackground];
-    appearance.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.949 alpha:1.0];
     self.navigationItem.standardAppearance = appearance;
     self.navigationItem.scrollEdgeAppearance = appearance;
     self.navigationItem.compactAppearance = appearance;
