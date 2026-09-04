@@ -776,18 +776,13 @@ static id DD_CellOption(id cell) {
     // 仅针对本设置页的导航栏外观，不污染微信全局导航栏。
     // 注意：直接改 self.navigationController.navigationBar 会因微信共用同一导航栈（bar 单例）而扩散到其他页面，
     // 导致其他页导航栏布局错乱/异常变大。故用 navigationItem.standardAppearance 做按 VC 隔离，pop 后自动恢复微信原生外观。
-    if (@available(iOS 13.0, *)) {
-        UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
-        [appearance configureWithOpaqueBackground];
-        appearance.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.949 alpha:1.0];
-        self.navigationItem.standardAppearance = appearance;
-        self.navigationItem.scrollEdgeAppearance = appearance;
-        self.navigationItem.compactAppearance = appearance;
-    } else {
-        UINavigationBar *navBar = self.navigationController.navigationBar;
-        navBar.translucent = NO;
-        navBar.barTintColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.949 alpha:1.0];
-    }
+    // 微信 8.0.76 最低 iOS 13，无需兼容旧系统。
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    [appearance configureWithOpaqueBackground];
+    appearance.backgroundColor = [UIColor colorWithRed:0.949 green:0.949 blue:0.949 alpha:1.0];
+    self.navigationItem.standardAppearance = appearance;
+    self.navigationItem.scrollEdgeAppearance = appearance;
+    self.navigationItem.compactAppearance = appearance;
     [self ensureTableViewMgr];
     if (!_tableViewManager) return;
     [self buildTable];
