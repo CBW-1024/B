@@ -58,10 +58,12 @@
 //      mainPullDown:(WCR rep 0x8b79b4，"展开"参数时直接 return 不显示面板)，并把
 //      showTableHeaderTopViewByPullDown:/startDragToShow/showTableHeaderTopView:fromScene: 一并拦截，
 //      仅藏起小程序面板、保留自然下拉手感。
-//    - ③「禁用朋友圈谁可以见图标」修正：隐藏点由 layoutSubviews(setHidden:YES 会留空白占位)改为
-//      WCR 真实 hook 点 initPrivacyButton:(WCR rep 0x656258)，按 0x65650c 做 setImage:nil +
-//      setAlpha:0 + setUserInteractionEnabled:NO，并 removeFromSuperview 保底消去预留空白
-//      (对应 WCR 0x656764 的重排视觉效果)。
+//    - ③「禁用朋友圈谁可以见图标」修正：对齐 WCR 两处 hook——initPrivacyButton:(WCR rep 0x656258
+//      按 0x65650c 做 setImage:nil + setAlpha:0 + setUserInteractionEnabled:NO 仅隐藏，不移除按钮)
+//      负责隐藏；真正消去预留空白的重排在 layoutSubviews(WCR rep 0x656764)完成：把 m_deleteButton
+//      左移到 m_privacyButton 的 minX(仅当 delete 可见且其 minX > privacy 的 minX+0.5)。早期用
+//      setHidden/removeFromSuperview 仍留白，根因就是缺了 layoutSubviews 里的这次重排(frame 在
+//      %orig 之后才就绪)。
 //
 //  【重要】功能 ⑨「禁用聊天文字折叠」已移除：
 //          WCR 的 1384 个 hook 中不存在任何 fold/FullText 相关目标，
@@ -404,14 +406,18 @@ static NSString *ddDeletedMarkText(void) {
 %end
 
 #pragma mark - ③ 禁用朋友圈谁可以见图标
-// WCR 证据(WCTimeLineCellView 安装函数 0x656104 起):
-//   initPrivacyButton: rep 0x656258 —— 读配置 momentsDisablePrivacyIconEnabled(门 0x656358)，
-//   命中后取 m_privacyButton(0x6563c8) 调 0x65650c: setImage:nil forState:0 / setAlpha:0 /
-//   setUserInteractionEnabled:NO，随后 0x656764 重排布局消去预留空白。
-//   ivar 证据 WCTimeLineCellView.h:12 MMUIButton *m_privacyButton；
-//   方法 WCTimeLineCellView.h:167 -initPrivacyButton:(id)a0。
-//   关键修正: 不再用 setHidden:YES(会在布局里留下空白占位)，改为对齐 WCR 的 alpha=0 + 清图 +
-//   禁交互，并 removeFromSuperview 保底消去预留空间(对应 WCR 0x656764 的重排视觉效果)。
+// WCR 证据(WCTimeLineCellView 两处 hook):
+//   (1) initPrivacyButton: rep 0x656258 -> 0x65650c: 命中 momentsDisablePrivacyIconEnabled 后，
+//       对 m_privacyButton(WCTimeLineCellView.h:12) 做 setImage:nil + setAlpha:0 +
+//       setUserInteractionEnabled:NO —— 仅隐藏，不 removeFromSuperview(其 selset 无 deleteButton/
+//       frame/superview，亦无 removeFromSuperview)。
+//   (2) layoutSubviews rep 0x656764: 读 m_privacyButton / m_deleteButton(WCTimeLineCellView.h:14)
+//       的 superview 与 frame，仅当 m_deleteButton.isHidden==NO 且
+//       CGRectGetMinX(delete) > CGRectGetMinX(privacy) + 0.5 时，把 m_deleteButton 左移到
+//       privacy 的 minX(优先 setLeft:，否则改 frame.origin.x)，从而消去预留空白占位。
+//   ivar 走运行时偏移，不在此声明。
+//   关键修正: 早期用 setHidden/removeFromSuperview 仍留白，是因为缺了 (2) 的重排——reflow 必须
+//   在 layoutSubviews(%orig 之后 frame 才就绪) 里执行，而非 initPrivacyButton: 时刻。
 %hook WCTimeLineCellView
 - (void)initPrivacyButton:(id)arg1 {
     %orig;
@@ -419,10 +425,32 @@ static NSString *ddDeletedMarkText(void) {
         // WCTimeLineCellView.h:12 -> MMUIButton *m_privacyButton (ivar 走运行时偏移，不在此声明)
         MMUIButton *btn = MSHookIvar<MMUIButton *>(self, "m_privacyButton");
         if (btn) {
-            [btn setImage:nil forState:0];
+            [btn setImage:nil forState:0];   // 对齐 WCR 0x65650c
             [btn setAlpha:0.0];
             [btn setUserInteractionEnabled:NO];
-            [btn removeFromSuperview];   // 消去预留空白(对齐 WCR 0x656764 重排的视觉效果)
+            // 注意: 不 removeFromSuperview。WCR 同样保留按钮，否则 layoutSubviews 引用已移除对象
+            // 会崩/布局错乱；空白占位由下方 layoutSubviews 重排 m_deleteButton 消去。
+        }
+    }
+}
+
+- (void)layoutSubviews {
+    %orig;   // 先让原始布局把 m_privacyButton / m_deleteButton 的 frame 设好
+    if ([DDWeChatConfig sharedConfig].disableSnsPrivacyIcon) {
+        MMUIButton *privacyBtn = MSHookIvar<MMUIButton *>(self, "m_privacyButton"); // WCTimeLineCellView.h:12
+        MMUIButton *deleteBtn  = MSHookIvar<MMUIButton *>(self, "m_deleteButton");  // WCTimeLineCellView.h:14
+        if (privacyBtn && deleteBtn && privacyBtn.superview && deleteBtn.superview && !deleteBtn.hidden) {
+            CGFloat pMinX = CGRectGetMinX(privacyBtn.frame);
+            CGFloat dMinX = CGRectGetMinX(deleteBtn.frame);
+            if (dMinX > pMinX + 0.5) {
+                if ([deleteBtn respondsToSelector:@selector(setLeft:)]) {
+                    [deleteBtn setLeft:pMinX];   // 对齐 WCR 0x656764 的 setLeft:
+                } else {
+                    CGRect f = deleteBtn.frame;  // 兜底: 直接改 frame.origin.x
+                    f.origin.x = pMinX;
+                    [deleteBtn setFrame:f];
+                }
+            }
         }
     }
 }
