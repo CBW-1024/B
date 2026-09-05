@@ -138,22 +138,9 @@
 @end
 @interface CBaseContact : NSObject @end
 
-// ⑫ 隐藏聊天顶栏名字(头文件推断，非 WCR)
-// 真机视图调试器证实: 聊天顶栏名字由导航栏内部的一个 MMUILabel 直接渲染(text=对方名字)，
-//   不走 MMTitleView -setTitle: 路径。故直接在聊天 VC 的布局周期内清空该 label。
-// 头文件锚点:
-//   BaseMsgContentViewController.h:137 tipsNavBar(MMMsgContentNavBar, 含 navBarTitleView:UIView)
-//   BaseMsgContentViewController.h:138 tipsNewNavBar(MMNewMsgContentNavBar, initWithFrame:navBarHeight:userName:)
-//   MMMsgContentNavBar.h:11  navBarTitleView
-//   MMNewMsgContentNavBar.h:26 nsUserName
-@interface MMMsgContentNavBar : UIView                                 // MMMsgContentNavBar.h:4
-@property (retain, nonatomic) UIView *navBarTitleView;                 // MMMsgContentNavBar.h:11
-@end
-@interface MMNewMsgContentNavBar : UIView                               // MMNewMsgContentNavBar.h:4
-@end
+// ⑫ 隐藏聊天顶栏名字(头文件推断，非 WCR)。BaseMsgContentViewController.h:223 -setCustomNavBarTitleView:
+// 安装的"自定义标题视图"承载名字 MMUILabel(text=对方显示名, 真机视图调试器证实)，故拦截该视图清空其内部 MMUILabel。
 @interface BaseMsgContentViewController : MMUIViewController   // BaseMsgContentViewController.h:4
-@property (retain, nonatomic) MMMsgContentNavBar *tipsNavBar;          // BaseMsgContentViewController.h:137
-@property (retain, nonatomic) MMNewMsgContentNavBar *tipsNewNavBar;    // BaseMsgContentViewController.h:138
 @end
 
 @protocol TimelineRequestInterceptorImpl <NSObject> @end
@@ -795,29 +782,27 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 }
 %end
 
-#pragma mark - ⑫ 隐藏聊天顶栏名字
-// 真机视图调试器证实: 聊天顶栏名字是导航栏内部一个 MMUILabel(text=对方显示名)直接渲染，
-//   不走 MMTitleView -setTitle:。头文件锚点: BaseMsgContentViewController.h:137/138
-//   (tipsNavBar:MMMsgContentNavBar / tipsNewNavBar:MMNewMsgContentNavBar)。
-//   "正在输入"分支按你的要求放弃，不特殊处理。头文件未暴露名字 label 属性，故运行时在
-//   navBar 视图树(含 MMMsgContentNavBar 的 navBarTitleView 容器)内定位 MMUILabel 清空。
-static void ddHideChatNameLabelsIn(UIView *container) {
-    if (!container) return;
-    for (UIView *sub in container.subviews) {
-        if (![sub isKindOfClass:%c(MMUILabel)]) continue;
-        MMUILabel *label = (MMUILabel *)sub;
-        if (label.text.length > 0)
-            [label setText:@""];
+#pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天 VC，头文件推断，非 WCR)
+// 真机视图调试器证实: 聊天顶栏名字是导航栏内一个 MMUILabel(text=对方显示名)直接渲染，
+//   不走 MMTitleView -setTitle:。BaseMsgContentViewController.h:223 -setCustomNavBarTitleView:
+//   安装的"自定义标题视图"即承载该名字 label；故只拦截此方法，递归清空其内部 MMUILabel。
+//   "正在输入"按你的要求放弃处理(不单独处理，若与名字同视图则一并清空)。
+static void ddClearNavBarName(UIView *view) {
+    if (!view) return;
+    for (UIView *sub in view.subviews) {
+        if ([sub isKindOfClass:%c(MMUILabel)]) {
+            MMUILabel *label = (MMUILabel *)sub;
+            if (label.text.length > 0) [label setText:@""];
+        } else {
+            ddClearNavBarName(sub);
+        }
     }
 }
 %hook BaseMsgContentViewController
-- (void)viewDidLayoutSubviews {
+- (void)setCustomNavBarTitleView:(id)view {                 // BaseMsgContentViewController.h:223
     %orig;
     if (![DDWeChatConfig sharedConfig].hideChatName) return;
-    ddHideChatNameLabelsIn(self.tipsNavBar);                                       // MMMsgContentNavBar.h:4
-    if ([self.tipsNavBar isKindOfClass:%c(MMMsgContentNavBar)])                    // 名字在 navBarTitleView 容器内
-        ddHideChatNameLabelsIn([(MMMsgContentNavBar *)self.tipsNavBar navBarTitleView]); // .h:11
-    ddHideChatNameLabelsIn(self.tipsNewNavBar);                                    // MMNewMsgContentNavBar.h:4
+    ddClearNavBarName(view);
 }
 %end
 
