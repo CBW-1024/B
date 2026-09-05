@@ -137,10 +137,9 @@
 @interface MMCPLabel : MMUILabel   // MMCPLabel.h:4 (: MMUILabel : UILabel)
 @end
 @interface CBaseContact : NSObject @end
-
-// ⑫ 隐藏聊天顶栏名字(头文件推断，非 WCR)。BaseMsgContentViewController.h:223 -setCustomNavBarTitleView:
-// 安装的"自定义标题视图"承载名字 MMUILabel(text=对方显示名, 真机视图调试器证实)，故拦截该视图清空其内部 MMUILabel。
-@interface BaseMsgContentViewController : MMUIViewController   // BaseMsgContentViewController.h:4
+// ⑫ 用。MMTitleView.h:7 delegate / :14 -setTitle:；m_baseTitleView 见 MMUIViewController.h:10
+@interface MMTitleView : UIView
+@property (weak, nonatomic) id delegate;   // MMTitleView.h:7 (@property id<MMTitleViewDelegate> delegate)
 @end
 
 @protocol TimelineRequestInterceptorImpl <NSObject> @end
@@ -783,26 +782,24 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 %end
 
 #pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天 VC，头文件推断，非 WCR)
-// 真机视图调试器证实: 聊天顶栏名字是导航栏内一个 MMUILabel(text=对方显示名)直接渲染，
-//   不走 MMTitleView -setTitle:。BaseMsgContentViewController.h:223 -setCustomNavBarTitleView:
-//   安装的"自定义标题视图"即承载该名字 label；故只拦截此方法，递归清空其内部 MMUILabel。
-//   "正在输入"按你的要求放弃处理(不单独处理，若与名字同视图则一并清空)。
-static void ddClearNavBarName(UIView *view) {
-    if (!view) return;
-    for (UIView *sub in view.subviews) {
-        if ([sub isKindOfClass:%c(MMUILabel)]) {
-            MMUILabel *label = (MMUILabel *)sub;
-            if (label.text.length > 0) [label setText:@""];
-        } else {
-            ddClearNavBarName(sub);
-        }
+// 头文件证据链:
+//   MMUIViewController.h:10  @property MMTitleView *m_baseTitleView;   —— 所有 MMUIViewController 的标题视图
+//   MMTitleView.h:7           @property id<MMTitleViewDelegate> delegate; —— 标题视图的代理(指向持有它的 VC)
+//   MMTitleView.h:14         - (void)setTitle:(id)a0;                  —— 写入主标题(对方显示名)的真正入口
+//   BaseMsgContentViewController.h:1086 - (void)onTitleViewClicked:    —— 证明聊天 VC 正是 MMTitleView 的 delegate
+// 结论: 聊天顶栏名字 = m_baseTitleView(MMTitleView) 经 -setTitle: 写入的 MMUILabel(text=对方显示名)。
+//   故只需 hook MMTitleView -setTitle:，当且仅当 delegate 是聊天 VC 且开关开启时改为空串。
+//   "正在输入"走 -setSubTitle:(MMTitleView.h:15)，按你的要求不处理。
+//   之前 hook setCustomNavBarTitleView:/updateTitleView: 全部失败，缘于那条路径只服务特殊标题栏(如通话条)，
+//   普通聊天的名字走的是标准 m_baseTitleView / MMTitleView -setTitle: —— 此即此前所有失败的根因。
+%hook MMTitleView
+- (void)setTitle:(id)a0 {                                   // MMTitleView.h:14
+    if ([DDWeChatConfig sharedConfig].hideChatName &&
+        [self.delegate isKindOfClass:%c(BaseMsgContentViewController)]) {
+        %orig(@"");
+        return;
     }
-}
-%hook BaseMsgContentViewController
-- (void)setCustomNavBarTitleView:(id)view {                 // BaseMsgContentViewController.h:223
     %orig;
-    if (![DDWeChatConfig sharedConfig].hideChatName) return;
-    ddClearNavBarName(view);
 }
 %end
 
