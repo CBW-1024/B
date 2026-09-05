@@ -414,7 +414,7 @@ static NSString *ddDeletedMarkText(void) {
 //   (2) layoutSubviews rep 0x656764: 读 m_privacyButton / m_deleteButton(WCTimeLineCellView.h:14)
 //       的 superview 与 frame，仅当 m_deleteButton.isHidden==NO 且
 //       CGRectGetMinX(delete) > CGRectGetMinX(privacy) + 0.5 时，把 m_deleteButton 左移到
-//       privacy 的 minX(优先 setLeft:，否则改 frame.origin.x)，从而消去预留空白占位。
+//       privacy 的 minX(setLeft:，本实现用等价的头文件原生 -setFrame: 改 origin.x)，从而消去预留空白占位。
 //   ivar 走运行时偏移，不在此声明。
 //   关键修正: 早期用 setHidden/removeFromSuperview 仍留白，是因为缺了 (2) 的重排——reflow 必须
 //   在 layoutSubviews(%orig 之后 frame 才就绪) 里执行，而非 initPrivacyButton: 时刻。
@@ -443,13 +443,11 @@ static NSString *ddDeletedMarkText(void) {
             CGFloat pMinX = CGRectGetMinX(privacyBtn.frame);
             CGFloat dMinX = CGRectGetMinX(deleteBtn.frame);
             if (dMinX > pMinX + 0.5) {
-                if ([deleteBtn respondsToSelector:@selector(setLeft:)]) {
-                    [deleteBtn setLeft:pMinX];   // 对齐 WCR 0x656764 的 setLeft:
-                } else {
-                    CGRect f = deleteBtn.frame;  // 兜底: 直接改 frame.origin.x
-                    f.origin.x = pMinX;
-                    [deleteBtn setFrame:f];
-                }
+                // 头文件原生方法(UIView -setFrame:)，不用私有分类 setLeft:
+                // (setLeft: 不在本 dump 头文件中，编译期不可见；setFrame 改 origin.x 效果等价)。
+                CGRect f = deleteBtn.frame;
+                f.origin.x = pMinX;
+                [deleteBtn setFrame:f];
             }
         }
     }
