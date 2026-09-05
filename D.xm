@@ -133,6 +133,9 @@
 @interface WCContentItemBaseView : UIView @end
 @interface MMUIImageView : UIImageView @end
 @interface MMUIButton : UIButton @end
+@interface MMUILabel : UILabel @end
+@interface MMCPLabel : MMUILabel   // MMCPLabel.h:4 (: MMUILabel : UILabel)
+@end
 @interface CBaseContact : NSObject @end
 @protocol TimelineRequestInterceptorImpl <NSObject> @end
 
