@@ -26,10 +26,11 @@
 //      tableFooterView 改为 AddContactToChatRoomViewController(聊天详情页) 注入原生 switch cell。
 //
 //  v2.2.0 变更(真机层次结构树 + WCR 反汇编双重实锤):
-//    - ⑩「隐藏好友微信号(资料页)」重写为 WCR 真实实现：
-//      ContactInfoViewController 的 viewWillAppear: / viewDidAppear: / viewDidLayoutSubviews
-//      三个时机递归遍历视图树，按 MMCPLabel + tag==90224(0x16070) 定位微信号 label
-//      并 setText: @"" 清空(遍历器对应 WCR 0x8c976c，常量 0x16070 与真机截图 tag=90224 一致)。
+//    - ⑩「隐藏好友微信号(资料页)」v2.2.0 曾改为"ContactInfoViewController 的 viewWillAppear:/
+//      viewDidAppear:/viewDidLayoutSubviews 三时机递归遍历视图树，按 MMCPLabel+tag==90224 清空 text"。
+//      (注: 此非 WCR 真证——WCR 实际未 hook ContactInfoViewController，impstr.pkl 无该类条目；
+//       且该方案因微信号文本在页面进入后异步/过渡期才写入，三时机清空总慢一拍导致"先闪一下再隐藏"，
+//       已被下方 MMCPLabel 源头拦截取代。)
 //    - 移除旧实现 WAProfileHeaderView.descLabel(那是视频号资料页简介，并非微信号)。
 //
 //  v2.3.0 变更(对齐用户真机截图 + WCR 反汇编，修正 v2.2.0 仍错的 ⑦):
@@ -64,6 +65,13 @@
 //      左移到 m_privacyButton 的 minX(仅当 delete 可见且其 minX > privacy 的 minX+0.5)。早期用
 //      setHidden/removeFromSuperview 仍留白，根因就是缺了 layoutSubviews 里的这次重排(frame 在
 //      %orig 之后才就绪)。
+//
+//  v2.3.0 续修(⑩ 闪现修正):
+//    - ⑩「隐藏好友微信号(资料页)」闪现修复: 旧三时机遍历清空 text 总慢一拍(文本异步/过渡期才写入)，
+//      表现为"先闪一下微信号再隐藏"。改为在【文本设置源头】拦截——%hook MMCPLabel(MMCPLabel.h:4
+//      : MMUILabel)，命中 tag==90224 时 setText:/setAttributedText: 直接传空、setTag: 兜底清已有文本，
+//      文本永不在屏上出现，彻底无闪现；config 关闭时全部透传。同时删除无引用的
+//      @interface ContactInfoViewController 死代码与 ddHideWxidLabelsInView 遍历函数。
 //
 //  【重要】功能 ⑨「禁用聊天文字折叠」已移除：
 //          WCR 的 1384 个 hook 中不存在任何 fold/FullText 相关目标，
@@ -160,12 +168,6 @@
 + (id)getDisplayContent:(id)a0 dataItem:(id)a1 pageContext:(id)a2;  // WCCommentListContentView.h:30
 @end
 
-// ⑦ 自定义头像 —— 宿主页与渲染点见下方 hook 注释(均锚定 WCR 反汇编真证)
-@interface ContactInfoViewController : MMUIViewController   // ContactInfoViewController.h:4
-@property (nonatomic, retain) CContact *m_contact;       // ContactInfoViewController.h:32
-@property (nonatomic, weak) UITableView *frontTableView; // ContactInfoViewController.h:23
-@end
-
 // ⑦ 渲染点: MMUILongPressImageView -setImage: (WCR 真证 IMP 0x373e0c/0x372bfc)
 //   MMUILongPressImageView.h:29 声明 - (void)setImage:(id)a0; 父类 MMUIImageView
 @interface MMUILongPressImageView : MMUIImageView
@@ -186,9 +188,10 @@
 - (void)setVideoPath:(id)arg1 initialTime:(double)arg2 isHLS:(long long)arg3;  // WAVideoPlayerView.h:135 —— WCR hook 之
 @end
 
-// ⑩ 隐藏好友微信号(资料页)：实现在下方 ContactInfoViewController 的 hook 内
-// (真机层次结构树证实 label 路径: ContactInfoViewController -> TextStateProfileTableView
-//  [TextStateProfileTableView.h:1 : WCTableView] -> ... -> MMCPLabel[MMCPLabel.h:1 : MMUILabel])
+// ⑩ 隐藏好友微信号(资料页)：实现见下方 %hook MMCPLabel —— 在 setText:/setAttributedText:/setTag:
+//    命中 tag==90224 时直接清空，从【文本设置源头】消除"先闪现再隐藏"。旧实现曾遍历
+//    ContactInfoViewController 视图树(三时机清空 text)，因微信号文本在过渡期/异步才写入总会慢一拍而闪现，已废除。
+//    (WCR 实际未 hook ContactInfoViewController，impstr.pkl 无该类条目；旧"三时机"为推断，非 WCR 真证。)
 
 // ⑪ 隐藏自己微信号(我界面)
 @interface WASettingAccountCell : UITableViewCell        // WASettingAccountCell.h:3
@@ -200,11 +203,6 @@
 - (void)updateTitleView:(id)arg1;                             // BaseMsgContentViewController.h:396 —— WCR hook 之
 - (void)updateTitleView:(id)arg1 ignoreAnimation:(_Bool)arg2; // BaseMsgContentViewController.h:398 —— WCR hook 之
 - (id)titleView;                                              // MMUIViewController.h:148
-@end
-
-// WCR hook 其 layoutSubviews，IMP 内读取 "MMTitleView" 配置键
-@interface MMTitleView : MMBarItemCustomView               // MMTitleView.h:2 (: MMBarItemCustomView : UIView)
-- (void)layoutSubviews;
 @end
 
 // ① 首页下拉小程序
@@ -782,13 +780,15 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 }
 %end
 
-#pragma mark - ⑫ 隐藏聊天名字(顶栏标题) (WCR 真证)
+#pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天会话界面 BaseMsgContentViewController)
 // WCR 证据:
 //   BaseMsgContentViewController: updateTitleView: 与 updateTitleView:ignoreAnimation: 都 hook
-//   MMTitleView: layoutSubviews —— 其 IMP 读取 "MMTitleView" 配置键，在此隐藏标题视图
-//   (两个 updateTitleView 的 IMP 都引用了 MMTitleView 键，说明三者配合完成隐藏)
-// 头文件: BaseMsgContentViewController.h:986 -updateTitleView:
-//        MMUIViewController.h:520 -titleView
+//   头文件: BaseMsgContentViewController.h:986 -updateTitleView: / MMUIViewController.h:520 -titleView
+// 范围收敛: 早期还 hook 了 MMTitleView -layoutSubviews 做全局隐藏，但 MMTitleView 是通用导航标题视图
+//   (联系人/设置等所有界面复用)，会把非聊天界面的标题也藏掉。改为仅在聊天会话 VC 内隐藏:
+//   1) updateTitleView: 两变体在 %orig 后把 titleView.hidden=YES(微信一设标题即隐藏)；
+//   2) viewDidLayoutSubviews 重申隐藏(聊天界面键盘起落频繁触发，覆盖微信内部重新显示标题的情况)。
+//   其它界面完全不受影响。
 %hook BaseMsgContentViewController
 - (void)updateTitleView:(id)arg1 {
     %orig;
@@ -804,14 +804,11 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
         if ([tv isKindOfClass:[UIView class]]) tv.hidden = YES;
     }
 }
-%end
-
-// 对齐 WCR：MMTitleView 自身布局时也隐藏，覆盖微信内部重新显示标题的情况
-%hook MMTitleView
-- (void)layoutSubviews {
+- (void)viewDidLayoutSubviews {
     %orig;
     if ([DDWeChatConfig sharedConfig].hideChatName) {
-        self.hidden = YES;
+        UIView *tv = [self titleView];
+        if ([tv isKindOfClass:[UIView class]]) tv.hidden = YES;
     }
 }
 %end
