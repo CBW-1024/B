@@ -1,5 +1,5 @@
 // =============================================================================
-//  DD微信助手 (DD WeChat Assistant)  v2.1.0
+//  DD微信助手 (DD WeChat Assistant)  v2.3.0
 //  单文件 iOS 越狱插件 (Theos / Logos)，目标微信 8.0.76
 //
 //  本版本依据 WCRefine.dylib 反汇编结果全量重写(对齐 WCR 真实 hook 点)。
@@ -20,11 +20,28 @@
 //           NewMainFrameViewController: MMTabBarBaseViewController /
 //           WAVideoPlayerView: WCPlayerControlView 等)，不再用猜测的 UIKit 基类。
 //    - ③ m_privacyButton 取偏移类型由 id 改为 MMUIButton *(WCTimeLineCellView.h:12)。
-//    - ⑦ 渲染点维持 FakeHeadImageView -setImage: (WCR 运行期确认目标；
-//      补充 dump 未列出该方法但运行期真实存在；MMHeadImageView 仅有
-//      setHeadImageByName:，无 setImage:，故不挂 MMHeadImageView)。
-//    - ⑩ 文案与键名统一为「清空视频号资料页简介」(WAProfileHeaderView.descLabel)，
-//      与钩子行为一致；原“隐藏好友微信号”标签系误标。
+//    - ⑦ 渲染点改为 MMUILongPressImageView -setImage: (WCR 反汇编真证 IMP 0x373e0c/0x372bfc；
+//      MMUILongPressImageView.h:29 声明 -setImage:，其 superview 为 MMHeadImageView，
+//      经 getRealUserName: 取用户名后命中自定义图)。宿主页由 ContactInfoViewController 的
+//      tableFooterView 改为 AddContactToChatRoomViewController(聊天详情页) 注入原生 switch cell。
+//
+//  v2.2.0 变更(真机层次结构树 + WCR 反汇编双重实锤):
+//    - ⑩「隐藏好友微信号(资料页)」重写为 WCR 真实实现：
+//      ContactInfoViewController 的 viewWillAppear: / viewDidAppear: / viewDidLayoutSubviews
+//      三个时机递归遍历视图树，按 MMCPLabel + tag==90224(0x16070) 定位微信号 label
+//      并 setText: @"" 清空(遍历器对应 WCR 0x8c976c，常量 0x16070 与真机截图 tag=90224 一致)。
+//    - 移除旧实现 WAProfileHeaderView.descLabel(那是视频号资料页简介，并非微信号)。
+//
+//  v2.3.0 变更(对齐用户真机截图 + WCR 反汇编，修正 v2.2.0 仍错的 ⑦):
+//    - ⑦「启用自定义头像」彻底重写为 WCR 真实形态：
+//      宿主页由 ContactInfoViewController 改为 AddContactToChatRoomViewController(聊天详情页，
+//      尽管类名像加群)，在 -reloadTableData / -reloadData / -onTableViewReload(%orig 之后) 向
+//      WCTableView 注入原生 switch cell「启用自定义头像」(WCTableViewCellManager
+//      switchCellForSel:target:title:on:，按"查找聊天内容"所在 section 用 insertCell:At: 插到其
+//      上方(位置固定，不依赖"查看好友资料卡"等其它功能行)，再 [tableView reloadData]
+//      刷新。
+//      渲染点由 FakeHeadImageView 改为 MMUILongPressImageView -setImage:(IMP 0x373e0c/0x372bfc)，
+//      取 superview(MMHeadImageView) 的 getRealUserName: 命中后换图(WCR 真证)。
 //
 //  【重要】功能 ⑨「禁用聊天文字折叠」已移除：
 //          WCR 的 1384 个 hook 中不存在任何 fold/FullText 相关目标，
@@ -52,13 +69,25 @@
 @property (nonatomic, weak) id delegate;
 @end
 
+@interface WCTableViewManager : NSObject
+- (id)getTableView;                                       // WCTableViewManager.h:23
+- (unsigned long long)getSectionCount;                   // WCTableViewManager.h:28
+- (id)getSectionAt:(unsigned long long)a0;               // WCTableViewManager.h:29
+@end
+
 @interface WCTableViewSectionManager : NSObject
 + (id)defaultSection;
 - (void)addCell:(id)arg1;
+- (void)insertCell:(id)a0 At:(unsigned int)a1;           // WCTableViewSectionManager.h:48
+- (unsigned long long)getCellCount;                      // WCTableViewSectionManager.h:49
+- (id)getCellAt:(unsigned long long)a0;                  // WCTableViewSectionManager.h:51
 @end
 
 @interface WCTableViewCellManager : NSObject
-+ (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(_Bool)arg4;
++ (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 on:(_Bool)arg4;  // WCTableViewCellManager.h:55
+@end
+
+@interface MMTableViewInfo : WCTableViewManager          // MMTableViewInfo.h:1 (: WCTableViewManager)
 @end
 
 // ---- 被 hook 微信类的声明(全部锚定 8.0.76 补充 dump 的真实签名) ----
@@ -70,7 +99,7 @@
 
 // 需要前向声明的微信类(作为父类或属性类型，非 Apple SDK 类)
 @class MMTabBarBaseViewController, MMUIViewController, MMUIView, WCPlayerControlView,
-      MMBarItemCustomView, WCContentItemBaseView, MMUIButton, CContact, MMUILabel,
+      MMBarItemCustomView, WCContentItemBaseView, MMUIButton, CContact,
       WASettingAccountCell;
 
 @interface CContact : NSObject
@@ -91,18 +120,24 @@
 - (_Bool)isWCMessageDeleted;                          // WCSNSMessage.h:19 —— WCR hook 之
 @end
 
-// ⑦ 自定义头像
+// ⑦ 自定义头像 —— 宿主页与渲染点见下方 hook 注释(均锚定 WCR 反汇编真证)
 @interface ContactInfoViewController : MMUIViewController   // ContactInfoViewController.h:4
 @property (nonatomic, retain) CContact *m_contact;       // ContactInfoViewController.h:32
 @property (nonatomic, weak) UITableView *frontTableView; // ContactInfoViewController.h:23
 @end
 
-@interface FakeHeadImageView : MMUIView                  // FakeHeadImageView.h:3 (: MMUIView)
-// 注: 补充 dump 的 FakeHeadImageView.h 未列出 setImage:，但 WCR 反汇编确认其运行期
-//     以 -setImage: 为渲染点(IMP 0x1dcf0c/0x20d050)，且 getRealUserName: (:18) 可取用户名。
-//     故此处声明 setImage: 供 Logos 绑定；该方法是运行期真实存在(否则钩子不触发)。
-- (id)getRealUserName:(id)arg1;                          // FakeHeadImageView.h:18
+// ⑦ 渲染点: MMUILongPressImageView -setImage: (WCR 真证 IMP 0x373e0c/0x372bfc)
+//   MMUILongPressImageView.h:29 声明 - (void)setImage:(id)a0; 父类 MMUIImageView
+@interface MMUILongPressImageView : MMUIImageView
 - (void)setImage:(id)arg1;
+@end
+
+// ⑦ 宿主页: AddContactToChatRoomViewController(微信"聊天详情"页, 尽管类名像加群)
+//   AddContactToChatRoomViewController.h:4 : MMUIViewController; :23 m_contact(CContact)
+//   :7 m_tableViewInfo(MMTableViewInfo); :5 m_tableView(MMTableView)
+@interface AddContactToChatRoomViewController : MMUIViewController
+@property (nonatomic, retain) CContact *m_contact;          // AddContactToChatRoomViewController.h:23
+@property (nonatomic, retain) MMTableViewInfo *m_tableViewInfo; // AddContactToChatRoomViewController.h:7
 @end
 
 // ⑧ 朋友圈视频点击关闭
@@ -111,12 +146,9 @@
 - (void)setVideoPath:(id)arg1 initialTime:(double)arg2 isHLS:(long long)arg3;  // WAVideoPlayerView.h:135 —— WCR hook 之
 @end
 
-// ⑩ 清空视频号资料页简介(WAProfileHeaderView.descLabel)
-@interface WAProfileHeaderView : UIView                  // WAProfileHeaderView.h:4
-// 必须声明成 UILabel 子类，不能写 id：OC 不允许对 id 用点语法
-// (self.descLabel.text / .hidden 会报 "property not found on object of type 'id'")
-@property (nonatomic, retain) MMUILabel *descLabel;   // WAProfileHeaderView.h:8 (MMUILabel.h:11 : UILabel)
-@end
+// ⑩ 隐藏好友微信号(资料页)：实现在下方 ContactInfoViewController 的 hook 内
+// (真机层次结构树证实 label 路径: ContactInfoViewController -> TextStateProfileTableView
+//  [TextStateProfileTableView.h:1 : WCTableView] -> ... -> MMCPLabel[MMCPLabel.h:1 : MMUILabel])
 
 // ⑪ 隐藏自己微信号(我界面)
 @interface WASettingAccountCell : UITableViewCell        // WASettingAccountCell.h:3
@@ -175,7 +207,7 @@
 #define kDDWADeletedComment    @"kDDWA_antiDeleteSnsComment"
 #define kDDWACustomAvatar      @"kDDWA_enableCustomAvatar"
 #define kDDWAVideoTapClose     @"kDDWA_disableSnsVideoTapClose"
-#define kDDWAClearWaProfileDesc    @"kDDWA_clearWaProfileDesc"
+#define kDDWAHideFriendWxid    @"kDDWA_hideFriendWxid"
 #define kDDWAHideMyWxid        @"kDDWA_hideMyWxid"
 #define kDDWAHideChatName      @"kDDWA_hideChatName"
 
@@ -189,7 +221,7 @@ static const BOOL kDDDefaultGroupFold         = NO;
 static const BOOL kDDDefaultAntiDelete        = NO;
 static const BOOL kDDDefaultCustomAvatar      = NO;
 static const BOOL kDDDefaultVideoTapClose     = NO;
-static const BOOL kDDDefaultClearWaProfileDesc    = NO;
+static const BOOL kDDDefaultHideFriendWxid    = NO;
 static const BOOL kDDDefaultHideMyWxid        = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
 
@@ -203,7 +235,7 @@ static const BOOL kDDDefaultHideChatName      = NO;
 @property (assign, nonatomic) BOOL antiDeleteSnsComment;
 @property (assign, nonatomic) BOOL enableCustomAvatar;
 @property (assign, nonatomic) BOOL disableSnsVideoTapClose;
-@property (assign, nonatomic) BOOL clearWaProfileDesc;
+@property (assign, nonatomic) BOOL hideFriendWxid;
 @property (assign, nonatomic) BOOL hideMyWxid;
 @property (assign, nonatomic) BOOL hideChatName;
 @end
@@ -227,7 +259,7 @@ static const BOOL kDDDefaultHideChatName      = NO;
         kDDWADeletedComment: @(kDDDefaultAntiDelete),
         kDDWACustomAvatar:   @(kDDDefaultCustomAvatar),
         kDDWAVideoTapClose:  @(kDDDefaultVideoTapClose),
-        kDDWAClearWaProfileDesc: @(kDDDefaultClearWaProfileDesc),
+        kDDWAHideFriendWxid: @(kDDDefaultHideFriendWxid),
         kDDWAHideMyWxid:     @(kDDDefaultHideMyWxid),
         kDDWAHideChatName:   @(kDDDefaultHideChatName),
     }];
@@ -243,7 +275,7 @@ static const BOOL kDDDefaultHideChatName      = NO;
         _antiDeleteSnsComment           = [ud boolForKey:kDDWADeletedComment];
         _enableCustomAvatar             = [ud boolForKey:kDDWACustomAvatar];
         _disableSnsVideoTapClose        = [ud boolForKey:kDDWAVideoTapClose];
-        _clearWaProfileDesc                 = [ud boolForKey:kDDWAClearWaProfileDesc];
+        _hideFriendWxid                 = [ud boolForKey:kDDWAHideFriendWxid];
         _hideMyWxid                     = [ud boolForKey:kDDWAHideMyWxid];
         _hideChatName                   = [ud boolForKey:kDDWAHideChatName];
     }
@@ -257,7 +289,7 @@ static const BOOL kDDDefaultHideChatName      = NO;
 - (void)setAntiDeleteSnsComment:(BOOL)v { _antiDeleteSnsComment = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWADeletedComment]; }
 - (void)setEnableCustomAvatar:(BOOL)v { _enableCustomAvatar = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWACustomAvatar]; }
 - (void)setDisableSnsVideoTapClose:(BOOL)v { _disableSnsVideoTapClose = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAVideoTapClose]; }
-- (void)setClearWaProfileDesc:(BOOL)v { _clearWaProfileDesc = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAClearWaProfileDesc]; }
+- (void)setHideFriendWxid:(BOOL)v { _hideFriendWxid = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideFriendWxid]; }
 - (void)setHideMyWxid:(BOOL)v { _hideMyWxid = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideMyWxid]; }
 - (void)setHideChatName:(BOOL)v { _hideChatName = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideChatName]; }
 @end
@@ -360,18 +392,23 @@ static const BOOL kDDDefaultHideChatName      = NO;
 %end
 
 #pragma mark - ⑦ 启用自定义头像(聊天详情页, 每聊独立)
-// WCR 证据:
-//   ContactInfoViewController: setM_contact: / viewDidLoad / viewWillAppear: / viewDidAppear: / viewDidLayoutSubviews
-//   FakeHeadImageView(渲染侧): initWithRoundCorner: / layoutSubviews / setImage:
-// ⚠️ 关键修正: 原实现 hook 的是 getRealUserName:，但 WCR 并不 hook 它。
-//    WCR 的渲染点在 FakeHeadImageView -setImage: —— 微信给头像赋值时走这里，
-//    因此自定义图必须在 setImage: 里覆盖，否则会被后续赋值冲掉。
+// WCR 真证实现(反汇编 WCRefine.dylib):
+//   [宿主页] AddContactToChatRoomViewController(即微信"聊天详情"页, 尽管类名像加群)
+//           hook -reloadTableData(IMP 0x374084) / -reloadData(IMP 0x3740c0)
+//           / -onTableViewReload(IMP 0x3740fc) —— 三者均在 %orig 之后调用注入器 0x37d0dc；
+//           注入器用 [WCTableViewCellManager switchCellForSel:@selector(toggleCustomContactAvatar:)
+//           target:vc title:@"启用自定义头像" on:enabled] 造原生 switch cell，
+//           按 "查找聊天内容" 所在 section 用 insertCell:At: 插到其上方(真机截图证实位于
+//           "查找聊天内容"上方(位置固定)，再 [tableView reloadData] 刷新。
+//   [渲染点] MMUILongPressImageView -setImage:(IMP 0x373e0c/0x372bfc) ——
+//           微信给头像赋值时经此；WCR 在 %orig 后取 superview(MMHeadImageView) 的
+//           getRealUserName:，校验 customAvatarFeatureEnabled + customAvatarGroupEnabledIDs
+//           命中后载入自定义图。DD 用 enableCustomAvatar(总开关) + 每聊 NSUserDefaults 命中。
 static NSString *ddCustomAvatarKey(NSString *userName) {
     return [NSString stringWithFormat:@"dd_customAvatar_%@", userName ?: @""];
 }
-static const void *kDDAvatarUsr      = &kDDAvatarUsr;
-static const void *kDDAvatarPicking  = &kDDAvatarPicking;
-static const void *kDDAvatarInjected = &kDDAvatarInjected;
+static const void *kDDAvatarUsr     = &kDDAvatarUsr;
+static const void *kDDAvatarPicking = &kDDAvatarPicking;
 
 // 取 userName：用 performSelector: 规避 NSProcessInfo.userName 的
 // API_UNAVAILABLE(ios) 与 CContact.userName 同名冲突。
@@ -381,67 +418,93 @@ static NSString *ddUserNameOf(id obj) {
     return [obj performSelector:@selector(userName)];
 }
 
-%hook ContactInfoViewController
-- (void)setM_contact:(id)contact {
-    %orig;
-    if ([DDWeChatConfig sharedConfig].enableCustomAvatar) {
-        NSString *usr = ddUserNameOf(contact);
-        if (usr.length) objc_setAssociatedObject(self, kDDAvatarUsr, usr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-}
-- (void)viewDidAppear:(_Bool)arg1 {
-    %orig;
-    if (![DDWeChatConfig sharedConfig].enableCustomAvatar) return;
-    if ([objc_getAssociatedObject(self, kDDAvatarInjected) boolValue]) return;
-    objc_setAssociatedObject(self, kDDAvatarInjected, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+// 读 cellInfo 的标题(用于定位插入点与幂等查重)：
+//   WCTableViewCellManager.cellConfig(WCTableViewCellNormalConfig).leftConfig(WCTableViewCellLeftConfig).title
+// 全部走 performSelector: 规避 KVC 与 dot-syntax-on-id。
+static NSString *ddCellTitle(id cellInfo) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
     @try {
-        NSString *usr = objc_getAssociatedObject(self, kDDAvatarUsr);
-        if (!usr.length) usr = ddUserNameOf(self.m_contact);
-        if (!usr.length) return;
-        UITableView *tv = self.frontTableView;
-        if (!tv) return;
+        id cfg  = [cellInfo performSelector:@selector(cellConfig)];
+        if (!cfg) return nil;
+        id left = [cfg performSelector:@selector(leftConfig)];
+        if (!left) return nil;
+        return [left performSelector:@selector(title)];
+    } @catch (NSException *e) { return nil; }
+#pragma clang diagnostic pop
+}
 
-        CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
-        CGFloat inset = 16.0, rowH = 44.0, gap = 8.0;
-        CGFloat cardW = screenW - inset * 2, cardH = rowH;
+// 该聊是否启用自定义头像(总开关 + 每聊命中)
+static BOOL ddCustomAvatarOnForUser(NSString *usr) {
+    if (![DDWeChatConfig sharedConfig].enableCustomAvatar) return NO;
+    if (usr.length == 0) return NO;
+    return [NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(usr)] != nil;
+}
 
-        UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, screenW, cardH + gap * 2)];
-        footer.backgroundColor = [UIColor clearColor];
-        UIView *card = [[UIView alloc] initWithFrame:CGRectMake(inset, gap, cardW, cardH)];
-        if (@available(iOS 13.0, *)) {
-            card.backgroundColor = [UIColor secondarySystemBackgroundColor];
-            card.layer.cornerRadius = 10.0;
-            card.layer.masksToBounds = YES;
-        } else { card.backgroundColor = [UIColor whiteColor]; }
-        [footer addSubview:card];
-
-        UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(16, cardH - 0.5, cardW - 16, 0.5)];
-        sep.backgroundColor = (@available(iOS 13.0, *) ? [UIColor separatorColor] : [UIColor colorWithWhite:0.88 alpha:1]);
-        [card addSubview:sep];
-
-        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(16, 0, cardW - 16 - 70, rowH)];
-        lab.text = @"自定义头像";
-        lab.font = [UIFont systemFontOfSize:17];
-        lab.textColor = (@available(iOS 13.0, *) ? [UIColor labelColor] : [UIColor blackColor]);
-        [card addSubview:lab];
-
-        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(cardW - 67, (rowH - 31) / 2.0, 51, 31)];
-        sw.on = ([NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(usr)] != nil);
-        [sw addTarget:self action:@selector(dd_onCustomAvatarSwitch:) forControlEvents:UIControlEventValueChanged];
-        [card addSubview:sw];
-        tv.tableFooterView = footer;
+// 在聊天详情页注入「启用自定义头像」原生 switch cell。
+// 位置固定：插到"查找聊天内容"(微信常驻功能，位置稳定)所在 section 的上方；
+// 找不到时兜底插到最后一个 section 末尾。不依赖"查看好友资料卡"(另一独立功能，默认不开启)。
+static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
+    @try {
+        NSString *usr = ddUserNameOf(vc.m_contact);
+        if (usr.length == 0) return;
+        MMTableViewInfo *ti = MSHookIvar<MMTableViewInfo *>(vc, "m_tableViewInfo");
+        if (!ti) return;
+        NSUInteger secCount = [ti getSectionCount];
+        if (secCount == 0) return;
+        NSInteger targetSec = -1, targetIdx = -1;
+        for (NSUInteger s = 0; s < secCount; s++) {
+            id sec = [ti getSectionAt:s];
+            if (!sec) continue;
+            NSUInteger cellCount = [sec getCellCount];
+            for (NSUInteger c = 0; c < cellCount; c++) {
+                NSString *t = ddCellTitle([sec getCellAt:c]);
+                if ([t isEqualToString:@"启用自定义头像"]) return;          // 已注入，幂等
+                if ([t isEqualToString:@"查找聊天内容"]) { targetSec = (NSInteger)s; targetIdx = (NSInteger)c; break; }
+            }
+            if (targetSec >= 0) break;
+        }
+        if (targetSec < 0) {   // 兜底：插到最后一个 section 末尾
+            id lastSec = [ti getSectionAt:secCount - 1];
+            if (lastSec) {
+                targetSec = (NSInteger)(secCount - 1);
+                targetIdx = (NSInteger)[lastSec getCellCount];
+            }
+        }
+        if (targetSec < 0) return;
+        id sec = [ti getSectionAt:(NSUInteger)targetSec];
+        Class cellMgr = objc_getClass("WCTableViewCellManager");
+        id cell = [cellMgr switchCellForSel:@selector(dd_toggleCustomAvatar:) target:vc
+                                      title:@"启用自定义头像" on:ddCustomAvatarOnForUser(usr)];
+        [sec insertCell:cell At:(unsigned int)targetIdx];
+        UITableView *tv = [ti getTableView];
+        [tv reloadData];
     } @catch (NSException *e) { }
 }
+
+%hook AddContactToChatRoomViewController
+- (void)reloadTableData {
+    %orig;
+    ddInjectCustomAvatarCell(self);
+}
+- (void)reloadData {
+    %orig;
+    ddInjectCustomAvatarCell(self);
+}
+- (void)onTableViewReload {
+    %orig;
+    ddInjectCustomAvatarCell(self);
+}
 %new
-- (void)dd_onCustomAvatarSwitch:(UISwitch *)s {
-    NSString *usr = objc_getAssociatedObject(self, kDDAvatarUsr);
-    if (!usr.length) usr = ddUserNameOf(self.m_contact);
-    if (!usr.length) return;
+- (void)dd_toggleCustomAvatar:(UISwitch *)s {
+    NSString *usr = ddUserNameOf(self.m_contact);
+    if (usr.length == 0) return;
     if (s.on) {
+        if (![DDWeChatConfig sharedConfig].enableCustomAvatar) { s.on = NO; return; }
         UIImagePickerController *picker = [[UIImagePickerController alloc] init];
         picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
         picker.delegate = (id<UINavigationControllerDelegate, UIImagePickerControllerDelegate>)self;
-        objc_setAssociatedObject(self, kDDAvatarPicking, usr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kDDAvatarUsr, usr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self presentViewController:picker animated:YES completion:nil];
     } else {
         [NSUserDefaults.standardUserDefaults removeObjectForKey:ddCustomAvatarKey(usr)];
@@ -450,29 +513,75 @@ static NSString *ddUserNameOf(id obj) {
 %new
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
     UIImage *image = info[UIImagePickerControllerOriginalImage];
-    NSString *usr = objc_getAssociatedObject(self, kDDAvatarPicking);
+    NSString *usr = objc_getAssociatedObject(self, kDDAvatarUsr);
     if (image && usr.length) {
         [NSUserDefaults.standardUserDefaults setObject:UIImagePNGRepresentation(image) forKey:ddCustomAvatarKey(usr)];
     }
     [self dismissViewControllerAnimated:YES completion:nil];
 }
+%new
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
 %end
 
-// 渲染侧：对齐 WCR，在 setImage: 处覆盖（微信给头像赋值时走这里）
-// 注: MMHeadImageView 头文件无 setImage:(仅有 setHeadImageByName:/setHeadImageViewCornerRadius:)，
-//     故主头像渲染点仍用 FakeHeadImageView -setImage: (WCR 运行期确认的目标，见上 @interface 注释)。
-%hook FakeHeadImageView
+// 渲染侧：对齐 WCR，在 MMUILongPressImageView -setImage: 处覆盖(微信给头像赋值时走这里)。
+// 仅当 superview 为头像视图(响应 getRealUserName:)才处理，避免误伤消息图片等。
+%hook MMUILongPressImageView
+%property (nonatomic, assign) BOOL dd_customAvatarApplying;
 - (void)setImage:(id)arg1 {
     %orig;
-    if (![DDWeChatConfig sharedConfig].enableCustomAvatar) return;
-    @try {
-        id usr = [self getRealUserName:nil];    // FakeHeadImageView.h:18
-        if (!usr) return;
-        NSData *d = [NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(usr)];
-        if (!d) return;
-        UIImage *img = [UIImage imageWithData:d];
-        if (img) %orig(img);   // 用自定义图覆盖
-    } @catch (NSException *e) { }
+    if (self.dd_customAvatarApplying) return;
+    UIView *head = self.superview;
+    if (![head respondsToSelector:@selector(getRealUserName:)]) {
+        head = head.superview;
+        if (![head respondsToSelector:@selector(getRealUserName:)]) return;
+    }
+    NSString *usr = [head performSelector:@selector(getRealUserName:) withObject:nil];
+    if (usr.length == 0) return;
+    if (!ddCustomAvatarOnForUser(usr)) return;
+    NSData *d = [NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(usr)];
+    if (!d) return;
+    UIImage *img = [UIImage imageWithData:d];
+    if (!img) return;
+    self.dd_customAvatarApplying = YES;
+    [self setImage:img];
+    self.dd_customAvatarApplying = NO;
+}
+%end
+
+// ⑩ 隐藏好友微信号(资料页)：实现在下方 ContactInfoViewController 的 hook 内
+// WCR 真证: 三个时机(viewWillAppear:/viewDidAppear:/viewDidLayoutSubviews) + 遍历器 0x8c976c，
+// 按 MMCPLabel + tag==90224 定位微信号 label 并 setText:@"" 清空。
+static void ddHideWxidLabelsInView(UIView *view) {
+    if (!view) return;
+    static Class wxidCls = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ wxidCls = objc_getClass("MMCPLabel"); });   // 0x8c97b4
+    if (!wxidCls) return;
+    for (UIView *sub in [view subviews]) {
+        if ([sub isKindOfClass:wxidCls] && sub.tag == 90224) {               // 0x16070
+            UILabel *lab = (UILabel *)sub;
+            if (lab.text.length > 0) lab.text = @"";                          // 对齐 WCR: setText: 清空
+        }
+        ddHideWxidLabelsInView(sub);
+    }
+}
+
+%hook ContactInfoViewController
+// ⑩ 隐藏好友微信号 —— 对齐 WCR: viewWillAppear: 也触发(资料页首次进入)
+- (void)viewWillAppear:(_Bool)arg1 {
+    %orig;
+    if ([DDWeChatConfig sharedConfig].hideFriendWxid) ddHideWxidLabelsInView(self.view);
+}
+- (void)viewDidAppear:(_Bool)arg1 {
+    %orig;
+    if ([DDWeChatConfig sharedConfig].hideFriendWxid) ddHideWxidLabelsInView(self.view);
+}
+// ⑩ 隐藏好友微信号 —— 对齐 WCR: viewDidLayoutSubviews 也触发(微信重排后重新清空)
+- (void)viewDidLayoutSubviews {
+    %orig;
+    if ([DDWeChatConfig sharedConfig].hideFriendWxid) ddHideWxidLabelsInView(self.view);
 }
 %end
 
@@ -489,20 +598,10 @@ static NSString *ddUserNameOf(id obj) {
 }
 %end
 
-#pragma mark - ⑩ 清空视频号资料页简介(WAProfileHeaderView.descLabel)
-// 头文件 WAProfileHeaderView.h:8  @property MMUILabel *descLabel;  :19 -updateContact:
-// 实现: 在资料页刷新联系人时把简介清空并隐藏。
-// 注: 此功能按 8.0.76 头文件实现(清空视频号资料页 descLabel)，并非 WCR 的对齐项；
-//     WCR 资料页相关目标为好友资料页 TLProfileExpandableHeaderView(补充 dump 已含该类，
-//     其 infoLabel / signatureLabel 为 MMCPLabel，可作隐藏微信号之用，本插件暂未启用)。
-%hook WAProfileHeaderView
-- (void)updateContact:(id)arg1 {
-    %orig;
-    if (![DDWeChatConfig sharedConfig].clearWaProfileDesc) return;
-    self.descLabel.text = @"";
-    self.descLabel.hidden = YES;
-}
-%end
+#pragma mark - ⑩ 隐藏好友微信号(资料页) —— 实现见上方 ContactInfoViewController 的 hook
+// WCR 真证: 三个时机(viewWillAppear:/viewDidAppear:/viewDidLayoutSubviews) + 遍历器 0x8c976c，
+// 按 MMCPLabel + tag==90224 定位微信号 label 并 setText:@"" 清空。
+// (旧实现 WAProfileHeaderView.descLabel 清的是视频号简介，并非微信号，已删除。)
 
 #pragma mark - ⑪ 隐藏自己微信号(我界面)
 // WCR 证据: hook NewSettingViewController -reloadTableData (头文件 :55)
@@ -618,13 +717,13 @@ static NSString *ddUserNameOf(id obj) {
     [_tableViewManager addSection:sns];
 
     WCTableViewSectionManager *privacy = [secMgr defaultSection];
-    [privacy addCell:[cellMgr switchCellForSel:@selector(onClearWaProfileDescSwitch:) target:self title:@"清空视频号资料页简介" on:cfg.clearWaProfileDesc]];
+    [privacy addCell:[cellMgr switchCellForSel:@selector(onHideFriendWxidSwitch:) target:self title:@"隐藏好友微信号(资料页)" on:cfg.hideFriendWxid]];
     [privacy addCell:[cellMgr switchCellForSel:@selector(onHideMyWxidSwitch:) target:self title:@"隐藏自己微信号(我界面)" on:cfg.hideMyWxid]];
     [privacy addCell:[cellMgr switchCellForSel:@selector(onHideChatNameSwitch:) target:self title:@"隐藏聊天顶栏名字" on:cfg.hideChatName]];
     [_tableViewManager addSection:privacy];
 
     WCTableViewSectionManager *general = [secMgr defaultSection];
-    [general addCell:[cellMgr switchCellForSel:@selector(onAvatarSwitch:) target:self title:@"启用自定义头像(聊天详情)" on:cfg.enableCustomAvatar]];
+    [general addCell:[cellMgr switchCellForSel:@selector(onAvatarSwitch:) target:self title:@"启用自定义头像(总开关)" on:cfg.enableCustomAvatar]];
     [_tableViewManager addSection:general];
 
     [_tableViewManager reloadTableView];
@@ -650,7 +749,7 @@ static NSString *ddUserNameOf(id obj) {
 - (void)onAntiDeleteSwitch:(UISwitch *)s    { [DDWeChatConfig sharedConfig].antiDeleteSnsComment = s.on; }
 - (void)onAvatarSwitch:(UISwitch *)s        { [DDWeChatConfig sharedConfig].enableCustomAvatar = s.on; }
 - (void)onVideoTapCloseSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableSnsVideoTapClose = s.on; }
-- (void)onClearWaProfileDescSwitch:(UISwitch *)s{ [DDWeChatConfig sharedConfig].clearWaProfileDesc = s.on; }
+- (void)onHideFriendWxidSwitch:(UISwitch *)s{ [DDWeChatConfig sharedConfig].hideFriendWxid = s.on; }
 - (void)onHideMyWxidSwitch:(UISwitch *)s    { [DDWeChatConfig sharedConfig].hideMyWxid = s.on; }
 - (void)onHideChatNameSwitch:(UISwitch *)s  { [DDWeChatConfig sharedConfig].hideChatName = s.on; }
 @end
@@ -661,7 +760,7 @@ static NSString *ddUserNameOf(id obj) {
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
             [[mgr sharedInstance] registerControllerWithTitle:@"DD微信助手"
-                                                      version:@"2.0.0"
+                                                      version:@"2.3.0"
                                                    controller:@"DDWeChatSettingsViewController"];
         }
     }
