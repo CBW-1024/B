@@ -440,14 +440,15 @@ static NSString *ddDeletedMarkText(void) {
         MMUIButton *privacyBtn = MSHookIvar<MMUIButton *>(self, "m_privacyButton"); // WCTimeLineCellView.h:12
         MMUIButton *deleteBtn  = MSHookIvar<MMUIButton *>(self, "m_deleteButton");  // WCTimeLineCellView.h:14
         if (privacyBtn && deleteBtn && privacyBtn.superview && deleteBtn.superview && !deleteBtn.hidden) {
-            CGFloat pMinX = CGRectGetMinX(privacyBtn.frame);
-            CGFloat dMinX = CGRectGetMinX(deleteBtn.frame);
+            CGRect pFrame = privacyBtn.frame;
+            CGRect dFrame = deleteBtn.frame;   // 同一帧只取一次，避免重复 getter
+            CGFloat pMinX = CGRectGetMinX(pFrame);
+            CGFloat dMinX = CGRectGetMinX(dFrame);
             if (dMinX > pMinX + 0.5) {
                 // 头文件原生方法(UIView -setFrame:)，不用私有分类 setLeft:
                 // (setLeft: 不在本 dump 头文件中，编译期不可见；setFrame 改 origin.x 效果等价)。
-                CGRect f = deleteBtn.frame;
-                f.origin.x = pMinX;
-                [deleteBtn setFrame:f];
+                dFrame.origin.x = pMinX;   // 删除按钮左移到隐私按钮原位，消去预留空白
+                [deleteBtn setFrame:dFrame];
             }
         }
     }
@@ -715,38 +716,34 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 }
 %end
 
-// ⑩ 隐藏好友微信号(资料页)：实现在下方 ContactInfoViewController 的 hook 内
-// WCR 真证: 三个时机(viewWillAppear:/viewDidAppear:/viewDidLayoutSubviews) + 遍历器 0x8c976c，
-// 按 MMCPLabel + tag==90224 定位微信号 label 并 setText:@"" 清空。
-static void ddHideWxidLabelsInView(UIView *view) {
-    if (!view) return;
-    static Class wxidCls = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ wxidCls = objc_getClass("MMCPLabel"); });   // 0x8c97b4
-    if (!wxidCls) return;
-    for (UIView *sub in [view subviews]) {
-        if ([sub isKindOfClass:wxidCls] && sub.tag == 90224) {               // 0x16070
-            UILabel *lab = (UILabel *)sub;
-            if (lab.text.length > 0) lab.text = @"";                          // 对齐 WCR: setText: 清空
-        }
-        ddHideWxidLabelsInView(sub);
+// ⑩ 隐藏好友微信号(资料页)
+// 旧方案在 viewWillAppear:/viewDidAppear:/viewDidLayoutSubviews 遍历 MMCPLabel(tag==90224) 清空 text，
+// 但微信号 label 的文本在进入页面后的过渡期/异步才写入，VC 生命周期清空总慢一拍 -> "先闪一下再隐藏"。
+// (WCR 实际未 hook ContactInfoViewController，impstr.pkl 无该类条目，旧"三时机"为推断，已废除。)
+// 改在【文本设置源头】拦截: hook MMCPLabel(MMCPLabel.h:4 @interface MMCPLabel : MMUILabel) 的
+// setText:/setAttributedText:，命中 tag==90224 时直接传空，文本永不在屏上出现，彻底无闪现；
+// 另 hook setTag: 兜底(防"先设文本后设 tag"导致 setText: 时 tag 尚未为 90224 而漏清)。config 关闭时全部透传。
+%hook MMCPLabel
+- (void)setText:(NSString *)text {
+    if ([DDWeChatConfig sharedConfig].hideFriendWxid && self.tag == 90224) {
+        %orig(@"");
+        return;
     }
-}
-
-%hook ContactInfoViewController
-// ⑩ 隐藏好友微信号 —— 对齐 WCR: viewWillAppear: 也触发(资料页首次进入)
-- (void)viewWillAppear:(_Bool)arg1 {
     %orig;
-    if ([DDWeChatConfig sharedConfig].hideFriendWxid) ddHideWxidLabelsInView(self.view);
 }
-- (void)viewDidAppear:(_Bool)arg1 {
+- (void)setAttributedText:(NSAttributedString *)text {
+    if ([DDWeChatConfig sharedConfig].hideFriendWxid && self.tag == 90224) {
+        %orig(nil);
+        return;
+    }
     %orig;
-    if ([DDWeChatConfig sharedConfig].hideFriendWxid) ddHideWxidLabelsInView(self.view);
 }
-// ⑩ 隐藏好友微信号 —— 对齐 WCR: viewDidLayoutSubviews 也触发(微信重排后重新清空)
-- (void)viewDidLayoutSubviews {
+- (void)setTag:(NSInteger)tag {
     %orig;
-    if ([DDWeChatConfig sharedConfig].hideFriendWxid) ddHideWxidLabelsInView(self.view);
+    if ([DDWeChatConfig sharedConfig].hideFriendWxid && tag == 90224) {
+        if (self.text.length) self.text = @"";
+        if (self.attributedText.length) self.attributedText = nil;
+    }
 }
 %end
 
@@ -762,11 +759,6 @@ static void ddHideWxidLabelsInView(UIView *view) {
     }
 }
 %end
-
-#pragma mark - ⑩ 隐藏好友微信号(资料页) —— 实现见上方 ContactInfoViewController 的 hook
-// WCR 真证: 三个时机(viewWillAppear:/viewDidAppear:/viewDidLayoutSubviews) + 遍历器 0x8c976c，
-// 按 MMCPLabel + tag==90224 定位微信号 label 并 setText:@"" 清空。
-// (旧实现 WAProfileHeaderView.descLabel 清的是视频号简介，并非微信号，已删除。)
 
 #pragma mark - ⑪ 隐藏自己微信号(我界面)
 // WCR 证据: hook NewSettingViewController -reloadTableData (头文件 :55)
