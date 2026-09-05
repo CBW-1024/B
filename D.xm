@@ -146,14 +146,14 @@
 //   BaseMsgContentViewController.h:138 tipsNewNavBar(MMNewMsgContentNavBar, initWithFrame:navBarHeight:userName:)
 //   MMMsgContentNavBar.h:11  navBarTitleView
 //   MMNewMsgContentNavBar.h:26 nsUserName
-@interface BaseMsgContentViewController : MMUIViewController   // BaseMsgContentViewController.h:4
-@property (retain, nonatomic) MMMsgContentNavBar *tipsNavBar;          // BaseMsgContentViewController.h:137
-@property (retain, nonatomic) MMNewMsgContentNavBar *tipsNewNavBar;    // BaseMsgContentViewController.h:138
-@end
 @interface MMMsgContentNavBar : UIView                                 // MMMsgContentNavBar.h:4
 @property (retain, nonatomic) UIView *navBarTitleView;                 // MMMsgContentNavBar.h:11
 @end
 @interface MMNewMsgContentNavBar : UIView                               // MMNewMsgContentNavBar.h:4
+@end
+@interface BaseMsgContentViewController : MMUIViewController   // BaseMsgContentViewController.h:4
+@property (retain, nonatomic) MMMsgContentNavBar *tipsNavBar;          // BaseMsgContentViewController.h:137
+@property (retain, nonatomic) MMNewMsgContentNavBar *tipsNewNavBar;    // BaseMsgContentViewController.h:138
 @end
 
 @protocol TimelineRequestInterceptorImpl <NSObject> @end
