@@ -59,20 +59,16 @@
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-// 设置页表管理器：依据 8.0.76 头文件手动声明(仅声明实际调用的接口)
+// 表管理器：设置页与聊天详情页共用，依据 8.0.76 头文件手动声明(仅声明实际调用的接口)
 @interface WCTableViewManager : NSObject
 - (id)initWithFrame:(struct CGRect)arg1 style:(long long)arg2;
-- (id)getTableView;
+- (id)getTableView;                                       // WCTableViewManager.h:23
 - (void)clearAllSection;
 - (void)addSection:(id)arg1;
 - (void)reloadTableView;
-@property (nonatomic, weak) id delegate;
-@end
-
-@interface WCTableViewManager : NSObject
-- (id)getTableView;                                       // WCTableViewManager.h:23
 - (unsigned long long)getSectionCount;                   // WCTableViewManager.h:28
 - (id)getSectionAt:(unsigned long long)a0;               // WCTableViewManager.h:29
+@property (nonatomic, weak) id delegate;
 @end
 
 @interface WCTableViewSectionManager : NSObject
@@ -97,12 +93,20 @@
 //     不在本地 @interface 中声明(手写 ivar 会让编译器按本地布局算固定偏移，
 //     与真机类布局不一致会读崩)。
 
-// 需要前向声明的微信类(作为父类或属性类型，非 Apple SDK 类)
-@class MMTabBarBaseViewController, MMUIViewController, MMUIView, WCPlayerControlView,
-      MMBarItemCustomView, WCContentItemBaseView, MMUIButton, CContact,
-      WASettingAccountCell;
+// 微信基类：仅 @class 前向声明无法作为 @interface 的父类(Obj-C 不允许)，
+// 故在此给出最小完整 @interface(锚定 8.0.76 dump 真实继承链——均为 UIKit 子类)。
+@interface MMTabBarBaseViewController : UIViewController @end
+@interface MMUIViewController : UIViewController @end
+@interface MMUIView : UIView @end
+@interface WCPlayerControlView : UIView @end
+@interface MMBarItemCustomView : UIView @end
+@interface WCContentItemBaseView : UIView @end
+@interface MMUIImageView : UIImageView @end
+@interface MMUIButton : UIButton @end
+@interface CBaseContact : NSObject @end
+@protocol TimelineRequestInterceptorImpl <NSObject> @end
 
-@interface CContact : NSObject
+@interface CContact : CBaseContact
 @property (nonatomic, readonly) NSString *userName;   // CContact.h:465
 @end
 
