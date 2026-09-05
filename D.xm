@@ -796,48 +796,28 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 %end
 
 #pragma mark - ⑫ 隐藏聊天顶栏名字
-// 真机视图调试器证据(8.0.76): 聊天顶栏名字由导航栏内部的一个 MMUILabel 直接渲染，
-//   实例描述: <MMUILabel: 0x406603b80; baseClass = UILabel; frame = (-8 0; 17 36);
-//   text = '陈'; userInteractionEnabled = NO> —— 即微信直接给该 label setText: 写入对方显示名。
-//
-// 根因: 之前 hook MMTitleView -setTitle: 整条路径无效，因为聊天界面使用的
-//   MMNewMsgContentNavBar(initWithFrame:navBarHeight:userName:) / MMMsgContentNavBar(navBarTitleView)
-//   自定义导航栏内部自行渲染名字，不经过 MMTitleView。
-//
-// 方案: 在 BaseMsgContentViewController 的布局周期内，遍历两个自定义导航栏的 subviews，
-//   找到 text 非空的 MMUILabel 并清空其 text。每次布局都执行，确保微信重新设名后仍被清除。
-//   不处理"正在输入"(用户明确放弃该分支)。
+// 真机视图调试器证实: 聊天顶栏名字是导航栏内部一个 MMUILabel(text=对方显示名)直接渲染，
+//   不走 MMTitleView -setTitle:。头文件锚点: BaseMsgContentViewController.h:137/138
+//   (tipsNavBar:MMMsgContentNavBar / tipsNewNavBar:MMNewMsgContentNavBar)。
+//   "正在输入"分支按你的要求放弃，不特殊处理。头文件未暴露名字 label 属性，故运行时在
+//   navBar 视图树(含 MMMsgContentNavBar 的 navBarTitleView 容器)内定位 MMUILabel 清空。
+static void ddHideChatNameLabelsIn(UIView *container) {
+    if (!container) return;
+    for (UIView *sub in container.subviews) {
+        if (![sub isKindOfClass:[MMUILabel class]]) continue;
+        MMUILabel *label = (MMUILabel *)sub;
+        if (label.text.length > 0)
+            [label setText:@""];
+    }
+}
 %hook BaseMsgContentViewController
 - (void)viewDidLayoutSubviews {
     %orig;
     if (![DDWeChatConfig sharedConfig].hideChatName) return;
-
-    // 遍历两个自定义导航栏，清空其中渲染名字的 MMUILabel
-    NSArray *navBars = @[
-        self.tipsNavBar,     // MMMsgContentNavBar  (BaseMsgContentViewController.h:137)
-        self.tipsNewNavBar   // MMNewMsgContentNavBar (BaseMsgContentViewController.h:138)
-    ];
-    for (UIView *navBar in navBars) {
-        if (!navBar) continue;
-        for (UIView *sub in navBar.subviews) {
-            if (![sub isKindOfClass:[MMUILabel class]]) continue;
-            MMUILabel *label = (MMUILabel *)sub;
-            if (label.text.length > 0)
-                [label setText:@""];
-        }
-        // 同时检查 navBarTitleView(MMMsgContentNavBar 特有) 的子视图
-        if ([navBar isKindOfClass:%c(MMMsgContentNavBar)]) {
-            UIView *titleView = [(MMMsgContentNavBar *)navBar navBarTitleView];
-            if (titleView) {
-                for (UIView *sub in titleView.subviews) {
-                    if (![sub isKindOfClass:[MMUILabel class]]) continue;
-                    MMUILabel *label = (MMUILabel *)sub;
-                    if (label.text.length > 0)
-                        [label setText:@""];
-                }
-            }
-        }
-    }
+    ddHideChatNameLabelsIn(self.tipsNavBar);                                       // MMMsgContentNavBar.h:4
+    if ([self.tipsNavBar isKindOfClass:%c(MMMsgContentNavBar)])                    // 名字在 navBarTitleView 容器内
+        ddHideChatNameLabelsIn([(MMMsgContentNavBar *)self.tipsNavBar navBarTitleView]); // .h:11
+    ddHideChatNameLabelsIn(self.tipsNewNavBar);                                    // MMNewMsgContentNavBar.h:4
 }
 %end
 
