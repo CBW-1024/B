@@ -137,10 +137,6 @@
 @interface MMCPLabel : MMUILabel   // MMCPLabel.h:4 (: MMUILabel : UILabel)
 @end
 @interface CBaseContact : NSObject @end
-// ⑫ 用。MMTitleView.h:7 delegate / :14 -setTitle:；m_baseTitleView 见 MMUIViewController.h:10
-@interface MMTitleView : UIView
-@property (weak, nonatomic) id delegate;   // MMTitleView.h:7 (@property id<MMTitleViewDelegate> delegate)
-@end
 
 @protocol TimelineRequestInterceptorImpl <NSObject> @end
 
@@ -782,22 +778,31 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 %end
 
 #pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天 VC，头文件推断，非 WCR)
-// 头文件证据链:
-//   MMUIViewController.h:10  @property MMTitleView *m_baseTitleView;   —— 所有 MMUIViewController 的标题视图
-//   MMTitleView.h:7           @property id<MMTitleViewDelegate> delegate; —— 标题视图的代理(指向持有它的 VC)
-//   MMTitleView.h:14         - (void)setTitle:(id)a0;                  —— 写入主标题(对方显示名)的真正入口
-//   BaseMsgContentViewController.h:1086 - (void)onTitleViewClicked:    —— 证明聊天 VC 正是 MMTitleView 的 delegate
-// 结论: 聊天顶栏名字 = m_baseTitleView(MMTitleView) 经 -setTitle: 写入的 MMUILabel(text=对方显示名)。
-//   故只需 hook MMTitleView -setTitle:，当且仅当 delegate 是聊天 VC 且开关开启时改为空串。
-//   "正在输入"走 -setSubTitle:(MMTitleView.h:15)，按你的要求不处理。
-//   之前 hook setCustomNavBarTitleView:/updateTitleView: 全部失败，缘于那条路径只服务特殊标题栏(如通话条)，
-//   普通聊天的名字走的是标准 m_baseTitleView / MMTitleView -setTitle: —— 此即此前所有失败的根因。
-%hook MMTitleView
-- (void)setTitle:(id)a0 {                                   // MMTitleView.h:14
-    if ([DDWeChatConfig sharedConfig].hideChatName &&
-        [self.delegate isKindOfClass:%c(BaseMsgContentViewController)]) {
-        %orig(@"");
-        return;
+// 真机视图调试器铁证: 聊天顶栏名字 = 导航栏内的一个 MMUILabel(text=对方显示名)，
+//   微信【直接 setText: 写入】，且【不走 MMTitleView -setTitle:】—— 即它由 setCustomNavBarTitleView:
+//   (BaseMsgContentViewController.h:223) 安装的"自定义标题视图"承载，而非标准 m_baseTitleView(MMTitleView)。
+// 因此: hook MMUILabel -setText:，当且仅当该 label 位于【聊天 VC 的导航栏】内时清空，
+//   写入时机/方法一律无关(无论是 updateTitleView: 还是别的路径触发 setText: 都会被拦)。
+//   作用域判定: label 向上找到 UINavigationBar → 其 delegate 即所在 UINavigationController →
+//   topViewController 是 BaseMsgContentViewController 即聊天 VC。
+//   "正在输入"按你的要求不处理(它若在同一 label 也一并清空，符合"放弃对其处理")。
+%hook MMUILabel
+- (void)setText:(id)text {                                  // 聊天顶栏名字经此写入
+    if ([DDWeChatConfig sharedConfig].hideChatName) {
+        UIView *v = self;
+        while (v && ![v isKindOfClass:%c(UINavigationBar)]) {
+            v = v.superview;
+        }
+        if (v) { // 命中导航栏
+            id nav = [(UINavigationBar *)v delegate];
+            if ([nav isKindOfClass:%c(UINavigationController)]) {
+                UIViewController *top = [(UINavigationController *)nav topViewController];
+                if ([top isKindOfClass:%c(BaseMsgContentViewController)]) {
+                    %orig(@"");
+                    return;
+                }
+            }
+        }
     }
     %orig;
 }
