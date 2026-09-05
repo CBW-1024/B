@@ -804,7 +804,7 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 static void ddHideChatNameLabelsIn(UIView *container) {
     if (!container) return;
     for (UIView *sub in container.subviews) {
-        if (![sub isKindOfClass:[MMUILabel class]]) continue;
+        if (![sub isKindOfClass:%c(MMUILabel)]) continue;
         MMUILabel *label = (MMUILabel *)sub;
         if (label.text.length > 0)
             [label setText:@""];
