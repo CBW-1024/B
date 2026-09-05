@@ -137,6 +137,8 @@
 @interface MMCPLabel : MMUILabel   // MMCPLabel.h:4 (: MMUILabel : UILabel)
 @end
 @interface CBaseContact : NSObject @end
+// ⑫ 用。BaseMsgContentViewController.h:4 (: MMUIViewController)
+@interface BaseMsgContentViewController : MMUIViewController @end
 
 @protocol TimelineRequestInterceptorImpl <NSObject> @end
 
@@ -778,33 +780,20 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 %end
 
 #pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天 VC，头文件推断，非 WCR)
-// 真机视图调试器铁证: 聊天顶栏名字 = 导航栏内的一个 MMUILabel(text=对方显示名)，
-//   微信【直接 setText: 写入】，且【不走 MMTitleView -setTitle:】—— 即它由 setCustomNavBarTitleView:
-//   (BaseMsgContentViewController.h:223) 安装的"自定义标题视图"承载，而非标准 m_baseTitleView(MMTitleView)。
-// 因此: hook MMUILabel -setText:，当且仅当该 label 位于【聊天 VC 的导航栏】内时清空，
-//   写入时机/方法一律无关(无论是 updateTitleView: 还是别的路径触发 setText: 都会被拦)。
-//   作用域判定: label 向上找到 UINavigationBar → 其 delegate 即所在 UINavigationController →
-//   topViewController 是 BaseMsgContentViewController 即聊天 VC。
-//   "正在输入"按你的要求不处理(它若在同一 label 也一并清空，符合"放弃对其处理")。
-%hook MMUILabel
-- (void)setText:(id)text {                                  // 聊天顶栏名字经此写入
-    if ([DDWeChatConfig sharedConfig].hideChatName) {
-        UIView *v = self;
-        while (v && ![v isKindOfClass:%c(UINavigationBar)]) {
-            v = v.superview;
-        }
-        if (v) { // 命中导航栏
-            id nav = [(UINavigationBar *)v delegate];
-            if ([nav isKindOfClass:%c(UINavigationController)]) {
-                UIViewController *top = [(UINavigationController *)nav topViewController];
-                if ([top isKindOfClass:%c(BaseMsgContentViewController)]) {
-                    %orig(@"");
-                    return;
-                }
-            }
-        }
-    }
+// 头文件: BaseMsgContentViewController.h:223 -setCustomNavBarTitleView: 安装"自定义标题视图"，
+//   该视图内含名字 MMUILabel(真机视图调试器证实: 直接 setText: 写入、不走 MMTitleView -setTitle:)。
+// 方案: 在标题视图【安装那一刻】将其整体 hidden=YES。优点:
+//   1) 不 hook 任何 UILabel，零性能开销；2) 视图永不显示文本 → 无"闪一下"；
+//   3) 作用域天然仅限聊天 VC(本 hook 即 %hook BaseMsgContentViewController)，不影响其它界面(返回键等不受影响)。
+//   此前 hook MMUILabel -setText: 之所以闪且影响其它界面，是全局拦截 + 过渡期 topViewController 判定歧义所致。
+//   (若某版微信名字不走 setCustomNavBarTitleView: 而由别的路径写入，此单一 hook 即失效——届时据真机再追安装点。)
+%hook BaseMsgContentViewController
+- (void)setCustomNavBarTitleView:(id)view {                 // BaseMsgContentViewController.h:223
     %orig;
+    if (![DDWeChatConfig sharedConfig].hideChatName) return;
+    if ([view isKindOfClass:%c(UIView)]) {
+        [(UIView *)view setHidden:YES];                     // 整视图隐藏，名字永不可见，无闪现
+    }
 }
 %end
 
