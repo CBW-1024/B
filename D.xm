@@ -136,6 +136,9 @@
 @interface MMUILabel : UILabel @end
 @interface MMCPLabel : MMUILabel   // MMCPLabel.h:4 (: MMUILabel : UILabel)
 @end
+@interface MMTitleView : MMBarItemCustomView   // MMTitleView.h:2 (: MMBarItemCustomView : UIView)
+- (void)setTitle:(id)arg1;                     // MMTitleView.h —— 主标题(名字)
+@end
 @interface CBaseContact : NSObject @end
 @protocol TimelineRequestInterceptorImpl <NSObject> @end
 
@@ -270,6 +273,7 @@ static const BOOL kDDDefaultHideChatName      = NO;
 // ⑥ 评论防删：被删评论显示时拼接的前缀文案(对齐 WCR momentsDeletedMarkText，默认"[已删除]")
 static NSString * const kDDDefaultDeletedMark = @"[已删除]";
 static const void *kDDWasDeletedKey = &kDDWasDeletedKey;
+static const void *kDDIsChatTitleKey = &kDDIsChatTitleKey;   // 标记"聊天 VC 的标题视图实例"，用于 ⑫ 只藏名字
 static NSString *ddDeletedMarkText(void) {
     NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kDDWADeletedCommentMark];
     return (t.length ? t : kDDDefaultDeletedMark);
@@ -783,36 +787,56 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 }
 %end
 
-#pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天会话界面 BaseMsgContentViewController)
+#pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天会话界面 BaseMsgContentViewController，只藏名字、保留"正在输入")
 // WCR 证据:
 //   BaseMsgContentViewController: updateTitleView: 与 updateTitleView:ignoreAnimation: 都 hook
 //   头文件: BaseMsgContentViewController.h:986 -updateTitleView: / MMUIViewController.h:520 -titleView
-// 范围收敛: 早期还 hook 了 MMTitleView -layoutSubviews 做全局隐藏，但 MMTitleView 是通用导航标题视图
-//   (联系人/设置等所有界面复用)，会把非聊天界面的标题也藏掉。改为仅在聊天会话 VC 内隐藏:
-//   1) updateTitleView: 两变体在 %orig 后把 titleView.hidden=YES(微信一设标题即隐藏)；
-//   2) viewDidLayoutSubviews 重申隐藏(聊天界面键盘起落频繁触发，覆盖微信内部重新显示标题的情况)。
-//   其它界面完全不受影响。
+// 只藏名字、不连带"正在输入": MMTitleView.h 暴露 setTitle:(主标题=名字) 与 setSubTitle:(副标题=状态/正在输入)
+//   两个独立文本槽，故只拦 setTitle: 传空即可藏名字，而 setSubTitle:(对方正在输入…) 完全不动。
+//   范围收敛: MMTitleView 是通用导航标题视图(联系人/设置等所有界面复用)，故不能全局清。改为【实例级限定】——
+//   在聊天 VC 的 updateTitleView:/viewDidLayoutSubviews 给 self.titleView 打关联对象标记 kDDIsChatTitleKey，
+//   仅对带标记的 MMTitleView 实例清空主标题；其它界面的 MMTitleView setTitle: 一律透传，不受影响。
 %hook BaseMsgContentViewController
 - (void)updateTitleView:(id)arg1 {
     %orig;
     if ([DDWeChatConfig sharedConfig].hideChatName) {
         UIView *tv = [self titleView];
-        if ([tv isKindOfClass:[UIView class]]) tv.hidden = YES;
+        if ([tv isKindOfClass:[UIView class]])
+            objc_setAssociatedObject(tv, kDDIsChatTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 - (void)updateTitleView:(id)arg1 ignoreAnimation:(_Bool)arg2 {
     %orig;
     if ([DDWeChatConfig sharedConfig].hideChatName) {
         UIView *tv = [self titleView];
-        if ([tv isKindOfClass:[UIView class]]) tv.hidden = YES;
+        if ([tv isKindOfClass:[UIView class]])
+            objc_setAssociatedObject(tv, kDDIsChatTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 - (void)viewDidLayoutSubviews {
     %orig;
     if ([DDWeChatConfig sharedConfig].hideChatName) {
         UIView *tv = [self titleView];
-        if ([tv isKindOfClass:[UIView class]]) tv.hidden = YES;
+        if ([tv isKindOfClass:[UIView class]]) {
+            objc_setAssociatedObject(tv, kDDIsChatTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            // 保底清主标题(名字)，覆盖首帧 setTitle 早于标记的情形；副标题(正在输入)不受影响
+            Class tcls = objc_getClass("MMTitleView");
+            if (tcls && [tv isKindOfClass:tcls]) [(MMTitleView *)tv setTitle:@""];
+        }
     }
+}
+%end
+
+// 只藏名字: 仅对"带聊天标记"的 MMTitleView 实例清空主标题，副标题(对方正在输入…)保留；
+// MMTitleView 作为通用标题视图，在联系人/设置等界面的 setTitle: 因无标记而完全透传。
+%hook MMTitleView
+- (void)setTitle:(id)arg1 {
+    if ([DDWeChatConfig sharedConfig].hideChatName &&
+        objc_getAssociatedObject(self, kDDIsChatTitleKey)) {
+        %orig(@"");   // 只清名字(主标题)，保留副标题(正在输入)
+        return;
+    }
+    %orig;
 }
 %end
 
