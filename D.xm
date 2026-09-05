@@ -780,38 +780,37 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 %end
 
 #pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天 VC，头文件推断，非 WCR)
-// 回到"修正在输入之前"的版本: BaseMsgContentViewController 类级方法(头文件推断，非 WCR)。
-//   BaseMsgContentViewController.h:223 -setCustomNavBarTitleView: 安装"自定义标题视图"(内含名字 MMUILabel)；
-//   .h:396/398 -updateTitleView: 两个变体在写入后清空该视图内的 MMUILabel。
-//   故: setCustomNavBarTitleView: 记录视图(无条件，修掉"开开关前已加载 VC 则抓不到"的旧 bug)，
-//       updateTitleView: 两个变体在写入后清空其内部 MMUILabel。
-//   不碰"正在输入"(按你要求放弃对其处理)、不加任何兜底(viewDidLayoutSubviews 之类一概不要)。
-static const void *kDDNavTitleViewKey = &kDDNavTitleViewKey;
-static void ddClearNavBarName(UIView *view) {
-    if (!view) return;
-    for (UIView *sub in view.subviews) {
-        if ([sub isKindOfClass:%c(MMUILabel)]) {
-            MMUILabel *label = (MMUILabel *)sub;
-            if (label.text.length > 0) [label setText:@""];
-        } else {
-            ddClearNavBarName(sub);
-        }
+// 目标: 隐藏导航栏标题区域文字("群聊(2)" / "陈某人")——即 topItem.titleView 内的 MMUILabel。
+// 真机截图证实: 该区域 = 导航栏中间的 titleView(含文字 + 右侧铃铛图标)，1 对 1 和群聊都走同一路径。
+// setCustomNavBarTitleView:/updateTitleView: 类级方法已两次实测无效(#4 hidden 整视图无效果、3-hook 清内部 label 也无效)，
+//   证明名字不由那条路径安装。#3 全局 MMUILabel -setText: 你亲眼看到藏住了名字(仅嫌闪/误清/性能)，
+//   故回到该机制，收紧作用域到【topItem.titleView 子视图】以消除副作用。
+// 判定: label 向上找 UINavigationBar → 取 topItem → titleView 存在且 self 是其子视图 → 命中。
+//   用 topItem.viewController 判定聊天 VC(避免返回过渡期误判其它界面)。
+// 不碰"正在输入"、不加任何兜底。
+static BOOL ddIsChatNavTitleLabel(MMUILabel *label) {
+    UIView *v = label;
+    while (v && ![v isKindOfClass:%c(UINavigationBar)]) v = v.superview;
+    if (!v) return NO;
+    UINavigationItem *top = [(UINavigationBar *)v topItem];
+    if (![top.viewController isKindOfClass:%c(BaseMsgContentViewController)]) return NO;
+    UIView *tv = top.titleView;
+    return tv && [label isDescendantOfView:tv];             // 只命中 titleView 区域(圈住的那块)
+}
+%hook MMUILabel
+- (void)setText:(id)text {
+    if ([DDWeChatConfig sharedConfig].hideChatName && ddIsChatNavTitleLabel(self)) {
+        %orig(@"");
+        return;
     }
-}
-%hook BaseMsgContentViewController
-- (void)setCustomNavBarTitleView:(id)view {                 // BaseMsgContentViewController.h:223
     %orig;
-    objc_setAssociatedObject(self, kDDNavTitleViewKey, view, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 无条件记录
 }
-- (void)updateTitleView:(id)a0 {                            // BaseMsgContentViewController.h:396
+- (void)setAttributedText:(id)text {
+    if ([DDWeChatConfig sharedConfig].hideChatName && ddIsChatNavTitleLabel(self)) {
+        %orig([[NSAttributedString alloc] initWithString:@""]);
+        return;
+    }
     %orig;
-    if (![DDWeChatConfig sharedConfig].hideChatName) return;
-    ddClearNavBarName(objc_getAssociatedObject(self, kDDNavTitleViewKey));
-}
-- (void)updateTitleView:(id)a0 ignoreAnimation:(_Bool)a1 { // BaseMsgContentViewController.h:398
-    %orig;
-    if (![DDWeChatConfig sharedConfig].hideChatName) return;
-    ddClearNavBarName(objc_getAssociatedObject(self, kDDNavTitleViewKey));
 }
 %end
 
