@@ -136,10 +136,26 @@
 @interface MMUILabel : UILabel @end
 @interface MMCPLabel : MMUILabel   // MMCPLabel.h:4 (: MMUILabel : UILabel)
 @end
-@interface MMTitleView : MMBarItemCustomView   // MMTitleView.h:2 (: MMBarItemCustomView : UIView)
-- (void)setTitle:(id)arg1;                     // MMTitleView.h —— 主标题(名字)
-@end
 @interface CBaseContact : NSObject @end
+
+// ⑫ 隐藏聊天顶栏名字(头文件推断，非 WCR)
+// 真机视图调试器证实: 聊天顶栏名字由导航栏内部的一个 MMUILabel 直接渲染(text=对方名字)，
+//   不走 MMTitleView -setTitle: 路径。故直接在聊天 VC 的布局周期内清空该 label。
+// 头文件锚点:
+//   BaseMsgContentViewController.h:137 tipsNavBar(MMMsgContentNavBar, 含 navBarTitleView:UIView)
+//   BaseMsgContentViewController.h:138 tipsNewNavBar(MMNewMsgContentNavBar, initWithFrame:navBarHeight:userName:)
+//   MMMsgContentNavBar.h:11  navBarTitleView
+//   MMNewMsgContentNavBar.h:26 nsUserName
+@interface BaseMsgContentViewController : MMUIViewController   // BaseMsgContentViewController.h:4
+@property (retain, nonatomic) MMMsgContentNavBar *tipsNavBar;          // BaseMsgContentViewController.h:137
+@property (retain, nonatomic) MMNewMsgContentNavBar *tipsNewNavBar;    // BaseMsgContentViewController.h:138
+@end
+@interface MMMsgContentNavBar : UIView                                 // MMMsgContentNavBar.h:4
+@property (retain, nonatomic) UIView *navBarTitleView;                 // MMMsgContentNavBar.h:11
+@end
+@interface MMNewMsgContentNavBar : UIView                               // MMNewMsgContentNavBar.h:4
+@end
+
 @protocol TimelineRequestInterceptorImpl <NSObject> @end
 
 @interface CContact : CBaseContact
@@ -204,13 +220,6 @@
 @property (nonatomic, retain) UILabel *detailLabel;  // WASettingAccountCell.h:7
 @end
 
-// ⑫ 隐藏聊天顶栏名字
-@interface BaseMsgContentViewController : MMUIViewController   // BaseMsgContentViewController.h:4
-- (void)updateTitleView:(id)arg1;                             // BaseMsgContentViewController.h:396 —— ⑫ 头文件推断(非 WCR)
-- (void)updateTitleView:(id)arg1 ignoreAnimation:(_Bool)arg2; // BaseMsgContentViewController.h:398 —— ⑫ 头文件推断(非 WCR)
-- (id)titleView;                                              // MMUIViewController.h:148 —— 取标题视图实例(⑫ 头文件推断，非 WCR)
-@end
-
 // ① 首页下拉小程序
 @interface NewMainFrameViewController : MMTabBarBaseViewController   // NewMainFrameViewController.h:4
 - (void)initTableHeaderView;                         // NewMainFrameViewController.h:314
@@ -273,7 +282,6 @@ static const BOOL kDDDefaultHideChatName      = NO;
 // ⑥ 评论防删：被删评论显示时拼接的前缀文案(对齐 WCR momentsDeletedMarkText，默认"[已删除]")
 static NSString * const kDDDefaultDeletedMark = @"[已删除]";
 static const void *kDDWasDeletedKey = &kDDWasDeletedKey;
-static const void *kDDIsChatTitleKey = &kDDIsChatTitleKey;   // 标记"聊天 VC 的标题视图实例"，用于 ⑫ 只藏名字
 static NSString *ddDeletedMarkText(void) {
     NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kDDWADeletedCommentMark];
     return (t.length ? t : kDDDefaultDeletedMark);
@@ -787,57 +795,49 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 }
 %end
 
-#pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天会话界面 BaseMsgContentViewController，只藏名字、保留"正在输入")
-// 说明: 此功能为推断实现(已查证 WCR 的 impstr.pkl 中并无 MMTitleView / BaseMsgContentViewController 名字文本相关 hook，
-//   故无 WCR 反汇编真证，仅锚定 8.0.76 头文件符号)。
-//   头文件锚点: BaseMsgContentViewController.h:396/398 -updateTitleView: / MMUIViewController.h:148 -titleView；
-//   MMTitleView.h:14-15 暴露 setTitle:(主标题=名字) 与 setSubTitle:(副标题=状态/正在输入) 两个独立文本槽。
-//   机制: 只拦 setTitle: 传空即可藏名字，setSubTitle:(对方正在输入…) 完全不动。
-//   范围收敛: MMTitleView 是通用导航标题视图(联系人/设置等所有界面复用)，故用【实例级标记】限定——
-//   在聊天 VC 的 updateTitleView:/viewDidLayoutSubviews 给 self.titleView 打关联对象标记 kDDIsChatTitleKey，
-//   仅对带标记的 MMTitleView 实例清空主标题；其它界面的 MMTitleView setTitle: 一律透传，不受影响。
+#pragma mark - ⑫ 隐藏聊天顶栏名字
+// 真机视图调试器证据(8.0.76): 聊天顶栏名字由导航栏内部的一个 MMUILabel 直接渲染，
+//   实例描述: <MMUILabel: 0x406603b80; baseClass = UILabel; frame = (-8 0; 17 36);
+//   text = '陈'; userInteractionEnabled = NO> —— 即微信直接给该 label setText: 写入对方显示名。
+//
+// 根因: 之前 hook MMTitleView -setTitle: 整条路径无效，因为聊天界面使用的
+//   MMNewMsgContentNavBar(initWithFrame:navBarHeight:userName:) / MMMsgContentNavBar(navBarTitleView)
+//   自定义导航栏内部自行渲染名字，不经过 MMTitleView。
+//
+// 方案: 在 BaseMsgContentViewController 的布局周期内，遍历两个自定义导航栏的 subviews，
+//   找到 text 非空的 MMUILabel 并清空其 text。每次布局都执行，确保微信重新设名后仍被清除。
+//   不处理"正在输入"(用户明确放弃该分支)。
 %hook BaseMsgContentViewController
-- (void)updateTitleView:(id)arg1 {
-    // 先打标记再 %orig: 微信只在 %orig 内部设一次主标题(MMTitleView -setTitle:)，
-    // 标记须先于设置，下方 hook 才拦得到那次 setTitle:，名字才藏得住。
-    if ([DDWeChatConfig sharedConfig].hideChatName) {
-        UIView *tv = [self titleView];
-        if ([tv isKindOfClass:[UIView class]])
-            objc_setAssociatedObject(tv, kDDIsChatTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    %orig;
-}
-- (void)updateTitleView:(id)arg1 ignoreAnimation:(_Bool)arg2 {
-    if ([DDWeChatConfig sharedConfig].hideChatName) {
-        UIView *tv = [self titleView];
-        if ([tv isKindOfClass:[UIView class]])
-            objc_setAssociatedObject(tv, kDDIsChatTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    %orig;
-}
 - (void)viewDidLayoutSubviews {
     %orig;
-    if ([DDWeChatConfig sharedConfig].hideChatName) {
-        UIView *tv = [self titleView];
-        if ([tv isKindOfClass:[UIView class]]) {
-            // 仅打标记(不在此主动调 setTitle:，否则 layout 递归->栈溢出闪退)。
-            // 名字清空交给下方 MMTitleView -setTitle: hook 在微信渲染名字时自然拦截。
-            objc_setAssociatedObject(tv, kDDIsChatTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (![DDWeChatConfig sharedConfig].hideChatName) return;
+
+    // 遍历两个自定义导航栏，清空其中渲染名字的 MMUILabel
+    NSArray *navBars = @[
+        self.tipsNavBar,     // MMMsgContentNavBar  (BaseMsgContentViewController.h:137)
+        self.tipsNewNavBar   // MMNewMsgContentNavBar (BaseMsgContentViewController.h:138)
+    ];
+    for (UIView *navBar in navBars) {
+        if (!navBar) continue;
+        for (UIView *sub in navBar.subviews) {
+            if (![sub isKindOfClass:[MMUILabel class]]) continue;
+            MMUILabel *label = (MMUILabel *)sub;
+            if (label.text.length > 0)
+                [label setText:@""];
+        }
+        // 同时检查 navBarTitleView(MMMsgContentNavBar 特有) 的子视图
+        if ([navBar isKindOfClass:%c(MMMsgContentNavBar)]) {
+            UIView *titleView = [(MMMsgContentNavBar *)navBar navBarTitleView];
+            if (titleView) {
+                for (UIView *sub in titleView.subviews) {
+                    if (![sub isKindOfClass:[MMUILabel class]]) continue;
+                    MMUILabel *label = (MMUILabel *)sub;
+                    if (label.text.length > 0)
+                        [label setText:@""];
+                }
+            }
         }
     }
-}
-%end
-
-// 只藏名字: 仅对"带聊天标记"的 MMTitleView 实例清空主标题，副标题(对方正在输入…)保留；
-// MMTitleView 作为通用标题视图，在联系人/设置等界面的 setTitle: 因无标记而完全透传。
-%hook MMTitleView
-- (void)setTitle:(id)arg1 {
-    if ([DDWeChatConfig sharedConfig].hideChatName &&
-        objc_getAssociatedObject(self, kDDIsChatTitleKey)) {
-        %orig(@"");   // 只清名字(主标题)，保留副标题(正在输入)
-        return;
-    }
-    %orig;
 }
 %end
 
