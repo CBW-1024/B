@@ -780,20 +780,38 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 %end
 
 #pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天 VC，头文件推断，非 WCR)
-// 头文件: BaseMsgContentViewController.h:223 -setCustomNavBarTitleView: 安装"自定义标题视图"，
-//   该视图内含名字 MMUILabel(真机视图调试器证实: 直接 setText: 写入、不走 MMTitleView -setTitle:)。
-// 方案: 在标题视图【安装那一刻】将其整体 hidden=YES。优点:
-//   1) 不 hook 任何 UILabel，零性能开销；2) 视图永不显示文本 → 无"闪一下"；
-//   3) 作用域天然仅限聊天 VC(本 hook 即 %hook BaseMsgContentViewController)，不影响其它界面(返回键等不受影响)。
-//   此前 hook MMUILabel -setText: 之所以闪且影响其它界面，是全局拦截 + 过渡期 topViewController 判定歧义所致。
-//   (若某版微信名字不走 setCustomNavBarTitleView: 而由别的路径写入，此单一 hook 即失效——届时据真机再追安装点。)
+// 回到"修正在输入之前"的版本: BaseMsgContentViewController 类级方法(头文件推断，非 WCR)。
+//   BaseMsgContentViewController.h:223 -setCustomNavBarTitleView: 安装"自定义标题视图"(内含名字 MMUILabel)；
+//   .h:396/398 -updateTitleView: 两个变体在写入后清空该视图内的 MMUILabel。
+//   故: setCustomNavBarTitleView: 记录视图(无条件，修掉"开开关前已加载 VC 则抓不到"的旧 bug)，
+//       updateTitleView: 两个变体在写入后清空其内部 MMUILabel。
+//   不碰"正在输入"(按你要求放弃对其处理)、不加任何兜底(viewDidLayoutSubviews 之类一概不要)。
+static const void *kDDNavTitleViewKey = &kDDNavTitleViewKey;
+static void ddClearNavBarName(UIView *view) {
+    if (!view) return;
+    for (UIView *sub in view.subviews) {
+        if ([sub isKindOfClass:%c(MMUILabel)]) {
+            MMUILabel *label = (MMUILabel *)sub;
+            if (label.text.length > 0) [label setText:@""];
+        } else {
+            ddClearNavBarName(sub);
+        }
+    }
+}
 %hook BaseMsgContentViewController
 - (void)setCustomNavBarTitleView:(id)view {                 // BaseMsgContentViewController.h:223
     %orig;
+    objc_setAssociatedObject(self, kDDNavTitleViewKey, view, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 无条件记录
+}
+- (void)updateTitleView:(id)a0 {                            // BaseMsgContentViewController.h:396
+    %orig;
     if (![DDWeChatConfig sharedConfig].hideChatName) return;
-    if ([view isKindOfClass:%c(UIView)]) {
-        [(UIView *)view setHidden:YES];                     // 整视图隐藏，名字永不可见，无闪现
-    }
+    ddClearNavBarName(objc_getAssociatedObject(self, kDDNavTitleViewKey));
+}
+- (void)updateTitleView:(id)a0 ignoreAnimation:(_Bool)a1 { // BaseMsgContentViewController.h:398
+    %orig;
+    if (![DDWeChatConfig sharedConfig].hideChatName) return;
+    ddClearNavBarName(objc_getAssociatedObject(self, kDDNavTitleViewKey));
 }
 %end
 
