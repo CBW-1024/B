@@ -43,6 +43,26 @@
 //      渲染点由 FakeHeadImageView 改为 MMUILongPressImageView -setImage:(IMP 0x373e0c/0x372bfc)，
 //      取 superview(MMHeadImageView) 的 getRealUserName: 命中后换图(WCR 真证)。
 //
+//  v2.3.0 续修(对齐用户真机截图 + WCR 反汇编，修正 ① ③ ⑥ 三处与 WCR 行为不一致):
+//    - ⑥「朋友圈评论防删」彻底重写：保留 bDeleted=NO(评论仍可见，WCR 0x610410 同)的前提下，
+//      在 WCCommentView +getDisplayCommentContent:dataItem:pageContext:(WCCommentView.h:35) 与
+//      WCCommentListContentView +getDisplayContent:dataItem:pageContext:(WCCommentListContentView.h:30)
+//      两处评论显示文本计算点，对真实被删的评论拼接前缀文案(默认"[已删除]"，对齐 WCR
+//      momentsDeletedMarkText)，显示为"[已删除]xxx"；而非裸显示被删内容。
+//      真实已删态只用头文件原生声明的 bDeleted / deletedByFeedOwner 两个 property 判定：
+//      WCUserComment 钩子经原生 getter(%orig) 取到真实值后暂存，渲染处直接读，不猜 ivar、不加兜底。
+//      两页都覆盖后，朋友圈流与"评论提示/通知详情页"格式一致对齐 WCR。
+//    - ①「禁用首页下拉小程序」修正：不再跳过 initTableHeaderView/initTableHeaderTopView(WCR 不跳过，
+//      否则搜索栏消失、下拉手感怪)；改为让原生初始化照常进行，再 hook
+//      setTableHeaderTopViewHiddenIfNotLimitedMode:(WCR rep 0x8b7944，强制 hidden=YES) 与
+//      mainPullDown:(WCR rep 0x8b79b4，"展开"参数时直接 return 不显示面板)，并把
+//      showTableHeaderTopViewByPullDown:/startDragToShow/showTableHeaderTopView:fromScene: 一并拦截，
+//      仅藏起小程序面板、保留自然下拉手感。
+//    - ③「禁用朋友圈谁可以见图标」修正：隐藏点由 layoutSubviews(setHidden:YES 会留空白占位)改为
+//      WCR 真实 hook 点 initPrivacyButton:(WCR rep 0x656258)，按 0x65650c 做 setImage:nil +
+//      setAlpha:0 + setUserInteractionEnabled:NO，并 removeFromSuperview 保底消去预留空白
+//      (对应 WCR 0x656764 的重排视觉效果)。
+//
 //  【重要】功能 ⑨「禁用聊天文字折叠」已移除：
 //          WCR 的 1384 个 hook 中不存在任何 fold/FullText 相关目标，
 //          TextMessageViewModel 只被 hook 了 isShowSourceView(与折叠无关)。
@@ -120,8 +140,22 @@
 
 @interface WCSNSMessage : NSObject
 @property (nonatomic) unsigned int delStatus;         // WCSNSMessage.h: (delStatus 属性)
+@property (retain, nonatomic) WCUserComment *comment; // WCSNSMessage.h:8 —— 评论本体(通知/评论列表页文本源)
 - (void)upgradeDataIfNeeded;                          // WCSNSMessage.h:36
 - (_Bool)isWCMessageDeleted;                          // WCSNSMessage.h:19 —— WCR hook 之
+@end
+
+// ⑥ 评论显示文本计算点(WCCommentView.h:35)。WCR 的"[已删除]"前缀即加在评论显示文本上，
+//    本插件在此处对齐 WCR：把被删评论显示为"[已删除]xxx"，而非裸显示被删内容。
+@interface WCCommentView : NSObject
++ (id)getDisplayCommentContent:(id)a0 dataItem:(id)a1 pageContext:(id)a2;  // WCCommentView.h:35
+@end
+
+// ⑥ 评论列表/通知详情页(由 WCSNSMessage 展开的那一页)的评论文本计算点(WCCommentListContentView.h:30)。
+//    这一页走的是 getDisplayContent: 而非 WCCommentView 的 getDisplayCommentContent:，
+//    所以 ⑥ 的前缀必须在这里也加一次，否则"朋友圈评论提示"里被删评论仍裸显示。
+@interface WCCommentListContentView : UIView
++ (id)getDisplayContent:(id)a0 dataItem:(id)a1 pageContext:(id)a2;  // WCCommentListContentView.h:30
 @end
 
 // ⑦ 自定义头像 —— 宿主页与渲染点见下方 hook 注释(均锚定 WCR 反汇编真证)
@@ -209,6 +243,7 @@
 #define kDDWATextFold          @"kDDWA_disableSnsTextFold"
 #define kDDWAGroupFold         @"kDDWA_disableSnsGroupFold"
 #define kDDWADeletedComment    @"kDDWA_antiDeleteSnsComment"
+#define kDDWADeletedCommentMark @"kDDWA_deletedCommentMark"   // ⑥ 前缀文案(对齐 WCR momentsDeletedMarkText)
 #define kDDWACustomAvatar      @"kDDWA_enableCustomAvatar"
 #define kDDWAVideoTapClose     @"kDDWA_disableSnsVideoTapClose"
 #define kDDWAHideFriendWxid    @"kDDWA_hideFriendWxid"
@@ -228,6 +263,14 @@ static const BOOL kDDDefaultVideoTapClose     = NO;
 static const BOOL kDDDefaultHideFriendWxid    = NO;
 static const BOOL kDDDefaultHideMyWxid        = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
+
+// ⑥ 评论防删：被删评论显示时拼接的前缀文案(对齐 WCR momentsDeletedMarkText，默认"[已删除]")
+static NSString * const kDDDefaultDeletedMark = @"[已删除]";
+static const void *kDDWasDeletedKey = &kDDWasDeletedKey;
+static NSString *ddDeletedMarkText(void) {
+    NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kDDWADeletedCommentMark];
+    return (t.length ? t : kDDDefaultDeletedMark);
+}
 
 @interface DDWeChatConfig : NSObject
 + (instancetype)sharedConfig;
@@ -266,6 +309,7 @@ static const BOOL kDDDefaultHideChatName      = NO;
         kDDWAHideFriendWxid: @(kDDDefaultHideFriendWxid),
         kDDWAHideMyWxid:     @(kDDDefaultHideMyWxid),
         kDDWAHideChatName:   @(kDDDefaultHideChatName),
+        kDDWADeletedCommentMark: kDDDefaultDeletedMark,
     }];
 }
 - (instancetype)init {
@@ -299,15 +343,48 @@ static const BOOL kDDDefaultHideChatName      = NO;
 @end
 
 #pragma mark - ① 禁用首页下拉小程序
-// WCR 证据: hook NewMainFrameViewController 的 initTableHeaderView 与 initTableHeaderTopView。
-//   头文件 NewMainFrameViewController.h:290 -initTableHeaderView, :425 -initTableHeaderTopView
-//   不创建下拉露出的面板视图即达效果(不动发现页小程序入口)。
+// WCR 证据(NewMainFrameViewController 安装函数 0x8b3928 起的一整片 MSHookMessageEx):
+//   setTableHeaderTopViewHiddenIfNotLimitedMode: rep 0x8b7944 —— 开关命中即强制 hidden=YES；
+//   mainPullDown: rep 0x8b79b4 —— 开关命中且"展开"参数为 YES 时直接 return 不显示面板；
+//   另 hook showTableHeaderTopViewByPullDown:/startDragToShow/showTableHeaderTopView:fromScene:
+//   以及 WCSearchBar 样式，目的是【保留搜索栏与自然下拉手感】，只是不露出小程序面板。
+//   头文件 NewMainFrameViewController.h:180 setTableHeaderTopViewHiddenIfNotLimitedMode: /
+//   :198 mainPullDown: / :165 showTableHeaderTopViewByPullDown: / :184 startDragToShow /
+//   :196 showTableHeaderTopView:fromScene: / :179 initTableHeaderTopView / :314 initTableHeaderView
+//   关键修正: 不再跳过 initTableHeaderView / initTableHeaderTopView(否则搜索栏消失、下拉手感怪)，
+//            改为让原生初始化照常进行，再用下面 hook 把露出的面板藏起来。
 %hook NewMainFrameViewController
+- (void)initTableHeaderView {
+    %orig;   // 保留搜索栏与自然布局(WCR 不跳过)
+}
 - (void)initTableHeaderTopView {
+    %orig;   // 同上
+}
+// 强制把下拉露出的顶部面板置为隐藏(对齐 WCR 0x8b7944)
+- (void)setTableHeaderTopViewHiddenIfNotLimitedMode:(BOOL)arg1 {
+    if ([DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram) {
+        %orig(YES);   // 始终隐藏：不露出小程序面板
+        return;
+    }
+    %orig;
+}
+// 下拉手势"展开"时(参数=YES)若开关开启则不显示面板(对齐 WCR 0x8b79b4)
+- (void)mainPullDown:(BOOL)arg1 {
+    if ([DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram && arg1) {
+        return;   // 不调原生，面板不出现；其余下拉逻辑保持自然
+    }
+    %orig;
+}
+// 其余露出入口一并拦截(对齐 WCR 同批 hook)
+- (void)showTableHeaderTopViewByPullDown:(unsigned long long)arg1 {
     if ([DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram) return;
     %orig;
 }
-- (void)initTableHeaderView {
+- (void)startDragToShow {
+    if ([DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram) return;
+    %orig;
+}
+- (void)showTableHeaderTopView:(BOOL)arg1 fromScene:(unsigned long long)arg2 {
     if ([DDWeChatConfig sharedConfig].disableHomePullDownMiniProgram) return;
     %orig;
 }
@@ -327,27 +404,36 @@ static const BOOL kDDDefaultHideChatName      = NO;
 %end
 
 #pragma mark - ③ 禁用朋友圈谁可以见图标
-// WCR 证据(IMP 0x656168): hook WCTimeLineCellView +instancesRespondToSelector:，
-//   内部 bl 0x656358 读开关 -> tbnz 命中后 adrp x1 "m_privacyButton" -> bl 0x6563c8 隐藏。
-//   即 WCR 把这个类方法当高频触发点，反复按名字取按钮并隐藏。
-// 本实现: 以 layoutSubviews(:260) 为主(可直接拿到实例，按 ivar 名隐藏，覆盖复用/重设)；
-//   ivar 证据 WCTimeLineCellView.h:26 MMUIButton *m_privacyButton
+// WCR 证据(WCTimeLineCellView 安装函数 0x656104 起):
+//   initPrivacyButton: rep 0x656258 —— 读配置 momentsDisablePrivacyIconEnabled(门 0x656358)，
+//   命中后取 m_privacyButton(0x6563c8) 调 0x65650c: setImage:nil forState:0 / setAlpha:0 /
+//   setUserInteractionEnabled:NO，随后 0x656764 重排布局消去预留空白。
+//   ivar 证据 WCTimeLineCellView.h:12 MMUIButton *m_privacyButton；
+//   方法 WCTimeLineCellView.h:167 -initPrivacyButton:(id)a0。
+//   关键修正: 不再用 setHidden:YES(会在布局里留下空白占位)，改为对齐 WCR 的 alpha=0 + 清图 +
+//   禁交互，并 removeFromSuperview 保底消去预留空间(对应 WCR 0x656764 的重排视觉效果)。
 %hook WCTimeLineCellView
-// ③ 禁用朋友圈"谁可以看"图标
-- (void)layoutSubviews {
+- (void)initPrivacyButton:(id)arg1 {
     %orig;
     if ([DDWeChatConfig sharedConfig].disableSnsPrivacyIcon) {
         // WCTimeLineCellView.h:12 -> MMUIButton *m_privacyButton (ivar 走运行时偏移，不在此声明)
         MMUIButton *btn = MSHookIvar<MMUIButton *>(self, "m_privacyButton");
-        if (btn) [btn setHidden:YES];
+        if (btn) {
+            [btn setImage:nil forState:0];
+            [btn setAlpha:0.0];
+            [btn setUserInteractionEnabled:NO];
+            [btn removeFromSuperview];   // 消去预留空白(对齐 WCR 0x656764 重排的视觉效果)
+        }
     }
 }
+%end
 
 // ④ 禁用朋友圈文字自动折叠
 // 头文件 WCTimeLineCellView.h:98 +shouldShowFullTextButtonWithDataItem:
 // 返回 NO -> 不显示"全文"按钮，内容按全文展示。
 // 注: WCR 的 1384 个 hook 中未定位到 fold / FullText 相关目标，
 //     本目标为按头文件推断，用户确认 WCR 具备该功能但二进制内未定位到实现，保留待验证。
+%hook WCTimeLineCellView
 + (_Bool)shouldShowFullTextButtonWithDataItem:(id)arg1 {
     if ([DDWeChatConfig sharedConfig].disableSnsTextFold) return NO;
     return %orig;
@@ -364,22 +450,35 @@ static const BOOL kDDDefaultHideChatName      = NO;
 }
 %end
 
-#pragma mark - ⑥ 朋友圈评论防删 (WCR 真证，hook getter 返回 NO)
-// WCR 证据:
-//   WCUserComment -bDeleted          IMP 0x610410: 读开关 -> tbz 未命中走原实现；
-//                                    命中则 mov w8,#0 -> 直接【返回 NO】(假装未删除)
+#pragma mark - ⑥ 朋友圈评论防删 (对齐 WCR：保留可见 + 显示"[已删除]"前缀)
+// WCR 真证:
+//   WCUserComment -bDeleted          IMP 0x610410: 读开关 -> 命中则 mov w8,#0 直接【返回 NO】(保留可见)
 //   WCUserComment -deletedByFeedOwner 同模式
-//   WCSNSMessage  -isWCMessageDeleted (WCSNSMessage.h:38, 返回 _Bool) 同模式
+//   WCSNSMessage  -isWCMessageDeleted (WCSNSMessage.h:19) 同模式
 //   WCSNSMessage  -upgradeDataIfNeeded (WCSNSMessage.h:36) 一并 hook
-// 头文件: WCUserComment.h:119 bDeleted(:16 _bDeleted) / :112 deletedByFeedOwner(:17)
+//   前缀文案来自 WCR 配置项 momentsDeletedMarkText(默认"[已删除]"，见 WCR 设置项"已删除内容/自定义标记文案")。
+//   帖子级 WCR 在 WCDataItem -contentDesc (IMP 0x610d7c) 命中 isDataItemMarkedDeleted: 且
+//   momentsAntiDeleteMarkDeletedEnabled 时，用 momentsDeletedMarkText 拼到原文前；
+//   评论级走 WCCommentView +getDisplayCommentContent:dataItem:pageContext: (WCCommentView.h:35) 这一
+//   显示文本计算点——本插件在此处对齐 WCR：把被删评论显示为"[已删除]xxx"，而非裸显示被删内容。
+// 头文件: WCUserComment.h:22 bDeleted / :32 deletedByFeedOwner; WCCommentView.h:35 getDisplayCommentContent:
 %hook WCUserComment
 - (_Bool)bDeleted {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;  // 对齐 WCR: 直接返回 NO
-    return %orig;
+    _Bool real = %orig;                       // 取真实已删状态
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) {
+        // 防删：列表仍保留可见；同时记住真实已删态，供评论文本加前缀(WCR momentsDeletedMarkText)
+        if (real) objc_setAssociatedObject(self, kDDWasDeletedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return NO;
+    }
+    return real;
 }
 - (_Bool)deletedByFeedOwner {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
-    return %orig;
+    _Bool real = %orig;
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) {
+        if (real) objc_setAssociatedObject(self, kDDWasDeletedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return NO;
+    }
+    return real;
 }
 %end
 
@@ -392,6 +491,46 @@ static const BOOL kDDDefaultHideChatName      = NO;
     %orig;
     if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return;
     if (self.delStatus != 0) self.delStatus = 0;  // 解除消息级删除标记
+}
+%end
+
+// ⑥ 渲染点：评论显示文本计算处拼接"[已删除]"前缀(对齐 WCR momentsDeletedMarkText)。
+//   仅对"真实被删、且本应保留可见"的评论生效；非 NSString(富文本)原样返回，避免破坏排版。
+%hook WCCommentView
++ (id)getDisplayCommentContent:(id)comment dataItem:(id)item pageContext:(id)ctx {
+    id orig = %orig;
+    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return orig;
+    if (![comment isKindOfClass:objc_getClass("WCUserComment")]) return orig;
+    NSNumber *wasDel = objc_getAssociatedObject(comment, kDDWasDeletedKey);
+    if (!wasDel || !wasDel.boolValue) return orig;
+    if ([orig isKindOfClass:[NSString class]]) {
+        return [ddDeletedMarkText() stringByAppendingString:(NSString *)orig];
+    }
+    return orig;
+}
+%end
+
+// ⑥ 评论列表/通知详情页(由 WCSNSMessage 展开的那一页)同样加 "[已删除]"前缀。
+//    这一页走 getDisplayContent: 而非上面的 getDisplayCommentContent:，故需单独 hook 一次，
+//    否则"朋友圈评论提示"里的被删评论仍裸显示、与 WCR 格式不一致。
+//    检测只用头文件原生声明的 bDeleted / deletedByFeedOwner 两个 property：其真实值由
+//    WCUserComment 钩子经原生 getter(%orig) 取后暂存，此处直接读，不猜 ivar、不加兜底。
+%hook WCCommentListContentView
++ (id)getDisplayContent:(id)a0 dataItem:(id)a1 pageContext:(id)a2 {
+    id orig = %orig;
+    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return orig;
+    id comment = nil;
+    Class WCUserCommentCls = objc_getClass("WCUserComment");
+    Class WCSNSMessageCls  = objc_getClass("WCSNSMessage");
+    if ([a0 isKindOfClass:WCUserCommentCls]) comment = a0;
+    else if (WCSNSMessageCls && [a0 isKindOfClass:WCSNSMessageCls]) comment = [a0 comment];
+    if (!comment) return orig;
+    NSNumber *wasDel = objc_getAssociatedObject(comment, kDDWasDeletedKey);
+    if (!wasDel || !wasDel.boolValue) return orig;
+    if ([orig isKindOfClass:[NSString class]]) {
+        return [ddDeletedMarkText() stringByAppendingString:(NSString *)orig];
+    }
+    return orig;
 }
 %end
 
