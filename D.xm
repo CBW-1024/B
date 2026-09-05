@@ -531,11 +531,10 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 
 // 渲染侧：对齐 WCR，在 MMUILongPressImageView -setImage: 处覆盖(微信给头像赋值时走这里)。
 // 仅当 superview 为头像视图(响应 getRealUserName:)才处理，避免误伤消息图片等。
+// 命中后直接 %orig(customImg) 调原实现换图(不重入本 hook，天然无递归，无需 %property/标志位)。
 %hook MMUILongPressImageView
-%property (nonatomic, assign) BOOL dd_customAvatarApplying;
 - (void)setImage:(id)arg1 {
     %orig;
-    if (self.dd_customAvatarApplying) return;
     UIView *head = self.superview;
     if (![head respondsToSelector:@selector(getRealUserName:)]) {
         head = head.superview;
@@ -547,10 +546,7 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
     NSData *d = [NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(usr)];
     if (!d) return;
     UIImage *img = [UIImage imageWithData:d];
-    if (!img) return;
-    self.dd_customAvatarApplying = YES;
-    [self setImage:img];
-    self.dd_customAvatarApplying = NO;
+    if (img) %orig(img);
 }
 %end
 
