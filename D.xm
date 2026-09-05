@@ -818,10 +818,9 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
     if ([DDWeChatConfig sharedConfig].hideChatName) {
         UIView *tv = [self titleView];
         if ([tv isKindOfClass:[UIView class]]) {
+            // 仅打标记(不在此主动调 setTitle:，否则 layout 递归->栈溢出闪退)。
+            // 名字清空交给下方 MMTitleView -setTitle: hook 在微信渲染名字时自然拦截。
             objc_setAssociatedObject(tv, kDDIsChatTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            // 保底清主标题(名字)，覆盖首帧 setTitle 早于标记的情形；副标题(正在输入)不受影响
-            Class tcls = objc_getClass("MMTitleView");
-            if (tcls && [tv isKindOfClass:tcls]) [(MMTitleView *)tv setTitle:@""];
         }
     }
 }
