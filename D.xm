@@ -206,9 +206,9 @@
 
 // ⑫ 隐藏聊天顶栏名字
 @interface BaseMsgContentViewController : MMUIViewController   // BaseMsgContentViewController.h:4
-- (void)updateTitleView:(id)arg1;                             // BaseMsgContentViewController.h:396 —— WCR hook 之
-- (void)updateTitleView:(id)arg1 ignoreAnimation:(_Bool)arg2; // BaseMsgContentViewController.h:398 —— WCR hook 之
-- (id)titleView;                                              // MMUIViewController.h:148
+- (void)updateTitleView:(id)arg1;                             // BaseMsgContentViewController.h:396 —— ⑫ 头文件推断(非 WCR)
+- (void)updateTitleView:(id)arg1 ignoreAnimation:(_Bool)arg2; // BaseMsgContentViewController.h:398 —— ⑫ 头文件推断(非 WCR)
+- (id)titleView;                                              // MMUIViewController.h:148 —— 取标题视图实例(⑫ 头文件推断，非 WCR)
 @end
 
 // ① 首页下拉小程序
@@ -788,30 +788,32 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 %end
 
 #pragma mark - ⑫ 隐藏聊天顶栏名字(仅聊天会话界面 BaseMsgContentViewController，只藏名字、保留"正在输入")
-// WCR 证据:
-//   BaseMsgContentViewController: updateTitleView: 与 updateTitleView:ignoreAnimation: 都 hook
-//   头文件: BaseMsgContentViewController.h:986 -updateTitleView: / MMUIViewController.h:520 -titleView
-// 只藏名字、不连带"正在输入": MMTitleView.h 暴露 setTitle:(主标题=名字) 与 setSubTitle:(副标题=状态/正在输入)
-//   两个独立文本槽，故只拦 setTitle: 传空即可藏名字，而 setSubTitle:(对方正在输入…) 完全不动。
-//   范围收敛: MMTitleView 是通用导航标题视图(联系人/设置等所有界面复用)，故不能全局清。改为【实例级限定】——
+// 说明: 此功能为推断实现(已查证 WCR 的 impstr.pkl 中并无 MMTitleView / BaseMsgContentViewController 名字文本相关 hook，
+//   故无 WCR 反汇编真证，仅锚定 8.0.76 头文件符号)。
+//   头文件锚点: BaseMsgContentViewController.h:396/398 -updateTitleView: / MMUIViewController.h:148 -titleView；
+//   MMTitleView.h:14-15 暴露 setTitle:(主标题=名字) 与 setSubTitle:(副标题=状态/正在输入) 两个独立文本槽。
+//   机制: 只拦 setTitle: 传空即可藏名字，setSubTitle:(对方正在输入…) 完全不动。
+//   范围收敛: MMTitleView 是通用导航标题视图(联系人/设置等所有界面复用)，故用【实例级标记】限定——
 //   在聊天 VC 的 updateTitleView:/viewDidLayoutSubviews 给 self.titleView 打关联对象标记 kDDIsChatTitleKey，
 //   仅对带标记的 MMTitleView 实例清空主标题；其它界面的 MMTitleView setTitle: 一律透传，不受影响。
 %hook BaseMsgContentViewController
 - (void)updateTitleView:(id)arg1 {
-    %orig;
+    // 先打标记再 %orig: 微信只在 %orig 内部设一次主标题(MMTitleView -setTitle:)，
+    // 标记须先于设置，下方 hook 才拦得到那次 setTitle:，名字才藏得住。
     if ([DDWeChatConfig sharedConfig].hideChatName) {
         UIView *tv = [self titleView];
         if ([tv isKindOfClass:[UIView class]])
             objc_setAssociatedObject(tv, kDDIsChatTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    %orig;
 }
 - (void)updateTitleView:(id)arg1 ignoreAnimation:(_Bool)arg2 {
-    %orig;
     if ([DDWeChatConfig sharedConfig].hideChatName) {
         UIView *tv = [self titleView];
         if ([tv isKindOfClass:[UIView class]])
             objc_setAssociatedObject(tv, kDDIsChatTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    %orig;
 }
 - (void)viewDidLayoutSubviews {
     %orig;
