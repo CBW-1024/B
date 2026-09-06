@@ -30,8 +30,6 @@
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 on:(_Bool)arg4;
-// 普通可点击行（标题 + 右侧值）
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 rightValue:(id)a4;
 @end
 
 // 被 hook 微信类声明（手写完整 @interface，锚定 8.0.76 继承链，不用 @class 前向声明）
@@ -501,10 +499,6 @@ static BOOL ddHideName(void) {
     [privacy addCell:[cellMgr switchCellForSel:@selector(onHideFriendWxidSwitch:) target:self title:@"隐藏好友微信号" on:cfg.hideFriendWxid]];
     [privacy addCell:[cellMgr switchCellForSel:@selector(onHideChatNameSwitch:) target:self title:@"隐藏聊天顶栏名字" on:cfg.hideChatName]];
     [_tableViewManager addSection:privacy];
-
-    WCTableViewSectionManager *diag = [secMgr defaultSection];
-                                 rightValue:@""]];
-    [_tableViewManager addSection:diag];
 
     [_tableViewManager reloadTableView];
 }
