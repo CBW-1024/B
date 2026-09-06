@@ -135,9 +135,10 @@
 + (_Bool)shouldShowFullTextButtonWithDataItem:(id)arg1;   // WCTimeLineCellView.h:95
 @end
 
-// ⑤ 朋友圈"余下N条"折叠
-@interface MicroMerchantFoldInterceptor : NSObject <TimelineRequestInterceptorImpl>   // MicroMerchantFoldInterceptor.h:3
-- (void)intercept:(id)arg1;                            // MicroMerchantFoldInterceptor.h:10
+// ⑤ 朋友圈"余下N条"折叠（改为锤子数据层做法：WCDataItem isWeiShang / setExtFlag）
+@interface WCDataItem : NSObject   // WCDataItem.h:11
+- (_Bool)isWeiShang;                          // WCDataItem.h:260
+- (void)setExtFlag:(unsigned int)arg1;        // WCDataItem.h:290
 @end
 
 // ⑪ 我界面
@@ -338,11 +339,17 @@ static NSString *ddDeletedMarkText(void) {
 }
 %end
 
-#pragma mark - ⑤ 禁用朋友圈"余下N条"折叠
-%hook MicroMerchantFoldInterceptor
-- (void)intercept:(id)arg1 {
-    if ([DDWeChatConfig sharedConfig].disableSnsGroupFold) return;
+#pragma mark - ⑤ 禁用朋友圈"余下N条"折叠（锤子数据层做法）
+%hook WCDataItem
+- (_Bool)isWeiShang {
+    if ([DDWeChatConfig sharedConfig].disableSnsGroupFold) return NO;  // 数据层抹掉微商标记，折叠逻辑失效
+    return %orig;
+}
+- (void)setExtFlag:(unsigned int)arg1 {
     %orig;
+    if ([DDWeChatConfig sharedConfig].disableSnsGroupFold) {
+        MSHookIvar<char>(self, "_isWeiShang") = 0;   // 兜底清掉微商标记，与锤子 setExtFlag 路数一致
+    }
 }
 %end
 
