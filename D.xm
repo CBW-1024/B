@@ -34,9 +34,7 @@
 
 // 被 hook 微信类声明（手写完整 @interface，锚定 8.0.76 继承链，不用 @class 前向声明）
 @interface MMTabBarBaseViewController : UIViewController @end
-@interface MMUIViewController : UIViewController @end
 @interface MMUIView : UIView @end
-@interface WCPlayerControlView : UIView @end
 @interface WCContentItemBaseView : UIView @end
 @interface MMUIButton : UIButton @end
 @interface MMUILabel : UILabel @end
