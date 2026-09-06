@@ -70,20 +70,6 @@
 @property (nonatomic) unsigned int delStatus;
 @property (retain, nonatomic) WCUserComment *comment;
 @property (retain, nonatomic) WCUserComment *refComment;
-- (void)upgradeDataIfNeeded;
-- (_Bool)isWCMessageDeleted;
-@end
-
-// 朋友圈评论实际渲染组件（8.0.76D 头文件）
-@interface WCCommentRichTextView : UIView
-@property (retain, nonatomic) WCUserComment *userComment;
-- (void)setContent:(id)arg1;
-- (BOOL)setPrefixContent:(id)a0 TargetContent:(id)a1 TargetParserString:(id)a2 SuffixContent:(id)a3;
-@end
-
-@interface WCCommentListContentView : UIView
-@property (retain, nonatomic) WCUserComment *comment;
-- (void)config:(id)a0 dataItem:(id)a1 width:(double)a2;
 @end
 
 // 朋友圈视频全屏播放器（SNS / Moments）。注意：WAVideoPlayerView 是「小程序/视频号」
@@ -127,11 +113,6 @@
 // 诊断日志总开关（设置页可切换）。开启后记录朋友圈评论的删除状态/注入过程，
 // 可在「DD微信助手 → 运行日志」里查看或导出，用于排查“谁被加了前缀”。
 #define kDDWADebugLog          @"kDDWA_debugLog"
-
-// 严格模式：默认 NO（与锤子一致，setDelStatus: 传入 1 即视为“该条已删”）。
-// 若发现“未删除的评论也被加了前缀”（说明微信对正常评论也回调了 delStatus=1），
-// 把该 key 设为 YES：改成只有评论对象本身处于删除态（bDeleted / deletedByFeedOwner）才注入。
-#define kDDWADeletedCommentStrict @"kDDWA_deletedCommentStrict"
 #define kDDWAVideoTapClose     @"kDDWA_disableSnsVideoTapClose"
 #define kDDWAVideoProgressBar  @"kDDWA_snsVideoProgressBar"   // 新增：朋友圈视频进度条
 #define kDDWAHideFriendWxid    @"kDDWA_hideFriendWxid"
@@ -194,7 +175,6 @@ static NSString *ddDeletedMarkText(void) {
         kDDWAHideFriendWxid: @(kDDDefaultHideFriendWxid),
         kDDWAHideChatName:   @(kDDDefaultHideChatName),
         kDDWADeletedCommentMark: kDDDefaultDeletedMark,
-        kDDWADeletedCommentStrict: @NO,
         kDDWADebugLog:           @(kDDDefaultDebugLog),
     }];
 }
@@ -520,30 +500,6 @@ static NSString *dd_abbrev(id obj) {
 // 时机也晚（setDelStatus: 之后评论可能已被路由到删除占位），所以前缀根本没机会上屏。
 // 因此必须对齐锤子：hook setDelStatus:，在它被调用时注入前缀并清零 delStatus。
 
-static NSString *dd_markDeletedContent(NSString *orig) {
-    NSString *mark = ddDeletedMarkText();
-    if ([orig isKindOfClass:[NSString class]] && orig.length && ![orig hasPrefix:mark]) {
-        return [mark stringByAppendingString:orig];
-    }
-    return orig;
-}
-// 严格模式：默认关闭（= 锤子行为：delStatus 传 1 即视为该条已删）。
-// 详见 kDDWADeletedCommentStrict 的定义处注释。
-static BOOL dd_strictMode(void) {
-    return [NSUserDefaults.standardUserDefaults boolForKey:kDDWADeletedCommentStrict];
-}
-
-// 该评论对象本身是否处于“已删除”状态。
-// 只认 WCUserComment，且必须 bDeleted / deletedByFeedOwner 至少有一个为真；
-// 拿不到类或都不是删除态一律返回 NO —— 这是“不给正常评论加前缀”的关键判定。
-static BOOL dd_isDeletedCommentObject(id c) {
-    if (!c) return NO;
-    if (![c isKindOfClass:%c(WCUserComment)]) return NO;
-    if ([c respondsToSelector:@selector(bDeleted)] && [c bDeleted]) return YES;
-    if ([c respondsToSelector:@selector(deletedByFeedOwner)] && [c deletedByFeedOwner]) return YES;
-    return NO;
-}
-
 // 日志用：把一条评论的删除状态打成一个短串，例如 "del=1 owner=0"
 static NSString *dd_commentFlagDesc(id c) {
     if (!c) return @"(nil)";
@@ -552,16 +508,29 @@ static NSString *dd_commentFlagDesc(id c) {
     return [NSString stringWithFormat:@"%@(del=%d owner=%d)", NSStringFromClass([c class]), b, o];
 }
 
-// 对 WCSNSMessage.comment / refComment 幂等补前缀（锤子只改 comment，这里顺带处理回复 refComment）
-static void dd_injectMarkIntoComment(id c) {
+// 对 WCSNSMessage.comment 幂等补前缀（refComment 是被回复的那条，不参与；与锤子一致只改 comment）
+// allowEmpty=YES：content 已被清空时，至少写入“[对方已删除]”标记，
+// 避免对方删评后留下一条空白评论（只对主评论用，回复的 content 常为空，不适用）。
+static void dd_injectMarkIntoCommentEx(id c, BOOL allowEmpty) {
     if (![c isKindOfClass:%c(WCUserComment)]) return;
+    NSString *mark = ddDeletedMarkText();
     NSString *s = [c content];
-    if ([s isKindOfClass:[NSString class]] && s.length && ![s hasPrefix:ddDeletedMarkText()]) {
-        [c setContent:[ddDeletedMarkText() stringByAppendingString:s]];
-        DDLog(@"SNS", @"INJECT -> %@", dd_abbrev([c content]));
-    } else {
-        DDLog(@"SNS", @"INJECT skip (空/已有前缀/非字符串) content=%@", dd_abbrev(s));
+    if ([s isKindOfClass:[NSString class]] && s.length) {
+        if (![s hasPrefix:mark]) {
+            [c setContent:[mark stringByAppendingString:s]];
+            DDLog(@"SNS", @"INJECT -> %@", dd_abbrev([c content]));
+        }
+        return;
     }
+    if (allowEmpty) {
+        NSString *bare = [mark stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (![s hasPrefix:bare]) {
+            [c setContent:bare];
+            DDLog(@"SNS", @"INJECT empty -> 仅标记: %@", bare);
+        }
+        return;
+    }
+    DDLog(@"SNS", @"INJECT skip (空/已有前缀/非字符串) content=%@", dd_abbrev(s));
 }
 
 // ★ 核心：对齐锤子 hook WCSNSMessage -setDelStatus:
@@ -577,72 +546,18 @@ static void dd_injectMarkIntoComment(id c) {
         if (dd_shouldDump(self)) { DDLog(@"DUMP", @"msg: %@", dd_dumpIvars(self)); }
         if (dd_shouldDump(c))    { DDLog(@"DUMP", @"comment: %@", dd_dumpIvars(c)); }
         if (dd_shouldDump(r))    { DDLog(@"DUMP", @"refComment: %@", dd_dumpIvars(r)); }
-        // 严格模式下只对“对象确实处于删除态”的评论注入，避免正常评论被误加前缀
-        BOOL shouldMark = dd_strictMode() ? (dd_isDeletedCommentObject(c) || dd_isDeletedCommentObject(r)) : YES;
-        if (shouldMark) {
-            // 已删除：在数据加载期就把前缀写回 comment.content（早于任何渲染）
-            dd_injectMarkIntoComment(c);
-            dd_injectMarkIntoComment(r);   // 回复
-        } else {
-            DDLog(@"SNS", @"严格模式：判定为未删除，跳过注入");
-        }
+        // 已删除：在数据加载期就把前缀写回 comment.content（早于任何渲染）。
+        // 实测证实 8.0.76D 中 setDelStatus:1 即“评论已删除”的真实信号，
+        // 无需要再依赖 bDeleted/deletedByFeedOwner（这两个字段恒为 0）。
+        // 只处理 comment（这条评论本身）。refComment 是“被回复的那条”，不是被删评论，
+        // 无论它是空壳（顶层评论）还是有内容（真回复），都不该加前缀，故不碰它（与锤子一致）。
+        dd_injectMarkIntoCommentEx(c, YES);   // 主评论：内容被清空时也要留下标记
         // 以 0 调回原方法：对外不视作已删，正常渲染
         %orig(0);
         return;
     }
     DDLog(@"SNS", @"setDelStatus=%u (非1，原样透传)", status);
     %orig;
-}
-// 兜底：feed 级删除也让 isWCMessageDeleted 返回 NO（先于 setDelStatus 的判定）
-// 返回类型与 8.0.76D 头文件一致，统一用 _Bool，避免个别架构下 BOOL 定义不同导致的签名告警
-- (_Bool)isWCMessageDeleted {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
-    return %orig;
-}
-%end
-
-// 渲染组件兜底：WCCommentRichTextView 实际把评论画到屏幕（截图已证实）
-// ⚠️ 这里必须带 dd_isDeletedCommentObject 判定：之前是“开关开着就补前缀”，
-// 导致所有正常评论都被加上 “[对方已删除] ”。现在只对确实处于删除态的评论生效。
-%hook WCCommentRichTextView
-- (void)setContent:(id)content {
-    BOOL on = [DDWeChatConfig sharedConfig].antiDeleteSnsComment;
-    BOOL deleted = dd_isDeletedCommentObject(self.userComment);
-    DDLog(@"RICH", @"setContent: deleted=%d | userComment=%@ | in=%@",
-          (int)deleted, dd_commentFlagDesc(self.userComment), dd_abbrev(content));
-    if (on && deleted && [content isKindOfClass:[NSString class]]) {
-        content = dd_markDeletedContent(content);
-        DDLog(@"RICH", @"  -> 加前缀后: %@", dd_abbrev(content));
-    }
-    %orig;
-}
-// 8.0.76D 头文件中的组装方法：prefix/targetContent/targetParserString/suffix
-- (BOOL)setPrefixContent:(id)prefix TargetContent:(id)targetContent TargetParserString:(id)parserString SuffixContent:(id)suffix {
-    BOOL on = [DDWeChatConfig sharedConfig].antiDeleteSnsComment;
-    BOOL deleted = dd_isDeletedCommentObject(self.userComment);
-    DDLog(@"RICH", @"setPrefixContent: deleted=%d | userComment=%@ | target=%@ | parser=%@",
-          (int)deleted, dd_commentFlagDesc(self.userComment), dd_abbrev(targetContent), dd_abbrev(parserString));
-    if (on && deleted) {
-        if ([targetContent isKindOfClass:[NSString class]]) targetContent = dd_markDeletedContent(targetContent);
-        if ([parserString isKindOfClass:[NSString class]]) parserString = dd_markDeletedContent(parserString);
-    }
-    return %orig(prefix, targetContent, parserString, suffix);
-}
-%end
-
-// 容器兜底：config 时若该评论确实是删除态且还没带前缀，补一道（幂等）
-%hook WCCommentListContentView
-- (void)config:(id)dataItem dataItem:(id)item width:(double)width {
-    %orig;
-    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return;
-    BOOL deleted = dd_isDeletedCommentObject(self.comment);
-    DDLog(@"LIST", @"config: deleted=%d | comment=%@ | content=%@",
-          (int)deleted, dd_commentFlagDesc(self.comment), dd_abbrev([self.comment content]));
-    // 渲染期字段快照：这时对象已完成解析，字段最全
-    if (dd_shouldDump(self.comment)) { DDLog(@"DUMP", @"渲染期 comment: %@", dd_dumpIvars(self.comment)); }
-    if (deleted) {
-        dd_injectMarkIntoComment(self.comment);
-    }
 }
 %end
 
