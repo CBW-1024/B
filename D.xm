@@ -601,87 +601,36 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 %end
 
 #pragma mark - ⑫ 隐藏聊天顶栏名字
-// 证据:
-//   头文件(8.0.76 dump): MMTitleView.h — 标题是自定义视图 MMTitleView，名字经 -setTitle: / -setSubTitle: 写入；
-//     MMUIViewController.h:26 m_baseTitleView(MMTitleView*)；:300 reloadTitleView；:307 setTitleView:；:520 titleView；
-//     BaseMsgContentViewController.h:983 setTitleView: / :984-986 updateTitleView: / :1094 handleMsgViewUpdateTitleView:
-//       / :1156 onPageSheetTitleViewUpdate / :1162 setCustomNavBarTitleView:
-//   真实砸壳二进制(微信8.0.76.ipa, ARM64)核验: __objc_methname 段字面存在 MMTitleView / setTitle: / setSubTitle:
-//     / setCustomNavBarTitleView: / updateTitleView:；全 App 检索 setTitleHidden:/setNavTitleHidden:/titleViewHidden:
-//     等"隐藏标题"类原生方法为 0 —— 即微信无原生隐藏标题开关，名字唯一原生写入点就是 MMTitleView -setTitle:/-setSubTitle:。
-// 故直接用微信原生 setter 写空: 机制②在 MMTitleView -setTitle:/-setSubTitle: 被调用时传 @""(名字写入那一刻即空,无闪现);
-//   机制①在各装配入口(%orig 之后)兜底(兜住 MMTitleView 尚未挂入导航栏时的首帧)。群聊/私聊共用 MMTitleView,均覆盖;铃铛是右视图,只清文本不动它。
-%hook BaseMsgContentViewController
-- (void)viewWillAppear:(BOOL)arg1 {
-    %orig;
-    [self ddHideChatTitle];
-}
-- (void)viewDidAppear:(BOOL)arg1 {
-    %orig;
-    [self ddHideChatTitle];
-}
-- (void)setTitleView:(id)arg1 {
-    %orig;
-    [self ddHideChatTitle];
-}
-- (void)reloadTitleView {
-    %orig;
-    [self ddHideChatTitle];
-}
-- (void)updateTitleView:(id)arg1 {
-    %orig;
-    [self ddHideChatTitle];
-}
-- (void)updateTitleView:(id)arg1 ignoreAnimation:(BOOL)arg2 {
-    %orig;
-    [self ddHideChatTitle];
-}
-- (void)handleMsgViewUpdateTitleView:(id)arg1 ignoreAnimation:(BOOL)arg2 {
-    %orig;
-    [self ddHideChatTitle];
-}
-- (void)onPageSheetTitleViewUpdate:(id)arg1 {
-    %orig;
-    [self ddHideChatTitle];
-}
-- (void)setCustomNavBarTitleView:(id)arg1 {
-    %orig;
-    [self ddHideChatTitle];
-}
-%new
-- (void)ddHideChatTitle {
-    if (![DDWeChatConfig sharedConfig].hideChatName) return;
-    self.navigationItem.title = @"";
-    MMTitleView *tv = nil;
-    if ([self.navigationItem.titleView isKindOfClass:%c(MMTitleView)])
-        tv = (MMTitleView *)self.navigationItem.titleView;
-    if (!tv) tv = MSHookIvar<MMTitleView *>(self, "m_baseTitleView");   // MMUIViewController.h:26
-    if (tv) {
-        [tv setTitle:@""];
-        [tv setSubTitle:@""];
-    }
-}
-%end
-
-// 源头兜底: MMTitleView -setTitle:/-setSubTitle: 被调用时，若它位于聊天 VC 的导航栏内则清空。
-// 与上方 VC 级装配入口双保险，覆盖初始与后续(群成员数变化等)写入，无闪现、不漏群聊。
-static BOOL ddTitleViewInChatNav(MMTitleView *tv) {
+// 证据: 真实砸壳二进制(微信8.0.76.ipa, ARM64)核验 —— __objc_methname 段字面存在 MMTitleView / setTitle: / setSubTitle:
+//   / setCustomNavBarTitleView: / updateTitleView:；全 App 检索 setTitleHidden:/setNavTitleHidden:/titleViewHidden:
+//   等"隐藏标题"类原生方法为 0。即微信无原生隐藏标题开关，名字唯一原生写入点就是 MMTitleView -setTitle:/-setSubTitle:
+//   (MMTitleView.h 亦证实: 标题是自定义视图 MMTitleView，名字经 -setTitle:/-setSubTitle: 写入)。
+// 最简单且正确的做法: 仅在 MMTitleView 这两个 setter 拦截，命中聊天 VC 时传 @"" —— 名字写入即空，无闪现、不漏群聊/私聊(皆共用 MMTitleView)，铃铛是右视图只清文本不动它。
+// 归属判定(既精确又兜首帧): 1) 已在导航栏内且顶层 VC 为聊天 VC；2) 尚未挂入导航栏但已有 superview 时，沿 responder 链找到聊天 VC。
+static BOOL ddIsChatTitleView(MMTitleView *tv) {
     UIView *v = tv;
     while (v && ![v isKindOfClass:%c(UINavigationBar)]) v = v.superview;
-    if (!v) return NO;
-    UINavigationController *nav = (UINavigationController *)[(UINavigationBar *)v delegate];
-    return nav && [nav.topViewController isKindOfClass:%c(BaseMsgContentViewController)];
+    if (v) {
+        UINavigationController *nav = (UINavigationController *)[(UINavigationBar *)v delegate];
+        if (nav && [nav.topViewController isKindOfClass:%c(BaseMsgContentViewController)]) return YES;
+    }
+    UIResponder *r = tv;
+    while (r) {
+        if ([r isKindOfClass:%c(BaseMsgContentViewController)]) return YES;
+        r = r.nextResponder;
+    }
+    return NO;
 }
 %hook MMTitleView
 - (void)setTitle:(id)arg1 {
-    if ([DDWeChatConfig sharedConfig].hideChatName && ddTitleViewInChatNav(self)) {
+    if ([DDWeChatConfig sharedConfig].hideChatName && ddIsChatTitleView(self)) {
         %orig(@"");
         return;
     }
     %orig;
 }
 - (void)setSubTitle:(id)arg1 {
-    if ([DDWeChatConfig sharedConfig].hideChatName && ddTitleViewInChatNav(self)) {
+    if ([DDWeChatConfig sharedConfig].hideChatName && ddIsChatTitleView(self)) {
         %orig(@"");
         return;
     }
