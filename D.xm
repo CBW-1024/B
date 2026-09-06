@@ -174,8 +174,8 @@ static const BOOL kDDDefaultHideFriendWxid    = NO;
 static const BOOL kDDDefaultHideMyWxid        = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
 
-// ⑥ 被删评论前缀文案(默认"[对方已删除]"，与锤子一致)
-static NSString * const kDDDefaultDeletedMark = @"[对方已删除]";
+// ⑥ 被删评论前缀文案（对齐锤子原文："对方已删除] "，见锤子 __ustring @0xbd80da）
+static NSString * const kDDDefaultDeletedMark = @"对方已删除] ";
 static NSString *ddDeletedMarkText(void) {
     NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kDDWADeletedCommentMark];
     return (t.length ? t : kDDDefaultDeletedMark);
@@ -353,20 +353,21 @@ static NSString *ddDeletedMarkText(void) {
 }
 %end
 
-#pragma mark - ⑥ 朋友圈评论防删（对齐锤子：WCFacade 数据层管道恢复 + 数据层改 comment.content 加前缀）
-// 渲染层兜底：任何读 bDeleted 的地方都不再隐藏评论（前缀判断用真实 ivar，避免与 getter hook 冲突）
-%hook WCUserComment
-- (_Bool)bDeleted {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
-    return %orig;
-}
-- (_Bool)deletedByFeedOwner {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
-    return %orig;
+#pragma mark - ⑥ 朋友圈查看已删评论（对齐锤子：WCFacade 数据层管道）
+// 根因：微信在 WCDataItem 层面用 clearExpiredDeltedByFeedOwnerComment 把已删评论从
+// commentUsers 数组移除；且 LLComment_onBeforeReturnDataItem: 的 arg1 是 WCDataItem
+// （不是单条评论）。故必须在 dataItem 层面遍历 commentUsers 恢复，并兜住移除逻辑。
+// 锤子 hook 点：WCFacade.h:472/474/725；清除点：WCDataItem.h:367。
+
+// 评论级兜底：开关开启时阻止微信把已删评论从 dataItem 移除（WCDataItem.h:367）
+%hook WCDataItem
+- (void)clearExpiredDeltedByFeedOwnerComment {
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return;
+    %orig;
 }
 %end
 
-// 消息级兜底
+// 消息级兜底（保留）
 %hook WCSNSMessage
 - (_Bool)isWCMessageDeleted {
     if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
@@ -379,8 +380,10 @@ static NSString *ddDeletedMarkText(void) {
 }
 %end
 
-// 数据层主链路：关掉删除过滤，并直接给已删评论的 content 拼"[对方已删除]"前缀
-// 前缀写在数据层，无论评论走哪条渲染路径都带前缀，故一定显示
+// 数据层主链路：WCFacade 三个 hook（锤子 hook 点，WCFacade.h:472/474/725）
+// isDataItemDeleted: 返回 NO 骗过"动态已删"判定
+// LL_onBeforeReturnDataItem: 返回 YES 放行 dataItem
+// LLComment_onBeforeReturnDataItem: 在返回前恢复已删评论 + 数据层拼锤子前缀
 %hook WCFacade
 - (_Bool)isDataItemDeleted:(id)arg1 {
     if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
@@ -391,17 +394,36 @@ static NSString *ddDeletedMarkText(void) {
     return %orig;
 }
 - (void)LLComment_onBeforeReturnDataItem:(id)arg1 {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment && [arg1 isKindOfClass:objc_getClass("WCUserComment")]) {
-        WCUserComment *c = (WCUserComment *)arg1;
-        _Bool realDel = MSHookIvar<_Bool>(arg1, "_bDeleted") || MSHookIvar<_Bool>(arg1, "_deletedByFeedOwner");
-        if (realDel) {
-            NSString *ct = [c content];
-            if ([ct isKindOfClass:[NSString class]] && ct.length && ![ct hasPrefix:ddDeletedMarkText()]) {
-                [c setContent:[ddDeletedMarkText() stringByAppendingString:ct]];
-            }
+    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) { %orig; return; }
+    Class DataItemCls = objc_getClass("WCDataItem");
+    Class CommentCls  = objc_getClass("WCUserComment");
+    if ([arg1 isKindOfClass:DataItemCls]) {
+        // 微信传整个 dataItem：遍历 commentUsers，恢复每条已删评论
+        NSMutableArray *users = MSHookIvar<NSMutableArray *>(arg1, "_commentUsers");
+        if ([users isKindOfClass:[NSArray class]]) {
+            for (id c in users) [self dd_restoreDeletedComment:c];
         }
+    } else if ([arg1 isKindOfClass:CommentCls]) {
+        // 兜底：微信也可能逐条传评论
+        [self dd_restoreDeletedComment:arg1];
     }
     %orig;
+}
+%new
+- (void)dd_restoreDeletedComment:(id)c {
+    Class CommentCls = objc_getClass("WCUserComment");
+    if (![c isKindOfClass:CommentCls]) return;
+    // 用真实 ivar 判删（getter 可能已被其它逻辑改写），避免误判
+    _Bool realDel = MSHookIvar<_Bool>(c, "_bDeleted") || MSHookIvar<_Bool>(c, "_deletedByFeedOwner");
+    if (!realDel) return;
+    // 清真实删除标记：无论渲染层读 getter 还是直接读 ivar 都显示
+    MSHookIvar<_Bool>(c, "_bDeleted") = 0;
+    MSHookIvar<_Bool>(c, "_deletedByFeedOwner") = 0;
+    NSString *ct = [c content];
+    NSString *mark = ddDeletedMarkText();
+    if ([ct isKindOfClass:[NSString class]] && ct.length && ![ct hasPrefix:mark]) {
+        [c setContent:[mark stringByAppendingString:ct]];
+    }
 }
 %end
 
@@ -697,7 +719,7 @@ static BOOL ddHideName(void) {
     [sns addCell:[cellMgr switchCellForSel:@selector(onPrivacySwitch:) target:self title:@"禁用朋友圈谁可以见图标" on:cfg.disableSnsPrivacyIcon]];
     [sns addCell:[cellMgr switchCellForSel:@selector(onTextFoldSwitch:) target:self title:@"禁用朋友圈文字自动折叠" on:cfg.disableSnsTextFold]];
     [sns addCell:[cellMgr switchCellForSel:@selector(onGroupFoldSwitch:) target:self title:@"禁用朋友圈余下N条折叠" on:cfg.disableSnsGroupFold]];
-    [sns addCell:[cellMgr switchCellForSel:@selector(onAntiDeleteSwitch:) target:self title:@"朋友圈评论防删" on:cfg.antiDeleteSnsComment]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onAntiDeleteSwitch:) target:self title:@"朋友圈查看已删评论" on:cfg.antiDeleteSnsComment]];
     [sns addCell:[cellMgr switchCellForSel:@selector(onVideoTapCloseSwitch:) target:self title:@"禁用朋友圈视频点击关闭" on:cfg.disableSnsVideoTapClose]];
     [_tableViewManager addSection:sns];
 
