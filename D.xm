@@ -440,8 +440,11 @@ static void dd_restoreDeletedComment(id c) {
     id cfg = %orig;
     if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) {
         // 禁止进度条自动隐藏（锤子机制：WCPlayerFullScreenConfig.bForbidProgressBarAutoHidden）。
-        // 该方法已在本文件顶部以分类扩展手动声明，故可直接发送；isKindOfClass 防止类型不符。
-        if ([cfg isKindOfClass:[WCPlayerFullScreenConfig class]]) {
+        // 必须用 objc_getClass 取类，不能写 [WCPlayerFullScreenConfig class]：后者会让链接器去找
+        // _OBJC_CLASS_$_WCPlayerFullScreenConfig（该类属于微信、不在本 dylib），导致
+        // Undefined symbols。强转 (WCPlayerFullScreenConfig *) 仅告诉编译器类型，不产生符号引用。
+        Class configCls = objc_getClass("WCPlayerFullScreenConfig");
+        if (configCls && [cfg isKindOfClass:configCls]) {
             [(WCPlayerFullScreenConfig *)cfg setBForbidProgressBarAutoHidden:YES];
         }
     }
