@@ -35,8 +35,6 @@
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 on:(_Bool)arg4;  // WCTableViewCellManager.h:55
 @end
 
-@interface MMTableViewInfo : WCTableViewManager          // MMTableViewInfo.h:1
-@end
 
 // ---- 被 hook 微信类声明(锚定 8.0.76 dump 真实继承链) ----
 
@@ -44,14 +42,11 @@
 @interface MMUIViewController : UIViewController @end
 @interface MMUIView : UIView @end
 @interface WCPlayerControlView : UIView @end
-@interface MMBarItemCustomView : UIView @end
 @interface WCContentItemBaseView : UIView @end
-@interface MMUIImageView : UIImageView @end
 @interface MMUIButton : UIButton @end
 @interface MMUILabel : UILabel @end
 @interface MMCPLabel : MMUILabel   // MMCPLabel.h:4 (: MMUILabel : UILabel)
 @end
-@interface CBaseContact : NSObject @end
 // ⑫ 用。聊天顶栏名字是"数据层取值 → 视图层渲染"两级：VC 通过 delegate 协议向 LogicController 要标题字符串
 @interface BaseMsgContentLogicController : NSObject      // BaseMsgContentLogicController.h:9
 - (id)GetUsrTitle;            // :299 主标题(单聊/通用)
@@ -64,13 +59,7 @@
 - (id)getMemeberCountLabel;        // :186 群人数 UILabel(拼写 Memeber 是微信原生 typo)
 - (id)getDefaultTitleTailSubViews; // :185 标题尾部子视图数组(人数 label 从这插入, 汇编 0x1054510c8)
 @end
-@interface BaseMsgContentViewController : MMUIViewController @end   // BaseMsgContentViewController.h:4
 
-@protocol TimelineRequestInterceptorImpl <NSObject> @end
-
-@interface CContact : CBaseContact
-@property (nonatomic, readonly) NSString *userName;   // CContact.h:465
-@end
 
 // ⑥ 朋友圈评论防删
 @interface WCUserComment : NSObject
@@ -89,23 +78,6 @@
 - (_Bool)isWCMessageDeleted;                          // WCSNSMessage.h:19
 @end
 
-// ⑥ 朋友圈评论防删：WCFacade 数据层删除判定管道（锤子 hook 点，WCFacade.h:472/474/725）
-@interface WCFacade : NSObject
-- (_Bool)LL_onBeforeReturnDataItem:(id)arg1;            // WCFacade.h:472
-- (_Bool)isDataItemDeleted:(id)arg1;                   // WCFacade.h:474
-- (void)LLComment_onBeforeReturnDataItem:(id)arg1;     // WCFacade.h:725
-@end
-
-// ⑦ 渲染点: MMUILongPressImageView -setImage: (MMUILongPressImageView.h:29)
-@interface MMUILongPressImageView : MMUIImageView
-- (void)setImage:(id)arg1;
-@end
-
-// ⑦ 宿主页: 微信"聊天详情"页(类名像加群)
-@interface AddContactToChatRoomViewController : MMUIViewController
-@property (nonatomic, retain) CContact *m_contact;          // AddContactToChatRoomViewController.h:23
-@property (nonatomic, retain) MMTableViewInfo *m_tableViewInfo; // AddContactToChatRoomViewController.h:7
-@end
 
 // ⑧ 朋友圈视频点击关闭
 @interface WAVideoPlayerView : WCPlayerControlView       // WAVideoPlayerView.h:4
@@ -113,10 +85,6 @@
 - (void)setVideoPath:(id)arg1 initialTime:(double)arg2 isHLS:(long long)arg3;  // WAVideoPlayerView.h:135
 @end
 
-// ⑪ 隐藏自己微信号(我界面)
-@interface WASettingAccountCell : UITableViewCell        // WASettingAccountCell.h:3
-@property (nonatomic, retain) UILabel *detailLabel;  // WASettingAccountCell.h:7
-@end
 
 // ① 首页下拉小程序
 @interface NewMainFrameViewController : MMTabBarBaseViewController   // NewMainFrameViewController.h:4
@@ -142,10 +110,6 @@
 - (void)setExtFlag:(unsigned int)arg1;        // WCDataItem.h:290
 @end
 
-// ⑪ 我界面
-@interface NewSettingViewController : MMUIViewController   // NewSettingViewController.h:3
-- (void)reloadTableData;                               // NewSettingViewController.h:44
-@end
 
 #pragma mark - 配置管理
 #define kDDWAPullDown          @"kDDWA_disableHomePullDownMiniProgram"
@@ -155,7 +119,6 @@
 #define kDDWAGroupFold         @"kDDWA_disableSnsGroupFold"
 #define kDDWADeletedComment    @"kDDWA_antiDeleteSnsComment"
 #define kDDWADeletedCommentMark @"kDDWA_deletedCommentMark"
-#define kDDWACustomAvatar      @"kDDWA_enableCustomAvatar"
 #define kDDWAVideoTapClose     @"kDDWA_disableSnsVideoTapClose"
 #define kDDWAHideFriendWxid    @"kDDWA_hideFriendWxid"
 #define kDDWAHideChatName      @"kDDWA_hideChatName"
@@ -167,7 +130,6 @@ static const BOOL kDDDefaultPrivacyIcon       = NO;
 static const BOOL kDDDefaultTextFold          = NO;
 static const BOOL kDDDefaultGroupFold         = NO;
 static const BOOL kDDDefaultAntiDelete        = NO;
-static const BOOL kDDDefaultCustomAvatar      = NO;
 static const BOOL kDDDefaultVideoTapClose     = NO;
 static const BOOL kDDDefaultHideFriendWxid    = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
@@ -187,7 +149,6 @@ static NSString *ddDeletedMarkText(void) {
 @property (assign, nonatomic) BOOL disableSnsTextFold;
 @property (assign, nonatomic) BOOL disableSnsGroupFold;
 @property (assign, nonatomic) BOOL antiDeleteSnsComment;
-@property (assign, nonatomic) BOOL enableCustomAvatar;
 @property (assign, nonatomic) BOOL disableSnsVideoTapClose;
 @property (assign, nonatomic) BOOL hideFriendWxid;
 @property (assign, nonatomic) BOOL hideChatName;
@@ -209,7 +170,6 @@ static NSString *ddDeletedMarkText(void) {
         kDDWATextFold:       @(kDDDefaultTextFold),
         kDDWAGroupFold:      @(kDDDefaultGroupFold),
         kDDWADeletedComment: @(kDDDefaultAntiDelete),
-        kDDWACustomAvatar:   @(kDDDefaultCustomAvatar),
         kDDWAVideoTapClose:  @(kDDDefaultVideoTapClose),
         kDDWAHideFriendWxid: @(kDDDefaultHideFriendWxid),
         kDDWAHideChatName:   @(kDDDefaultHideChatName),
@@ -225,7 +185,6 @@ static NSString *ddDeletedMarkText(void) {
         _disableSnsTextFold             = [ud boolForKey:kDDWATextFold];
         _disableSnsGroupFold            = [ud boolForKey:kDDWAGroupFold];
         _antiDeleteSnsComment           = [ud boolForKey:kDDWADeletedComment];
-        _enableCustomAvatar             = [ud boolForKey:kDDWACustomAvatar];
         _disableSnsVideoTapClose        = [ud boolForKey:kDDWAVideoTapClose];
         _hideFriendWxid                 = [ud boolForKey:kDDWAHideFriendWxid];
         _hideChatName                   = [ud boolForKey:kDDWAHideChatName];
@@ -238,7 +197,6 @@ static NSString *ddDeletedMarkText(void) {
 - (void)setDisableSnsTextFold:(BOOL)v { _disableSnsTextFold = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWATextFold]; }
 - (void)setDisableSnsGroupFold:(BOOL)v { _disableSnsGroupFold = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAGroupFold]; }
 - (void)setAntiDeleteSnsComment:(BOOL)v { _antiDeleteSnsComment = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWADeletedComment]; }
-- (void)setEnableCustomAvatar:(BOOL)v { _enableCustomAvatar = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWACustomAvatar]; }
 - (void)setDisableSnsVideoTapClose:(BOOL)v { _disableSnsVideoTapClose = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAVideoTapClose]; }
 - (void)setHideFriendWxid:(BOOL)v { _hideFriendWxid = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideFriendWxid]; }
 - (void)setHideChatName:(BOOL)v { _hideChatName = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideChatName]; }
@@ -347,11 +305,12 @@ static NSString *ddDeletedMarkText(void) {
 }
 %end
 
-#pragma mark - ⑥ 朋友圈查看已删评论（对齐锤子：WCFacade 数据层管道）
-// 根因：微信在 WCDataItem 层面用 clearExpiredDeltedByFeedOwnerComment 把已删评论从
-// commentUsers 数组移除；且 LLComment_onBeforeReturnDataItem: 的 arg1 是 WCDataItem
-// （不是单条评论）。故必须在 dataItem 层面遍历 commentUsers 恢复，并兜住移除逻辑。
-// 锤子 hook 点：WCFacade.h:472/474/725；清除点：WCDataItem.h:367。
+#pragma mark - ⑥ 朋友圈查看已删评论（对齐锤子：单点 %hook WCSNSMessage）
+// 对齐锤子，整个功能收敛为单一 hook：%hook WCSNSMessage。
+// 提醒/通知里被删评论来自 WCSNSMessage.comment / refComment（独立 WCUserComment，
+// WCSNSMessage.h:18/19）；在此拦截 isWCMessageDeleted（放行）+ upgradeDataIfNeeded
+// （重置 delStatus、恢复 comment/refComment 并拼锤子前缀"对方已删除] "，@0xbd80da）。
+// 单点即覆盖提醒路径，不再分散到 WCFacade / WCDataItem。
 
 // 恢复单条已删评论（C helper，避免 %new 调用编译期 selector 可见性问题）：
 // 清真实删除标记，并数据层拼锤子前缀"对方已删除] "
@@ -369,15 +328,7 @@ static void dd_restoreDeletedComment(id c) {
     }
 }
 
-// 评论级兜底：开关开启时阻止微信把已删评论从 dataItem 移除（WCDataItem.h:367）
-%hook WCDataItem
-- (void)clearExpiredDeltedByFeedOwnerComment {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return;
-    %orig;
-}
-%end
-
-// 消息级兜底（保留）
+// 单点核心（对齐锤子 %hook WCSNSMessage）：isWCMessageDeleted 放行 + upgradeDataIfNeeded 恢复
 %hook WCSNSMessage
 - (_Bool)isWCMessageDeleted {
     if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
@@ -387,172 +338,12 @@ static void dd_restoreDeletedComment(id c) {
     %orig;
     if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return;
     if (self.delStatus != 0) self.delStatus = 0;
-}
-%end
-
-// 数据层主链路：WCFacade 三个 hook（锤子 hook 点，WCFacade.h:472/474/725）
-// isDataItemDeleted: 返回 NO 骗过"动态已删"判定
-// LL_onBeforeReturnDataItem: 返回 YES 放行 dataItem
-// LLComment_onBeforeReturnDataItem: 在返回前恢复已删评论 + 数据层拼锤子前缀
-%hook WCFacade
-- (_Bool)isDataItemDeleted:(id)arg1 {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
-    return %orig;
-}
-- (_Bool)LL_onBeforeReturnDataItem:(id)arg1 {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return YES;
-    return %orig;
-}
-- (void)LLComment_onBeforeReturnDataItem:(id)arg1 {
-    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) { %orig; return; }
-    Class DataItemCls = objc_getClass("WCDataItem");
-    Class CommentCls  = objc_getClass("WCUserComment");
-    if ([arg1 isKindOfClass:DataItemCls]) {
-        // 微信传整个 dataItem：遍历 commentUsers，恢复每条已删评论
-        NSMutableArray *users = MSHookIvar<NSMutableArray *>(arg1, "_commentUsers");
-        if ([users isKindOfClass:[NSArray class]]) {
-            for (id c in users) dd_restoreDeletedComment(c);
-        }
-    } else if ([arg1 isKindOfClass:CommentCls]) {
-        // 兜底：微信也可能逐条传评论
-        dd_restoreDeletedComment(arg1);
-    }
-    %orig;
-}
-%end
-
-#pragma mark - ⑦ 启用自定义头像(聊天详情页, 每聊独立)
-static NSString *ddCustomAvatarKey(NSString *userName) {
-    return [NSString stringWithFormat:@"dd_customAvatar_%@", userName ?: @""];
-}
-static const void *kDDAvatarUsr     = &kDDAvatarUsr;
-static const void *kDDAvatarPicking = &kDDAvatarPicking;
-
-// 用 performSelector: 取 userName，规避 NSProcessInfo.userName 不可用与同名冲突
-static NSString *ddUserNameOf(id obj) {
-    if (!obj) return nil;
-    if (![obj respondsToSelector:@selector(userName)]) return nil;
-    return [obj performSelector:@selector(userName)];
-}
-
-// 读 cellInfo 标题(用于定位插入点与幂等查重)，走 performSelector: 规避 KVC / id 点语法
-static NSString *ddCellTitle(id cellInfo) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    @try {
-        id cfg  = [cellInfo performSelector:@selector(cellConfig)];
-        if (!cfg) return nil;
-        id left = [cfg performSelector:@selector(leftConfig)];
-        if (!left) return nil;
-        return [left performSelector:@selector(title)];
-    } @catch (NSException *e) { return nil; }
-#pragma clang diagnostic pop
-}
-
-static BOOL ddCustomAvatarOnForUser(NSString *usr) {
-    if (![DDWeChatConfig sharedConfig].enableCustomAvatar) return NO;
-    if (usr.length == 0) return NO;
-    return [NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(usr)] != nil;
-}
-
-// 在聊天详情页注入「启用自定义头像」原生 switch cell，插到"查找聊天内容"上方；找不到则插末尾
-static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
-    @try {
-        NSString *usr = ddUserNameOf(vc.m_contact);
-        if (usr.length == 0) return;
-        MMTableViewInfo *ti = MSHookIvar<MMTableViewInfo *>(vc, "m_tableViewInfo");
-        if (!ti) return;
-        NSUInteger secCount = [ti getSectionCount];
-        if (secCount == 0) return;
-        NSInteger targetSec = -1, targetIdx = -1;
-        for (NSUInteger s = 0; s < secCount; s++) {
-            id sec = [ti getSectionAt:s];
-            if (!sec) continue;
-            NSUInteger cellCount = [sec getCellCount];
-            for (NSUInteger c = 0; c < cellCount; c++) {
-                NSString *t = ddCellTitle([sec getCellAt:c]);
-                if ([t isEqualToString:@"启用自定义头像"]) return;          // 已注入，幂等
-                if ([t isEqualToString:@"查找聊天内容"]) { targetSec = (NSInteger)s; targetIdx = (NSInteger)c; break; }
-            }
-            if (targetSec >= 0) break;
-        }
-        if (targetSec < 0) {   // 兜底: 插到最后一个 section 末尾
-            id lastSec = [ti getSectionAt:secCount - 1];
-            if (lastSec) {
-                targetSec = (NSInteger)(secCount - 1);
-                targetIdx = (NSInteger)[lastSec getCellCount];
-            }
-        }
-        if (targetSec < 0) return;
-        id sec = [ti getSectionAt:(NSUInteger)targetSec];
-        Class cellMgr = objc_getClass("WCTableViewCellManager");
-        id cell = [cellMgr switchCellForSel:@selector(dd_toggleCustomAvatar:) target:vc
-                                      title:@"启用自定义头像" on:ddCustomAvatarOnForUser(usr)];
-        [sec insertCell:cell At:(unsigned int)targetIdx];
-        UITableView *tv = [ti getTableView];
-        [tv reloadData];
-    } @catch (NSException *e) { }
-}
-
-%hook AddContactToChatRoomViewController
-- (void)reloadTableData {
-    %orig;
-    ddInjectCustomAvatarCell(self);
-}
-- (void)reloadData {
-    %orig;
-    ddInjectCustomAvatarCell(self);
-}
-- (void)onTableViewReload {
-    %orig;
-    ddInjectCustomAvatarCell(self);
-}
-%new
-- (void)dd_toggleCustomAvatar:(UISwitch *)s {
-    NSString *usr = ddUserNameOf(self.m_contact);
-    if (usr.length == 0) return;
-    if (s.on) {
-        if (![DDWeChatConfig sharedConfig].enableCustomAvatar) { s.on = NO; return; }
-        UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-        picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-        picker.delegate = (id<UINavigationControllerDelegate, UIImagePickerControllerDelegate>)self;
-        objc_setAssociatedObject(self, kDDAvatarUsr, usr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [self presentViewController:picker animated:YES completion:nil];
-    } else {
-        [NSUserDefaults.standardUserDefaults removeObjectForKey:ddCustomAvatarKey(usr)];
-    }
-}
-%new
-- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
-    UIImage *image = info[UIImagePickerControllerOriginalImage];
-    NSString *usr = objc_getAssociatedObject(self, kDDAvatarUsr);
-    if (image && usr.length) {
-        [NSUserDefaults.standardUserDefaults setObject:UIImagePNGRepresentation(image) forKey:ddCustomAvatarKey(usr)];
-    }
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-%new
-- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-%end
-
-// 渲染侧: MMUILongPressImageView -setImage: 处换图，仅当 superview 为头像视图(MMHeadImageView)才处理
-%hook MMUILongPressImageView
-- (void)setImage:(id)arg1 {
-    %orig;
-    UIView *head = self.superview;
-    if (![head respondsToSelector:@selector(getRealUserName:)]) {
-        head = head.superview;
-        if (![head respondsToSelector:@selector(getRealUserName:)]) return;
-    }
-    NSString *usr = [head performSelector:@selector(getRealUserName:) withObject:nil];
-    if (usr.length == 0) return;
-    if (!ddCustomAvatarOnForUser(usr)) return;
-    NSData *d = [NSUserDefaults.standardUserDefaults objectForKey:ddCustomAvatarKey(usr)];
-    if (!d) return;
-    UIImage *img = [UIImage imageWithData:d];
-    if (img) %orig(img);
+    // 提醒/通知路径核心（对齐锤子 %hook WCSNSMessage）：WCSNSMessage.comment /
+    // refComment 是独立 WCUserComment，在此恢复并加锤子前缀（WCSNSMessage.h:18/19）
+    id cm = [self comment];
+    if (cm) dd_restoreDeletedComment(cm);
+    id ref = [self refComment];
+    if (ref) dd_restoreDeletedComment(ref);
 }
 %end
 
@@ -702,9 +493,6 @@ static BOOL ddHideName(void) {
     [privacy addCell:[cellMgr switchCellForSel:@selector(onHideChatNameSwitch:) target:self title:@"隐藏聊天顶栏名字" on:cfg.hideChatName]];
     [_tableViewManager addSection:privacy];
 
-    WCTableViewSectionManager *general = [secMgr defaultSection];
-    [general addCell:[cellMgr switchCellForSel:@selector(onAvatarSwitch:) target:self title:@"启用自定义头像(总开关)" on:cfg.enableCustomAvatar]];
-    [_tableViewManager addSection:general];
 
     [_tableViewManager reloadTableView];
 }
@@ -727,7 +515,6 @@ static BOOL ddHideName(void) {
 - (void)onTextFoldSwitch:(UISwitch *)s      { [DDWeChatConfig sharedConfig].disableSnsTextFold = s.on; }
 - (void)onGroupFoldSwitch:(UISwitch *)s     { [DDWeChatConfig sharedConfig].disableSnsGroupFold = s.on; }
 - (void)onAntiDeleteSwitch:(UISwitch *)s    { [DDWeChatConfig sharedConfig].antiDeleteSnsComment = s.on; }
-- (void)onAvatarSwitch:(UISwitch *)s        { [DDWeChatConfig sharedConfig].enableCustomAvatar = s.on; }
 - (void)onVideoTapCloseSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableSnsVideoTapClose = s.on; }
 - (void)onHideFriendWxidSwitch:(UISwitch *)s{ [DDWeChatConfig sharedConfig].hideFriendWxid = s.on; }
 - (void)onHideChatNameSwitch:(UISwitch *)s  { [DDWeChatConfig sharedConfig].hideChatName = s.on; }
