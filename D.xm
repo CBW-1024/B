@@ -78,6 +78,8 @@
 @property (nonatomic) _Bool deletedByFeedOwner;      // WCUserComment.h:32
 - (_Bool)bDeleted;
 - (_Bool)deletedByFeedOwner;
+- (id)content;                                       // WCUserComment.h:37
+- (void)setContent:(id)arg1;                         // WCUserComment.h:37
 @end
 
 @interface WCSNSMessage : NSObject
@@ -87,12 +89,11 @@
 - (_Bool)isWCMessageDeleted;                          // WCSNSMessage.h:19
 @end
 
-@interface WCCommentView : NSObject
-+ (id)getDisplayCommentContent:(id)a0 dataItem:(id)a1 pageContext:(id)a2;  // WCCommentView.h:35
-@end
-
-@interface WCCommentListContentView : UIView
-+ (id)getDisplayContent:(id)a0 dataItem:(id)a1 pageContext:(id)a2;  // WCCommentListContentView.h:30
+// ⑥ 朋友圈评论防删：WCFacade 数据层删除判定管道（锤子 hook 点，WCFacade.h:472/474/725）
+@interface WCFacade : NSObject
+- (_Bool)LL_onBeforeReturnDataItem:(id)arg1;            // WCFacade.h:472
+- (_Bool)isDataItemDeleted:(id)arg1;                   // WCFacade.h:474
+- (void)LLComment_onBeforeReturnDataItem:(id)arg1;     // WCFacade.h:725
 @end
 
 // ⑦ 渲染点: MMUILongPressImageView -setImage: (MMUILongPressImageView.h:29)
@@ -173,9 +174,8 @@ static const BOOL kDDDefaultHideFriendWxid    = NO;
 static const BOOL kDDDefaultHideMyWxid        = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
 
-// ⑥ 被删评论前缀文案(默认"[已删除]")
-static NSString * const kDDDefaultDeletedMark = @"[已删除]";
-static const void *kDDWasDeletedKey = &kDDWasDeletedKey;
+// ⑥ 被删评论前缀文案(默认"[对方已删除]"，与锤子一致)
+static NSString * const kDDDefaultDeletedMark = @"[对方已删除]";
 static NSString *ddDeletedMarkText(void) {
     NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kDDWADeletedCommentMark];
     return (t.length ? t : kDDDefaultDeletedMark);
@@ -353,27 +353,20 @@ static NSString *ddDeletedMarkText(void) {
 }
 %end
 
-#pragma mark - ⑥ 朋友圈评论防删
-// bDeleted / deletedByFeedOwner 返回 NO(保留可见)，并用关联对象记住真实已删态供文本加前缀
+#pragma mark - ⑥ 朋友圈评论防删（对齐锤子：WCFacade 数据层管道恢复 + 数据层改 comment.content 加前缀）
+// 渲染层兜底：任何读 bDeleted 的地方都不再隐藏评论（前缀判断用真实 ivar，避免与 getter hook 冲突）
 %hook WCUserComment
 - (_Bool)bDeleted {
-    _Bool real = %orig;
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) {
-        if (real) objc_setAssociatedObject(self, kDDWasDeletedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return NO;
-    }
-    return real;
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
+    return %orig;
 }
 - (_Bool)deletedByFeedOwner {
-    _Bool real = %orig;
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) {
-        if (real) objc_setAssociatedObject(self, kDDWasDeletedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return NO;
-    }
-    return real;
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
+    return %orig;
 }
 %end
 
+// 消息级兜底
 %hook WCSNSMessage
 - (_Bool)isWCMessageDeleted {
     if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
@@ -386,38 +379,29 @@ static NSString *ddDeletedMarkText(void) {
 }
 %end
 
-// 评论显示文本计算处拼接"[已删除]"前缀；非 NSString(富文本)原样返回
-%hook WCCommentView
-+ (id)getDisplayCommentContent:(id)comment dataItem:(id)item pageContext:(id)ctx {
-    id orig = %orig;
-    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return orig;
-    if (![comment isKindOfClass:objc_getClass("WCUserComment")]) return orig;
-    NSNumber *wasDel = objc_getAssociatedObject(comment, kDDWasDeletedKey);
-    if (!wasDel || !wasDel.boolValue) return orig;
-    if ([orig isKindOfClass:[NSString class]]) {
-        return [ddDeletedMarkText() stringByAppendingString:(NSString *)orig];
-    }
-    return orig;
+// 数据层主链路：关掉删除过滤，并直接给已删评论的 content 拼"[对方已删除]"前缀
+// 前缀写在数据层，无论评论走哪条渲染路径都带前缀，故一定显示
+%hook WCFacade
+- (_Bool)isDataItemDeleted:(id)arg1 {
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
+    return %orig;
 }
-%end
-
-// 评论列表/通知详情页走 getDisplayContent:，需单独加一次前缀
-%hook WCCommentListContentView
-+ (id)getDisplayContent:(id)a0 dataItem:(id)a1 pageContext:(id)a2 {
-    id orig = %orig;
-    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return orig;
-    id comment = nil;
-    Class WCUserCommentCls = objc_getClass("WCUserComment");
-    Class WCSNSMessageCls  = objc_getClass("WCSNSMessage");
-    if ([a0 isKindOfClass:WCUserCommentCls]) comment = a0;
-    else if (WCSNSMessageCls && [a0 isKindOfClass:WCSNSMessageCls]) comment = [a0 comment];
-    if (!comment) return orig;
-    NSNumber *wasDel = objc_getAssociatedObject(comment, kDDWasDeletedKey);
-    if (!wasDel || !wasDel.boolValue) return orig;
-    if ([orig isKindOfClass:[NSString class]]) {
-        return [ddDeletedMarkText() stringByAppendingString:(NSString *)orig];
+- (_Bool)LL_onBeforeReturnDataItem:(id)arg1 {
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return YES;
+    return %orig;
+}
+- (void)LLComment_onBeforeReturnDataItem:(id)arg1 {
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment && [arg1 isKindOfClass:objc_getClass("WCUserComment")]) {
+        WCUserComment *c = (WCUserComment *)arg1;
+        _Bool realDel = MSHookIvar<_Bool>(arg1, "_bDeleted") || MSHookIvar<_Bool>(arg1, "_deletedByFeedOwner");
+        if (realDel) {
+            NSString *ct = [c content];
+            if ([ct isKindOfClass:[NSString class]] && ct.length && ![ct hasPrefix:ddDeletedMarkText()]) {
+                [c setContent:[ddDeletedMarkText() stringByAppendingString:ct]];
+            }
+        }
     }
-    return orig;
+    %orig;
 }
 %end
 
