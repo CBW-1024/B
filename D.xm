@@ -327,6 +327,71 @@ static inline BOOL dd_logOn(void) {
 // 用法：DDLog(@"SNS", @"setDelStatus=%u ...", status);
 #define DDLog(tag, fmt, ...) do { if (dd_logOn()) { [[DDLogStore shared] appendFormat:(@"[" tag "] " fmt), ##__VA_ARGS__]; } } while (0)
 
+// ===== 字段快照诊断 =====
+static NSString *dd_abbrev(id obj);   // 前向声明（定义在下方）
+
+// 目的：8.0.76D 里到底哪个字段标记“评论已删除”无法靠猜（bDeleted / deletedByFeedOwner
+// 实测恒为 0）。这里把对象的全部 ivar 名称和值打成一行，直接对比
+// “自己刚发的评论” vs “真正被删除的评论” 的字段差异，一次就能定位判定条件。
+static NSMutableSet *dd_dumpedObjects(void) {
+    static NSMutableSet *set = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ set = [[NSMutableSet alloc] init]; });
+    return set;
+}
+// 每个对象只 dump 一次，且总量设上限，避免日志爆炸
+static BOOL dd_shouldDump(id obj) {
+    if (!obj) return NO;
+    NSMutableSet *set = dd_dumpedObjects();
+    if (set.count > 200) return NO;
+    NSNumber *key = [NSNumber numberWithUnsignedLongLong:(unsigned long long)(uintptr_t)(__bridge void *)obj];
+    if ([set containsObject:key]) return NO;
+    [set addObject:key];
+    return YES;
+}
+static NSString *dd_dumpIvars(id obj) {
+    if (!obj) return @"(nil)";
+    NSMutableArray *parts = [NSMutableArray array];
+    for (Class cls = [obj class]; cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(cls, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            Ivar v = ivars[i];
+            const char *nameC = ivar_getName(v);
+            const char *typeC = ivar_getTypeEncoding(v);
+            if (!nameC || !typeC) continue;
+            NSString *name = [NSString stringWithUTF8String:nameC];
+            if (!name) continue;
+            char *q = (char *)(__bridge void *)obj + ivar_getOffset(v);
+            NSString *val = nil;
+            switch (typeC[0]) {
+                case 'c': val = [NSString stringWithFormat:@"%d", (int)*(char *)q]; break;
+                case 'B': val = [NSString stringWithFormat:@"%d", (int)*(unsigned char *)q]; break;
+                case 'i': val = [NSString stringWithFormat:@"%d", *(int *)q]; break;
+                case 'I': val = [NSString stringWithFormat:@"%u", *(unsigned int *)q]; break;
+                case 's': val = [NSString stringWithFormat:@"%d", (int)*(short *)q]; break;
+                case 'S': val = [NSString stringWithFormat:@"%u", (unsigned)*(unsigned short *)q]; break;
+                case 'l': val = [NSString stringWithFormat:@"%ld", *(long *)q]; break;
+                case 'L': val = [NSString stringWithFormat:@"%lu", *(unsigned long *)q]; break;
+                case 'q': val = [NSString stringWithFormat:@"%lld", *(long long *)q]; break;
+                case 'Q': val = [NSString stringWithFormat:@"%llu", *(unsigned long long *)q]; break;
+                case 'f': val = [NSString stringWithFormat:@"%g", (double)*(float *)q]; break;
+                case 'd': val = [NSString stringWithFormat:@"%g", *(double *)q]; break;
+                case '@': val = dd_abbrev(object_getIvar(obj, v)); break;
+                case '*': {
+                    const char *s = *(const char **)q;
+                    val = s ? dd_abbrev([NSString stringWithUTF8String:s]) : @"(null)";
+                    break;
+                }
+                default: break;   // 结构体/数组/指针等跳过，避免误读内存
+            }
+            if (val) [parts addObject:[NSString stringWithFormat:@"%@=%@", name, val]];
+        }
+        free(ivars);
+    }
+    return [NSString stringWithFormat:@"%@ { %@ }", NSStringFromClass([obj class]), [parts componentsJoinedByString:@" | "]];
+}
+
 // 日志里截断长文本，避免刷屏
 static NSString *dd_abbrev(id obj) {
     NSString *t = [obj isKindOfClass:[NSString class]] ? (NSString *)obj : [obj description];
@@ -508,6 +573,10 @@ static void dd_injectMarkIntoComment(id c) {
         id r = [self refComment];
         DDLog(@"SNS", @"setDelStatus=1 | msg=%@ | comment=%@ | ref=%@ | commentContent=%@",
               NSStringFromClass([self class]), dd_commentFlagDesc(c), dd_commentFlagDesc(r), dd_abbrev([c content]));
+        // 字段快照：每个对象只打一次，用于对比“发评论”与“真删除”的字段差异
+        if (dd_shouldDump(self)) { DDLog(@"DUMP", @"msg: %@", dd_dumpIvars(self)); }
+        if (dd_shouldDump(c))    { DDLog(@"DUMP", @"comment: %@", dd_dumpIvars(c)); }
+        if (dd_shouldDump(r))    { DDLog(@"DUMP", @"refComment: %@", dd_dumpIvars(r)); }
         // 严格模式下只对“对象确实处于删除态”的评论注入，避免正常评论被误加前缀
         BOOL shouldMark = dd_strictMode() ? (dd_isDeletedCommentObject(c) || dd_isDeletedCommentObject(r)) : YES;
         if (shouldMark) {
@@ -569,6 +638,8 @@ static void dd_injectMarkIntoComment(id c) {
     BOOL deleted = dd_isDeletedCommentObject(self.comment);
     DDLog(@"LIST", @"config: deleted=%d | comment=%@ | content=%@",
           (int)deleted, dd_commentFlagDesc(self.comment), dd_abbrev([self.comment content]));
+    // 渲染期字段快照：这时对象已完成解析，字段最全
+    if (dd_shouldDump(self.comment)) { DDLog(@"DUMP", @"渲染期 comment: %@", dd_dumpIvars(self.comment)); }
     if (deleted) {
         dd_injectMarkIntoComment(self.comment);
     }
