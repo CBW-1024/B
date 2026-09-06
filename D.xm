@@ -76,17 +76,9 @@
 @interface WCPlayerConfigFullScreenViewController : UIViewController
 - (void)onFullScreenSingleTap;
 - (BOOL)shouldShowProgressBar;
-- (BOOL)shouldShowProgressBarWithoutThreshold;
 - (BOOL)autoShowProgressBarWithThreshold;
-- (id)generateConfig;
-@end
-
-// 手动声明 WCPlayerFullScreenConfig（工程不 import 其头文件，故在此用完整类声明
-// 同时引入类与进度条 setter，使直接发送可编译；无需单独的 @class 前向声明）。
-// 注意：若以后 import 了真实 WCPlayerFullScreenConfig.h，请改回
-// “@class ...; @interface ... (Category)” 形式，以免“重复接口定义”冲突。
-@interface WCPlayerFullScreenConfig : NSObject
-- (void)setBForbidProgressBarAutoHidden:(BOOL)v;
+- (void)onToolViewAutoClose;
+- (void)fadeControl;
 @end
 
 @interface NewMainFrameViewController : MMTabBarBaseViewController
@@ -407,10 +399,15 @@ static void dd_restoreDeletedComment(id c) {
 // ② 禁用点击关闭：单次点按触发 onFullScreenSingleTap，内部走向关闭。开启后吞掉该
 //    点按即可（X 关闭按钮 onTapCloseButton 仍可正常关闭）。
 //
-// ③ 启用进度条：朋友圈短视频(<约15秒)默认不显示进度条，阈值逻辑在
-//    autoShowProgressBarWithThreshold；是否显示由 shouldShowProgressBar 决定；
-//    常驻与否由 config.bForbidProgressBarAutoHidden 决定（与锤子同款机制：
-//    setBForbidProgressBarAutoHidden:）。开启后强制三者，使短视频也常驻显示进度条。
+// ③ 启用进度条：朋友圈短视频(<约15秒)的进度条“一开始就是折叠/隐藏”的（并非没有、
+//    只是默认收起），且播放约5秒后会随控制栏一起再收起。两段都要做：
+//    (a) 强制展开：shouldShowProgressBar / autoShowProgressBarWithThreshold 返回 YES，
+//        让短视频进度条从一开始就显示；
+//    (b) 不折叠：拦住控制栏自动收起(onToolViewAutoClose 隐藏 / fadeControl 淡出)，
+//        常驻可见。
+//    注：原 WCPlayerFullScreenConfig.bForbidProgressBarAutoHidden（进度条专属防自动隐藏）
+//    已移除——它是“进度条独立于控制栏单独隐藏”时的兜底，而本版折叠是控制栏整体收起，
+//    由 (b) 的 onToolViewAutoClose / fadeControl 拦截统一覆盖，故冗余。
 %hook WCPlayerConfigFullScreenViewController
 
 - (void)onFullScreenSingleTap {
@@ -426,29 +423,22 @@ static void dd_restoreDeletedComment(id c) {
     return %orig;
 }
 
-- (BOOL)shouldShowProgressBarWithoutThreshold {
-    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) return YES;
-    return %orig;
-}
-
 - (BOOL)autoShowProgressBarWithThreshold {
-    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) return YES;  // 短视频(<15s)也显示
+    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) return YES;  // 短视频(<15s)从一开始也展开
     return %orig;
 }
 
-- (id)generateConfig {
-    id cfg = %orig;
-    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) {
-        // 禁止进度条自动隐藏（锤子机制：WCPlayerFullScreenConfig.bForbidProgressBarAutoHidden）。
-        // 必须用 objc_getClass 取类，不能写 [WCPlayerFullScreenConfig class]：后者会让链接器去找
-        // _OBJC_CLASS_$_WCPlayerFullScreenConfig（该类属于微信、不在本 dylib），导致
-        // Undefined symbols。强转 (WCPlayerFullScreenConfig *) 仅告诉编译器类型，不产生符号引用。
-        Class configCls = objc_getClass("WCPlayerFullScreenConfig");
-        if (configCls && [cfg isKindOfClass:configCls]) {
-            [(WCPlayerFullScreenConfig *)cfg setBForbidProgressBarAutoHidden:YES];
-        }
-    }
-    return cfg;
+// 进度条“不自动折叠”的关键：播放约5秒后控制栏会自动收起（onToolViewAutoClose 隐藏 /
+// fadeControl 淡出），进度条是控制栏的一部分会跟着收起。开启进度条开关时直接拦住
+// 这两个自动收起动作，使控制栏（含进度条）常驻可见。
+- (void)onToolViewAutoClose {
+    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) return;  // 禁止控制栏自动隐藏
+    %orig;
+}
+
+- (void)fadeControl {
+    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) return;  // 禁止控制栏淡出
+    %orig;
 }
 
 %end
