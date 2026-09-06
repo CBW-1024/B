@@ -66,6 +66,7 @@
 @interface WCSNSMessage : NSObject
 @property (nonatomic) unsigned int delStatus;
 @property (retain, nonatomic) WCUserComment *comment;
+@property (retain, nonatomic) WCUserComment *refComment;
 - (void)upgradeDataIfNeeded;
 - (_Bool)isWCMessageDeleted;
 @end
