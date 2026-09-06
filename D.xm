@@ -72,9 +72,15 @@
 - (_Bool)isWCMessageDeleted;
 @end
 
-@interface WAVideoPlayerView : WCPlayerControlView
-@property (nonatomic) _Bool disableTapGesture;
-- (void)setVideoPath:(id)arg1 initialTime:(double)arg2 isHLS:(long long)arg3;
+// 朋友圈视频全屏播放器（SNS / Moments）。注意：WAVideoPlayerView 是「小程序/视频号」
+// 播放器，朋友圈视频走的是 WCPlayerConfigFullScreenViewController，因此点按关闭与
+// 进度条都必须 hook 此类（已用 微信8.0.76D 头文件核对）。
+@interface WCPlayerConfigFullScreenViewController : UIViewController
+- (void)onFullScreenSingleTap;
+- (BOOL)shouldShowProgressBar;
+- (BOOL)shouldShowProgressBarWithoutThreshold;
+- (BOOL)autoShowProgressBarWithThreshold;
+- (id)generateConfig;
 @end
 
 @interface NewMainFrameViewController : MMTabBarBaseViewController
@@ -107,6 +113,7 @@
 #define kDDWADeletedComment    @"kDDWA_antiDeleteSnsComment"
 #define kDDWADeletedCommentMark @"kDDWA_deletedCommentMark"
 #define kDDWAVideoTapClose     @"kDDWA_disableSnsVideoTapClose"
+#define kDDWAVideoProgressBar  @"kDDWA_snsVideoProgressBar"   // 新增：朋友圈视频进度条
 #define kDDWAHideFriendWxid    @"kDDWA_hideFriendWxid"
 #define kDDWAHideChatName      @"kDDWA_hideChatName"
 
@@ -117,14 +124,21 @@ static const BOOL kDDDefaultTextFold          = NO;
 static const BOOL kDDDefaultGroupFold         = NO;
 static const BOOL kDDDefaultAntiDelete        = NO;
 static const BOOL kDDDefaultVideoTapClose     = NO;
+static const BOOL kDDDefaultVideoProgressBar  = NO;   // 新增
 static const BOOL kDDDefaultHideFriendWxid    = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
 
-static NSString * const kDDDefaultDeletedMark = @"对方已删除] ";
+// 修复点：原默认前缀为 @"对方已删除] "（带方括号且常因还原时机问题不显示）。
+// 改为干净的 @"对方已删除 "，使其与“对方已删除”前缀的预期一致；仍可在 NSUserDefaults
+// 的 kDDWADeletedCommentMark 中自定义。
+static NSString * const kDDDefaultDeletedMark = @"对方已删除 ";
 static NSString *ddDeletedMarkText(void) {
     NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kDDWADeletedCommentMark];
     return (t.length ? t : kDDDefaultDeletedMark);
 }
+
+// 关联对象 key：标记“该评论原本是已删除的”，供 content getter 幂等地补回前缀
+static const void *kDDWasDeletedCommentKey = &kDDWasDeletedCommentKey;
 
 @interface DDWeChatConfig : NSObject
 + (instancetype)sharedConfig;
@@ -135,6 +149,7 @@ static NSString *ddDeletedMarkText(void) {
 @property (assign, nonatomic) BOOL disableSnsGroupFold;
 @property (assign, nonatomic) BOOL antiDeleteSnsComment;
 @property (assign, nonatomic) BOOL disableSnsVideoTapClose;
+@property (assign, nonatomic) BOOL snsVideoProgressBar;   // 新增
 @property (assign, nonatomic) BOOL hideFriendWxid;
 @property (assign, nonatomic) BOOL hideChatName;
 @end
@@ -156,6 +171,7 @@ static NSString *ddDeletedMarkText(void) {
         kDDWAGroupFold:      @(kDDDefaultGroupFold),
         kDDWADeletedComment: @(kDDDefaultAntiDelete),
         kDDWAVideoTapClose:  @(kDDDefaultVideoTapClose),
+        kDDWAVideoProgressBar: @(kDDDefaultVideoProgressBar),   // 新增
         kDDWAHideFriendWxid: @(kDDDefaultHideFriendWxid),
         kDDWAHideChatName:   @(kDDDefaultHideChatName),
         kDDWADeletedCommentMark: kDDDefaultDeletedMark,
@@ -171,6 +187,7 @@ static NSString *ddDeletedMarkText(void) {
         _disableSnsGroupFold            = [ud boolForKey:kDDWAGroupFold];
         _antiDeleteSnsComment           = [ud boolForKey:kDDWADeletedComment];
         _disableSnsVideoTapClose        = [ud boolForKey:kDDWAVideoTapClose];
+        _snsVideoProgressBar            = [ud boolForKey:kDDWAVideoProgressBar];   // 新增
         _hideFriendWxid                 = [ud boolForKey:kDDWAHideFriendWxid];
         _hideChatName                   = [ud boolForKey:kDDWAHideChatName];
     }
@@ -183,6 +200,7 @@ static NSString *ddDeletedMarkText(void) {
 - (void)setDisableSnsGroupFold:(BOOL)v { _disableSnsGroupFold = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAGroupFold]; }
 - (void)setAntiDeleteSnsComment:(BOOL)v { _antiDeleteSnsComment = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWADeletedComment]; }
 - (void)setDisableSnsVideoTapClose:(BOOL)v { _disableSnsVideoTapClose = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAVideoTapClose]; }
+- (void)setSnsVideoProgressBar:(BOOL)v { _snsVideoProgressBar = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAVideoProgressBar]; }   // 新增
 - (void)setHideFriendWxid:(BOOL)v { _hideFriendWxid = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideFriendWxid]; }
 - (void)setHideChatName:(BOOL)v { _hideChatName = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideChatName]; }
 @end
@@ -292,12 +310,16 @@ static NSString *ddDeletedMarkText(void) {
 
 #pragma mark - ⑥ 朋友圈查看已删评论
 
-// 恢复单条已删评论
+// 恢复单条已删评论：清掉删除标记 + 打“对方已删除”前缀，并用关联对象记住“原本已删”
 static void dd_restoreDeletedComment(id c) {
     Class CommentCls = objc_getClass("WCUserComment");
     if (![c isKindOfClass:CommentCls]) return;
     _Bool realDel = MSHookIvar<_Bool>(c, "_bDeleted") || MSHookIvar<_Bool>(c, "_deletedByFeedOwner");
     if (!realDel) return;
+
+    // 打标记：即便 content 后续被重读/刷新，getter 也能幂等地补回前缀
+    objc_setAssociatedObject(c, kDDWasDeletedCommentKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
     MSHookIvar<_Bool>(c, "_bDeleted") = 0;
     MSHookIvar<_Bool>(c, "_deletedByFeedOwner") = 0;
     NSString *ct = [c content];
@@ -306,6 +328,23 @@ static void dd_restoreDeletedComment(id c) {
         [c setContent:[mark stringByAppendingString:ct]];
     }
 }
+
+// 修复点：原实现只在 upgradeDataIfNeeded 里补一次前缀。若评论内容在展示前被
+// 微信重新读取/刷新，前缀就会丢失。这里 hook content getter，对“原本已删”的评论
+// 幂等地保证前缀存在，从而稳定显示“对方已删除”。
+%hook WCUserComment
+- (id)content {
+    NSString *orig = %orig;
+    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return orig;
+    if (!objc_getAssociatedObject(self, kDDWasDeletedCommentKey)) return orig;
+    if (![orig isKindOfClass:[NSString class]] || orig.length == 0) return orig;
+    NSString *mark = ddDeletedMarkText();
+    if (![orig hasPrefix:mark]) {
+        return [mark stringByAppendingString:orig];
+    }
+    return orig;
+}
+%end
 
 // ⑥ 提醒里查看已删评论
 %hook WCSNSMessage
@@ -351,15 +390,57 @@ static void dd_restoreDeletedComment(id c) {
 }
 %end
 
-#pragma mark - ⑧ 禁用朋友圈视频点击关闭
+#pragma mark - ⑧ 禁用朋友圈视频点击关闭 + ⑦ 朋友圈视频进度条
 
-%hook WAVideoPlayerView
-- (void)setVideoPath:(id)arg1 initialTime:(double)arg2 isHLS:(long long)arg3 {
-    %orig;
+// 修正（关键）：原实现 hook 了 WAVideoPlayerView，但那是「小程序/视频号」播放器，
+// 朋友圈(SNS)视频走的是全屏播放器 WCPlayerConfigFullScreenViewController，所以原
+// 修复对朋友圈完全不生效（已用 微信8.0.76D 头文件核对：WAVideoPlayerView 中无任何
+// Moments/SNS 字样，而 WCPlayerConfigFullScreenViewController 委托含 Moments/SNS）。
+// 下面改为 hook 正确的类。
+//
+// ② 禁用点击关闭：单次点按触发 onFullScreenSingleTap，内部走向关闭。开启后吞掉该
+//    点按即可（X 关闭按钮 onTapCloseButton 仍可正常关闭）。
+//
+// ③ 启用进度条：朋友圈短视频(<约15秒)默认不显示进度条，阈值逻辑在
+//    autoShowProgressBarWithThreshold；是否显示由 shouldShowProgressBar 决定；
+//    常驻与否由 config.bForbidProgressBarAutoHidden 决定（与锤子同款机制：
+//    setBForbidProgressBarAutoHidden:）。开启后强制三者，使短视频也常驻显示进度条。
+%hook WCPlayerConfigFullScreenViewController
+
+- (void)onFullScreenSingleTap {
     if ([DDWeChatConfig sharedConfig].disableSnsVideoTapClose) {
-        self.disableTapGesture = YES;
+        // 禁用「点按关闭」：吞掉单次点按，不再触发关闭（X 按钮仍可关闭）
+        return;
     }
+    %orig;
 }
+
+- (BOOL)shouldShowProgressBar {
+    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) return YES;
+    return %orig;
+}
+
+- (BOOL)shouldShowProgressBarWithoutThreshold {
+    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) return YES;
+    return %orig;
+}
+
+- (BOOL)autoShowProgressBarWithThreshold {
+    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) return YES;  // 短视频(<15s)也显示
+    return %orig;
+}
+
+- (id)generateConfig {
+    id cfg = %orig;
+    if ([DDWeChatConfig sharedConfig].snsVideoProgressBar) {
+        // 禁止进度条自动隐藏（锤子机制：WCPlayerFullScreenConfig.bForbidProgressBarAutoHidden）
+        if ([cfg respondsToSelector:NSSelectorFromString(@"setBForbidProgressBarAutoHidden:")]) {
+            [cfg setBForbidProgressBarAutoHidden:YES];
+        }
+    }
+    return cfg;
+}
+
 %end
 
 #pragma mark - ⑫ 隐藏聊天顶栏名字
@@ -455,6 +536,7 @@ static BOOL ddHideName(void) {
     [sns addCell:[cellMgr switchCellForSel:@selector(onGroupFoldSwitch:) target:self title:@"禁用朋友圈微商折叠" on:cfg.disableSnsGroupFold]];
     [sns addCell:[cellMgr switchCellForSel:@selector(onAntiDeleteSwitch:) target:self title:@"查看朋友圈已删评论" on:cfg.antiDeleteSnsComment]];
     [sns addCell:[cellMgr switchCellForSel:@selector(onVideoTapCloseSwitch:) target:self title:@"禁用朋友圈视频点击关闭" on:cfg.disableSnsVideoTapClose]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onVideoProgressBarSwitch:) target:self title:@"启用朋友圈视频进度条" on:cfg.snsVideoProgressBar]];   // 新增
     [_tableViewManager addSection:sns];
 
     WCTableViewSectionManager *privacy = [secMgr defaultSection];
@@ -484,6 +566,7 @@ static BOOL ddHideName(void) {
 - (void)onGroupFoldSwitch:(UISwitch *)s     { [DDWeChatConfig sharedConfig].disableSnsGroupFold = s.on; }
 - (void)onAntiDeleteSwitch:(UISwitch *)s    { [DDWeChatConfig sharedConfig].antiDeleteSnsComment = s.on; }
 - (void)onVideoTapCloseSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableSnsVideoTapClose = s.on; }
+- (void)onVideoProgressBarSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].snsVideoProgressBar = s.on; }   // 新增
 - (void)onHideFriendWxidSwitch:(UISwitch *)s{ [DDWeChatConfig sharedConfig].hideFriendWxid = s.on; }
 - (void)onHideChatNameSwitch:(UISwitch *)s  { [DDWeChatConfig sharedConfig].hideChatName = s.on; }
 @end
