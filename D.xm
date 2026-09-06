@@ -1,5 +1,5 @@
 
-// DD微信助手 —— 微信功能增强
+// DD微信助手 —— 微信功能增强 tweak（精简版）
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <substrate.h>
@@ -121,6 +121,7 @@ static const BOOL kDDDefaultVideoProgressBar  = NO;
 static const BOOL kDDDefaultHideFriendWxid    = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
 
+// 已删评论前缀（与锤子 WeChatTweak 一致）
 static NSString * const kDDDefaultDeletedMark = @"[对方已删除] ";
 static NSString *ddDeletedMarkText(void) {
     NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kDDWADeletedCommentMark];
@@ -296,8 +297,10 @@ static NSString *ddDeletedMarkText(void) {
 }
 %end
 
-#pragma mark - ⑥ 朋友圈查看已删评论
+#pragma mark - ⑥ 朋友圈查看已删评论（对齐锤子 WeChatTweak.dylib 的实现）
 
+// 对齐锤子：hook setDelStatus:，评论被标记删除时给 comment.content 加前缀
+// 给评论内容加 [对方已删除] 前缀；content 为空时只写纯标记，避免空白评论
 static void dd_injectMarkIntoComment(id c) {
     if (![c isKindOfClass:%c(WCUserComment)]) return;
     NSString *mark = ddDeletedMarkText();
@@ -321,6 +324,7 @@ static void dd_injectMarkIntoComment(id c) {
     if (status == 1) {
         id c = [self comment];
         dd_injectMarkIntoComment(c);
+        // 以 0 透传，对外视为未删除，正常渲染
         %orig(0);
         return;
     }
