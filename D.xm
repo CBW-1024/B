@@ -30,7 +30,7 @@
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 on:(_Bool)arg4;
-// 普通可点击行（用于“查看日志 / 导出日志 / 清空日志”）
+// 普通可点击行（标题 + 右侧值）
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 rightValue:(id)a4;
 @end
 
@@ -110,9 +110,6 @@
 #define kDDWAGroupFold         @"kDDWA_disableSnsGroupFold"
 #define kDDWADeletedComment    @"kDDWA_antiDeleteSnsComment"
 #define kDDWADeletedCommentMark @"kDDWA_deletedCommentMark"
-// 诊断日志总开关（设置页可切换）。开启后记录朋友圈评论的删除状态/注入过程，
-// 可在「DD微信助手 → 运行日志」里查看或导出，用于排查“谁被加了前缀”。
-#define kDDWADebugLog          @"kDDWA_debugLog"
 #define kDDWAVideoTapClose     @"kDDWA_disableSnsVideoTapClose"
 #define kDDWAVideoProgressBar  @"kDDWA_snsVideoProgressBar"   // 新增：朋友圈视频进度条
 #define kDDWAHideFriendWxid    @"kDDWA_hideFriendWxid"
@@ -128,11 +125,7 @@ static const BOOL kDDDefaultVideoTapClose     = NO;
 static const BOOL kDDDefaultVideoProgressBar  = NO;   // 新增
 static const BOOL kDDDefaultHideFriendWxid    = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
-static const BOOL kDDDefaultDebugLog          = YES;
 
-// 修复点：对齐锤子 WeChatTweak。锤子写回 comment.content 的前缀是 @"[对方已删除] "
-// （带方括号 + 尾随空格，已反汇编 CFString @0xdae080 / UTF-16 确认），原先 @"对方已删除 "
-// 不带括号，与锤子渲染路径不一致。仍可在 NSUserDefaults 的 kDDWADeletedCommentMark 中自定义。
 static NSString * const kDDDefaultDeletedMark = @"[对方已删除] ";
 static NSString *ddDeletedMarkText(void) {
     NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kDDWADeletedCommentMark];
@@ -151,7 +144,6 @@ static NSString *ddDeletedMarkText(void) {
 @property (assign, nonatomic) BOOL snsVideoProgressBar;   // 新增
 @property (assign, nonatomic) BOOL hideFriendWxid;
 @property (assign, nonatomic) BOOL hideChatName;
-@property (assign, nonatomic) BOOL debugLog;
 @end
 
 @implementation DDWeChatConfig
@@ -175,7 +167,6 @@ static NSString *ddDeletedMarkText(void) {
         kDDWAHideFriendWxid: @(kDDDefaultHideFriendWxid),
         kDDWAHideChatName:   @(kDDDefaultHideChatName),
         kDDWADeletedCommentMark: kDDDefaultDeletedMark,
-        kDDWADebugLog:           @(kDDDefaultDebugLog),
     }];
 }
 - (instancetype)init {
@@ -191,7 +182,6 @@ static NSString *ddDeletedMarkText(void) {
         _snsVideoProgressBar            = [ud boolForKey:kDDWAVideoProgressBar];   // 新增
         _hideFriendWxid                 = [ud boolForKey:kDDWAHideFriendWxid];
         _hideChatName                   = [ud boolForKey:kDDWAHideChatName];
-        _debugLog                       = [ud boolForKey:kDDWADebugLog];
     }
     return self;
 }
@@ -205,180 +195,8 @@ static NSString *ddDeletedMarkText(void) {
 - (void)setSnsVideoProgressBar:(BOOL)v { _snsVideoProgressBar = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAVideoProgressBar]; }   // 新增
 - (void)setHideFriendWxid:(BOOL)v { _hideFriendWxid = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideFriendWxid]; }
 - (void)setHideChatName:(BOOL)v { _hideChatName = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideChatName]; }
-- (void)setDebugLog:(BOOL)v { _debugLog = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWADebugLog]; }
 @end
 
-#pragma mark - 日志系统（诊断用，设置页可查看 / 导出）
-
-#import <pthread.h>
-#import <sys/time.h>
-
-#define kDDLogMaxLines 2000
-
-@interface DDLogStore : NSObject
-+ (instancetype)shared;
-- (void)appendFormat:(NSString *)fmt, ... NS_FORMAT_FUNCTION(1,2);
-- (NSString *)allText;
-- (NSUInteger)count;
-- (void)clear;
-- (NSString *)logFilePath;
-- (BOOL)flushToFile;
-@end
-
-// 毫秒级时间戳（不用 NSDateFormatter，避免锁与频繁创建开销）
-static NSString *DDLogNowString(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    time_t sec = (time_t)tv.tv_sec;
-    struct tm tmVal;
-    localtime_r(&sec, &tmVal);
-    char buf[32];
-    strftime(buf, sizeof(buf), "%m-%d %H:%M:%S", &tmVal);
-    return [NSString stringWithFormat:@"%s.%03d", buf, (int)(tv.tv_usec / 1000)];
-}
-
-@implementation DDLogStore {
-    NSMutableArray<NSString *> *_lines;
-    pthread_mutex_t _lock;
-}
-+ (instancetype)shared {
-    static DDLogStore *store = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ store = [[DDLogStore alloc] init]; });
-    return store;
-}
-- (instancetype)init {
-    if (self = [super init]) {
-        _lines = [[NSMutableArray alloc] init];
-        pthread_mutex_init(&_lock, NULL);
-    }
-    return self;
-}
-- (void)appendFormat:(NSString *)fmt, ... {
-    if (!fmt) return;
-    va_list args;
-    va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    NSString *line = [NSString stringWithFormat:@"%@ %@", DDLogNowString(), msg];
-    pthread_mutex_lock(&_lock);
-    [_lines addObject:line];
-    if (_lines.count > kDDLogMaxLines) {
-        [_lines removeObjectsInRange:NSMakeRange(0, (NSUInteger)_lines.count - kDDLogMaxLines)];
-    }
-    pthread_mutex_unlock(&_lock);
-}
-- (NSString *)allText {
-    pthread_mutex_lock(&_lock);
-    NSString *text = [_lines componentsJoinedByString:@"\n"];
-    pthread_mutex_unlock(&_lock);
-    return text ?: @"";
-}
-- (NSUInteger)count {
-    pthread_mutex_lock(&_lock);
-    NSUInteger c = _lines.count;
-    pthread_mutex_unlock(&_lock);
-    return c;
-}
-- (void)clear {
-    pthread_mutex_lock(&_lock);
-    [_lines removeAllObjects];
-    pthread_mutex_unlock(&_lock);
-}
-- (NSString *)logFilePath {
-    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    return [doc stringByAppendingPathComponent:@"DDWeChatTweak.log"];
-}
-- (BOOL)flushToFile {
-    NSString *text = [self allText];
-    if (!text.length) text = @"(日志为空)";
-    NSError *err = nil;
-    BOOL ok = [text writeToFile:[self logFilePath] atomically:YES encoding:NSUTF8StringEncoding error:&err];
-    if (!ok) {
-        [[DDLogStore shared] appendFormat:@"[LOG] 写文件失败: %@", err.localizedDescription];
-    }
-    return ok;
-}
-@end
-
-static inline BOOL dd_logOn(void) {
-    return [NSUserDefaults.standardUserDefaults boolForKey:kDDWADebugLog];
-}
-// 用法：DDLog(@"SNS", @"setDelStatus=%u ...", status);
-#define DDLog(tag, fmt, ...) do { if (dd_logOn()) { [[DDLogStore shared] appendFormat:(@"[" tag "] " fmt), ##__VA_ARGS__]; } } while (0)
-
-// ===== 字段快照诊断 =====
-static NSString *dd_abbrev(id obj);   // 前向声明（定义在下方）
-
-// 目的：8.0.76D 里到底哪个字段标记“评论已删除”无法靠猜（bDeleted / deletedByFeedOwner
-// 实测恒为 0）。这里把对象的全部 ivar 名称和值打成一行，直接对比
-// “自己刚发的评论” vs “真正被删除的评论” 的字段差异，一次就能定位判定条件。
-static NSMutableSet *dd_dumpedObjects(void) {
-    static NSMutableSet *set = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ set = [[NSMutableSet alloc] init]; });
-    return set;
-}
-// 每个对象只 dump 一次，且总量设上限，避免日志爆炸
-static BOOL dd_shouldDump(id obj) {
-    if (!obj) return NO;
-    NSMutableSet *set = dd_dumpedObjects();
-    if (set.count > 200) return NO;
-    NSNumber *key = [NSNumber numberWithUnsignedLongLong:(unsigned long long)(uintptr_t)(__bridge void *)obj];
-    if ([set containsObject:key]) return NO;
-    [set addObject:key];
-    return YES;
-}
-static NSString *dd_dumpIvars(id obj) {
-    if (!obj) return @"(nil)";
-    NSMutableArray *parts = [NSMutableArray array];
-    for (Class cls = [obj class]; cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
-        unsigned int n = 0;
-        Ivar *ivars = class_copyIvarList(cls, &n);
-        for (unsigned int i = 0; i < n; i++) {
-            Ivar v = ivars[i];
-            const char *nameC = ivar_getName(v);
-            const char *typeC = ivar_getTypeEncoding(v);
-            if (!nameC || !typeC) continue;
-            NSString *name = [NSString stringWithUTF8String:nameC];
-            if (!name) continue;
-            char *q = (char *)(__bridge void *)obj + ivar_getOffset(v);
-            NSString *val = nil;
-            switch (typeC[0]) {
-                case 'c': val = [NSString stringWithFormat:@"%d", (int)*(char *)q]; break;
-                case 'B': val = [NSString stringWithFormat:@"%d", (int)*(unsigned char *)q]; break;
-                case 'i': val = [NSString stringWithFormat:@"%d", *(int *)q]; break;
-                case 'I': val = [NSString stringWithFormat:@"%u", *(unsigned int *)q]; break;
-                case 's': val = [NSString stringWithFormat:@"%d", (int)*(short *)q]; break;
-                case 'S': val = [NSString stringWithFormat:@"%u", (unsigned)*(unsigned short *)q]; break;
-                case 'l': val = [NSString stringWithFormat:@"%ld", *(long *)q]; break;
-                case 'L': val = [NSString stringWithFormat:@"%lu", *(unsigned long *)q]; break;
-                case 'q': val = [NSString stringWithFormat:@"%lld", *(long long *)q]; break;
-                case 'Q': val = [NSString stringWithFormat:@"%llu", *(unsigned long long *)q]; break;
-                case 'f': val = [NSString stringWithFormat:@"%g", (double)*(float *)q]; break;
-                case 'd': val = [NSString stringWithFormat:@"%g", *(double *)q]; break;
-                case '@': val = dd_abbrev(object_getIvar(obj, v)); break;
-                case '*': {
-                    const char *s = *(const char **)q;
-                    val = s ? dd_abbrev([NSString stringWithUTF8String:s]) : @"(null)";
-                    break;
-                }
-                default: break;   // 结构体/数组/指针等跳过，避免误读内存
-            }
-            if (val) [parts addObject:[NSString stringWithFormat:@"%@=%@", name, val]];
-        }
-        free(ivars);
-    }
-    return [NSString stringWithFormat:@"%@ { %@ }", NSStringFromClass([obj class]), [parts componentsJoinedByString:@" | "]];
-}
-
-// 日志里截断长文本，避免刷屏
-static NSString *dd_abbrev(id obj) {
-    NSString *t = [obj isKindOfClass:[NSString class]] ? (NSString *)obj : [obj description];
-    if (!t) return @"(nil)";
-    t = [t stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
-    return (t.length > 60) ? [[t substringToIndex:60] stringByAppendingString:@"…"] : t;
-}
 
 #pragma mark - ① 禁用首页下拉小程序
 %hook NewMainFrameViewController
@@ -485,29 +303,7 @@ static NSString *dd_abbrev(id obj) {
 
 #pragma mark - ⑥ 朋友圈查看已删评论（对齐锤子 WeChatTweak.dylib 的实现）
 
-// ===== 根因：为什么“锤子有效、你的无效” =====
-// 反汇编锤子 WeChatTweak.dylib 确认，它的已删评论核心只 hook 一个方法：
-//   %hook WCSNSMessage -setDelStatus:
-// 微信在解析/加载一条评论时，会用 setDelStatus:1 把它标记为“已删除”。锤子的 newImp（0x7a66b8）逻辑：
-//   1) 开关开启 且 传入的 delStatus == 1 时：
-//        c  = [self comment];
-//        s  = [c content];
-//        [c setContent:[@"[对方已删除] " stringByAppendingString:s]];   // 数据加载期就把前缀写回 content
-//   2) 再以 delStatus = 0 调回原方法（对外不标记为已删 → 评论走正常 WCCommentRichTextView 渲染）
-// 关键点：(a) hook 的是 setDelStatus: 这个“真正写入删除标记”的点；(b) 在数据加载期就改好 content；
-//        (c) 把 delStatus 清零，使评论不被过滤、不走“删除占位”。
-// 原实现 hook 的是 upgradeDataIfNeeded / isWCMessageDeleted，且只在 getter 里补前缀 —— 既 hook 错了写入点，
-// 时机也晚（setDelStatus: 之后评论可能已被路由到删除占位），所以前缀根本没机会上屏。
-// 因此必须对齐锤子：hook setDelStatus:，在它被调用时注入前缀并清零 delStatus。
-
-// 日志用：把一条评论的删除状态打成一个短串，例如 "del=1 owner=0"
-static NSString *dd_commentFlagDesc(id c) {
-    if (!c) return @"(nil)";
-    int b = ([c respondsToSelector:@selector(bDeleted)]) ? (int)[c bDeleted] : -1;
-    int o = ([c respondsToSelector:@selector(deletedByFeedOwner)]) ? (int)[c deletedByFeedOwner] : -1;
-    return [NSString stringWithFormat:@"%@(del=%d owner=%d)", NSStringFromClass([c class]), b, o];
-}
-
+// 对齐锤子：hook WCSNSMessage -setDelStatus:，评论被标记为已删时给 comment.content 加前缀。
 // 对 WCSNSMessage.comment 幂等补前缀（refComment 是被回复的那条，不参与，与锤子一致只改 comment）。
 // content 已被清空时也写入纯标记，避免对方删评后留下一条空白评论。
 static void dd_injectMarkIntoComment(id c) {
@@ -517,7 +313,6 @@ static void dd_injectMarkIntoComment(id c) {
     if ([s isKindOfClass:[NSString class]] && s.length) {
         if (![s hasPrefix:mark]) {
             [c setContent:[mark stringByAppendingString:s]];
-            DDLog(@"SNS", @"INJECT -> %@", dd_abbrev([c content]));
         }
         return;
     }
@@ -525,33 +320,19 @@ static void dd_injectMarkIntoComment(id c) {
     NSString *bare = [mark stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
     if (![s hasPrefix:bare]) {
         [c setContent:bare];
-        DDLog(@"SNS", @"INJECT empty -> 仅标记: %@", bare);
     }
 }
 
-// ★ 核心：对齐锤子 hook WCSNSMessage -setDelStatus:
 %hook WCSNSMessage
 - (void)setDelStatus:(unsigned int)status {
     if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) { %orig; return; }
     if (status == 1) {
         id c = [self comment];
-        id r = [self refComment];
-        DDLog(@"SNS", @"setDelStatus=1 | msg=%@ | comment=%@ | ref=%@ | commentContent=%@",
-              NSStringFromClass([self class]), dd_commentFlagDesc(c), dd_commentFlagDesc(r), dd_abbrev([c content]));
-        // 字段快照：每个对象只打一次。refComment 实测恒为空壳，无需 dump
-        if (dd_shouldDump(self)) { DDLog(@"DUMP", @"msg: %@", dd_dumpIvars(self)); }
-        if (dd_shouldDump(c))    { DDLog(@"DUMP", @"comment: %@", dd_dumpIvars(c)); }
-        // 已删除：在数据加载期就把前缀写回 comment.content（早于任何渲染）。
-        // 实测证实 8.0.76D 中 setDelStatus:1 即“评论已删除”的真实信号，
-        // 无需要再依赖 bDeleted/deletedByFeedOwner（这两个字段恒为 0）。
-        // 只处理 comment（这条评论本身）。refComment 是“被回复的那条”，不是被删评论，
-        // 无论它是空壳（顶层评论）还是有内容（真回复），都不该加前缀，故不碰它（与锤子一致）。
         dd_injectMarkIntoComment(c);          // 主评论：内容被清空时也会写入纯标记
         // 以 0 调回原方法：对外不视作已删，正常渲染
         %orig(0);
         return;
     }
-    DDLog(@"SNS", @"setDelStatus=%u (非1，原样透传)", status);
     %orig;
 }
 %end
@@ -657,78 +438,6 @@ static BOOL ddHideName(void) {
 }
 %end
 
-#pragma mark - 日志查看 / 导出页面
-@interface DDWeChatLogViewController : UIViewController
-@property (nonatomic, strong) UITextView *textView;
-@end
-
-@implementation DDWeChatLogViewController
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"运行日志";
-    self.view.backgroundColor = [UIColor whiteColor];
-
-    UITextView *tv = [[UITextView alloc] initWithFrame:self.view.bounds];
-    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    tv.editable = NO;
-    UIFont *logFont = [UIFont fontWithName:@"Menlo" size:11.0];
-    if (!logFont) { logFont = [UIFont systemFontOfSize:11.0]; }
-    tv.font = logFont;
-    tv.textContainerInset = UIEdgeInsetsMake(8, 6, 8, 6);
-    tv.text = [[DDLogStore shared] allText];
-    [self.view addSubview:tv];
-    self.textView = tv;
-
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"操作"
-                                                                              style:UIBarButtonItemStylePlain
-                                                                             target:self
-                                                                             action:@selector(onAction:)];
-}
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    self.textView.text = [[DDLogStore shared] allText];
-}
-- (void)showMessage:(NSString *)msg {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:nil
-                                                                message:msg
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-- (void)exportLog {
-    if (![[DDLogStore shared] flushToFile]) { [self showMessage:@"导出失败：无法写入文件"]; return; }
-    NSURL *url = [NSURL fileURLWithPath:[[DDLogStore shared] logFilePath]];
-    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url]
-                                                                      applicationActivities:nil];
-    avc.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
-    [self presentViewController:avc animated:YES completion:nil];
-    [[DDLogStore shared] appendFormat:@"[LOG] 已导出到: %@", url.path];
-}
-- (void)onAction:(id)sender {
-    __weak __typeof__(self) weakSelf = self;
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"运行日志"
-                                                               message:[NSString stringWithFormat:@"共 %lu 条（最多保留 %d 条）\n路径：%@",
-                                                                        (unsigned long)[DDLogStore shared].count,
-                                                                        kDDLogMaxLines,
-                                                                        [[DDLogStore shared] logFilePath]]
-                                                        preferredStyle:UIAlertControllerStyleActionSheet];
-    [ac addAction:[UIAlertAction actionWithTitle:@"复制全部" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [UIPasteboard generalPasteboard].string = [[DDLogStore shared] allText];
-        [weakSelf showMessage:@"已复制到剪贴板"];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"导出到文件并分享" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [weakSelf exportLog];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"清空日志" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        [[DDLogStore shared] clear];
-        weakSelf.textView.text = @"";
-        [[DDLogStore shared] appendFormat:@"[LOG] 日志已清空"];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    ac.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
-    [self presentViewController:ac animated:YES completion:nil];
-}
-@end
 
 #pragma mark - 设置界面
 @interface DDWeChatSettingsViewController : UIViewController <UITableViewDelegate>
@@ -794,15 +503,6 @@ static BOOL ddHideName(void) {
     [_tableViewManager addSection:privacy];
 
     WCTableViewSectionManager *diag = [secMgr defaultSection];
-    [diag addCell:[cellMgr switchCellForSel:@selector(onDebugLogSwitch:) target:self title:@"记录诊断日志" on:cfg.debugLog]];
-    [diag addCell:[cellMgr normalCellForSel:@selector(onViewLog) target:self
-                                      title:@"查看运行日志"
-                                 rightValue:[NSString stringWithFormat:@"%lu 条", (unsigned long)[DDLogStore shared].count]]];
-    [diag addCell:[cellMgr normalCellForSel:@selector(onExportLog) target:self
-                                      title:@"导出日志到文件"
-                                 rightValue:@"分享 / 文件App"]];
-    [diag addCell:[cellMgr normalCellForSel:@selector(onClearLog) target:self
-                                      title:@"清空日志"
                                  rightValue:@""]];
     [_tableViewManager addSection:diag];
 
@@ -832,34 +532,11 @@ static BOOL ddHideName(void) {
 - (void)onHideFriendWxidSwitch:(UISwitch *)s{ [DDWeChatConfig sharedConfig].hideFriendWxid = s.on; }
 - (void)onHideChatNameSwitch:(UISwitch *)s  { [DDWeChatConfig sharedConfig].hideChatName = s.on; }
 
-#pragma mark - 诊断日志
-- (void)onDebugLogSwitch:(UISwitch *)s {
-    [DDWeChatConfig sharedConfig].debugLog = s.on;
-    DDLog(@"CFG", @"诊断日志 %@", s.on ? @"开启" : @"关闭");
-}
-- (void)onViewLog {
-    [self.navigationController pushViewController:[[DDWeChatLogViewController alloc] init] animated:YES];
-}
-- (void)onExportLog {
-    if (![[DDLogStore shared] flushToFile]) { return; }
-    NSURL *url = [NSURL fileURLWithPath:[[DDLogStore shared] logFilePath]];
-    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url]
-                                                                      applicationActivities:nil];
-    avc.popoverPresentationController.sourceView = self.view;
-    [self presentViewController:avc animated:YES completion:nil];
-    [[DDLogStore shared] appendFormat:@"[LOG] 已导出到: %@", url.path];
-}
-- (void)onClearLog {
-    [[DDLogStore shared] clear];
-    [[DDLogStore shared] appendFormat:@"[LOG] 日志已清空"];
-    [self buildTable];
-}
 @end
 
 #pragma mark - 插件注册
 %ctor {
     @autoreleasepool {
-        DDLog(@"BOOT", @"DD微信助手 已加载");
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
             [[mgr sharedInstance] registerControllerWithTitle:@"DD微信助手"
