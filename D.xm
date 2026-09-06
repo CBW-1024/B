@@ -56,14 +56,12 @@
 @interface WCUserComment : NSObject
 @property (nonatomic) _Bool bDeleted;
 @property (nonatomic) _Bool deletedByFeedOwner;
-@property (retain, nonatomic) NSString *content;
-@property (retain, nonatomic) NSString *contentPattern;
-- (_Bool)bDeleted;
-- (_Bool)deletedByFeedOwner;
-- (id)content;
-- (id)contentPattern;
-- (void)setContent:(id)arg1;
-- (void)setContentPattern:(id)arg1;
+// 注意：property 类型必须与手工 accessor 声明完全一致，否则 -Werror 下会报
+//   "type of property 'content' does not match type of accessor 'setContent:'"
+// 微信各版本 content / contentPattern 实际类型并不统一（NSString / NSMutableString / 富文本对象），
+// 这里统一声明为 id，既避免类型冲突，也避免对返回值做错误假设。
+@property (retain, nonatomic) id content;
+@property (retain, nonatomic) id contentPattern;
 @end
 
 @interface WCSNSMessage : NSObject
@@ -365,7 +363,8 @@ static void dd_injectMarkIntoComment(id c) {
     %orig;
 }
 // 兜底：feed 级删除也让 isWCMessageDeleted 返回 NO（先于 setDelStatus 的判定）
-- (BOOL)isWCMessageDeleted {
+// 返回类型与 8.0.76D 头文件一致，统一用 _Bool，避免个别架构下 BOOL 定义不同导致的签名告警
+- (_Bool)isWCMessageDeleted {
     if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
     return %orig;
 }
