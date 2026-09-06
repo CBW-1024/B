@@ -3,6 +3,7 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 
+#pragma mark - 微信类声明
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -97,7 +98,7 @@
 @end
 
 #pragma mark - 配置管理
-// 开关默认全 OFF（与原生行为一致）
+// 开关默认全 OFF
 #define kDDWAPullDown          @"kDDWA_disableHomePullDownMiniProgram"
 #define kDDWAVideoAutoPlay     @"kDDWA_disableSnsVideoAutoPlay"
 #define kDDWAPrivacyIcon       @"kDDWA_disableSnsPrivacyIcon"
@@ -266,7 +267,7 @@ static NSString *ddDeletedMarkText(void) {
 }
 %end
 
-#pragma mark - ④ 禁用朋友圈文字自动折叠
+#pragma mark - ④ 禁用朋友圈长文字折叠
 
 %hook WCTimeLineCellView
 + (_Bool)shouldShowFullTextButtonWithDataItem:(id)arg1 {
@@ -275,7 +276,7 @@ static NSString *ddDeletedMarkText(void) {
 }
 %end
 
-#pragma mark - ⑤ 禁用朋友圈"余下N条"折叠
+#pragma mark - ⑤ 禁用朋友圈微商折叠
 %hook WCDataItem
 - (_Bool)isWeiShang {
     if ([DDWeChatConfig sharedConfig].disableSnsGroupFold) return NO;
@@ -291,7 +292,7 @@ static NSString *ddDeletedMarkText(void) {
 
 #pragma mark - ⑥ 朋友圈查看已删评论
 
-// 恢复单条已删评论：清删除标记并拼锤子前缀
+// 恢复单条已删评论
 static void dd_restoreDeletedComment(id c) {
     Class CommentCls = objc_getClass("WCUserComment");
     if (![c isKindOfClass:CommentCls]) return;
@@ -306,7 +307,7 @@ static void dd_restoreDeletedComment(id c) {
     }
 }
 
-// ⑥ 提醒里查看已删评论：放行删除判定 + 恢复 comment 前缀（单点 hook）
+// ⑥ 提醒里查看已删评论
 %hook WCSNSMessage
 - (_Bool)isWCMessageDeleted {
     if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
@@ -444,20 +445,20 @@ static BOOL ddHideName(void) {
     Class secMgr  = objc_getClass("WCTableViewSectionManager");
 
     WCTableViewSectionManager *home = [secMgr defaultSection];
-    [home addCell:[cellMgr switchCellForSel:@selector(onPullDownSwitch:) target:self title:@"禁用首页下拉小程序" on:cfg.disableHomePullDownMiniProgram]];
+    [home addCell:[cellMgr switchCellForSel:@selector(onPullDownSwitch:) target:self title:@"禁用下拉小程序" on:cfg.disableHomePullDownMiniProgram]];
     [_tableViewManager addSection:home];
 
     WCTableViewSectionManager *sns = [secMgr defaultSection];
     [sns addCell:[cellMgr switchCellForSel:@selector(onVideoSwitch:) target:self title:@"禁用朋友圈视频自动播放" on:cfg.disableSnsVideoAutoPlay]];
-    [sns addCell:[cellMgr switchCellForSel:@selector(onPrivacySwitch:) target:self title:@"禁用朋友圈谁可以见图标" on:cfg.disableSnsPrivacyIcon]];
-    [sns addCell:[cellMgr switchCellForSel:@selector(onTextFoldSwitch:) target:self title:@"禁用朋友圈文字自动折叠" on:cfg.disableSnsTextFold]];
-    [sns addCell:[cellMgr switchCellForSel:@selector(onGroupFoldSwitch:) target:self title:@"禁用朋友圈余下N条折叠" on:cfg.disableSnsGroupFold]];
-    [sns addCell:[cellMgr switchCellForSel:@selector(onAntiDeleteSwitch:) target:self title:@"朋友圈查看已删评论" on:cfg.antiDeleteSnsComment]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onPrivacySwitch:) target:self title:@"禁用朋友圈隐私图标" on:cfg.disableSnsPrivacyIcon]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onTextFoldSwitch:) target:self title:@"禁用朋友圈文字折叠" on:cfg.disableSnsTextFold]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onGroupFoldSwitch:) target:self title:@"禁用朋友圈微商折叠" on:cfg.disableSnsGroupFold]];
+    [sns addCell:[cellMgr switchCellForSel:@selector(onAntiDeleteSwitch:) target:self title:@"查看朋友圈已删评论" on:cfg.antiDeleteSnsComment]];
     [sns addCell:[cellMgr switchCellForSel:@selector(onVideoTapCloseSwitch:) target:self title:@"禁用朋友圈视频点击关闭" on:cfg.disableSnsVideoTapClose]];
     [_tableViewManager addSection:sns];
 
     WCTableViewSectionManager *privacy = [secMgr defaultSection];
-    [privacy addCell:[cellMgr switchCellForSel:@selector(onHideFriendWxidSwitch:) target:self title:@"隐藏好友微信号(资料页)" on:cfg.hideFriendWxid]];
+    [privacy addCell:[cellMgr switchCellForSel:@selector(onHideFriendWxidSwitch:) target:self title:@"隐藏好友微信号" on:cfg.hideFriendWxid]];
     [privacy addCell:[cellMgr switchCellForSel:@selector(onHideChatNameSwitch:) target:self title:@"隐藏聊天顶栏名字" on:cfg.hideChatName]];
     [_tableViewManager addSection:privacy];
 
@@ -493,7 +494,7 @@ static BOOL ddHideName(void) {
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
             [[mgr sharedInstance] registerControllerWithTitle:@"DD微信助手"
-                                                      version:@"2.3.0"
+                                                      version:@"1.0.0"
                                                    controller:@"DDWeChatSettingsViewController"];
         }
     }
