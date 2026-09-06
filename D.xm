@@ -77,8 +77,15 @@
 - (void)onFullScreenSingleTap;
 - (BOOL)shouldShowProgressBar;
 - (BOOL)autoShowProgressBarWithThreshold;
-- (void)onToolViewAutoClose;
-- (void)fadeControl;
+- (id)generateConfig;
+@end
+
+// 手动声明 WCPlayerFullScreenConfig（工程不 import 其头文件，故在此用完整类声明
+// 引入类与进度条 setter，使直接发送可编译；无需单独的 @class 前向声明）。
+// 注意：若以后 import 了真实 WCPlayerFullScreenConfig.h，请改回
+// “@class ...; @interface ... (Category)” 形式，以免“重复接口定义”冲突。
+@interface WCPlayerFullScreenConfig : NSObject
+- (void)setBForbidProgressBarAutoHidden:(BOOL)v;
 @end
 
 @interface NewMainFrameViewController : MMTabBarBaseViewController
