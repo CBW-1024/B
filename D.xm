@@ -508,10 +508,9 @@ static NSString *dd_commentFlagDesc(id c) {
     return [NSString stringWithFormat:@"%@(del=%d owner=%d)", NSStringFromClass([c class]), b, o];
 }
 
-// 对 WCSNSMessage.comment 幂等补前缀（refComment 是被回复的那条，不参与；与锤子一致只改 comment）
-// allowEmpty=YES：content 已被清空时，至少写入“[对方已删除]”标记，
-// 避免对方删评后留下一条空白评论（只对主评论用，回复的 content 常为空，不适用）。
-static void dd_injectMarkIntoCommentEx(id c, BOOL allowEmpty) {
+// 对 WCSNSMessage.comment 幂等补前缀（refComment 是被回复的那条，不参与，与锤子一致只改 comment）。
+// content 已被清空时也写入纯标记，避免对方删评后留下一条空白评论。
+static void dd_injectMarkIntoComment(id c) {
     if (![c isKindOfClass:%c(WCUserComment)]) return;
     NSString *mark = ddDeletedMarkText();
     NSString *s = [c content];
@@ -522,15 +521,12 @@ static void dd_injectMarkIntoCommentEx(id c, BOOL allowEmpty) {
         }
         return;
     }
-    if (allowEmpty) {
-        NSString *bare = [mark stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        if (![s hasPrefix:bare]) {
-            [c setContent:bare];
-            DDLog(@"SNS", @"INJECT empty -> 仅标记: %@", bare);
-        }
-        return;
+    // content 为空（已删评论内容被清空）：至少写入纯标记
+    NSString *bare = [mark stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (![s hasPrefix:bare]) {
+        [c setContent:bare];
+        DDLog(@"SNS", @"INJECT empty -> 仅标记: %@", bare);
     }
-    DDLog(@"SNS", @"INJECT skip (空/已有前缀/非字符串) content=%@", dd_abbrev(s));
 }
 
 // ★ 核心：对齐锤子 hook WCSNSMessage -setDelStatus:
@@ -542,16 +538,15 @@ static void dd_injectMarkIntoCommentEx(id c, BOOL allowEmpty) {
         id r = [self refComment];
         DDLog(@"SNS", @"setDelStatus=1 | msg=%@ | comment=%@ | ref=%@ | commentContent=%@",
               NSStringFromClass([self class]), dd_commentFlagDesc(c), dd_commentFlagDesc(r), dd_abbrev([c content]));
-        // 字段快照：每个对象只打一次，用于对比“发评论”与“真删除”的字段差异
+        // 字段快照：每个对象只打一次。refComment 实测恒为空壳，无需 dump
         if (dd_shouldDump(self)) { DDLog(@"DUMP", @"msg: %@", dd_dumpIvars(self)); }
         if (dd_shouldDump(c))    { DDLog(@"DUMP", @"comment: %@", dd_dumpIvars(c)); }
-        if (dd_shouldDump(r))    { DDLog(@"DUMP", @"refComment: %@", dd_dumpIvars(r)); }
         // 已删除：在数据加载期就把前缀写回 comment.content（早于任何渲染）。
         // 实测证实 8.0.76D 中 setDelStatus:1 即“评论已删除”的真实信号，
         // 无需要再依赖 bDeleted/deletedByFeedOwner（这两个字段恒为 0）。
         // 只处理 comment（这条评论本身）。refComment 是“被回复的那条”，不是被删评论，
         // 无论它是空壳（顶层评论）还是有内容（真回复），都不该加前缀，故不碰它（与锤子一致）。
-        dd_injectMarkIntoCommentEx(c, YES);   // 主评论：内容被清空时也要留下标记
+        dd_injectMarkIntoComment(c);          // 主评论：内容被清空时也会写入纯标记
         // 以 0 调回原方法：对外不视作已删，正常渲染
         %orig(0);
         return;
