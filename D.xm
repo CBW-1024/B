@@ -306,43 +306,54 @@ static const void *kDDWasDeletedCommentKey = &kDDWasDeletedCommentKey;
 
 #pragma mark - ⑥ 朋友圈查看已删评论
 
-// 恢复单条已删评论：清掉删除标记 + 打“对方已删除”前缀，并用关联对象记住“原本已删”
-static void dd_restoreDeletedComment(id c) {
-    Class CommentCls = objc_getClass("WCUserComment");
-    if (![c isKindOfClass:CommentCls]) return;
-    _Bool realDel = MSHookIvar<_Bool>(c, "_bDeleted") || MSHookIvar<_Bool>(c, "_deletedByFeedOwner");
-    if (!realDel) return;
+// ===== 对比锤子 WeChatTweak 后的修正说明 =====
+// 锤子的核心不是“在某个升级方法里补一次前缀”，而是让已删评论在 UI 层“照常显示”：
+// 它保证 _bDeleted / deletedByFeedOwner 这两个“删除标记”对外表现为 NO，于是朋友圈 UI
+// 走正常的 content 分支（而不是调用 WCUserComment 的 +deleteByFeedOwnerTips 显示删除占位）。
+//
+// 原实现把“打标记 + 清标记”全部押在 WCSNSMessage upgradeDataIfNeeded 的调用时机上。
+// 问题：若微信不对该对象调用 upgradeDataIfNeeded（或调用晚于 UI 读取），关联对象 key 不会被
+// 设置 → content getter 直接返回原文（看不到“对方已删除”）；更糟的是 _bDeleted/_deletedByFeedOwner
+// 仍为 1，评论会被 UI 过滤 / 显示为删除占位，根本不会走到 content。这就是“开了没提示”的根因。
+//
+// 修正思路：把“清删除标记 + 补前缀”做成 按需、幂等，直接挂在 WCUserComment 的
+// content 与两个删除标记 getter 上，不再依赖 upgradeDataIfNeeded 的时机。
 
-    // 打标记：即便 content 后续被重读/刷新，getter 也能幂等地补回前缀
-    objc_setAssociatedObject(c, kDDWasDeletedCommentKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    MSHookIvar<_Bool>(c, "_bDeleted") = 0;
-    MSHookIvar<_Bool>(c, "_deletedByFeedOwner") = 0;
-    NSString *ct = [c content];
-    NSString *mark = ddDeletedMarkText();
-    if ([ct isKindOfClass:[NSString class]] && ct.length && ![ct hasPrefix:mark]) {
-        [c setContent:[mark stringByAppendingString:ct]];
-    }
+// 检测“原本已删”：直接读 ivar（不走被 hook 的 getter，避免递归/误判）
+static BOOL dd_commentWasDeleted(id c) {
+    return MSHookIvar<_Bool>(c, "_bDeleted") || MSHookIvar<_Bool>(c, "_deletedByFeedOwner");
 }
-
-// 修复点：原实现只在 upgradeDataIfNeeded 里补一次前缀。若评论内容在展示前被
-// 微信重新读取/刷新，前缀就会丢失。这里 hook content getter，对“原本已删”的评论
-// 幂等地保证前缀存在，从而稳定显示“对方已删除”。
-%hook WCUserComment
-- (id)content {
-    NSString *orig = %orig;
-    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return orig;
-    if (!objc_getAssociatedObject(self, kDDWasDeletedCommentKey)) return orig;
-    if (![orig isKindOfClass:[NSString class]] || orig.length == 0) return orig;
+// 幂等补前缀
+static NSString *dd_markDeletedContent(NSString *orig) {
     NSString *mark = ddDeletedMarkText();
-    if (![orig hasPrefix:mark]) {
+    if ([orig isKindOfClass:[NSString class]] && orig.length && ![orig hasPrefix:mark]) {
         return [mark stringByAppendingString:orig];
     }
     return orig;
 }
+
+%hook WCUserComment
+// 关键：让 UI 认为该评论“未删”，从而走正常 content 显示分支（而非 deleteByFeedOwnerTips 占位）
+- (BOOL)bDeleted {
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
+    return %orig;
+}
+- (BOOL)deletedByFeedOwner {
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
+    return %orig;
+}
+// content getter：按需清理底层删除标记并补前缀（幂等：清完后再读 wasDel 为 NO，hasPrefix 兜底）
+- (id)content {
+    NSString *orig = %orig;
+    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return orig;
+    if (!dd_commentWasDeleted(self)) return orig;
+    MSHookIvar<_Bool>(self, "_bDeleted") = 0;
+    MSHookIvar<_Bool>(self, "_deletedByFeedOwner") = 0;
+    return dd_markDeletedContent(orig);
+}
 %end
 
-// ⑥ 提醒里查看已删评论
+// ⑥ 朋友圈（含提醒）查看已删评论：feed 级删除也要放过
 %hook WCSNSMessage
 - (_Bool)isWCMessageDeleted {
     if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
@@ -352,11 +363,17 @@ static void dd_restoreDeletedComment(id c) {
     %orig;
     if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return;
     if (self.delStatus != 0) self.delStatus = 0;
-
+    // 兜底：若 feed 直接持有已删评论对象，也一并还原（幂等；content 钩子会补前缀）
     id cm = [self comment];
-    if (cm) dd_restoreDeletedComment(cm);
+    if (cm && dd_commentWasDeleted(cm)) {
+        MSHookIvar<_Bool>(cm, "_bDeleted") = 0;
+        MSHookIvar<_Bool>(cm, "_deletedByFeedOwner") = 0;
+    }
     id ref = [self refComment];
-    if (ref) dd_restoreDeletedComment(ref);
+    if (ref && dd_commentWasDeleted(ref)) {
+        MSHookIvar<_Bool>(ref, "_bDeleted") = 0;
+        MSHookIvar<_Bool>(ref, "_deletedByFeedOwner") = 0;
+    }
 }
 %end
 
