@@ -158,7 +158,6 @@
 #define kDDWACustomAvatar      @"kDDWA_enableCustomAvatar"
 #define kDDWAVideoTapClose     @"kDDWA_disableSnsVideoTapClose"
 #define kDDWAHideFriendWxid    @"kDDWA_hideFriendWxid"
-#define kDDWAHideMyWxid        @"kDDWA_hideMyWxid"
 #define kDDWAHideChatName      @"kDDWA_hideChatName"
 
 // 开关默认全部 OFF，装好与原生一致
@@ -171,7 +170,6 @@ static const BOOL kDDDefaultAntiDelete        = NO;
 static const BOOL kDDDefaultCustomAvatar      = NO;
 static const BOOL kDDDefaultVideoTapClose     = NO;
 static const BOOL kDDDefaultHideFriendWxid    = NO;
-static const BOOL kDDDefaultHideMyWxid        = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
 
 // ⑥ 被删评论前缀文案（对齐锤子原文："对方已删除] "，见锤子 __ustring @0xbd80da）
@@ -192,7 +190,6 @@ static NSString *ddDeletedMarkText(void) {
 @property (assign, nonatomic) BOOL enableCustomAvatar;
 @property (assign, nonatomic) BOOL disableSnsVideoTapClose;
 @property (assign, nonatomic) BOOL hideFriendWxid;
-@property (assign, nonatomic) BOOL hideMyWxid;
 @property (assign, nonatomic) BOOL hideChatName;
 @end
 
@@ -215,7 +212,6 @@ static NSString *ddDeletedMarkText(void) {
         kDDWACustomAvatar:   @(kDDDefaultCustomAvatar),
         kDDWAVideoTapClose:  @(kDDDefaultVideoTapClose),
         kDDWAHideFriendWxid: @(kDDDefaultHideFriendWxid),
-        kDDWAHideMyWxid:     @(kDDDefaultHideMyWxid),
         kDDWAHideChatName:   @(kDDDefaultHideChatName),
         kDDWADeletedCommentMark: kDDDefaultDeletedMark,
     }];
@@ -232,7 +228,6 @@ static NSString *ddDeletedMarkText(void) {
         _enableCustomAvatar             = [ud boolForKey:kDDWACustomAvatar];
         _disableSnsVideoTapClose        = [ud boolForKey:kDDWAVideoTapClose];
         _hideFriendWxid                 = [ud boolForKey:kDDWAHideFriendWxid];
-        _hideMyWxid                     = [ud boolForKey:kDDWAHideMyWxid];
         _hideChatName                   = [ud boolForKey:kDDWAHideChatName];
     }
     return self;
@@ -246,7 +241,6 @@ static NSString *ddDeletedMarkText(void) {
 - (void)setEnableCustomAvatar:(BOOL)v { _enableCustomAvatar = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWACustomAvatar]; }
 - (void)setDisableSnsVideoTapClose:(BOOL)v { _disableSnsVideoTapClose = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAVideoTapClose]; }
 - (void)setHideFriendWxid:(BOOL)v { _hideFriendWxid = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideFriendWxid]; }
-- (void)setHideMyWxid:(BOOL)v { _hideMyWxid = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideMyWxid]; }
 - (void)setHideChatName:(BOOL)v { _hideChatName = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDWAHideChatName]; }
 @end
 
@@ -359,6 +353,22 @@ static NSString *ddDeletedMarkText(void) {
 // （不是单条评论）。故必须在 dataItem 层面遍历 commentUsers 恢复，并兜住移除逻辑。
 // 锤子 hook 点：WCFacade.h:472/474/725；清除点：WCDataItem.h:367。
 
+// 恢复单条已删评论（C helper，避免 %new 调用编译期 selector 可见性问题）：
+// 清真实删除标记，并数据层拼锤子前缀"对方已删除] "
+static void dd_restoreDeletedComment(id c) {
+    Class CommentCls = objc_getClass("WCUserComment");
+    if (![c isKindOfClass:CommentCls]) return;
+    _Bool realDel = MSHookIvar<_Bool>(c, "_bDeleted") || MSHookIvar<_Bool>(c, "_deletedByFeedOwner");
+    if (!realDel) return;
+    MSHookIvar<_Bool>(c, "_bDeleted") = 0;
+    MSHookIvar<_Bool>(c, "_deletedByFeedOwner") = 0;
+    NSString *ct = [c content];
+    NSString *mark = ddDeletedMarkText();
+    if ([ct isKindOfClass:[NSString class]] && ct.length && ![ct hasPrefix:mark]) {
+        [c setContent:[mark stringByAppendingString:ct]];
+    }
+}
+
 // 评论级兜底：开关开启时阻止微信把已删评论从 dataItem 移除（WCDataItem.h:367）
 %hook WCDataItem
 - (void)clearExpiredDeltedByFeedOwnerComment {
@@ -401,29 +411,13 @@ static NSString *ddDeletedMarkText(void) {
         // 微信传整个 dataItem：遍历 commentUsers，恢复每条已删评论
         NSMutableArray *users = MSHookIvar<NSMutableArray *>(arg1, "_commentUsers");
         if ([users isKindOfClass:[NSArray class]]) {
-            for (id c in users) [self dd_restoreDeletedComment:c];
+            for (id c in users) dd_restoreDeletedComment(c);
         }
     } else if ([arg1 isKindOfClass:CommentCls]) {
         // 兜底：微信也可能逐条传评论
-        [self dd_restoreDeletedComment:arg1];
+        dd_restoreDeletedComment(arg1);
     }
     %orig;
-}
-%new
-- (void)dd_restoreDeletedComment:(id)c {
-    Class CommentCls = objc_getClass("WCUserComment");
-    if (![c isKindOfClass:CommentCls]) return;
-    // 用真实 ivar 判删（getter 可能已被其它逻辑改写），避免误判
-    _Bool realDel = MSHookIvar<_Bool>(c, "_bDeleted") || MSHookIvar<_Bool>(c, "_deletedByFeedOwner");
-    if (!realDel) return;
-    // 清真实删除标记：无论渲染层读 getter 还是直接读 ivar 都显示
-    MSHookIvar<_Bool>(c, "_bDeleted") = 0;
-    MSHookIvar<_Bool>(c, "_deletedByFeedOwner") = 0;
-    NSString *ct = [c content];
-    NSString *mark = ddDeletedMarkText();
-    if ([ct isKindOfClass:[NSString class]] && ct.length && ![ct hasPrefix:mark]) {
-        [c setContent:[mark stringByAppendingString:ct]];
-    }
 }
 %end
 
@@ -600,26 +594,6 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 }
 %end
 
-#pragma mark - ⑪ 隐藏自己微信号(我界面)
-// 刷新时遍历可见 cell，对账户卡片清空副标题(微信号行)
-%hook NewSettingViewController
-- (void)reloadTableData {
-    %orig;
-    if (![DDWeChatConfig sharedConfig].hideMyWxid) return;
-    id mgr = MSHookIvar<id>(self, "m_tableViewMgr");   // :11
-    UITableView *tv = nil;
-    if (mgr && [mgr respondsToSelector:@selector(getTableView)]) tv = [mgr getTableView];
-    if (!tv) return;
-    Class accCls = objc_getClass("WASettingAccountCell");
-    for (UITableViewCell *cell in tv.visibleCells) {
-        if (accCls && [cell isKindOfClass:accCls]) {
-            UILabel *d = [(id)cell detailLabel];       // WASettingAccountCell.h:13/20
-            if (d) { d.text = @""; d.hidden = YES; }
-        }
-    }
-}
-%end
-
 #pragma mark - ⑫ 隐藏聊天顶栏名字(仅群聊 + 个人聊天)
 // 数据流(砸壳二进制汇编实证): [self GetUsrTitle] → setTitle:subTitle:leftLoading:rightView: → titleView
 //   0x100531360 取 GetUsrTitle  →  0x1005313a0 作为 setTitle:subTitle:leftLoading:rightView: 的 title 参数
@@ -725,7 +699,6 @@ static BOOL ddHideName(void) {
 
     WCTableViewSectionManager *privacy = [secMgr defaultSection];
     [privacy addCell:[cellMgr switchCellForSel:@selector(onHideFriendWxidSwitch:) target:self title:@"隐藏好友微信号(资料页)" on:cfg.hideFriendWxid]];
-    [privacy addCell:[cellMgr switchCellForSel:@selector(onHideMyWxidSwitch:) target:self title:@"隐藏自己微信号(我界面)" on:cfg.hideMyWxid]];
     [privacy addCell:[cellMgr switchCellForSel:@selector(onHideChatNameSwitch:) target:self title:@"隐藏聊天顶栏名字" on:cfg.hideChatName]];
     [_tableViewManager addSection:privacy];
 
@@ -757,7 +730,6 @@ static BOOL ddHideName(void) {
 - (void)onAvatarSwitch:(UISwitch *)s        { [DDWeChatConfig sharedConfig].enableCustomAvatar = s.on; }
 - (void)onVideoTapCloseSwitch:(UISwitch *)s { [DDWeChatConfig sharedConfig].disableSnsVideoTapClose = s.on; }
 - (void)onHideFriendWxidSwitch:(UISwitch *)s{ [DDWeChatConfig sharedConfig].hideFriendWxid = s.on; }
-- (void)onHideMyWxidSwitch:(UISwitch *)s    { [DDWeChatConfig sharedConfig].hideMyWxid = s.on; }
 - (void)onHideChatNameSwitch:(UISwitch *)s  { [DDWeChatConfig sharedConfig].hideChatName = s.on; }
 @end
 
