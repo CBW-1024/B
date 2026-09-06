@@ -56,10 +56,14 @@
 @interface WCUserComment : NSObject
 @property (nonatomic) _Bool bDeleted;
 @property (nonatomic) _Bool deletedByFeedOwner;
+@property (retain, nonatomic) NSString *content;
+@property (retain, nonatomic) NSString *contentPattern;
 - (_Bool)bDeleted;
 - (_Bool)deletedByFeedOwner;
 - (id)content;
+- (id)contentPattern;
 - (void)setContent:(id)arg1;
+- (void)setContentPattern:(id)arg1;
 @end
 
 @interface WCSNSMessage : NSObject
@@ -68,6 +72,18 @@
 @property (retain, nonatomic) WCUserComment *refComment;
 - (void)upgradeDataIfNeeded;
 - (_Bool)isWCMessageDeleted;
+@end
+
+// 朋友圈评论实际渲染组件（8.0.76D 头文件）
+@interface WCCommentRichTextView : UIView
+@property (retain, nonatomic) WCUserComment *userComment;
+- (void)setContent:(id)arg1;
+- (BOOL)setPrefixContent:(id)a0 TargetContent:(id)a1 TargetParserString:(id)a2 SuffixContent:(id)a3;
+@end
+
+@interface WCCommentListContentView : UIView
+@property (retain, nonatomic) WCUserComment *comment;
+- (void)config:(id)a0 dataItem:(id)a1 width:(double)a2;
 @end
 
 // 朋友圈视频全屏播放器（SNS / Moments）。注意：WAVideoPlayerView 是「小程序/视频号」
@@ -124,17 +140,14 @@ static const BOOL kDDDefaultVideoProgressBar  = NO;   // 新增
 static const BOOL kDDDefaultHideFriendWxid    = NO;
 static const BOOL kDDDefaultHideChatName      = NO;
 
-// 修复点：原默认前缀为 @"对方已删除] "（带方括号且常因还原时机问题不显示）。
-// 改为干净的 @"对方已删除 "，使其与“对方已删除”前缀的预期一致；仍可在 NSUserDefaults
-// 的 kDDWADeletedCommentMark 中自定义。
-static NSString * const kDDDefaultDeletedMark = @"对方已删除 ";
+// 修复点：对齐锤子 WeChatTweak。锤子写回 comment.content 的前缀是 @"[对方已删除] "
+// （带方括号 + 尾随空格，已反汇编 CFString @0xdae080 / UTF-16 确认），原先 @"对方已删除 "
+// 不带括号，与锤子渲染路径不一致。仍可在 NSUserDefaults 的 kDDWADeletedCommentMark 中自定义。
+static NSString * const kDDDefaultDeletedMark = @"[对方已删除] ";
 static NSString *ddDeletedMarkText(void) {
     NSString *t = [NSUserDefaults.standardUserDefaults stringForKey:kDDWADeletedCommentMark];
     return (t.length ? t : kDDDefaultDeletedMark);
 }
-
-// 关联对象 key：标记“该评论原本是已删除的”，供 content getter 幂等地补回前缀
-static const void *kDDWasDeletedCommentKey = &kDDWasDeletedCommentKey;
 
 @interface DDWeChatConfig : NSObject
 + (instancetype)sharedConfig;
@@ -304,26 +317,23 @@ static const void *kDDWasDeletedCommentKey = &kDDWasDeletedCommentKey;
 }
 %end
 
-#pragma mark - ⑥ 朋友圈查看已删评论
+#pragma mark - ⑥ 朋友圈查看已删评论（对齐锤子 WeChatTweak.dylib 的实现）
 
-// ===== 对比锤子 WeChatTweak 后的修正说明 =====
-// 锤子的核心不是“在某个升级方法里补一次前缀”，而是让已删评论在 UI 层“照常显示”：
-// 它保证 _bDeleted / deletedByFeedOwner 这两个“删除标记”对外表现为 NO，于是朋友圈 UI
-// 走正常的 content 分支（而不是调用 WCUserComment 的 +deleteByFeedOwnerTips 显示删除占位）。
-//
-// 原实现把“打标记 + 清标记”全部押在 WCSNSMessage upgradeDataIfNeeded 的调用时机上。
-// 问题：若微信不对该对象调用 upgradeDataIfNeeded（或调用晚于 UI 读取），关联对象 key 不会被
-// 设置 → content getter 直接返回原文（看不到“对方已删除”）；更糟的是 _bDeleted/_deletedByFeedOwner
-// 仍为 1，评论会被 UI 过滤 / 显示为删除占位，根本不会走到 content。这就是“开了没提示”的根因。
-//
-// 修正思路：把“清删除标记 + 补前缀”做成 按需、幂等，直接挂在 WCUserComment 的
-// content 与两个删除标记 getter 上，不再依赖 upgradeDataIfNeeded 的时机。
+// ===== 根因：为什么“锤子有效、你的无效” =====
+// 反汇编锤子 WeChatTweak.dylib 确认，它的已删评论核心只 hook 一个方法：
+//   %hook WCSNSMessage -setDelStatus:
+// 微信在解析/加载一条评论时，会用 setDelStatus:1 把它标记为“已删除”。锤子的 newImp（0x7a66b8）逻辑：
+//   1) 开关开启 且 传入的 delStatus == 1 时：
+//        c  = [self comment];
+//        s  = [c content];
+//        [c setContent:[@"[对方已删除] " stringByAppendingString:s]];   // 数据加载期就把前缀写回 content
+//   2) 再以 delStatus = 0 调回原方法（对外不标记为已删 → 评论走正常 WCCommentRichTextView 渲染）
+// 关键点：(a) hook 的是 setDelStatus: 这个“真正写入删除标记”的点；(b) 在数据加载期就改好 content；
+//        (c) 把 delStatus 清零，使评论不被过滤、不走“删除占位”。
+// 原实现 hook 的是 upgradeDataIfNeeded / isWCMessageDeleted，且只在 getter 里补前缀 —— 既 hook 错了写入点，
+// 时机也晚（setDelStatus: 之后评论可能已被路由到删除占位），所以前缀根本没机会上屏。
+// 因此必须对齐锤子：hook setDelStatus:，在它被调用时注入前缀并清零 delStatus。
 
-// 检测“原本已删”：直接读 ivar（不走被 hook 的 getter，避免递归/误判）
-static BOOL dd_commentWasDeleted(id c) {
-    return MSHookIvar<_Bool>(c, "_bDeleted") || MSHookIvar<_Bool>(c, "_deletedByFeedOwner");
-}
-// 幂等补前缀
 static NSString *dd_markDeletedContent(NSString *orig) {
     NSString *mark = ddDeletedMarkText();
     if ([orig isKindOfClass:[NSString class]] && orig.length && ![orig hasPrefix:mark]) {
@@ -331,48 +341,62 @@ static NSString *dd_markDeletedContent(NSString *orig) {
     }
     return orig;
 }
+// 对 WCSNSMessage.comment / refComment 幂等补前缀（锤子只改 comment，这里顺带处理回复 refComment）
+static void dd_injectMarkIntoComment(id c) {
+    if (![c isKindOfClass:%c(WCUserComment)]) return;
+    NSString *s = [c content];
+    if ([s isKindOfClass:[NSString class]] && s.length && ![s hasPrefix:ddDeletedMarkText()]) {
+        [c setContent:[ddDeletedMarkText() stringByAppendingString:s]];
+    }
+}
 
-%hook WCUserComment
-// 关键：让 UI 认为该评论“未删”，从而走正常 content 显示分支（而非 deleteByFeedOwnerTips 占位）
-- (BOOL)bDeleted {
+// ★ 核心：对齐锤子 hook WCSNSMessage -setDelStatus:
+%hook WCSNSMessage
+- (void)setDelStatus:(unsigned int)status {
+    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) { %orig; return; }
+    if (status == 1) {
+        // 已删除：在数据加载期就把前缀写回 comment.content（早于任何渲染）
+        dd_injectMarkIntoComment([self comment]);
+        dd_injectMarkIntoComment([self refComment]);   // 回复
+        // 以 0 调回原方法：对外不视作已删，正常渲染
+        %orig(0);
+        return;
+    }
+    %orig;
+}
+// 兜底：feed 级删除也让 isWCMessageDeleted 返回 NO（先于 setDelStatus 的判定）
+- (BOOL)isWCMessageDeleted {
     if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
     return %orig;
-}
-- (BOOL)deletedByFeedOwner {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
-    return %orig;
-}
-// content getter：按需清理底层删除标记并补前缀（幂等：清完后再读 wasDel 为 NO，hasPrefix 兜底）
-- (id)content {
-    NSString *orig = %orig;
-    if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return orig;
-    if (!dd_commentWasDeleted(self)) return orig;
-    MSHookIvar<_Bool>(self, "_bDeleted") = 0;
-    MSHookIvar<_Bool>(self, "_deletedByFeedOwner") = 0;
-    return dd_markDeletedContent(orig);
 }
 %end
 
-// ⑥ 朋友圈（含提醒）查看已删评论：feed 级删除也要放过
-%hook WCSNSMessage
-- (_Bool)isWCMessageDeleted {
-    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) return NO;
-    return %orig;
+// 渲染组件兜底：WCCommentRichTextView 实际把评论画到屏幕（截图已证实）
+%hook WCCommentRichTextView
+- (void)setContent:(id)content {
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment &&
+        [content isKindOfClass:[NSString class]]) {
+        content = dd_markDeletedContent(content);
+    }
+    %orig;
 }
-- (void)upgradeDataIfNeeded {
+// 8.0.76D 头文件中的组装方法：prefix/targetContent/targetParserString/suffix
+- (BOOL)setPrefixContent:(id)prefix TargetContent:(id)targetContent TargetParserString:(id)parserString SuffixContent:(id)suffix {
+    if ([DDWeChatConfig sharedConfig].antiDeleteSnsComment) {
+        if ([targetContent isKindOfClass:[NSString class]]) targetContent = dd_markDeletedContent(targetContent);
+        if ([parserString isKindOfClass:[NSString class]]) parserString = dd_markDeletedContent(parserString);
+    }
+    return %orig(prefix, targetContent, parserString, suffix);
+}
+%end
+
+// 容器兜底：config 时若发现 content 还未带前缀，补一道（幂等）
+%hook WCCommentListContentView
+- (void)config:(id)dataItem dataItem:(id)item width:(double)width {
     %orig;
     if (![DDWeChatConfig sharedConfig].antiDeleteSnsComment) return;
-    if (self.delStatus != 0) self.delStatus = 0;
-    // 兜底：若 feed 直接持有已删评论对象，也一并还原（幂等；content 钩子会补前缀）
-    id cm = [self comment];
-    if (cm && dd_commentWasDeleted(cm)) {
-        MSHookIvar<_Bool>(cm, "_bDeleted") = 0;
-        MSHookIvar<_Bool>(cm, "_deletedByFeedOwner") = 0;
-    }
-    id ref = [self refComment];
-    if (ref && dd_commentWasDeleted(ref)) {
-        MSHookIvar<_Bool>(ref, "_bDeleted") = 0;
-        MSHookIvar<_Bool>(ref, "_deletedByFeedOwner") = 0;
+    if ([self.comment isKindOfClass:%c(WCUserComment)]) {
+        dd_injectMarkIntoComment(self.comment);
     }
 }
 %end
