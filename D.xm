@@ -52,10 +52,17 @@
 @interface MMCPLabel : MMUILabel   // MMCPLabel.h:4 (: MMUILabel : UILabel)
 @end
 @interface CBaseContact : NSObject @end
-// ⑫ 用。MMTitleView.h — 聊天顶栏名字是自定义视图 MMTitleView，经 -setTitle: / -setSubTitle: 写入
-@interface MMTitleView : UIView
-- (void)setTitle:(id)arg1;
-- (void)setSubTitle:(id)arg1;
+// ⑫ 用。聊天顶栏名字是"数据层取值 → 视图层渲染"两级：VC 通过 delegate 协议向 LogicController 要标题字符串
+@interface BaseMsgContentLogicController : NSObject      // BaseMsgContentLogicController.h:9
+- (id)GetUsrTitle;            // :299 主标题(单聊/通用)
+- (id)getSubTitle;            // :296 副标题
+- (id)GetTitleTailImageView;  // :280 标题尾部视图(免打扰铃铛, 协议 BaseMsgContentDelgate-Protocol.h:16)
+@end
+@interface RoomContentLogicController : NSObject         // RoomContentLogicController.h:9
+- (id)GetUsrTitle;                 // :188 群聊自己重写了一份，屏蔽基类
+- (id)getSubTitle;                 // :151 群聊副标题
+- (id)getMemeberCountLabel;        // :186 群人数 UILabel(拼写 Memeber 是微信原生 typo)
+- (id)getDefaultTitleTailSubViews; // :185 标题尾部子视图数组(人数 label 从这插入, 汇编 0x1054510c8)
 @end
 @interface BaseMsgContentViewController : MMUIViewController @end   // BaseMsgContentViewController.h:4
 
@@ -600,41 +607,49 @@ static void ddInjectCustomAvatarCell(AddContactToChatRoomViewController *vc) {
 }
 %end
 
-#pragma mark - ⑫ 隐藏聊天顶栏名字
-// 证据: 真实砸壳二进制(微信8.0.76.ipa, ARM64)核验 —— __objc_methname 段字面存在 MMTitleView / setTitle: / setSubTitle:
-//   / setCustomNavBarTitleView: / updateTitleView:；全 App 检索 setTitleHidden:/setNavTitleHidden:/titleViewHidden:
-//   等"隐藏标题"类原生方法为 0。即微信无原生隐藏标题开关，名字唯一原生写入点就是 MMTitleView -setTitle:/-setSubTitle:
-//   (MMTitleView.h 亦证实: 标题是自定义视图 MMTitleView，名字经 -setTitle:/-setSubTitle: 写入)。
-// 最简单且正确的做法: 仅在 MMTitleView 这两个 setter 拦截，命中聊天 VC 时传 @"" —— 名字写入即空，无闪现、不漏群聊/私聊(皆共用 MMTitleView)，铃铛是右视图只清文本不动它。
-// 归属判定(既精确又兜首帧): 1) 已在导航栏内且顶层 VC 为聊天 VC；2) 尚未挂入导航栏但已有 superview 时，沿 responder 链找到聊天 VC。
-static BOOL ddIsChatTitleView(MMTitleView *tv) {
-    UIView *v = tv;
-    while (v && ![v isKindOfClass:%c(UINavigationBar)]) v = v.superview;
-    if (v) {
-        UINavigationController *nav = (UINavigationController *)[(UINavigationBar *)v delegate];
-        if (nav && [nav.topViewController isKindOfClass:%c(BaseMsgContentViewController)]) return YES;
-    }
-    UIResponder *r = tv;
-    while (r) {
-        if ([r isKindOfClass:%c(BaseMsgContentViewController)]) return YES;
-        r = r.nextResponder;
-    }
-    return NO;
+#pragma mark - ⑫ 隐藏聊天顶栏名字(仅群聊 + 个人聊天)
+// 数据流(砸壳二进制汇编实证): [self GetUsrTitle] → setTitle:subTitle:leftLoading:rightView: → titleView
+//   0x100531360 取 GetUsrTitle  →  0x1005313a0 作为 setTitle:subTitle:leftLoading:rightView: 的 title 参数
+// 覆盖两个类即可:
+//   BaseMsgContentLogicController  = 个人聊天(WeixinContentLogicController 等未重写，走基类实现)
+//   RoomContentLogicController     = 群聊(重写了 GetUsrTitle，必须单独 hook)
+// 不覆盖也不误伤: 全库仅 13 个类重写 GetUsrTitle，全是公众号(WASessionContentLogicController)、
+//   企微(CBTAsstContentLogicController)、模板消息、客服这类特殊会话——子类实现会屏蔽基类 hook，天然不受影响。
+// 开关开时不调 %orig: 群聊 GetUsrTitle 在无备注时会 fallback 到 [self GetChatRoomTitle]
+//   (汇编 0x105450bd8)，直接返回 @"" 即一并堵死这条 fallback，省掉一个 hook。
+static BOOL ddHideName(void) {
+    return [DDWeChatConfig sharedConfig].hideChatName;
 }
-%hook MMTitleView
-- (void)setTitle:(id)arg1 {
-    if ([DDWeChatConfig sharedConfig].hideChatName && ddIsChatTitleView(self)) {
-        %orig(@"");
-        return;
-    }
-    %orig;
+%hook BaseMsgContentLogicController
+- (id)GetUsrTitle {
+    if (ddHideName()) return @"";
+    return %orig;
 }
-- (void)setSubTitle:(id)arg1 {
-    if ([DDWeChatConfig sharedConfig].hideChatName && ddIsChatTitleView(self)) {
-        %orig(@"");
-        return;
-    }
-    %orig;
+- (id)getSubTitle {
+    if (ddHideName()) return @"";
+    return %orig;
+}
+- (id)GetTitleTailImageView {
+    if (ddHideName()) return nil;   // 免打扰铃铛(rightView)
+    return %orig;
+}
+%end
+%hook RoomContentLogicController
+- (id)GetUsrTitle {
+    if (ddHideName()) return @"";
+    return %orig;
+}
+- (id)getSubTitle {
+    if (ddHideName()) return @"";
+    return %orig;
+}
+- (id)getDefaultTitleTailSubViews {
+    if (ddHideName()) return nil;   // 尾部数组(人数 label 在这插入)；必须先于人数 hook，否则 insertObject:nil 崩溃
+    return %orig;
+}
+- (id)getMemeberCountLabel {
+    if (ddHideName()) return nil;   // "群聊 (N)" 的人数
+    return %orig;
 }
 %end
 
