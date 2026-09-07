@@ -35,6 +35,7 @@ static BOOL g_videoSuppress = NO;  // 派生值：g_suppressMask != 0
 // “拍照取值”由按下快门那一刻反推（captureStillImage/capturePhoto 仅拍照触发），并持久化。
 static unsigned long long g_photoCameraMode  = 0;   // 已确认的“拍照模式”取值（拍照/录像判别基准）
 static int                g_photoModeLearned = 0;   // 0=未学 1=推测(默认进入模式) 2=快门确认(权威)
+static __weak id         g_cameraVC        = nil;  // 缓存当前相机 VC（最可靠，直接从它取 shortVideoToolbar）
 static __weak id         g_shootSwitchView  = nil;  // 缓存切换控件，避免每帧遍历视图树
 static CFTimeInterval    s_lastModePoll     = 0;    // 拍摄模式轮询节流时间戳
 
@@ -335,13 +336,14 @@ static UIViewController *vcm_topViewController(void) {
     return vc;
 }
 
-// 读取当前拍摄模式（拍照/录像取值）。优先用缓存的切换控件，找不到再向上遍历视图树定位一次
+// 读取当前拍摄模式（拍照/录像取值）。优先直接用已缓存的相机 VC 取（不依赖视图树遍历，
+// 因为相机常被外层容器 VC 包住，遍历顶层取不到 shortVideoToolbar）；缓存控件失效再兜底遍历一次。
 static unsigned long long vcm_currentShootMode(void) {
     id sw = g_shootSwitchView;
     if (!sw) {
-        UIViewController *top = vcm_topViewController();
-        if (!top) return ULLONG_MAX;
-        id toolbar = [top valueForKey:@"shortVideoToolbar"];
+        id camera = g_cameraVC;
+        id toolbar = camera ? [camera valueForKey:@"shortVideoToolbar"]
+                            : [vcm_topViewController() valueForKey:@"shortVideoToolbar"];
         sw = [toolbar valueForKey:@"shootingModeSwitchView"];
         if (sw) g_shootSwitchView = sw;
     }
@@ -1215,6 +1217,8 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 %hook MMSightCameraViewController
 - (void)viewWillAppear:(_Bool)arg1 {
     %orig;
+    g_cameraVC = self;  // 缓存相机 VC：后续直接用 self.shortVideoToolbar 取拍摄模式，绕开视图树遍历
+    g_shootSwitchView = nil;  // 新进入一个相机会话，切换控件需重新定位（避免复用上一个会话的弱引用）
     unsigned long long m = vcm_currentShootMode();
     if (m != ULLONG_MAX && g_photoModeLearned < 2) vcm_guessPhotoMode(m);  // 默认进入模式多为拍照，先猜
     vcm_applyShootSuppress();
