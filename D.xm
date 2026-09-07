@@ -1385,7 +1385,7 @@ static VCamAudioProxy *g_audioProxy = nil;
     g_videoSuppress = YES;   // 拍照期间：视频透传真实画面
     vcm_log(@"[capture] 拍照开始：视频替换暂停（拍真实画面）");
     VCamPhotoDelegateProxy *p = [[VCamPhotoDelegateProxy alloc] initWithOriginal:delegate];
-    %orig(settings, p);
+    %orig(settings, (id<AVCapturePhotoCaptureDelegate>)p);
 }
 %end
 
