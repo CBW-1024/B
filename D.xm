@@ -9,6 +9,7 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 #include <dlfcn.h>
+#include "fishhook.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
 
@@ -1525,12 +1526,15 @@ static void vcm_installTapGesture(UIWindow *win) {
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
 
-    // substrate 内联钩子 AudioUnitRender：先确保 AudioToolbox 已加载并取址，再改写函数入口，原始实现回存 g_origAudioUnitRender
+    // fishhook 重定向 AudioUnitRender：改写 WeChat 的间接符号指针拦截麦克风上行，
+    // 比内联钩子对共享缓存里的框架函数更稳（MSHookFunction 在此环境会静默失效）
     dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_NOW);
-    void *audioUnitRender = dlsym(RTLD_DEFAULT, "AudioUnitRender");
-    if (audioUnitRender) {
-        MSHookFunction(audioUnitRender, (void *)hooked_AudioUnitRender, (void **)&g_origAudioUnitRender);
-    }
+    struct rebinding reb = {
+        "AudioUnitRender",
+        (void *)hooked_AudioUnitRender,
+        (void **)&g_origAudioUnitRender,
+    };
+    rebind_symbols(&reb, 1);
 }
 
 %dtor {
