@@ -51,6 +51,7 @@
 #pragma mark - 配置开关
 static BOOL g_isReplace  = NO;      // 默认关：无素材时透传真实摄像头/麦克风；导入素材后自动开启
 static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
+static double g_loopEndAt = -1;     // 循环关闭时的终止时刻（elapsed 绝对值）；-1 = 未设置/循环开启
 static BOOL g_isSound    = YES;     // 是否替换麦克风采集
 // 拍照 / 拍摄（录制）期间临时置位：此时视频透传真实摄像头画面（拍出来才是真实场景），
 // 拍完 / 录完清位恢复替换。仅作用于视频，声音不受此标志影响。
@@ -131,6 +132,7 @@ static void vcm_resetClock(void) {
     g_clockReady         = NO;   // 下一帧重新锚定
     g_srcFrameIdx        = -1;   // 强迫画面从素材头重新锚定
     g_audioConsumedBytes = 0.0;
+    g_loopEndAt          = -1;   // 新会话：重新按「当前轮播完」计算循环终止时刻
 }
 // 清掉素材目录下某个前缀的所有残留文件（扩展名随导入文件变化，不能只删固定的那一个）。
 static void vcm_clearMaterialFiles(NSString *prefix) {
@@ -307,6 +309,25 @@ static void vcm_log(NSString *fmt, ...) {
 }
 
 #pragma mark - 配置存取
+
+// 循环关闭时的终止时刻。不能直接拿 elapsed >= duration 判断——elapsed 是会话累计时长，
+// 循环播过几轮后它早已远超素材时长，那样一点「关」就会立刻冻结（用户反馈的现象）。
+// 正确语义是「当前这一轮播完再停」：首次检测到关闭时，把终止时刻定在当前轮结束边界，
+// 即 elapsed + (duration - 轮内进度) = (k+1) * duration。音视频共用，保证同时停止。
+static double vcm_loopEndAt(double elapsed) {
+    if (g_isLoop) { g_loopEndAt = -1; return -1; }   // 循环重新开启 → 清除
+    if (g_loopEndAt < 0) {
+        if (g_srcDuration > 0.1) {
+            double prog = fmod(elapsed, g_srcDuration);
+            g_loopEndAt = elapsed + (g_srcDuration - prog);
+            vcm_log(@"[loop] 循环已关：当前这一轮播完后冻结（还需 %.2fs）", g_srcDuration - prog);
+        } else {
+            g_loopEndAt = elapsed;   // 时长未知 → 只能立即冻结
+        }
+    }
+    return g_loopEndAt;
+}
+
 static void vcm_saveSettings(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d setBool:g_isReplace   forKey:@"vcam_replace"];
@@ -724,10 +745,13 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
 
     if (g_pcmBytesPerSec > 0 && len > 0) {
         double want = elapsed * g_pcmBytesPerSec;
-        if (g_isLoop) want = fmod(want, (double)len);
-        // loop off 且已过素材末尾：保持静音即可，不要再校正——
+        // 无论循环开关都取模：关闭循环时也要把「当前这一轮」播完，不能一点「关」就立刻没声音。
+        // 停止由 endAt（当前轮结束边界）决定，与视频冻结同一时刻，保证音画同时停。
+        double endAt = vcm_loopEndAt(elapsed);
+        want = fmod(want, (double)len);
+        // 当前轮已播完：保持静音即可，不要再校正——
         // 否则会把游标反复拉回 0 造成「重播 + 每帧刷日志」的怪音/卡顿（关闭循环时声音异常的根因）。
-        if (!g_isLoop && want >= (double)len) {
+        if (endAt >= 0 && elapsed >= endAt) {
             os_unfair_lock_unlock(&g_audioPCMLock);
             memset(outData, 0, length);
             return;
@@ -799,9 +823,11 @@ static void vcm_probeCaptureAudioFormat(CMSampleBufferRef s) {
     // 时钟追平：本次回调应把素材消费到 elapsed * 采集字节率 的位置。
     // 采集端来一次回调就取一帧的旧写法，在丢帧/重建时会掉队且永不补齐 → 音频落后于画面。
     double t = elapsed;
-    if (g_isLoop && g_audioSrcDuration > 0.1) t = fmod(t, g_audioSrcDuration);
+    // 无论循环开关都取模：关闭循环时也要把「当前这一轮」播完，停止统一由 endAt 决定（与视频同一时刻）。
+    if (g_audioSrcDuration > 0.1) t = fmod(t, g_audioSrcDuration);
     double wantBytes = (g_audioCaptureBytesPerSec > 0) ? (t * g_audioCaptureBytesPerSec) : -1.0;
-    if (!g_isLoop && g_audioSrcDuration > 0.1 && elapsed > g_audioSrcDuration) wantBytes = -1.0;
+    double endAt = vcm_loopEndAt(elapsed);
+    if (endAt >= 0 && elapsed >= endAt) wantBytes = -1.0;
 
     // 循环回卷：已投递满一整段就重建 reader 回到素材头，与画面侧 fmod 回卷对齐。
     // 不重建的话 reader 会继续顺序播到尾才回卷，音频比画面晚整整一个素材长度。
@@ -896,13 +922,15 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 // 现在：want = floor(elapsed * 素材fps)，一次补齐落后的帧；落后太多时直接跳位置而不是狂解码。
 + (CVPixelBufferRef)nextSourcePixelAt:(CFTimeInterval)elapsed {
     double fps = (g_srcFps > 1.0) ? g_srcFps : 30.0;
+    double endAt = vcm_loopEndAt(elapsed);   // 循环关闭时的终止时刻；循环开启返回 -1
     double t   = elapsed;
-    if (g_isLoop && g_srcDuration > 0.1) t = fmod(t, g_srcDuration);
+    // 循环开关与否都取模定位（轮内位置）。关闭时靠 endAt 冻结，而不是靠 t 越界——
+    // elapsed 是会话累计时长，循环播过几轮后它早已远超 duration，若直接比较会一点「关」就立刻冻住。
+    if (g_srcDuration > 0.1) t = fmod(t, g_srcDuration);
 
-    // loop 关：素材播完即冻结在末帧，不再重建回卷（与音频静音对齐）。
-    // 否则 want 单调增长到超过素材长度后，reader 末尾 pullVideoFrame 返回 NULL 会置 g_videoReload，
-    // 触发下次重建从头读 → 视频反复从头播放（用户反馈「循环关了视频还在继续播」）。
-    if (!g_isLoop && g_srcDuration > 0.1 && elapsed >= g_srcDuration) {
+    // 循环关闭且「当前这一轮」播完 → 冻结在末帧（与音频静音对齐）。
+    // 终止时刻定在当前轮结束边界，所以是播完才停。
+    if (endAt >= 0 && elapsed >= endAt) {
         [g_mediaLock lock];
         CVPixelBufferRef f = g_lastVideoPixel ? CVPixelBufferRetain(g_lastVideoPixel) : NULL;
         [g_mediaLock unlock];
@@ -1389,50 +1417,15 @@ static VCamAudioProxy *g_audioProxy = nil;
 %end
 
 #pragma mark - 拍照 / 拍摄期间暂停视频替换
-// 拍照片 / 录视频时微信从当前 session 取帧，若继续替换会拍出素材而非真实场景。
-// 故在拍照 / 录制入口置 g_videoSuppress=YES，使视频 captureOutput 透传真实画面；
-// 拍完 / 录完由 proxy delegate / stopRecording 清位恢复（stopRunning 也有兜底清位）。
+// 拍照片 / 录视频时若继续替换，会拍出素材而非真实场景，故期间置 g_videoSuppress=YES 让视频透传真实画面。
 // 仅作用于视频，声音替换不受影响——用户只要求「视频」真实。
-@interface VCamPhotoDelegateProxy : NSObject
-- (instancetype)initWithOriginal:(id)orig;
-@end
-@implementation VCamPhotoDelegateProxy {
-    __weak id _orig;
-}
-- (instancetype)initWithOriginal:(id)orig {
-    if (self = [super init]) _orig = orig;
-    return self;
-}
-// 不实现任何具体 delegate 方法：所有回调原样转发给微信原 delegate，仅对「拍照完成」两个 selector 插桩恢复视频替换。
-// 原因：AVCapturePhotoCaptureDelegate 是 informal protocol（方法声明在 NSObject category 而非正式协议），
-// 具体实现会导致编译器报 expected a type（AVCaptureResolvedSettings 未声明）/ no known instance method。
-// 故改用消息转发，方法体里不出现任何具体 delegate 类型名。
-- (BOOL)respondsToSelector:(SEL)aSelector {
-    return [_orig respondsToSelector:aSelector];
-}
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
-    return [_orig methodSignatureForSelector:aSelector];
-}
-- (void)forwardInvocation:(NSInvocation *)invocation {
-    SEL sel = invocation.selector;
-    if (sel == @selector(capturePhoto:didFinishProcessingPhoto:error:) ||
-        sel == @selector(capturePhoto:didFinishCaptureForResolvedSettings:error:)) {
-        g_videoSuppress = NO;   // 拍完：恢复视频替换
-        vcm_log(@"[capture] 拍照完成：视频替换恢复");
-    }
-    [invocation invokeWithTarget:_orig];
-}
-@end
-
-%hook AVCapturePhotoOutput
-- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings
-                        delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
-    g_videoSuppress = YES;   // 拍照期间：视频透传真实画面
-    vcm_log(@"[capture] 拍照开始：视频替换暂停（拍真实画面）");
-    VCamPhotoDelegateProxy *p = [[VCamPhotoDelegateProxy alloc] initWithOriginal:delegate];
-    %orig(settings, (id<AVCapturePhotoCaptureDelegate>)p);
-}
-%end
+//
+// 日志实证的微信真实路径：
+//   · 拍照取帧用 AVCaptureStillImageOutput（见 [session] addOutput 日志）——它不经过我们 hook 的
+//     VideoDataOutput，所以拍照成片天然是真实画面，无需额外处理。
+//   · 落盘（拍照写图 / 录视频）统一走 AVAssetWriter —— 这才是真正需要拦的抑制入口（见下方 hook）。
+// 因此原先 hook 的 AVCapturePhotoOutput 是死代码（微信完全不用该类，日志从未出现对应 [capture]），已删除。
+// AVCaptureMovieFileOutput 目前也未被观测到调用，保留作为兜底路径，成本仅几行。
 
 %hook AVCaptureMovieFileOutput
 - (void)startRecordingToOutputFileURL:(NSURL *)url
