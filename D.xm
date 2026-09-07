@@ -338,17 +338,27 @@ static UIViewController *vcm_topViewController(void) {
 
 // 读取当前拍摄模式（拍照/录像取值）。优先直接用已缓存的相机 VC 取（不依赖视图树遍历，
 // 因为相机常被外层容器 VC 包住，遍历顶层取不到 shortVideoToolbar）；缓存控件失效再兜底遍历一次。
+// 全程取不到时打印探针，定位到底卡在 cameraVC / shortVideoToolbar / shootingModeSwitchView 哪一层。
 static unsigned long long vcm_currentShootMode(void) {
-    id sw = g_shootSwitchView;
-    if (!sw) {
-        id camera = g_cameraVC;
-        id toolbar = camera ? [camera valueForKey:@"shortVideoToolbar"]
-                            : [vcm_topViewController() valueForKey:@"shortVideoToolbar"];
-        sw = [toolbar valueForKey:@"shootingModeSwitchView"];
-        if (sw) g_shootSwitchView = sw;
+    if (g_shootSwitchView) {
+        return (unsigned long long)[[g_shootSwitchView valueForKey:@"currentShootingMode"] unsignedLongLongValue];
     }
-    if (!sw) return ULLONG_MAX;
-    return (unsigned long long)[[sw valueForKey:@"currentShootingMode"] unsignedLongLongValue];
+    id camera   = g_cameraVC;
+    id toolbar  = camera ? [camera valueForKey:@"shortVideoToolbar"]
+                         : [vcm_topViewController() valueForKey:@"shortVideoToolbar"];
+    id sw = [toolbar valueForKey:@"shootingModeSwitchView"];
+    if (sw) { g_shootSwitchView = sw; return (unsigned long long)[[sw valueForKey:@"currentShootingMode"] unsignedLongLongValue]; }
+    // 调试探针：定位取不到拍摄模式的环节（限频，避免刷屏）
+    static CFTimeInterval s_lastProbe = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - s_lastProbe > 2.0) {
+        s_lastProbe = now;
+        vcm_dbg(@"shootProbe cameraVC=%@ tb=%@ top=%@",
+                NSStringFromClass([camera class]),
+                NSStringFromClass([toolbar class]),
+                NSStringFromClass([vcm_topViewController() class]));
+    }
+    return ULLONG_MAX;
 }
 
 // 推测拍照取值：打开相机时按默认进入模式猜测（Sight 相机默认进入拍照），可被快门确认覆盖
@@ -1222,7 +1232,7 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     unsigned long long m = vcm_currentShootMode();
     if (m != ULLONG_MAX && g_photoModeLearned < 2) vcm_guessPhotoMode(m);  // 默认进入模式多为拍照，先猜
     vcm_applyShootSuppress();
-    vcm_dbg(@"MMSightCamera viewWillAppear mode=%llu photo=%llu suppressing=%d", m, g_photoCameraMode, g_videoSuppress);
+    vcm_dbg(@"MMSightCamera viewWillAppear[b20260908b] mode=%llu photo=%llu suppressing=%d", m, g_photoCameraMode, g_videoSuppress);
 }
 - (void)viewWillDisappear:(_Bool)arg1 {
     %orig;
