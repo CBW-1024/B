@@ -1029,25 +1029,28 @@ static OSStatus hooked_AudioUnitRender(
      fromConnection:(AVCaptureConnection *)connection {
     g_videoOrientation = connection.videoOrientation;
     CMSampleBufferRef newSample = NULL;
-    if (g_isReplace && !g_videoSuppress) {   // 拍照/拍摄期间透传真实画面
+    if (g_isReplace && !g_videoSuppress) {   // 替换开启且未被抑制：把真实帧换成素材帧
         @try {
             newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
             if (newSample && g_displayLayer) {
                 if (!g_displayLayer.isReadyForMoreMediaData) [g_displayLayer flush];
                 [g_displayLayer enqueueSampleBuffer:newSample];
             }
-    if (g_dbgFirstFrame) {
-        g_dbgFirstFrame = NO;
-        vcm_dbg(@"proxy firstFrame isReplace=%d suppress=%d replacing=%d",
-                g_isReplace, g_videoSuppress, (newSample != NULL));
-    }
         } @catch (NSException *e) {
             newSample = NULL;
         }
     }
 
-    if (_originalDelegate &&
-        [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+    // 成片是否替换取决于这一步：素材帧必须交给微信原始 delegate 才会被写进文件
+    BOOL hasOrig = (_originalDelegate &&
+                    [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]);
+    if (g_dbgFirstFrame) {
+        g_dbgFirstFrame = NO;
+        vcm_dbg(@"proxy firstFrame isReplace=%d suppress=%d replacing=%d origDelegate=%d",
+                g_isReplace, g_videoSuppress, (newSample != NULL), (hasOrig ? 1 : 0));
+    }
+
+    if (hasOrig) {
         [_originalDelegate captureOutput:output
                     didOutputSampleBuffer:(newSample ?: sampleBuffer)
                            fromConnection:connection];
@@ -1055,18 +1058,25 @@ static OSStatus hooked_AudioUnitRender(
     if (newSample) CFRelease(newSample);
 }
 @end
-static VCamVideoProxy *g_videoProxy = nil;
+static char kVCamVideoProxyKey;   // 关联对象 key：每个 AVCaptureVideoDataOutput 独立持有自己的 proxy
 
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    // 每个 output 独立持有 proxy：微信可能同时存在预览与录制两个 video data output，
+    // 共用单例会让 _originalDelegate 互相覆盖，素材帧转发错对象、导致成片不被替换
+    VCamVideoProxy *p = objc_getAssociatedObject(self, &kVCamVideoProxyKey);
     if (delegate == nil) {
         %orig(nil, nil);  // detach 时原样透传，避免在已停 session 上塞入 proxy 导致闪退
-        if (g_videoProxy) [g_videoProxy setOriginalDelegate:nil queue:nil];
+        [p setOriginalDelegate:nil queue:nil];
         return;
     }
-    if (!g_videoProxy) g_videoProxy = [[VCamVideoProxy alloc] init];
-    [g_videoProxy setOriginalDelegate:delegate queue:queue];
-    %orig(g_videoProxy, queue);
+    if (!p) {
+        p = [[VCamVideoProxy alloc] init];
+        objc_setAssociatedObject(self, &kVCamVideoProxyKey, p, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [p setOriginalDelegate:delegate queue:queue];
+    vcm_dbg(@"setSampleBufferDelegate delegate=%@", NSStringFromClass([delegate class]));
+    %orig(p, queue);
 }
 %end
 
