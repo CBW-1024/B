@@ -14,8 +14,23 @@
 //   ② AVCaptureAudioDataOutput  音频采集回调
 //   ③ AudioUnitRender           视频通话的麦克风采集（裸 PCM 字节流）
 // 前两条投递 CMSampleBuffer，第三条是裸 PCM，故音频有两套实现；
-// 其中 AudioUnit 链路采用「整段预解码进内存 + 只读游标顺序推进」的方式，
+// 其中 AudioUnit 链路采用「整段预解码进内存 + 按时钟定位读取」的方式，
 // 音频在播放前一次性解码完毕，消费期间 PCM 恒定不变、永不被覆盖，从根本上保证清晰度。
+//
+// ============================ 音画同步（本次改动核心） ============================
+// 旧实现的致命缺陷：画面走「帧到帧」（一个采集回调吐一个素材帧），声音走「时钟」
+// （按 ioData 字节数推进）。两者时间基准不同 —— 一旦采集被压帧（微信常把采集压到
+// 15~20fps）或采集回调里 CI 渲染耗时触发 alwaysDiscardsLateVideoFrames 丢帧，
+// 素材消费速度就永久落后于真实时间 → 画面慢放，并与声音持续漂移。
+//
+// 修法：给音视频接同一个会话时钟 CACurrentMediaTime()，两边都按「会话已过多少秒」
+// 定位素材位置（time-to-frame / time-to-sample）：
+//   · 画面  want = floor(elapsed * 素材fps)   → 一次补齐落后的帧（上限 kVCamMaxCatchUp）
+//   · 声音  pos  = fmod(elapsed * 每秒字节数, PCM总长)  → 直接按字节定位，天然循环
+//   · AVCapture 音频同样按 elapsed 追平已消费字节数，且保留素材自身 duration 不再被
+//     采集帧 duration 覆盖（旧代码会导致音频被变速 8%~12%）
+// 采集端掉帧时画面会「跳帧」但速度恒定 —— 速度正确优先于流畅。
+// ==============================================================================
 //
 // 画面流向：素材 → AVAssetReader 取帧 → 旋转 / 等比居中 → 合成到与采集帧同尺寸黑底 →
 // CIContext 渲染成同格式 CVPixelBuffer → 套用采集帧时序 → 新的 CMSampleBuffer。
@@ -72,17 +87,64 @@ static AVAssetReaderTrackOutput *g_audioOutput = nil;
 // 最近一帧源画面。reader 读完后冻结复用，避免画面闪回真实摄像头。
 static CVPixelBufferRef g_lastVideoPixel = NULL;
 
+#pragma mark - 统一会话时钟（音画同步的地基）
+// 一次会话（startRunning 或换素材）内，画面与声音共用同一个 elapsed：
+//   elapsed = CACurrentMediaTime() - anchor
+// anchor 采用惰性建立：第一次真正取帧/取数时才锚定，天然对齐首帧，
+// 不受 startRunning 到首帧之间的启动延迟影响。
+static CFTimeInterval g_clockAnchor = 0;
+static BOOL           g_clockReady  = NO;
+
+// 素材属性（建 reader 时从 AVAssetTrack 读取，用于 time-to-frame）
+static double  g_srcFps      = 30.0;  // 素材帧率（track.nominalFrameRate，读不到时取 30）
+static double  g_srcDuration = 0.0;   // 素材时长（秒），循环回卷用
+static int64_t g_srcFrameIdx = -1;    // 素材已推进到的帧号；-1 = reader 刚重建待锚定
+
+// 掉帧追赶上限：一次回调最多补这么多帧。超过说明卡顿严重，直接跳位置而不是疯狂解码，
+// 否则回调耗时进一步变长 → 更容易丢帧 → 正反馈卡死。
+static const long long kVCamMaxCatchUp = 4;
+
+// AudioUnit 链路：预解码 PCM 的字节速率与帧字节数，用于按时钟定位
+static double g_pcmBytesPerSec  = 0.0;
+static size_t g_audioFrameBytes = 1;   // 一个采样帧的字节数（帧边界对齐，防半个采样点起播爆音）
+
+// AVCapture 音频链路：采集端格式与素材时长，用于按时钟追平
+static double g_captureSampleRate      = 0.0;   // 麦克风真实采样率（从采集帧 ASBD 探测）
+static double g_audioCaptureBytesPerSec = 0.0;  // 采集端每秒字节数
+static double g_audioSrcDuration       = 0.0;   // 音频素材时长（秒），循环回卷用
+static double g_audioConsumedBytes     = 0.0;   // 已投递给下游的音频字节数
+
+static void vcm_resetClock(void) {
+    g_clockReady         = NO;   // 下一帧重新锚定
+    g_srcFrameIdx        = -1;   // 强迫画面从素材头重新锚定
+    g_audioConsumedBytes = 0.0;
+}
+static CFTimeInterval vcm_elapsed(void) {
+    CFTimeInterval now = CACurrentMediaTime();
+    if (!g_clockReady) { g_clockAnchor = now; g_clockReady = YES; }
+    return now - g_clockAnchor;
+}
+
 #pragma mark - 预览显示层
 static AVSampleBufferDisplayLayer *g_displayLayer     = nil;
 static CADisplayLink              *g_displayLink      = nil;
 static AVCaptureVideoOrientation   g_videoOrientation = AVCaptureVideoOrientationPortrait;
 
-#pragma mark - 音频预解码缓冲（整段预解码进内存 + 顺序游标回卷）
-// 整段音频一次性解码进内存，消费端按读游标顺序取用、到尾按 g_isLoop 回卷，期间零写入。
+#pragma mark - 像素缓冲池
+// 旧实现每帧 CVPixelBufferCreate：分配 + IOSurface 建/拆把采集回调拖长，
+// 回调一慢就触发 alwaysDiscardsLateVideoFrames 丢帧 → 画面更慢（正反馈）。
+// 改用按 (w,h,fmt) 缓存的 CVPixelBufferPool；外部仍持有旧 buffer 时 pool 会自动新建，安全。
+static CVPixelBufferPoolRef g_pbPool = NULL;
+static size_t               g_poolW  = 0;
+static size_t               g_poolH  = 0;
+static OSType               g_poolFmt = 0;
+
+#pragma mark - 音频预解码缓冲（整段预解码进内存 + 按时钟定位读取）
+// 整段音频一次性解码进内存，消费端按「会话已过秒数」换算字节偏移直接定位，期间零写入。
 // 因解码在播放前完成、消费期间 PCM 不被任何写入覆盖，从架构上保证连续性，是清晰度的根本保证。
 static uint8_t       *g_audioPCM      = NULL;  // 整段预解码 PCM
 static size_t         g_audioPCMLen   = 0;     // PCM 总字节数
-static size_t         g_audioPCMRead  = 0;     // 读游标（顺序推进；g_isLoop 时到尾回卷 0）
+static size_t         g_audioPCMRead  = 0;     // 已废弃：改由时钟定位，保留仅为状态一致
 static os_unfair_lock g_audioPCMLock  = OS_UNFAIR_LOCK_INIT;
 static BOOL           g_audioPCMReady = NO;    // 预解码完成才取数；未就绪则补零静音
 static AudioStreamBasicDescription g_audioPCMFormat = {0};  // 预解码所用 ASBD（变更即需重解码）
@@ -151,6 +213,7 @@ static void vcm_stopReaders(void) {
     if (g_audioReader) { [g_audioReader cancelReading]; g_audioReader = nil; g_audioOutput = nil; }
     if (g_lastVideoPixel) { CVPixelBufferRelease(g_lastVideoPixel); g_lastVideoPixel = NULL; }
     [g_mediaLock unlock];
+    g_srcFrameIdx = -1;   // reader 已废，画面下次必须重新锚定
 }
 // 换素材 / 会话重启时让两条链路从头来过。关键是清 g_hasProbedASBD：
 // 不清则麦克风链路认为格式已探测完，既不重新探测新会话 ASBD 也不重新解码，新素材音频进不了麦克风。
@@ -158,6 +221,9 @@ static void vcm_reloadReaders(void) {
     g_videoReload   = YES;
     g_audioReload   = YES;
     g_hasProbedASBD = NO;
+    // 音视频共用同一个时钟：换素材 / 新会话必须重新锚定，否则 elapsed 带着旧会话的
+    // 时间继续推进 → 一上来就按「已播 N 秒」定位，画面与声音瞬间跳到素材中段。
+    vcm_resetClock();
     // 自增代次作废在途解码结果，释放旧 PCM 并取消解码线程（持锁释放，避免与消费端竞争）。
     g_audioDecodeGen++;
     g_decodeFailCount = 0;
@@ -215,21 +281,57 @@ static UIViewController *vcm_topViewController(void) {
     return vc;
 }
 
+#pragma mark - 像素缓冲池（替代每帧 CVPixelBufferCreate）
+static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
+    NSDictionary *iosurf = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+
+    if (g_pbPool && g_poolW == w && g_poolH == h && g_poolFmt == pfmt) {
+        CVPixelBufferRef pb = NULL;
+        if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_pbPool, &pb) == kCVReturnSuccess && pb) return pb;
+        if (pb) { CVPixelBufferRelease(pb); pb = NULL; }
+        CVPixelBufferPoolRelease(g_pbPool);
+        g_pbPool = NULL;
+    }
+
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferWidthKey:  @(w),
+        (id)kCVPixelBufferHeightKey: @(h),
+        (id)kCVPixelBufferPixelFormatTypeKey: @(pfmt),
+        // 多备几块：下游（显示层 / 编码器）还会持有若干帧，避免立刻复用正在显示的 buffer
+        (id)kCVPixelBufferPoolMinimumBufferCountKey: @(8),
+    };
+    if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
+                                (__bridge CFDictionaryRef)attrs, &g_pbPool) != kCVReturnSuccess || !g_pbPool) {
+        g_pbPool = NULL;
+    } else {
+        g_poolW = w; g_poolH = h; g_poolFmt = pfmt;
+        CVPixelBufferRef pb = NULL;
+        if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_pbPool, &pb) == kCVReturnSuccess && pb) return pb;
+        if (pb) CVPixelBufferRelease(pb);
+    }
+
+    // 兜底：pool 不可用时退回直接创建，功能不受影响
+    CVPixelBufferRef pb = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, w, h, pfmt, (__bridge CFDictionaryRef)iosurf, &pb);
+    return pb;
+}
+
 #pragma mark - VCamMediaManager
 @interface VCamMediaManager : NSObject
 + (void)setupVideoReaderIfNeeded;
 + (void)setupAudioReaderIfNeeded;
-+ (CVPixelBufferRef)nextSourcePixel;
-+ (CIImage *)composedImageForTarget:(CGSize)target;
++ (CVPixelBufferRef)nextSourcePixelAt:(CFTimeInterval)elapsed;   // 按会话时钟定位素材帧
++ (CIImage *)composedImageForTarget:(CGSize)target atTime:(CFTimeInterval)elapsed;
 + (CIImage *)blackImageForTarget:(CGSize)target;
 + (CMSampleBufferRef)makeSampleFromImage:(CIImage *)img
                                    width:(size_t)w height:(size_t)h
                                   format:(OSType)pfmt
                                timingSrc:(CMSampleBufferRef)src;
 + (CMSampleBufferRef)getVideoFrame:(CMSampleBufferRef)origSample;
-+ (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample;
++ (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample atTime:(CFTimeInterval)elapsed;
 + (void)decodeAudioToMemory;   // 整段音频一次性预解码进内存（非流式）
-+ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length;  // 顺序推进读游标 + 到尾按 g_isLoop 回卷
++ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length atTime:(CFTimeInterval)elapsed;
 + (void)cleanup;
 @end
 
@@ -257,12 +359,26 @@ static UIViewController *vcm_topViewController(void) {
             AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
             // 这里不清冻结的末帧，否则循环重建 reader 失败时会闪黑帧
             if (track) {
+                // time-to-frame 的两个基准：素材帧率与素材时长。
+                // 缺帧率就只能退回「帧到帧」，画面又会随采集帧率漂移，故读不到时取 30 并夹到合理区间。
+                double fps = track.nominalFrameRate;
+                if (!(fps > 1.0)) fps = 30.0;
+                if (fps > 120.0) fps = 120.0;
+                g_srcFps = fps;
+
+                double dur = CMTimeGetSeconds(track.timeRange.duration);
+                g_srcDuration = (dur > 0.0 && isfinite(dur)) ? dur : 0.0;
+
                 NSDictionary *settings = @{
                     (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
                 };
                 g_videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
                 [g_videoReader addOutput:g_videoOutput];
-                [g_videoReader startReading];
+                if ([g_videoReader startReading]) {
+                    // reader 回到素材头，帧索引必须重新锚定，否则循环回卷后
+                    // want 变小而 idx 仍是旧的大值 → 判定「已超前」→ 永久冻结在末帧。
+                    g_srcFrameIdx = -1;
+                }
             }
         }
     } @catch (NSException *e) {
@@ -293,11 +409,22 @@ static UIViewController *vcm_topViewController(void) {
             AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
             if (track) {
                 g_audioReader = [[AVAssetReader alloc] initWithAsset:asset error:nil];
-                NSDictionary *settings = @{ AVFormatIDKey: @(kAudioFormatLinearPCM) };
+
+                // 必须把解码输出采样率对齐到采集端。旧实现只给 AVFormatIDKey，解码器按素材
+                // 原生采样率直出（常见 44.1k），却被下游按 48k 的采集时钟消费 → 音频整体变速。
+                // 这是「画面比声音慢」最容易被忽略的一半原因。
+                NSMutableDictionary *settings = [NSMutableDictionary dictionary];
+                settings[AVFormatIDKey] = @(kAudioFormatLinearPCM);
+                if (g_captureSampleRate > 0) settings[AVSampleRateKey] = @(g_captureSampleRate);
+
                 g_audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
                 g_audioOutput.alwaysCopiesSampleData = NO;
                 [g_audioReader addOutput:g_audioOutput];
-                [g_audioReader startReading];
+                if ([g_audioReader startReading]) {
+                    double dur = CMTimeGetSeconds(track.timeRange.duration);
+                    g_audioSrcDuration   = (dur > 0.0 && isfinite(dur)) ? dur : 0.0;
+                    g_audioConsumedBytes = 0.0;   // reader 回到素材头，已投递字节数同步归零
+                }
             }
         }
         // ASBD 探明后 AudioUnit 链路才需要数据：触发整段预解码（幂等，已在跑或已就绪则忽略）。
@@ -309,7 +436,7 @@ static UIViewController *vcm_topViewController(void) {
     }
 }
 
-// 整段预解码：一次性把素材音频全部解码成目标格式 PCM 存进内存，之后消费端只读游标推进、期间零写入。
+// 整段预解码：一次性把素材音频全部解码成目标格式 PCM 存进内存，之后消费端按时钟定位读取、期间零写入。
 // 触发时机（幂等，重复调用无副作用）：
 //   ① 首次探测到 ASBD；② 换素材（reloadReaders 作废 PCM）；③ ASBD 变更（格式不符需按新格式重解码）。
 + (void)decodeAudioToMemory {
@@ -397,11 +524,18 @@ static UIViewController *vcm_topViewController(void) {
                     return;
                 }
 
-                // 落地：分配并拷贝整段 PCM，读游标归零，标记就绪（消费端自此开始顺序读取）。
+                // 落地：分配并拷贝整段 PCM，标记就绪（消费端自此按时钟定位读取）。
                 size_t   total = acc.length;
                 uint8_t *buf   = (uint8_t *)malloc(total);
                 if (!buf) return;
                 memcpy(buf, acc.bytes, total);
+
+                // 字节速率与帧字节数：时钟定位的换算基准。
+                // 字节速率必须按「解码实际使用的 ASBD」算，不能用素材原始采样率，
+                // 否则 elapsed→字节偏移换算错比例，音频会整体快/慢一档。
+                size_t frameBytes = (size_t)((bits / 8) * (ch > 0 ? ch : 1));
+                if (frameBytes == 0) frameBytes = 1;
+                double bytesPerSec = rate * (double)frameBytes;
 
                 os_unfair_lock_lock(&g_audioPCMLock);
                 if (g_audioPCM) free(g_audioPCM);
@@ -410,6 +544,8 @@ static UIViewController *vcm_topViewController(void) {
                 g_audioPCMRead   = 0;
                 g_audioPCMReady  = YES;
                 g_audioPCMFormat = t;
+                g_pcmBytesPerSec  = bytesPerSec;
+                g_audioFrameBytes = frameBytes;
                 os_unfair_lock_unlock(&g_audioPCMLock);
                 g_decodeFailCount = 0;
                 g_decodeNextRetry = 0;
@@ -425,25 +561,50 @@ static UIViewController *vcm_topViewController(void) {
     });
 }
 
-// 消费者（实时安全）：从预解码 PCM 按读游标顺序取 length 字节；
-// 游标到尾时按 g_isLoop 回卷重播，否则补零静音（严格一次性播放）。
-// 本函数只读、不修改 PCM，且写入方就绪后不再写入 → 消费期间 PCM 恒定不变、相邻取数严格连续。
-+ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length {
+// 消费者（实时安全）：按「会话已过秒数」换算字节偏移直接从预解码 PCM 取 length 字节。
+// 旧实现是顺序推进读游标 —— 音频本身没错，但它与画面不是同一个时间基准；
+// 现在音频也挂到会话时钟上，两边按同一个 elapsed 走，掉帧时各自独立定位，不会互相拉偏。
+// 本函数只读、不修改 PCM，且写入方就绪后不再写入 → 消费期间 PCM 恒定不变。
++ (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length atTime:(CFTimeInterval)elapsed {
     if (!outData || length == 0) return;
     if (length > 0x100000) { memset(outData, 0, length); return; }  // 超大请求直接静音
     if (!g_audioPCMReady || !g_audioPCM || g_audioPCMLen == 0) { memset(outData, 0, length); return; }
 
     os_unfair_lock_lock(&g_audioPCMLock);
+    size_t   len       = g_audioPCMLen;
+    size_t   frameB    = (g_audioFrameBytes > 0) ? g_audioFrameBytes : 1;
+    size_t   start     = 0;
+    BOOL     exhausted = NO;
+
+    if (g_pcmBytesPerSec > 0 && len > 0) {
+        double wantBytes = elapsed * g_pcmBytesPerSec;
+        if (!g_isLoop && wantBytes >= (double)len) {
+            // 不循环：整段播完后静音（与旧行为一致）
+            exhausted = YES;
+        } else {
+            double pos = fmod(wantBytes, (double)len);
+            if (pos < 0) pos = 0;
+            // 对齐到帧边界：避免从半个采样点开始导致每次读取相位跳变 → 爆音
+            start = ((size_t)pos / frameB) * frameB;
+            if (start > len) start = len;
+        }
+    }
+    if (exhausted) {
+        os_unfair_lock_unlock(&g_audioPCMLock);
+        memset(outData, 0, length);
+        return;
+    }
+
     size_t written = 0;
     while (written < length) {
-        size_t avail = (g_audioPCMLen > g_audioPCMRead) ? (g_audioPCMLen - g_audioPCMRead) : 0;
+        size_t avail = (len > start) ? (len - start) : 0;
         if (avail == 0) {
-            if (g_isLoop) { g_audioPCMRead = 0; continue; }  // 回卷重播
+            if (g_isLoop) { start = 0; continue; }  // 回卷重播
             break;  // 一次性播放：余下补零静音
         }
         size_t n = (length - written < avail) ? (length - written) : avail;
-        memcpy(outData + written, g_audioPCM + g_audioPCMRead, n);
-        g_audioPCMRead += n;
+        memcpy(outData + written, g_audioPCM + start, n);
+        start += n;
         written += n;
     }
     os_unfair_lock_unlock(&g_audioPCMLock);
@@ -451,16 +612,66 @@ static UIViewController *vcm_topViewController(void) {
     if (written < length) memset(outData + written, 0, length - written);
 }
 
+// 探测采集端音频格式：采样率变化必须重建 reader，否则解码输出与采集时钟不同率 → 变速；
+// 同时算出采集端每秒字节数，供按时钟追平使用。
+static void vcm_probeCaptureAudioFormat(CMSampleBufferRef s) {
+    if (!s) return;
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(s);
+    if (!fmt) return;
+    const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
+    if (!asbd) return;
+    double rate = asbd->mSampleRate;
+    if (rate <= 0) return;
+
+    if (fabs(rate - g_captureSampleRate) > 0.5) {
+        g_captureSampleRate = rate;
+        g_audioReload = YES;   // 采样率变了 → 按新采样率重解码
+    }
+    UInt32 ch   = asbd->mChannelsPerFrame > 0 ? asbd->mChannelsPerFrame : 1;
+    UInt32 bits = asbd->mBitsPerChannel   > 0 ? asbd->mBitsPerChannel   : 16;
+    g_audioCaptureBytesPerSec = rate * (double)((bits / 8) * ch);
+}
+
 // 从音频 reader 取一帧，套用采集帧的时序后返回（调用方负责 CFRelease）。
 // setupAudioReaderIfNeeded 内部也会加 g_mediaLock，而 NSLock 不可重入，故重建动作须在此之前完成。
-+ (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample {
++ (CMSampleBufferRef)getAudioFrame:(CMSampleBufferRef)origSample atTime:(CFTimeInterval)elapsed {
+    if (!origSample) return NULL;
+
+    vcm_probeCaptureAudioFormat(origSample);
+
+    // 时钟追平：本次回调应把素材消费到 elapsed * 采集字节率 的位置。
+    // 采集端来一次回调就取一帧的旧写法，在丢帧/重建时会掉队且永不补齐 → 音频落后于画面。
+    double t = elapsed;
+    if (g_isLoop && g_audioSrcDuration > 0.1) t = fmod(t, g_audioSrcDuration);
+    double wantBytes = (g_audioCaptureBytesPerSec > 0) ? (t * g_audioCaptureBytesPerSec) : -1.0;
+    if (!g_isLoop && g_audioSrcDuration > 0.1 && elapsed > g_audioSrcDuration) wantBytes = -1.0;
+
+    // 循环回卷：已投递满一整段就重建 reader 回到素材头，与画面侧 fmod 回卷对齐。
+    // 不重建的话 reader 会继续顺序播到尾才回卷，音频比画面晚整整一个素材长度。
+    if (g_isLoop && g_audioSrcDuration > 0.1 && g_audioCaptureBytesPerSec > 0 &&
+        g_audioConsumedBytes >= g_audioSrcDuration * g_audioCaptureBytesPerSec) {
+        g_audioReload = YES;
+    }
     if (g_audioReload) [self setupAudioReaderIfNeeded];
 
     CMSampleBufferRef s = NULL;
     [g_mediaLock lock];
     @try {
         @autoreleasepool {
-            if (g_audioOutput) s = [g_audioOutput copyNextSampleBuffer];
+            if (g_audioOutput) {
+                int guard = 0;
+                while (guard++ < 32) {
+                    BOOL caughtUp = (wantBytes > 0.0) && (g_audioConsumedBytes >= wantBytes);
+                    if (caughtUp && s) break;   // 已追平且手上有一帧 → 不再超前消费
+                    CMSampleBufferRef tmp = [g_audioOutput copyNextSampleBuffer];
+                    if (!tmp) { g_audioReload = YES; break; }
+                    if (s) CFRelease(s);
+                    s = tmp;
+                    CMBlockBufferRef blk = CMSampleBufferGetDataBuffer(s);
+                    if (blk) g_audioConsumedBytes += (double)CMBlockBufferGetDataLength(blk);
+                    if (wantBytes <= 0.0) break;  // 未知字节率：退回帧到帧，不空转
+                }
+            }
         }
     } @catch (NSException *e) {
     } @finally {
@@ -471,12 +682,27 @@ static UIViewController *vcm_topViewController(void) {
 
     CMSampleBufferRef out = NULL;
     @try {
-        CMSampleTimingInfo timing = kCMTimingInfoInvalid;
-        if (origSample && CMSampleBufferGetSampleTimingInfo(origSample, 0, &timing) == noErr) {
-            CMSampleBufferRef tmp = NULL;
-            if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, s, 1, &timing, &tmp) == noErr && tmp) {
-                out = tmp;
+        // 时序：PTS 用采集帧的（保证与视频同一时钟、下游排序正确），
+        // duration 必须用素材自身的 —— 旧代码整条 timing 都用采集帧的，
+        // 素材每帧样本数与采集不同的话，音频就被整体变速（常见 8%~12%）。
+        CMTime capTime = kCMTimeInvalid, capDur = kCMTimeInvalid;
+        if (origSample) {
+            CMSampleTimingInfo cap = kCMTimingInfoInvalid;
+            if (CMSampleBufferGetSampleTimingInfo(origSample, 0, &cap) == noErr) {
+                capTime = cap.presentationTimeStamp;
+                capDur  = cap.duration;
             }
+        }
+        CMTime srcDur = CMSampleBufferGetDuration(s);
+
+        CMSampleTimingInfo timing;
+        timing.duration              = CMTIME_IS_VALID(srcDur) ? srcDur : capDur;
+        timing.presentationTimeStamp = CMTIME_IS_VALID(capTime) ? capTime : CMSampleBufferGetPresentationTimeStamp(s);
+        timing.decodeTimeStamp       = kCMTimeInvalid;
+
+        CMSampleBufferRef tmp = NULL;
+        if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, s, 1, &timing, &tmp) == noErr && tmp) {
+            out = tmp;
         }
     } @catch (NSException *e) {
         CFRelease(s);
@@ -486,7 +712,7 @@ static UIViewController *vcm_topViewController(void) {
     return out;
 }
 
-// 取下一帧源视频：读完时按 g_isLoop 决定回卷重播还是冻结末帧，返回 +1 引用
+// 取下一帧源视频：返回 +1 引用
 static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CVPixelBufferRef frame = NULL;
     [g_mediaLock lock];
@@ -507,11 +733,50 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     return frame;
 }
 
-+ (CVPixelBufferRef)nextSourcePixel {
+// 按「会话已过秒数」定位素材帧（time-to-frame）。
+// 旧实现 nextSourcePixel 是「一个采集帧吐一个素材帧」：采集被压到 15~20fps、
+// 或回调里 CI 渲染耗时触发丢帧时，素材消费速度就永久落后于真实时间 → 画面慢放并持续漂移。
+// 现在：want = floor(elapsed * 素材fps)，一次补齐落后的帧；落后太多时直接跳位置而不是狂解码。
++ (CVPixelBufferRef)nextSourcePixelAt:(CFTimeInterval)elapsed {
     if (g_videoReload) [self setupVideoReaderIfNeeded];
 
-    CVPixelBufferRef frame = vcm_pullVideoFrame();
-    if (!frame) g_videoReload = YES;  // 取不到帧就标重建，由下一帧处理
+    double fps = (g_srcFps > 1.0) ? g_srcFps : 30.0;
+    double t   = elapsed;
+    if (g_isLoop && g_srcDuration > 0.1) t = fmod(t, g_srcDuration);
+
+    long long want = (long long)floor(t * fps);
+    long long need;
+    if (g_srcFrameIdx < 0) {
+        need = 1;                       // reader 刚重建：先取一帧把索引锚到 want
+    } else {
+        need = want - g_srcFrameIdx;
+        if (need < 0) {
+            // 时钟已回卷到素材头（循环）：reader 还停在上一轮的尾部位置，
+            // 不重建的话会一直判定「超前」而冻结在末帧，直到旧 reader 读完为止。
+            [self setupVideoReaderIfNeeded];
+            g_srcFrameIdx = -1;
+            need = 1;
+        } else if (need == 0) {
+            // 已追平：复用上一帧，不倒退
+            [g_mediaLock lock];
+            CVPixelBufferRef f = g_lastVideoPixel
+                               ? (CVPixelBufferRef)CVPixelBufferRetain(g_lastVideoPixel) : NULL;
+            [g_mediaLock unlock];
+            return f;
+        } else if (need > kVCamMaxCatchUp) {
+            need = kVCamMaxCatchUp;  // 掉帧太多 → 跳帧，不一次性补完
+        }
+    }
+
+    CVPixelBufferRef frame = NULL;
+    for (long long i = 0; i < need; i++) {
+        CVPixelBufferRef f = vcm_pullVideoFrame();
+        if (!f) { g_videoReload = YES; break; }
+        if (frame) CVPixelBufferRelease(frame);
+        frame = f;   // 只保留这批里的最后一帧
+    }
+    // 位置对齐到时钟：没取到的帧直接跳过，避免下次继续堆积 need
+    g_srcFrameIdx = want;
 
     [g_mediaLock lock];
     if (frame) {
@@ -526,11 +791,11 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 }
 
 // 旋转 + 等比居中 + 黑底合成，返回 extent 严格为 (0,0,target) 的 CIImage
-+ (CIImage *)composedImageForTarget:(CGSize)target {
++ (CIImage *)composedImageForTarget:(CGSize)target atTime:(CFTimeInterval)elapsed {
     CGFloat targetW = target.width, targetH = target.height;
     if (targetW <= 0 || targetH <= 0) return nil;
 
-    CVPixelBufferRef pix = [self nextSourcePixel];
+    CVPixelBufferRef pix = [self nextSourcePixelAt:elapsed];
     if (!pix) return nil;
     CIImage *img = [CIImage imageWithCVPixelBuffer:pix options:nil];
     CVPixelBufferRelease(pix);
@@ -568,10 +833,11 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
                                   format:(OSType)pfmt
                                timingSrc:(CMSampleBufferRef)src {
     if (!img || w == 0 || h == 0) return NULL;
-    NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
-    CVPixelBufferRef pb = NULL;
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pfmt,
-                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess || !pb) return NULL;
+
+    // 走像素缓冲池：每帧 CVPixelBufferCreate 的分配 + IOSurface 建拆是采集回调的主要耗时，
+    // 回调一慢就更容易被 alwaysDiscardsLateVideoFrames 丢帧 → 画面更慢（正反馈）。
+    CVPixelBufferRef pb = vcm_pooledPixelBuffer(w, h, pfmt);
+    if (!pb) return NULL;
 
     [g_ciContext render:img toCVPixelBuffer:pb
                  bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h) colorSpace:nil];
@@ -612,10 +878,13 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
                                (CGFloat)CVPixelBufferGetHeight(camPix));
     OSType pfmt = CVPixelBufferGetPixelFormatType(camPix);
 
+    // 画面位置由会话时钟决定，与音频共用同一个 elapsed
+    CFTimeInterval elapsed = vcm_elapsed();
+
     CMSampleBufferRef out = NULL;
     @try {
         @autoreleasepool {
-            CIImage *img = [self composedImageForTarget:target];
+            CIImage *img = [self composedImageForTarget:target atTime:elapsed];
             if (!img) img = [self blackImageForTarget:target];
             out = [self makeSampleFromImage:img
                                       width:(size_t)target.width
@@ -633,6 +902,9 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     g_audioDecodeGen++;                 // 作废在途预解码结果
     g_audioFeederStop = YES;            // 通知预解码线程取消
     vcm_stopReaders();
+    vcm_resetClock();
+    if (g_pbPool) { CVPixelBufferPoolRelease(g_pbPool); g_pbPool = NULL; }
+    g_poolW = 0; g_poolH = 0; g_poolFmt = 0;
     os_unfair_lock_lock(&g_audioPCMLock);
     if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
     g_audioPCMLen   = 0;
@@ -744,7 +1016,8 @@ static OSStatus hooked_AudioUnitRender(
     uint8_t *temp = (uint8_t *)calloc(1, need);
     if (!temp) return status;
     @try {
-        [VCamMediaManager pullAudioData:temp length:(UInt32)need];
+        // 与画面共用同一个会话时钟定位音频位置
+        [VCamMediaManager pullAudioData:temp length:(UInt32)need atTime:vcm_elapsed()];
         // 逐 buffer 顺序直拷：off 按 mBuffers 顺序累加，与解码器直出的布局严格对应。
         size_t off = 0;
         for (UInt32 i = 0; i < nBuf; i++) {
@@ -779,8 +1052,10 @@ static OSStatus hooked_AudioUnitRender(
     if (g_isReplace) {
         @try {
             newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
-            if (newSample && g_displayLayer && g_displayLayer.isReadyForMoreMediaData) {
-                [g_displayLayer flush];
+            if (newSample && g_displayLayer) {
+                // 旧实现每帧 flush：清空解码队列等于丢弃所有待显示帧，预览会明显发涩。
+                // 只在显示层真的满了（来不及消费）时才 flush 腾位置。
+                if (!g_displayLayer.isReadyForMoreMediaData) [g_displayLayer flush];
                 [g_displayLayer enqueueSampleBuffer:newSample];
             }
         } @catch (NSException *e) {
@@ -822,7 +1097,7 @@ static VCamVideoProxy *g_videoProxy = nil;
     CMSampleBufferRef outBuf = sampleBuffer;
     if (g_isReplace && g_isSound) {
         @try {
-            CMSampleBufferRef rep = [VCamMediaManager getAudioFrame:sampleBuffer];
+            CMSampleBufferRef rep = [VCamMediaManager getAudioFrame:sampleBuffer atTime:vcm_elapsed()];
             if (rep) outBuf = rep;
         } @catch (NSException *e) {
             outBuf = sampleBuffer;  // 取帧异常本帧透传真实麦克风
@@ -861,11 +1136,13 @@ static VCamAudioProxy *g_audioProxy = nil;
     // 只清标志、不 reload。stopRunning 后链路可能还在收尾取帧，此时清 reader 会打断它；
     // 内存 PCM 留着，等下次 startRunning 再清。
     %orig;
+    // 会话结束 → 时钟作废，下次 startRunning 重新锚定（不清的话新会话一上来就跳到素材中段）
+    vcm_resetClock();
 }
 %end
 
 #pragma mark - AVCaptureVideoPreviewLayer（叠加预览显示层）
-// 预览叠加层用 AVSampleBufferDisplayLayer：帧由采集回调 enqueue，播放节奏由素材自身 PTS 决定。
+// 预览叠加层用 AVSampleBufferDisplayLayer：帧由采集回调 enqueue，素材位置由会话时钟决定。
 %hook AVCaptureVideoPreviewLayer
 - (void)addSublayer:(CALayer *)layer {
     %orig;
@@ -1164,6 +1441,9 @@ static VCamAudioProxy *g_audioProxy = nil;
         vcm_stopReaders();      // 让链路重新 setup（声音源变化需重启解码）
         [self updateStatusUI];
     }
+    // 换素材后重新锚定时钟与像素池尺寸（素材分辨率/帧率可能不同）
+    vcm_resetClock();
+    if (g_pbPool) { CVPixelBufferPoolRelease(g_pbPool); g_pbPool = NULL; }
     [self refreshGridButtons];
 }
 
@@ -1234,6 +1514,7 @@ static void vcm_installTapGesture(UIWindow *win) {
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
     g_videoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
     vcm_loadSettings();
+    g_srcFrameIdx = -1;   // 尚未锚定
 
     if ([g_fileManager fileExistsAtPath:vcm_videoPath()]) {
         [VCamMediaManager setupVideoReaderIfNeeded];
