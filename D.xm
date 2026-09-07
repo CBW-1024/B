@@ -55,7 +55,10 @@ static BOOL g_isSound    = YES;     // 是否替换麦克风采集
 // 拍照 / 拍摄（录制）期间临时置位：此时视频透传真实摄像头画面（拍出来才是真实场景），
 // 拍完 / 录完清位恢复替换。仅作用于视频，声音不受此标志影响。
 static BOOL g_videoSuppress = NO;
-static int  g_rotation   = 90;      // 0 / 90 / 180 / 270（点击旋转按钮循环取值）
+// 额外手动微调角度（旋转按钮循环取值）。方向对齐由 composedImageForTarget 自动判断补 90°，
+// 所以这里默认必须是 0：若默认 90，竖屏素材进横屏画布会被算成 180°——180° 不改变宽高比，
+// 结果是 scale=1.78 放大裁切（画面只留中间 56%）且每帧都走 Lanczos 缩放，既糊又卡。
+static int  g_rotation   = 0;       // 0 / 90 / 180 / 270
 
 #pragma mark - reader 重建标记
 // 置位后由下一帧开头重建对应 reader；不在取帧失败的同帧重建（刚 startReading 的 reader 首帧必取不到）。
@@ -246,12 +249,17 @@ static void vcm_log(NSString *fmt, ...) {
     static NSMutableArray<NSString *> *s_log = nil;
     static NSLock *s_lock = nil;
     static NSDateFormatter *s_fmt = nil;
+    static dispatch_queue_t s_logQueue = NULL;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         s_log = [NSMutableArray arrayWithCapacity:64];
         s_lock = [[NSLock alloc] init];
         s_fmt = [[NSDateFormatter alloc] init];
         s_fmt.dateFormat = @"HH:mm:ss.SSS";
+        // 后台串行队列：时间戳格式化 / 数组入队 / 文件落盘全部挪到这里。
+        // 之前这些都在采集回调线程同步执行，卡顿时「落后 N 帧」每帧触发一次 fopen+fprintf+fclose，
+        // 形成「越卡越写、越写越卡」的正反馈——这是微信整体变卡的主因之一。
+        s_logQueue = dispatch_queue_create("com.vcam.diaglog", DISPATCH_QUEUE_SERIAL);
         g_diagLog  = s_log;   // 暴露给导出读取
         g_diagLock = s_lock;
         // 启动恢复：从落盘文件读回历史，微信重启也不丢（并回写裁剪后的内容，避免文件无限增长）
@@ -272,17 +280,30 @@ static void vcm_log(NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     if (!msg) return;
-    NSString *line = [NSString stringWithFormat:@"%@  %@",
-                      [s_fmt stringFromDate:[NSDate date]], msg];
-    [s_lock lock];
-    [s_log addObject:line];
-    if (s_log.count > kVCamDiagMaxLines) [s_log removeObjectAtIndex:0];
-    [s_lock unlock];
-    // 落盘追加一行（仅尺寸/格式变化或首帧/异常才记，量很小）；微信重启后仍可查看。
-    if (g_diagFilePath) {
-        FILE *f = fopen([g_diagFilePath UTF8String], "a");
-        if (f) { fprintf(f, "%s\n", [line UTF8String]); fclose(f); }
+
+    // 高频日志节流：卡顿时「落后 N 帧」会每帧触发，既刷屏又加重卡顿（每帧一次入队也有开销）。
+    // 这类纯噪音 2 秒最多记一条；其余 tag 全部保留。
+    static CFTimeInterval s_lastLagLog = 0;
+    if ([msg hasPrefix:@"[video] 落后"]) {
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now - s_lastLagLog < 2.0) return;
+        s_lastLagLog = now;
     }
+
+    // 采集线程只做「字符串格式化 + 入队」，文件 I/O 与时间戳格式化全部交给后台队列。
+    dispatch_async(s_logQueue, ^{
+        NSString *line = [NSString stringWithFormat:@"%@  %@",
+                          [s_fmt stringFromDate:[NSDate date]], msg];
+        [s_lock lock];
+        [s_log addObject:line];
+        if (s_log.count > kVCamDiagMaxLines) [s_log removeObjectAtIndex:0];
+        [s_lock unlock];
+        // 仍每行落盘：闪退时未 flush 的日志会丢，持久性优先（写操作已在后台线程，不阻塞采集）。
+        if (g_diagFilePath) {
+            FILE *f = fopen([g_diagFilePath UTF8String], "a");
+            if (f) { fprintf(f, "%s\n", [line UTF8String]); fclose(f); }
+        }
+    });
 }
 
 #pragma mark - 配置存取
@@ -306,7 +327,13 @@ static void vcm_loadSettings(void) {
     if ([d objectForKey:@"vcam_loop"])     g_isLoop    = [d boolForKey:@"vcam_loop"];
     if ([d objectForKey:@"vcam_sound"])    g_isSound   = [d boolForKey:@"vcam_sound"];
     if ([d objectForKey:@"vcam_rotation"]) g_rotation  = (int)[d integerForKey:@"vcam_rotation"];
-    else                                   g_rotation  = 90;
+    else                                   g_rotation  = 0;
+    // 一次性纠正旧存档：旧版默认 90 与自动判断叠加 → 实际 180°，导致放大裁切 + 每帧 Lanczos。
+    // 语义上它是「额外微调」，默认 0 才对。已装过旧版的用户升级后自动纠正一次，不用手动点旋转。
+    if (![d boolForKey:@"vcam_rotation_default_fixed"]) {
+        if (g_rotation == 90) g_rotation = 0;
+        [d setBool:YES forKey:@"vcam_rotation_default_fixed"];
+    }
     // 恢复素材路径：存在则用持久化路径（动态扩展名），否则回退默认名（由 %ctor 在 loadSettings 前给定）。
     NSString *savedVideo = [d stringForKey:@"vcam_video_path"];
     if (savedVideo.length > 0) g_videoPath = [savedVideo copy];
@@ -344,7 +371,7 @@ static void vcm_resetSettings(void) {
     g_isReplace   = NO;
     g_isLoop      = YES;
     g_isSound     = YES;
-    g_rotation    = 90;
+    g_rotation    = 0;    // 额外微调，默认 0（自动判断会补方向差）
 
     vcm_stopReaders();
     vcm_reloadReaders();
@@ -563,7 +590,9 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
     g_audioFeederRunning = YES;
     NSUInteger myGen = g_audioDecodeGen;   // 代次快照：期间若换素材/ASBD 变更，本轮结果作废
 
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+    // 低优先级：整段预解码（68s 素材约 6.5MB PCM）是耗时任务，跑在 HIGH 会跟采集回调、
+    // 主线程抢 CPU → 采集掉帧、微信整体变卡。它是「提前备好数据」的后台活，慢一点无所谓。
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @try {
             @autoreleasepool {
                 NSString *path = g_tempAudioPath;
@@ -987,9 +1016,15 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CGFloat ty = (targetH - r.size.height) / 2.0 - r.origin.y;
     scaled = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(tx, ty)];
 
-    // 裁到画布尺寸（铺满时裁掉溢出）；crop 不重采样，无损。黑底仅兜底，铺满时不可见。
+    // 裁到画布尺寸（铺满时裁掉溢出）；crop 不重采样，无损。
     CIImage *canvas = [scaled imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
-    img = [canvas imageByCompositingOverImage:[self blackImageForTarget:target]];
+    // 铺满模式下缩放后必定 >= 画布，没有透明区 → 跳过黑底合成，省掉一次全屏 GPU pass。
+    // 仅当浮点误差导致未完全覆盖时回退合成，避免边缘透明像素（编码后表现为黑边/绿边）。
+    if (r.size.width + 0.5 >= targetW && r.size.height + 0.5 >= targetH) {
+        img = canvas;
+    } else {
+        img = [canvas imageByCompositingOverImage:[self blackImageForTarget:target]];
+    }
 
     return img;
 }
@@ -1341,6 +1376,16 @@ static VCamAudioProxy *g_audioProxy = nil;
     vcm_resetClock();             // 会话结束 → 时钟作废，下次 startRunning 重新锚定
     vcm_log(@"[session] stopRunning（相机已停，显示层心跳与解码线程已暂停）");
 }
+// 诊断：微信拍摄时到底往 session 上挂了什么 output。日志实证 AVCaptureMovieFileOutput 未被调用
+// （拍摄时无 [capture] 条目），说明微信走自研录制管线；靠这条日志可确认它真实用的类。
+- (void)addOutput:(AVCaptureOutput *)output {
+    %orig;
+    vcm_log(@"[session] addOutput: %@", NSStringFromClass([output class]));
+}
+- (void)removeOutput:(AVCaptureOutput *)output {
+    vcm_log(@"[session] removeOutput: %@", NSStringFromClass([output class]));
+    %orig;
+}
 %end
 
 #pragma mark - 拍照 / 拍摄期间暂停视频替换
@@ -1400,6 +1445,50 @@ static VCamAudioProxy *g_audioProxy = nil;
     %orig;
     g_videoSuppress = NO;   // 录完：恢复视频替换
     vcm_log(@"[capture] 结束录制：视频替换恢复");
+}
+%end
+
+// 微信拍摄实证走的是「AVCaptureVideoDataOutput 采集 + 自写文件」的自研管线，不是 AVCaptureMovieFileOutput
+// （日志里拍摄期间无 [capture] 条目可证）。帧仍从我们 hook 的采集回调出去，所以录制期间照样被替换。
+// 故补 AVAssetWriter 系列作为录制起止信号：开始写文件即置位抑制替换，写完/取消即恢复。
+%hook AVAssetWriter
+- (BOOL)startWriting {
+    BOOL ok = %orig;
+    g_videoSuppress = YES;
+    vcm_log(@"[capture] AVAssetWriter startWriting ok=%d：视频替换暂停（拍真实画面）", ok);
+    return ok;
+}
+- (void)startSessionAtSourceTime:(CMTime)startTime {
+    g_videoSuppress = YES;
+    vcm_log(@"[capture] AVAssetWriter startSessionAtSourceTime：视频替换暂停");
+    %orig(startTime);
+}
+- (void)finishWritingWithCompletionHandler:(void (^)(void))handler {
+    vcm_log(@"[capture] AVAssetWriter finishWriting：视频替换恢复");
+    %orig(^{
+        g_videoSuppress = NO;   // 先清位再回调微信，保证微信收尾时链路已恢复
+        if (handler) handler();
+    });
+}
+// 不 hook -finishWriting（同步版）：已 deprecated，-Werror 下有编译风险；
+// 异步 finishWritingWithCompletionHandler / cancelWriting 已覆盖现代录制收尾，
+// 万一都没走到，stopRunning 还有兜底清位，不会卡在透传。
+- (void)cancelWriting {
+    %orig;
+    g_videoSuppress = NO;   // 取消录制也要恢复，否则会一直卡在透传真实画面
+    vcm_log(@"[capture] AVAssetWriter cancelWriting：视频替换恢复");
+}
+%end
+
+%hook AVAssetWriterInput
+// 兜底：开始信号漏掉时（如 writer 复用、startWriting 未被调用），只要真的在往文件写帧就抑制替换。
+// 加 g_sessionRunning 条件：避免微信在「视频压缩/编辑」等非采集场景用 AVAssetWriter 时误抑制。
+- (BOOL)appendSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!g_videoSuppress && g_sessionRunning) {
+        g_videoSuppress = YES;
+        vcm_log(@"[capture] AVAssetWriterInput appendSampleBuffer：视频替换暂停（录制中）");
+    }
+    return %orig(sampleBuffer);
 }
 %end
 
