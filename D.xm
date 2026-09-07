@@ -52,6 +52,7 @@
 static BOOL g_isReplace  = NO;      // 默认关：无素材时透传真实摄像头/麦克风；导入素材后自动开启
 static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
 static long long g_loopStopRound = -1;  // 关闭循环时记录的「当前轮次」；-1 = 未记录/循环开启
+static BOOL g_frozen    = NO;    // 冻结锁存：当前轮播完后锁死，不因开关瞬时抖动而漏冻
 static BOOL g_isSound    = YES;     // 是否替换麦克风采集
 // 拍照 / 拍摄（录制）期间临时置位：此时视频透传真实摄像头画面（拍出来才是真实场景），
 // 拍完 / 录完清位恢复替换。仅作用于视频，声音不受此标志影响。
@@ -133,6 +134,9 @@ static void vcm_resetClock(void) {
     g_srcFrameIdx        = -1;   // 强迫画面从素材头重新锚定
     g_audioConsumedBytes = 0.0;
     g_loopStopRound      = -1;   // 新会话：重新按「当前轮播完」记录循环轮次
+    g_frozen             = NO;   // 新会话：解除上一轮的冻结锁存
+    // 打日志便于区分：日志里若在没有「循环: 开/关」的情况下出现这条，说明是会话级重置而非用户操作
+    vcm_log(@"[clock] 时钟重置（新会话/换素材/关相机）");
 }
 // 清掉素材目录下某个前缀的所有残留文件（扩展名随导入文件变化，不能只删固定的那一个）。
 static void vcm_clearMaterialFiles(NSString *prefix) {
@@ -315,10 +319,23 @@ static void vcm_log(NSString *fmt, ...) {
 // 素材时长，那样一点「关」就会立刻冻结（用户反馈的现象）。正确语义是「当前这一轮播完再停」。
 // 用整数轮次而非浮点时刻比较：round = floor(elapsed / duration)，关闭时记下当前 round，
 // 一旦进入下一轮（round 变大）就冻结。整数比较没有浮点边界误差，比绝对时刻更稳。
+// 锁存语义：一旦判定「当前轮播完」就置 g_frozen=YES 并永久返回 YES，直到用户重新开循环
+// 或新会话 resetClock。不加锁存时，若循环开关被瞬时切到「开」再切回「关」（用户来回点测开关），
+// g_loopStopRound 会被清成 -1 后按新的 round 重算 → 本该冻结的那一轮又多播一轮，表现为「关了还在播」。
 static BOOL vcm_loopShouldFreeze(double elapsed) {
-    static BOOL s_frozenLogged = NO;
-    if (g_isLoop) { g_loopStopRound = -1; s_frozenLogged = NO; return NO; }   // 重新开启 → 清除
-    if (g_srcDuration <= 0.1) return YES;   // 时长未知 → 只能立即冻结
+    if (g_isLoop) {                          // 循环开启 → 解锁
+        if (g_loopStopRound >= 0 || g_frozen) {
+            g_loopStopRound = -1;
+            g_frozen = NO;
+            vcm_log(@"[loop] 循环已开：解除冻结，恢复循环播放");
+        }
+        return NO;
+    }
+    if (g_frozen) return YES;                // 已锁定冻结：不再重算，免受开关抖动影响
+    if (g_srcDuration <= 0.1) {              // 时长未知 → 只能立即冻结
+        if (!g_frozen) { g_frozen = YES; vcm_log(@"[loop] 素材时长未知 → 立即冻结"); }
+        return YES;
+    }
     long long round = (long long)floor(elapsed / g_srcDuration);
     if (g_loopStopRound < 0) {
         g_loopStopRound = round;             // 记下关闭时的轮次：这一轮播完才停
@@ -327,10 +344,8 @@ static BOOL vcm_loopShouldFreeze(double elapsed) {
         return NO;
     }
     if (round > g_loopStopRound) {
-        if (!s_frozenLogged) {
-            s_frozenLogged = YES;
-            vcm_log(@"[loop] 当前轮已播完 → 冻结末帧 + 静音");
-        }
+        g_frozen = YES;
+        vcm_log(@"[loop] 当前轮已播完 → 冻结末帧 + 静音（已锁存）");
         return YES;
     }
     return NO;
@@ -1739,7 +1754,11 @@ static VCamLinkProxy *g_linkProxy = nil;
 
 #pragma mark - 按钮动作
 - (void)toggleRotate  { g_rotation   = (g_rotation + 90) % 360; vcm_saveSettings(); [self refreshGridButtons]; }
-- (void)toggleLoop    { g_isLoop     = !g_isLoop;     vcm_saveSettings(); [self refreshGridButtons]; }
+- (void)toggleLoop    {
+    g_isLoop = !g_isLoop;
+    vcm_log(@"[ui] 用户点击「循环」→ %@", g_isLoop ? @"开" : @"关");
+    vcm_saveSettings(); [self refreshGridButtons];
+}
 - (void)toggleSound   { g_isSound    = !g_isSound;    vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleReplace { g_isReplace  = !g_isReplace;  vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
