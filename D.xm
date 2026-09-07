@@ -24,7 +24,7 @@ static BOOL g_isSound        = YES;  // 是否替换麦克风采集
 
 // 抑制（拍照/写文件期间透传真实画面）用位掩码区分两个独立原因，清除时只动自己那一位
 typedef NS_ENUM(NSUInteger, VCamSuppressReason) {
-    kSuppressPhotoMode = 1 << 0,   // 拍照/拍摄模式（session 挂着 StillImageOutput）
+    kSuppressPhotoMode = 1 << 0,   // 拍照快门窗口位（按下快门到拍照结束的极短窗口内透传真实画面）
     kSuppressWriting   = 1 << 1,   // 正在写文件（AVAssetWriter 活动中）
 };
 static NSUInteger g_suppressMask = 0;
@@ -227,6 +227,19 @@ static void vcm_scheduleUnsuppressWriting(void) {
 static void vcm_finishWritingNow(void) {
     s_unsuppressToken++;
     vcm_suppressSet(kSuppressWriting, NO);
+}
+
+// 拍照快门窗口：按下快门到拍照结束的极短窗口内透传真实画面，预览显示真实相机、与成片一致。
+// token 防竞态：连拍时上一次还没到期的清除会被新一次作废（但位已置上，无需重复清）。
+static int s_photoToken = 0;
+static void vcm_suppressPhotoBriefly(void) {
+    vcm_suppressSet(kSuppressPhotoMode, YES);
+    int my = ++s_photoToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (my != s_photoToken) return;
+        vcm_suppressSet(kSuppressPhotoMode, NO);
+    });
 }
 
 static void vcm_saveSettings(void) {
@@ -1107,11 +1120,11 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 %end
 
-#pragma mark - AVCaptureSession（会话起停 + 拍照模式识别）
-// AVCaptureSession 钩子：监听会话起停；用 AVCaptureStillImageOutput 是否挂上判断“是否进入拍照模式”。
-// 微信只在拍照界面挂该 output，故它是进/出拍照模式的信号；用字符串取类避开其 deprecated 类型名。
-// 用字符串取类（AVCaptureStillImageOutput 自 iOS 10 deprecated，-Werror 下写类型名会编译失败）。
-// 微信只在拍照界面挂这个 output，故它是进入/退出拍照模式的信号。
+#pragma mark - AVCaptureSession（会话起停）
+// AVCaptureSession 钩子：监听会话起停。
+// 注：原先用 session 是否挂 AVCaptureStillImageOutput 判断拍照模式、并据此抑制视频替换，
+// 但实测微信所有相机 session 都挂该 output，信号恒真，反而把替换永久关死并导致黑屏，故已弃用该判定。
+// AVCaptureStillImageOutput 自 iOS 10 deprecated，-Werror 下只能以字符串取类。
 static Class vcm_stillImageClass(void) { return NSClassFromString(@"AVCaptureStillImageOutput"); }
 
 // 按 session 实际 outputs 判定是否拍照模式（比事件可靠，微信常 stop 后复用 session 不 removeOutput）
@@ -1132,7 +1145,6 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     %orig;
     g_sessionRunning = YES;
     if (g_displayLink) g_displayLink.paused = NO;
-    vcm_suppressSet(kSuppressPhotoMode, vcm_sessionHasStillOutput(self));  // 校准拍照模式（双保险）
     g_dbgFirstFrame = YES;
     NSMutableString *outs = [NSMutableString string];
     for (AVCaptureOutput *o in self.outputs) [outs appendFormat:@"%@ ", NSStringFromClass([o class])];
@@ -1148,22 +1160,29 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     vcm_invalidatePCM();
     vcm_resetClock();
 }
-- (void)addOutput:(AVCaptureOutput *)output {
+%end
+
+#pragma mark - 拍照快门：透传真实画面
+// 拍照（快门）时让视频透传真实摄像头，预览显示真实相机、与成片一致。
+// 触发信号用快门调用本身，不依赖“是否挂 StillImageOutput”（该信号在微信恒真，已失效）。
+%hook AVCaptureStillImageOutput
+- (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection completionHandler:(void (^)(CMSampleBufferRef, NSError *)) {
+    vcm_suppressPhotoBriefly();
+    vcm_dbg(@"captureStillImage fired (old API)");
     %orig;
-    if ([output isKindOfClass:vcm_stillImageClass()])
-        vcm_suppressSet(kSuppressPhotoMode, YES);  // 进入拍照界面即抑制预览，所见即所得
 }
-- (void)removeOutput:(AVCaptureOutput *)output {
+%end
+%hook AVCapturePhotoOutput
+- (void)capturePhotoWithDelegate:(id)delegate {
+    vcm_suppressPhotoBriefly();
+    vcm_dbg(@"capturePhotoWithDelegate fired (new API)");
     %orig;
-    if ([output isKindOfClass:vcm_stillImageClass()])
-        vcm_suppressSet(kSuppressPhotoMode, NO);   // 退出拍照模式恢复替换
 }
 %end
 
 #pragma mark - 拍摄期间暂停视频替换
-// 拍摄期间暂停视频替换：拍照片/录视频时让视频透传真实摄像头（声音替换不受影响）。
+// 录视频时让视频透传真实摄像头（声音替换不受影响）。
 // 录制文件统一走 AVAssetWriter，故从这里切入抑制替换。
-// 拍照片/录视频时透传真实摄像头（声音替换不受影响）。录制落盘统一走 AVAssetWriter。
 %hook AVAssetWriter
 - (BOOL)startWriting {
     BOOL ok = %orig;
