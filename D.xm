@@ -54,14 +54,32 @@ static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
 static long long g_loopStopRound = -1;  // 关闭循环时记录的「当前轮次」；-1 = 未记录/循环开启
 static BOOL g_frozen    = NO;    // 冻结锁存：当前轮播完后锁死，不因开关瞬时抖动而漏冻
 static BOOL g_isSound    = YES;     // 是否替换麦克风采集
-// 拍照 / 拍摄（录制）期间临时置位：此时视频透传真实摄像头画面（拍出来才是真实场景），
-// 拍完 / 录完清位恢复替换。仅作用于视频，声音不受此标志影响。
-static BOOL g_videoSuppress = NO;
-// 当前 session 上是否仍挂着 AVCaptureStillImageOutput（= 处于拍照模式）。
-// 必须持久化而非只看 addOutput 事件：微信拍完照只 stopRunning、并不 removeOutput，
-// 再 startRunning 时 session 被复用、不会重新触发 addOutput；而 stopRunning 的兜底
-// 又已把 g_videoSuppress 清掉 → 预览重新被替换（「朋友圈拍照误伤」的根因）。
-static BOOL g_stillAttached  = NO;
+// ── 视频抑制状态机 ────────────────────────────────────────────────────────────
+// 抑制（透传真实摄像头）的原因不止一个，且生命周期互不相同：
+//   · 拍照模式：从 addOutput:StillImage 持续到 removeOutput，跨越任意次 stop/start 复用
+//   · 写文件  ：从 startWriting 到 finish/cancel 后再延迟 1.5s（writer 可能极短命）
+// 早期两者共用一个 BOOL，导致「清一个原因时误伤另一个」，只能靠补丁救场（延迟恢复加闸门、
+// stopRunning 兜底后再在 startRunning 补位、token 防竞态）。改用位掩码后每个原因独立一位，
+// 清除时只动自己那一位，三个补丁全部不再需要。
+// g_videoSuppress 是派生值，供取帧路径热路径读取，只在 vcm_suppressSet 里统一更新。
+typedef NS_ENUM(NSUInteger, VCamSuppressReason) {
+    kSuppressPhotoMode = 1 << 0,   // 处于拍照 / 拍摄模式（session 上挂着 StillImageOutput）
+    kSuppressWriting   = 1 << 1,   // 正在写文件（AVAssetWriter 活动中）
+};
+static NSUInteger g_suppressMask = 0;
+static BOOL g_videoSuppress = NO;   // 派生：g_suppressMask != 0
+
+static void vcm_suppressSet(VCamSuppressReason mask, BOOL on, NSString *why) {
+    NSUInteger old = g_suppressMask;
+    if (on) g_suppressMask |=  mask;
+    else    g_suppressMask &= ~mask;
+    if (old != g_suppressMask) {
+        g_videoSuppress = (g_suppressMask != 0);
+        vcm_log(@"[suppress] %@ %@ → mask=0x%lx（抑制=%@）",
+                on ? @"置位" : @"清除", why,
+                (unsigned long)g_suppressMask, g_videoSuppress ? @"YES" : @"NO");
+    }
+}
 // 额外手动微调角度（旋转按钮循环取值）。方向对齐由 composedImageForTarget 自动判断补 90°，
 // 所以这里默认必须是 0：若默认 90，竖屏素材进横屏画布会被算成 180°——180° 不改变宽高比，
 // 结果是 scale=1.78 放大裁切（画面只留中间 56%）且每帧都走 Lanczos 缩放，既糊又卡。
@@ -356,31 +374,26 @@ static BOOL vcm_loopShouldFreeze(double elapsed) {
     return NO;
 }
 
-// 拍照/录制的 writer 生命周期可能极短：日志实测出现过 startWriting 后 9ms 就 cancelWriting，
-// 若收到结束信号就立刻恢复替换，快门那一帧仍会取到素材画面。
-// 故统一延迟恢复，并带 token 防止「结束→又立刻开始」时的竞态误恢复。
+// writer 生命周期可能极短：日志实测出现过 startWriting 后 9ms 就 cancelWriting，
+// 若收到结束信号就立刻恢复替换，那一帧仍会取到素材画面，故统一延迟 1.5s 再清位。
+// 只清 kSuppressWriting 位：拍照模式位是独立原因，不受写文件结束影响，因此不需要任何
+// 「是否仍在拍照模式」的闸门判断（旧实现那道闸门是单布尔位结构的产物，位掩码下已无必要）。
+// token 防「结束→又立刻开始」的竞态：期间若又有新的写操作，本次清除自行放弃。
 static int  s_unsuppressToken = 0;
-static void vcm_scheduleUnsuppress(void) {
+static void vcm_scheduleUnsuppressWriting(void) {
     int my = ++s_unsuppressToken;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (my != s_unsuppressToken) return;   // 期间又有新的拍照/录制 → 放弃本次恢复
-        // 仍处于拍照模式（session 上还挂着 StillImageOutput）→ 放弃恢复，预览保持真实画面。
-        // 不加这道闸：拍/录完回退到拍照界面时，1.5s 一到就恢复替换，预览立刻切回素材 ——
-        // 「拍摄视频回退回来误伤」的根因（日志 23:33:53.095 恢复 → 23:33:53.100 [req] 1080x1920）。
-        // 真正退出拍照模式时由 removeOutput 恢复（那里 g_stillAttached 已置 NO）。
-        if (g_stillAttached) {
-            vcm_log(@"[capture] 延迟恢复跳过：仍处于拍照模式，预览保持真实画面");
-            return;
-        }
-        g_videoSuppress = NO;
-        vcm_log(@"[capture] 延迟恢复：视频替换已恢复");
+        if (my != s_unsuppressToken) return;   // 期间又有新的写操作 → 放弃本次清除
+        vcm_suppressSet(kSuppressWriting, NO, @"写文件已结束（延迟）");
     });
 }
-
-// 作废尚未触发的延迟恢复：退出拍照模式时用，防止 pending 定时器在用户已再次进入拍照后
-// 把刚置上的抑制清掉（token 自增即让旧的那次恢复自行放弃）。
-static void vcm_cancelUnsuppress(void) { s_unsuppressToken++; }
+// 作废尚未触发的延迟清除，并立即清掉写文件位。用于退出拍照模式（录制必然也已结束）等明确收尾处，
+// 避免 pending 定时器在之后才触发、清掉一个已经重新置上的位。
+static void vcm_finishWritingNow(void) {
+    s_unsuppressToken++;                      // 作废 pending
+    vcm_suppressSet(kSuppressWriting, NO, @"收尾立即清位");
+}
 
 static void vcm_saveSettings(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -1424,17 +1437,22 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 %end
 
-#pragma mark - AVCaptureSession（会话起停）
-// 直接读 session 当前的 outputs 判断是否处于拍照模式。比依赖 addOutput/removeOutput 事件更可靠：
-// 事件可能因 session 复用而漏触发（拍完照只 stop 不 remove，再 start 时不会重新 addOutput），
-// 而 outputs 是权威事实，每次 startRunning 刷新一次，不存在状态残留。
+#pragma mark - AVCaptureSession（会话起停 + 拍照模式识别）
+// 用字符串取类而非直接写类型名：AVCaptureStillImageOutput 自 iOS 10 起 deprecated，
+// 写类型名会在 -Werror 下编译失败（Logos 展开生成的原 IMP 声明里也含类名，pragma 盖不住）。
+// 微信只在「拍照界面」挂这个 output（录制 / 视频通话模式不加，日志 22:58:16 那段 startRunning
+// 前无此 addOutput 可证），故它是进入 / 退出拍照模式的干净信号。
+static BOOL vcm_isStillImageOutput(AVCaptureOutput *output) {
+    if (!output) return NO;
+    Class c = NSClassFromString(@"AVCaptureStillImageOutput");
+    return (c != nil) && [output isKindOfClass:c];
+}
+// 按 session 实际 outputs 判定是否处于拍照模式。比仅依赖 addOutput/removeOutput 事件更可靠：
+// 微信拍完照常「只 stopRunning 不 removeOutput 再复用 session」，事件会漏触发，而 outputs 是权威事实。
 static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     if (!session) return NO;
-    Class c = NSClassFromString(@"AVCaptureStillImageOutput");
-    if (!c) return NO;
-    for (AVCaptureOutput *o in session.outputs) {
-        if ([o isKindOfClass:c]) return YES;
-    }
+    for (AVCaptureOutput *o in session.outputs)
+        if (vcm_isStillImageOutput(o)) return YES;
     return NO;
 }
 %hook AVCaptureSession
@@ -1450,14 +1468,9 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     // 这里统一恢复：避免关相机（拍照）后显示层仍被主线程每帧操作 → 闪退。
     g_sessionRunning = YES;
     if (g_displayLink) g_displayLink.paused = NO;
-    // 会话复用：微信拍完照只 stopRunning、不 removeOutput，再 startRunning 时不会重新触发 addOutput，
-    // 而 stopRunning 的兜底已清过 g_videoSuppress → 预览又被替换（「朋友圈拍照误伤」的根因）。
-    // 故每次 startRunning 都按 session 实际 outputs 重新判定，抑制得以跨 stop/start 保持。
-    g_stillAttached = vcm_sessionHasStillOutput(self);
-    if (g_stillAttached) {
-        g_videoSuppress = YES;
-        vcm_log(@"[capture] 会话起停复用：仍处于拍照模式，预览保持真实画面");
-    }
+    // 按 session 实际 outputs 校准拍照模式位（双保险）：正常路径由 addOutput/removeOutput 维护，
+    // 但微信存在「只 stopRunning 不 removeOutput 再复用」的情况，这里用权威事实兜住状态漂移。
+    vcm_suppressSet(kSuppressPhotoMode, vcm_sessionHasStillOutput(self), @"startRunning 校准拍照模式");
     vcm_log(@"[session] startRunning  replace=%@  video=%@ audio=%@",
             g_isReplace ? @"YES" : @"NO",
             [g_fileManager fileExistsAtPath:vcm_videoPath()]  ? @"有" : @"无",
@@ -1470,154 +1483,63 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     // 后台解码线程仍在跑 → 访问已释放资源闪退。统一：停心跳 + 停解码线程 + 清 PCM + 时钟作废。
     // 状态机简化：stop 即清理、start 即重建，去掉「留 PCM 等下次 start」的微妙特例。
     g_sessionRunning = NO;
-    g_videoSuppress = NO;   // 保险：若拍照/录制 proxy 未回调恢复，下次会话不会卡在透传真实画面
+    // 兜底只清「写文件」位：若录制回调未走到，下次会话不会卡在透传真实画面。
+    // 注意不能连带清拍照模式位——会话停止不等于退出拍照模式（微信常 stop 后复用同一 session）。
+    vcm_finishWritingNow();
     if (g_displayLink) g_displayLink.paused = YES;
     vcm_invalidatePCM();          // 含停解码线程 + 代次失效，关相机后不再有后台解码
     vcm_resetClock();             // 会话结束 → 时钟作废，下次 startRunning 重新锚定
     vcm_log(@"[session] stopRunning（相机已停，显示层心跳与解码线程已暂停）");
 }
-// 诊断：微信拍摄时到底往 session 上挂了什么 output。日志实证 AVCaptureMovieFileOutput 未被调用
-// （拍摄时无 [capture] 条目），说明微信走自研录制管线；靠这条日志可确认它真实用的类。
-// 同时兼作「进入 / 退出拍照模式」的信号——见下方 vcm_isStillImageOutput 说明。
-// 用字符串取类而非直接写类型名：AVCaptureStillImageOutput 自 iOS 10 起 deprecated，
-// 写类型名会在 -Werror 下编译失败（Logos 展开生成的原 IMP 声明里也有类名，pragma 盖不住）。
-static BOOL vcm_isStillImageOutput(AVCaptureOutput *output) {
-    if (!output) return NO;
-    Class c = NSClassFromString(@"AVCaptureStillImageOutput");
-    return (c != nil) && [output isKindOfClass:c];
-}
 - (void)addOutput:(AVCaptureOutput *)output {
     %orig;
     vcm_log(@"[session] addOutput: %@", NSStringFromClass([output class]));
-    // 进入拍照模式：微信只在拍照界面挂 AVCaptureStillImageOutput（录制 / 视频通话模式不加，
-    // 日志 22:58:16 那段 startRunning 前无此 addOutput 可证）。
-    // 必须在此就抑制预览：只在快门那一刻置位的话，进拍照界面到按下快门之间（实测 3.8s）
-    // 屏幕显示的仍是素材，与成片不一致——用户反馈「屏幕上显示的是替换的素材」。
-    // 提前到进入拍照模式即抑制，做到所见即所得（预览与成片都是真实画面）。
-    if (vcm_isStillImageOutput(output)) {
-        vcm_cancelUnsuppress();   // 作废上一次拍照遗留的 pending 恢复，避免它稍后误清本次抑制
-        g_videoSuppress = YES;
-        g_stillAttached  = YES;
-        vcm_log(@"[capture] 进入拍照模式：预览切真实画面（视频替换暂停）");
-    }
+    // 进入拍照模式：微信只在拍照界面挂 AVCaptureStillImageOutput。在此即抑制预览做到所见即所得
+    // （只在快门那一刻置位的话，进拍照界面到按下快门之间屏幕显示的仍是素材）。startRunning 还会再校准一次。
+    if (vcm_isStillImageOutput(output))
+        vcm_suppressSet(kSuppressPhotoMode, YES, @"进入拍照模式");
 }
 - (void)removeOutput:(AVCaptureOutput *)output {
     vcm_log(@"[session] removeOutput: %@", NSStringFromClass([output class]));
     %orig;
-    // 退出拍照模式：摘掉 StillImageOutput 即恢复替换。先作废 pending 的延迟恢复，
-    // 否则定时器可能在用户再次进入拍照、重新置位之后才触发，把抑制误清掉。
-    if (vcm_isStillImageOutput(output)) {
-        vcm_cancelUnsuppress();
-        g_videoSuppress = NO;
-        g_stillAttached  = NO;
-        vcm_log(@"[capture] 退出拍照模式：视频替换恢复");
-    }
+    // 退出拍照模式：摘掉 StillImageOutput 即恢复替换。
+    if (vcm_isStillImageOutput(output))
+        vcm_suppressSet(kSuppressPhotoMode, NO, @"退出拍照模式");
 }
 %end
 
-#pragma mark - 拍照 / 拍摄期间暂停视频替换
-// 拍照片 / 录视频时若继续替换，会拍出素材而非真实场景，故期间置 g_videoSuppress=YES 让视频透传真实画面。
+#pragma mark - 拍摄期间暂停视频替换
+// 拍照片 / 录视频时若继续替换会拍出素材而非真实场景，故期间透传真实摄像头画面。
 // 仅作用于视频，声音替换不受影响——用户只要求「视频」真实。
-//
-// 日志实证的微信真实路径（22:57~22:58 那份）：
-//   · 拍照取帧用 AVCaptureStillImageOutput —— 它不经过我们 hook 的 VideoDataOutput，
-//     所以「成片」天然是真实画面，与抑不抑制无关（这点早期判断正确）。
-//   · 但「预览」走的是 VideoDataOutput（[req] 1920x1080 出现在 addOutput:StillImage 之后），
-//     不抑制的话进拍照界面到按下快门之间屏幕上一直是素材 —— 这才是用户反馈的
-//     「屏幕上显示的是替换的素材」。抑制点因此前移到 addOutput:StillImage（见 AVCaptureSession hook）。
-//   · 落盘（拍照写图 / 录视频）统一走 AVAssetWriter —— 用于拦「拍摄视频」的画面。
-// 因此原先 hook 的 AVCapturePhotoOutput 是死代码（微信完全不用该类，日志从未出现对应 [capture]），已删除。
-// AVCaptureMovieFileOutput 目前也未被观测到调用，保留作为兜底路径，成本仅几行。
-// 快门 hook（vcm_shutter）在成片上属冗余保险，保留以防微信日后改用 VideoDataOutput 取拍照帧。
-
-%hook AVCaptureMovieFileOutput
-- (void)startRecordingToOutputFileURL:(NSURL *)url
-                     recordingDelegate:(id<AVCaptureFileOutputRecordingDelegate>)delegate {
-    g_videoSuppress = YES;   // 录制期间：视频透传真实画面
-    vcm_log(@"[capture] 开始录制：视频替换暂停");
-    %orig(url, delegate);
-}
-- (void)stopRecording {
-    %orig;
-    vcm_scheduleUnsuppress();   // 录完：延迟恢复视频替换
-    vcm_log(@"[capture] 结束录制：1.5s 后恢复替换");
-}
-%end
-
-// 拍照的「快门」信号，比 AVAssetWriter 更早：日志实证微信建了 AVCaptureStillImageOutput
-// （见 [session] addOutput: AVCaptureStillImageOutput）。AVAssetWriter 属于「写文件」阶段，晚于取帧；
-// 第一次拍照时 writer 可能只活 9ms（startWriting → 立刻 cancelWriting），那时才抑制已经来不及，
-// 拍到的仍是素材——这正是「第一次拍照被替换」的根因。必须抢在快门这一刻置位。
-//
-// 这里不能用 %hook：该类 iOS 10 起 deprecated，即使加 #pragma ignored，Logos 展开后自动生成的
-// 代码（原 IMP 函数指针声明等）里仍会出现类名类型，pragma 作用域覆盖不到，在 -Werror 下照样报错
-// （CI 实测 D.xm:1365: 'AVCaptureStillImageOutput' is deprecated）。
-// 故改用运行时动态 hook：源码里只出现字符串形式的类名，不产生任何废弃告警；
-// 附带好处是类不存在时自动跳过，不会像 %hook 那样对缺失类做无谓绑定。
-static void (*vcm_orig_shutter)(id, SEL, AVCaptureConnection *, void (^)(CMSampleBufferRef, NSError *));
-static void vcm_shutter(id self, SEL _cmd, AVCaptureConnection *connection,
-                        void (^handler)(CMSampleBufferRef, NSError *)) {
-    g_videoSuppress = YES;   // 快门瞬间：视频透传真实画面
-    vcm_log(@"[capture] 快门(StillImage)：视频替换暂停（拍真实画面）");
-    if (vcm_orig_shutter) vcm_orig_shutter(self, _cmd, connection, handler);
-    else if (handler) handler(NULL, nil);   // 取原实现失败时兜底回调，避免微信永远等不到快门结果
-}
-// 在 %ctor 里按字符串取类挂载，避免编译期出现类名类型
-static void vcm_installShutterHook(void) {
-    Class cls = NSClassFromString(@"AVCaptureStillImageOutput");
-    if (!cls) { vcm_log(@"[init] 未找到 AVCaptureStillImageOutput，跳过快门 hook"); return; }
-    MSHookMessageEx(cls,
-                    @selector(captureStillImageAsynchronouslyFromConnection:completionHandler:),
-                    (IMP)&vcm_shutter,
-                    (IMP *)&vcm_orig_shutter);
-    vcm_log(@"[init] 已挂载快门 hook（AVCaptureStillImageOutput）orig=%d", vcm_orig_shutter != NULL);
-}
-
-// 微信拍摄实证走的是「AVCaptureVideoDataOutput 采集 + 自写文件」的自研管线，不是 AVCaptureMovieFileOutput
-// （日志里拍摄期间无 [capture] 条目可证）。帧仍从我们 hook 的采集回调出去，所以录制期间照样被替换。
-// 故补 AVAssetWriter 系列作为录制起止信号：开始写文件即置位抑制替换，写完/取消即恢复。
+// 微信真实路径（日志实证）：
+//   · 拍照「成片」用 AVCaptureStillImageOutput，不经我们 hook 的 VideoDataOutput → 成片天然真实，与抑不抑制无关；
+//   · 但「预览」走 VideoDataOutput，不抑制则进拍照界面到按下快门之间屏幕一直是素材 → 故用拍照模式位（见上）抑制；
+//   · 「拍摄视频」落盘统一走 AVAssetWriter，下面 hook 它的起止作为录制信号。
+// 早期 hook 的 AVCapturePhotoOutput / AVCaptureMovieFileOutput 实测从未触发（微信走自研管线），已删除。
 %hook AVAssetWriter
 - (BOOL)startWriting {
     BOOL ok = %orig;
-    g_videoSuppress = YES;
+    vcm_suppressSet(kSuppressWriting, YES, @"开始写文件（拍摄）");
     vcm_log(@"[capture] AVAssetWriter startWriting ok=%d：视频替换暂停（拍真实画面）", ok);
     return ok;
 }
-- (void)startSessionAtSourceTime:(CMTime)startTime {
-    g_videoSuppress = YES;
-    vcm_log(@"[capture] AVAssetWriter startSessionAtSourceTime：视频替换暂停");
-    %orig(startTime);
-}
 - (void)finishWritingWithCompletionHandler:(void (^)(void))handler {
-    // 文案与 cancelWriting 对齐：这里也是延迟恢复，不是立即恢复（延迟期间仍显示真实画面）
+    // 延迟恢复：writer 可能极短命（日志实测 startWriting 后 9ms 就 cancel），立刻恢复会让那一帧取到素材。
     vcm_log(@"[capture] AVAssetWriter finishWriting：1.5s 后恢复替换");
-    // block 字面量不能直接写在 %orig(...) 里：Logos 预处理器解析嵌套大括号会失败，
-    // 报 “missing closing parenthesis”。必须先赋给局部变量，再传标识符。
+    // block 字面量不能直接写进 %orig(...)：Logos 预处理器解析嵌套大括号会报 “missing closing parenthesis”，
+    // 必须先赋给局部变量再传标识符。
     void (^wrapped)(void) = ^{
-        vcm_scheduleUnsuppress();   // 延迟恢复：writer 可能极短命，立刻恢复会让快门帧取到素材
+        vcm_scheduleUnsuppressWriting();
         if (handler) handler();
     };
     %orig(wrapped);
 }
-// 不 hook -finishWriting（同步版）：已 deprecated，-Werror 下有编译风险；
-// 异步 finishWritingWithCompletionHandler / cancelWriting 已覆盖现代录制收尾，
-// 万一都没走到，stopRunning 还有兜底清位，不会卡在透传。
+// 不 hook 同步版 -finishWriting（已 deprecated，-Werror 有编译风险）；异步版 + cancelWriting 已覆盖现代收尾，
+// 万一都没走到 stopRunning 还有兜底清位，不会卡在透传。
 - (void)cancelWriting {
     %orig;
-    vcm_scheduleUnsuppress();   // 取消也要恢复（延迟），否则会一直卡在透传真实画面
+    vcm_scheduleUnsuppressWriting();
     vcm_log(@"[capture] AVAssetWriter cancelWriting：1.5s 后恢复替换");
-}
-%end
-
-%hook AVAssetWriterInput
-// 兜底：开始信号漏掉时（如 writer 复用、startWriting 未被调用），只要真的在往文件写帧就抑制替换。
-// 加 g_sessionRunning 条件：避免微信在「视频压缩/编辑」等非采集场景用 AVAssetWriter 时误抑制。
-- (BOOL)appendSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    if (!g_videoSuppress && g_sessionRunning) {
-        g_videoSuppress = YES;
-        vcm_log(@"[capture] AVAssetWriterInput appendSampleBuffer：视频替换暂停（录制中）");
-    }
-    return %orig(sampleBuffer);
 }
 %end
 
@@ -2061,9 +1983,6 @@ static void vcm_installTapGesture(UIWindow *win) {
         (void **)&g_origAudioUnitRender,
     };
     rebind_symbols(&reb, 1);
-
-    // 快门 hook 走运行时挂载（非 %hook），必须在 g_diagFilePath 之后调用，保证日志已可用
-    vcm_installShutterHook();
 }
 
 %dtor {
