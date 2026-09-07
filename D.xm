@@ -57,6 +57,11 @@ static BOOL g_isSound    = YES;     // 是否替换麦克风采集
 // 拍照 / 拍摄（录制）期间临时置位：此时视频透传真实摄像头画面（拍出来才是真实场景），
 // 拍完 / 录完清位恢复替换。仅作用于视频，声音不受此标志影响。
 static BOOL g_videoSuppress = NO;
+// 当前 session 上是否仍挂着 AVCaptureStillImageOutput（= 处于拍照模式）。
+// 必须持久化而非只看 addOutput 事件：微信拍完照只 stopRunning、并不 removeOutput，
+// 再 startRunning 时 session 被复用、不会重新触发 addOutput；而 stopRunning 的兜底
+// 又已把 g_videoSuppress 清掉 → 预览重新被替换（「朋友圈拍照误伤」的根因）。
+static BOOL g_stillAttached  = NO;
 // 额外手动微调角度（旋转按钮循环取值）。方向对齐由 composedImageForTarget 自动判断补 90°，
 // 所以这里默认必须是 0：若默认 90，竖屏素材进横屏画布会被算成 180°——180° 不改变宽高比，
 // 结果是 scale=1.78 放大裁切（画面只留中间 56%）且每帧都走 Lanczos 缩放，既糊又卡。
@@ -1412,6 +1417,18 @@ static VCamAudioProxy *g_audioProxy = nil;
 %end
 
 #pragma mark - AVCaptureSession（会话起停）
+// 直接读 session 当前的 outputs 判断是否处于拍照模式。比依赖 addOutput/removeOutput 事件更可靠：
+// 事件可能因 session 复用而漏触发（拍完照只 stop 不 remove，再 start 时不会重新 addOutput），
+// 而 outputs 是权威事实，每次 startRunning 刷新一次，不存在状态残留。
+static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
+    if (!session) return NO;
+    Class c = NSClassFromString(@"AVCaptureStillImageOutput");
+    if (!c) return NO;
+    for (AVCaptureOutput *o in session.outputs) {
+        if ([o isKindOfClass:c]) return YES;
+    }
+    return NO;
+}
 %hook AVCaptureSession
 - (void)startRunning {
     // 新会话的麦克风格式可能是另一套（采样率/位深随通话类型变），不清旧的 g_targetASBD 会沿用上一通格式去解码。
@@ -1425,6 +1442,14 @@ static VCamAudioProxy *g_audioProxy = nil;
     // 这里统一恢复：避免关相机（拍照）后显示层仍被主线程每帧操作 → 闪退。
     g_sessionRunning = YES;
     if (g_displayLink) g_displayLink.paused = NO;
+    // 会话复用：微信拍完照只 stopRunning、不 removeOutput，再 startRunning 时不会重新触发 addOutput，
+    // 而 stopRunning 的兜底已清过 g_videoSuppress → 预览又被替换（「朋友圈拍照误伤」的根因）。
+    // 故每次 startRunning 都按 session 实际 outputs 重新判定，抑制得以跨 stop/start 保持。
+    g_stillAttached = vcm_sessionHasStillOutput(self);
+    if (g_stillAttached) {
+        g_videoSuppress = YES;
+        vcm_log(@"[capture] 会话起停复用：仍处于拍照模式，预览保持真实画面");
+    }
     vcm_log(@"[session] startRunning  replace=%@  video=%@ audio=%@",
             g_isReplace ? @"YES" : @"NO",
             [g_fileManager fileExistsAtPath:vcm_videoPath()]  ? @"有" : @"无",
@@ -1464,6 +1489,7 @@ static BOOL vcm_isStillImageOutput(AVCaptureOutput *output) {
     if (vcm_isStillImageOutput(output)) {
         vcm_cancelUnsuppress();   // 作废上一次拍照遗留的 pending 恢复，避免它稍后误清本次抑制
         g_videoSuppress = YES;
+        g_stillAttached  = YES;
         vcm_log(@"[capture] 进入拍照模式：预览切真实画面（视频替换暂停）");
     }
 }
@@ -1475,6 +1501,7 @@ static BOOL vcm_isStillImageOutput(AVCaptureOutput *output) {
     if (vcm_isStillImageOutput(output)) {
         vcm_cancelUnsuppress();
         g_videoSuppress = NO;
+        g_stillAttached  = NO;
         vcm_log(@"[capture] 退出拍照模式：视频替换恢复");
     }
 }
