@@ -13,6 +13,7 @@
 #import <os/lock.h>
 
 #pragma mark - 开关配置
+// 开关配置：全局运行状态。g_isReplace 总开关（无素材时透传真实摄像头，导入后自动开）；g_isLoop 素材播完是否回卷；g_loopStopRound 记录“冻结在哪一轮”用于循环停止判定。
 static BOOL g_isReplace      = NO;   // 总开关：无素材时透传真实摄像头，导入后自动开
 static BOOL g_isLoop         = YES;  // 素材读完是否回卷重播
 static long long g_loopStopRound = -1;
@@ -37,15 +38,18 @@ static void vcm_suppressSet(VCamSuppressReason mask, BOOL on) {
 static int g_rotation = 0;  // 0/90/180/270，额外旋转微调（方向对齐会自动补 90°）
 
 #pragma mark - reader 重建标记
+// reader 重建标记：素材切换或 reader 失效时置位，下次访问重建 AVAssetReader，避免读到旧/空 reader。
 static BOOL g_videoReload = NO;
 static BOOL g_audioReload = NO;
 
 #pragma mark - 沙箱路径
+// 沙箱路径：素材视频目录、临时音频解码路径、当前选中视频路径，均位于 App 沙盒内。
 static NSString *g_videoDir       = nil;
 static NSString *g_tempAudioPath  = nil;
 static NSString *g_videoPath      = nil;
 
 #pragma mark - 运行时状态
+// 运行时状态：文件管理器、媒体锁（reader/缓冲并发保护）、CoreImage 上下文（像素合成用）。
 static NSFileManager *g_fileManager = nil;
 static NSLock        *g_mediaLock   = nil;
 static CIContext     *g_ciContext   = nil;
@@ -58,6 +62,7 @@ static AVAssetReaderTrackOutput *g_audioOutput = nil;
 static CVPixelBufferRef g_lastVideoPixel = NULL;  // 最近一帧，reader 读完后冻结复用防闪回
 
 #pragma mark - 统一会话时钟（音画同步）
+// 统一会话时钟：以显示层首帧时间为锚点，视频与音频都按此时钟定位读取，保证音画同步。
 static CFTimeInterval g_clockAnchor = 0;
 static BOOL           g_clockReady  = NO;
 
@@ -69,10 +74,12 @@ static CGSize  g_srcSize     = {0,0}; // 素材原生分辨率
 static const long long kVCamMaxCatchUp = 4;  // 一次回调最多补的帧数，防正反馈卡死
 
 #pragma mark - AudioUnit 链路（按时钟定位预解码 PCM）
+// AudioUnit 链路：麦克风被替换时，按统一时钟在预解码 PCM 缓冲里定位对应样本喂给上行。
 static double g_pcmBytesPerSec  = 0.0;
 static size_t g_audioFrameBytes = 1;   // 一个采样帧字节数（帧边界对齐防爆音）
 
 #pragma mark - AVCapture 音频链路（按时钟追平）
+// AVCapture 音频链路：把采集端采样率/字节率换算成“按帧追平”参数，使替换音频与时钟对齐。
 static double g_captureSampleRate       = 0.0;
 static double g_audioCaptureBytesPerSec  = 0.0;
 static double g_audioSrcDuration        = 0.0;
@@ -102,18 +109,22 @@ static CFTimeInterval vcm_elapsed(void) {
 }
 
 #pragma mark - 预览显示层
+// 预览显示层：用 AVSampleBufferDisplayLayer + CADisplayLink 把替换画面叠加到相机预览上。
 static AVSampleBufferDisplayLayer *g_displayLayer     = nil;
 static CADisplayLink              *g_displayLink      = nil;
 static AVCaptureVideoOrientation   g_videoOrientation = AVCaptureVideoOrientationPortrait;
 static BOOL                        g_sessionRunning   = NO;  // 采集回调/显示层心跳的硬护栏
 
 #pragma mark - 像素缓冲池
+// 像素缓冲池：复用 CVPixelBuffer，避免每帧 new/释放带来的卡顿与内存抖动。
 static CVPixelBufferPoolRef g_pbPool = NULL;
 static size_t               g_poolW  = 0;
 static size_t               g_poolH  = 0;
 static OSType               g_poolFmt = 0;
 
 #pragma mark - 音频预解码缓冲（整段预解码进内存 + 按时钟定位读取）
+// 音频预解码缓冲：整段素材音频一次解码进内存（g_audioPCM），按统一时钟用游标顺序读取，连续不爆音。
+// 视频不整段解码——整段解码内存代价约大千倍，不可行。
 static uint8_t       *g_audioPCM      = NULL;
 static size_t         g_audioPCMLen   = 0;
 static size_t         g_audioPCMRead  = 0;   // 读取游标，顺序推进保证样本连续
@@ -149,6 +160,7 @@ static BOOL vcm_asbdMatches(AudioStreamBasicDescription a, AudioStreamBasicDescr
 }
 
 #pragma mark - AudioUnit 采集状态
+// AudioUnit 采集状态：首次回调先探测麦克风真实 ASBD（即解码目标格式），后续按此格式拉 PCM。
 static BOOL                        g_hasProbedASBD = NO;
 static AudioStreamBasicDescription g_targetASBD    = {0};  // 麦克风真实 ASBD，即解码目标格式
 
@@ -162,6 +174,7 @@ static OSStatus (*g_origAudioUnitRender)(
 ) = NULL;
 
 #pragma mark - 路径辅助
+// 路径辅助：沙盒目录与素材/临时文件绝对路径的取路径小工具。
 static NSString *vcm_documentPath(void) {
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 }
@@ -231,6 +244,7 @@ static void vcm_loadSettings(void) {
 }
 
 #pragma mark - 停止 reader 与重置
+// 停止 reader 与重置：取消并释放视频/音频 AVAssetReader，复位缓冲与时钟，供素材切换或退出时调用。
 static void vcm_stopReaders(void) {
     [g_mediaLock lock];
     if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
@@ -268,6 +282,7 @@ static void vcm_resetSettings(void) {
 }
 
 #pragma mark - 视图控制器查找
+// 视图控制器查找：从 keyWindow 层级里找出当前最上层 UIViewController，用于弹菜单。
 static UIViewController *vcm_topViewController(void) {
     UIWindow *key = nil;
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -285,6 +300,7 @@ static UIViewController *vcm_topViewController(void) {
 }
 
 #pragma mark - 像素缓冲池（替代每帧 CVPixelBufferCreate）
+// 像素缓冲池构建：按宽高/格式创建 CVPixelBufferPool，尺寸或格式变化时重建。
 static void vcm_createPool(size_t w, size_t h, OSType pfmt) {
     if (g_pbPool) { CVPixelBufferPoolRelease(g_pbPool); g_pbPool = NULL; }
     NSDictionary *attrs = @{
@@ -318,6 +334,7 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
 }
 
 #pragma mark - VCamMediaManager
+// VCamMediaManager：素材媒体读取中枢，懒初始化视频/音频 AVAssetReader，对外提供按帧/按位置的样本。
 @interface VCamMediaManager : NSObject
 + (void)setupVideoReaderIfNeeded;
 + (void)setupAudioReaderIfNeeded;
@@ -892,6 +909,8 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 @end
 
 #pragma mark - AudioUnitRender Hook（麦克风采集替换）
+// AudioUnitRender 钩子：截获麦克风渲染回调，把上行音频替换为预解码 PCM（仅 bus=1 麦克风上行，播放总线不动）。
+// 这是“替换麦克风声音”的核心落点。
 // 麦克风走裸 PCM：先按 bus=1 探测目标 ASBD，之后按 ioData 尺寸拉 PCM 再 memcpy，不做格式转换
 static OSStatus hooked_AudioUnitRender(
     AudioUnit                   inUnit,
@@ -967,6 +986,7 @@ static OSStatus hooked_AudioUnitRender(
 }
 
 #pragma mark - VCamVideoProxy（相机采集替换）
+// VCamVideoProxy：接管 AVCaptureVideoDataOutput 的采样回调代理，把真实画面换成素材视频帧。
 @interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
@@ -1017,6 +1037,7 @@ static VCamVideoProxy *g_videoProxy = nil;
 %end
 
 #pragma mark - VCamAudioProxy（AVCapture 音频采集替换）
+// VCamAudioProxy：接管 AVCaptureAudioDataOutput 的采样回调代理，把真实麦克风换成素材音频。
 @interface VCamAudioProxy : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
@@ -1061,6 +1082,8 @@ static VCamAudioProxy *g_audioProxy = nil;
 %end
 
 #pragma mark - AVCaptureSession（会话起停 + 拍照模式识别）
+// AVCaptureSession 钩子：监听会话起停；用 AVCaptureStillImageOutput 是否挂上判断“是否进入拍照模式”。
+// 微信只在拍照界面挂该 output，故它是进/出拍照模式的信号；用字符串取类避开其 deprecated 类型名。
 // 用字符串取类（AVCaptureStillImageOutput 自 iOS 10 deprecated，-Werror 下写类型名会编译失败）。
 // 微信只在拍照界面挂这个 output，故它是进入/退出拍照模式的信号。
 static Class vcm_stillImageClass(void) { return NSClassFromString(@"AVCaptureStillImageOutput"); }
@@ -1106,6 +1129,8 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 %end
 
 #pragma mark - 拍摄期间暂停视频替换
+// 拍摄期间暂停视频替换：拍照片/录视频时让视频透传真实摄像头（声音替换不受影响）。
+// 录制文件统一走 AVAssetWriter，故从这里切入抑制替换。
 // 拍照片/录视频时透传真实摄像头（声音替换不受影响）。录制落盘统一走 AVAssetWriter。
 %hook AVAssetWriter
 - (BOOL)startWriting {
@@ -1128,6 +1153,7 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 %end
 
 #pragma mark - AVCaptureVideoPreviewLayer（叠加预览显示层）
+// AVCaptureVideoPreviewLayer 钩子：在相机预览层上叠加我们的显示层，并把素材方向对齐到预览方向。
 @protocol VCamSync <NSObject>
 - (void)vcm_syncDisplayLayer;
 @end
@@ -1184,6 +1210,7 @@ static VCamLinkProxy *g_linkProxy = nil;
 %end
 
 #pragma mark - VCamMenuVC（控制菜单）
+// VCamMenuVC：悬浮控制菜单，集中所有交互入口（开关、旋转、循环、素材选择等）。
 @interface VCamMenuVC : UIViewController
     <UIImagePickerControllerDelegate, UIDocumentPickerDelegate, UINavigationControllerDelegate>
 @end
@@ -1199,6 +1226,7 @@ static VCamLinkProxy *g_linkProxy = nil;
 }
 
 #pragma mark - 生命周期
+// 生命周期：菜单视图加载与销毁时的初始化/清理。
 - (void)viewDidLoad {
     [super viewDidLoad];
     [self setupBackground];
@@ -1210,6 +1238,7 @@ static VCamLinkProxy *g_linkProxy = nil;
 }
 
 #pragma mark - UI 构建
+// UI 构建：菜单背景、面板容器与按钮网格的搭建。
 - (void)setupBackground { self.view.backgroundColor = [UIColor clearColor]; }
 
 - (void)setupPanel {
@@ -1323,6 +1352,7 @@ static VCamLinkProxy *g_linkProxy = nil;
 }
 
 #pragma mark - 按钮动作
+// 按钮动作：各开关/旋转/循环/重置按钮的点击事件处理。
 - (void)toggleRotate  { g_rotation   = (g_rotation + 90) % 360; vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleLoop    { g_isLoop = !g_isLoop; vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleSound   { g_isSound    = !g_isSound;    vcm_saveSettings(); [self refreshGridButtons]; }
@@ -1330,6 +1360,7 @@ static VCamLinkProxy *g_linkProxy = nil;
 - (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
 
 #pragma mark - 面板刷新
+// 面板刷新：根据当前运行状态刷新按钮标题与高亮样式。
 - (void)applyTitle:(NSString *)title toButton:(UIButton *)btn withFont:(UIFont *)font {
     if (!btn) return;
     UIButtonConfiguration *config = btn.configuration;
@@ -1358,6 +1389,7 @@ static VCamLinkProxy *g_linkProxy = nil;
 - (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
 
 #pragma mark - 文件选择
+// 文件选择：从相册/文件 App 选取素材视频并加载。
 - (void)actionSelectAlbum {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
@@ -1414,6 +1446,7 @@ static VCamLinkProxy *g_linkProxy = nil;
 }
 
 #pragma mark - UIImagePickerControllerDelegate
+// UIImagePickerController 回调：相册选完/取消后的处理。
 - (void)imagePickerController:(UIImagePickerController *)picker
 didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
@@ -1423,6 +1456,7 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker { [picker dismissViewControllerAnimated:YES completion:nil]; }
 
 #pragma mark - UIDocumentPickerDelegate
+// UIDocumentPickerDelegate 回调：文件 App 选完视频后的处理。
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     [controller dismissViewControllerAnimated:YES completion:nil];
     if (urls.count > 0) [self processSelectedVideoURL:urls.firstObject];
@@ -1435,6 +1469,7 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 @end
 
 #pragma mark - UIWindow 手势触发
+// UIWindow 手势触发：给 keyWindow 挂双击手势唤起菜单；becomeKeyWindow 会反复触发，需判重防叠加。
 static void vcm_installTapGesture(UIWindow *win) {
     // becomeKeyWindow 会反复调用，不判重会一层层叠加手势 → 一次双击弹 N 个面板
     static char kVCamTapKey;
@@ -1471,6 +1506,7 @@ static void vcm_installTapGesture(UIWindow *win) {
 %end
 
 #pragma mark - 构造 / 析构
+// 构造/析构：%ctor 初始化全部状态、挂好各钩子、安装手势；%dtor 释放显示层等。
 %ctor {
     g_fileManager = [NSFileManager defaultManager];
     g_mediaLock   = [[NSLock alloc] init];
