@@ -69,6 +69,7 @@ typedef NS_ENUM(NSUInteger, VCamSuppressReason) {
 static NSUInteger g_suppressMask = 0;
 static BOOL g_videoSuppress = NO;   // 派生：g_suppressMask != 0
 
+static void vcm_log(NSString *fmt, ...);   // 前向声明：vcm_suppressSet 在第 276 行前的函数体里调用它
 static void vcm_suppressSet(VCamSuppressReason mask, BOOL on, NSString *why) {
     NSUInteger old = g_suppressMask;
     if (on) g_suppressMask |=  mask;
@@ -134,8 +135,8 @@ static CGSize  g_diagLastOutSize = {0,0}; // 上次记录的输出画布尺寸
 static BOOL    g_diagFirstFrame  = YES;    // 首帧必定记一条完整诊断
 static NSString *g_diagFilePath   = nil;   // 落盘路径（沙箱 Documents/VCAM/VCAM_diag.log）：微信重启也不丢历史日志
 
-// 前向声明：日志函数定义在文件后方，供前面的时钟 / 同步逻辑调用。
-static void vcm_log(NSString *fmt, ...);
+// 前向声明：部分工具函数定义在文件后方，供前面的时钟 / 同步逻辑调用。
+// （vcm_log 已在其首个调用点 vcm_suppressSet 之前单独声明，此处仅补 vcm_pixFmtName）
 static NSString *vcm_pixFmtName(OSType t);
 
 // 掉帧追赶上限：一次回调最多补这么多帧。超过说明卡顿严重，直接跳位置而不是疯狂解码，
