@@ -7,6 +7,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <substrate.h>
 #include <dlfcn.h>
 #include "fishhook.h"
@@ -1002,6 +1003,12 @@ static OSStatus hooked_AudioUnitRender(
 // VCamVideoProxy：接管 AVCaptureVideoDataOutput 的采样回调代理，把真实画面换成素材视频帧。
 // 前置声明：vcm_sessionHasStillOutput 定义于下方 AVCaptureSession 段落，此处 proxy 需要先引用。
 static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session);
+// AVCaptureOutput.session 在部分 SDK 头中未声明（如 macOS runner 的 AVFoundation），
+// 直接用 objc_msgSend 取，规避“未声明 selector”的编译错误，且绕开 ARC 下 performSelector 的 leak 警告。
+static AVCaptureSession *vcm_getOutputSession(AVCaptureOutput *output) {
+    if (!output) return nil;
+    return ((AVCaptureSession *(*)(id, SEL))objc_msgSend)(output, @selector(session));
+}
 @interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
@@ -1015,7 +1022,7 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session);
      fromConnection:(AVCaptureConnection *)connection {
     g_videoOrientation = connection.videoOrientation;
     // 底层判别：session 含静态图像输出 = 拍照/扫码 → 真实；只有视频输出 = 视频通话 → 素材
-    BOOL hasStill   = vcm_sessionHasStillOutput([output session]);
+    BOOL hasStill   = vcm_sessionHasStillOutput(vcm_getOutputSession(output));
     BOOL replacing  = (g_isReplace && !hasStill);
     CMSampleBufferRef newSample = NULL;
     if (replacing) {   // 替换开启且非拍照/扫码场景
@@ -1067,7 +1074,7 @@ static char kVCamVideoProxyKey;   // 关联对象 key：每个 AVCaptureVideoDat
     // 底层判别：真实/素材由采集回调时取 session 的静态输出决定，这里不再按类名估场景
     NSString *cls = NSStringFromClass([delegate class]);
     vcm_dbg(@"setSampleBufferDelegate delegate=%@ hasStill=%d",
-            cls, vcm_sessionHasStillOutput([self session]));
+            cls, vcm_sessionHasStillOutput(vcm_getOutputSession(self)));
     %orig(p, queue);
 }
 %end
