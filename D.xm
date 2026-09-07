@@ -13,7 +13,6 @@
 #include "fishhook.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
-#include <stdarg.h>
 
 #pragma mark - 开关配置
 // 开关配置：全局运行状态。g_isReplace 总开关（无素材时透传真实摄像头，导入后自动开）；g_isLoop 素材播完是否回卷；g_loopStopRound 记录“冻结在哪一轮”用于循环停止判定。
@@ -111,22 +110,6 @@ static CFTimeInterval vcm_elapsed(void) {
 static AVSampleBufferDisplayLayer *g_displayLayer     = nil;
 static CADisplayLink              *g_displayLink      = nil;
 static AVCaptureVideoOrientation   g_videoOrientation = AVCaptureVideoOrientationPortrait;
-static BOOL                        g_sessionRunning   = NO;  // 采集回调/显示层心跳的硬护栏
-static BOOL                        g_dbgFirstFrame    = YES; // 诊断：每会话首帧打印一次取流路径
-
-// 诊断日志缓冲区：菜单「导出诊断」按钮可导出，供无 syslog 权限的侧载环境定位问题
-static NSMutableArray *g_diagLog = nil;
-static const NSUInteger kVCamDiagMaxLines = 2000;
-static void vcm_dbg(NSString *fmt, ...) {
-    if (!fmt) return;
-    va_list ap; va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    if (!g_diagLog) g_diagLog = [NSMutableArray array];
-    [g_diagLog addObject:[NSString stringWithFormat:@"%@ %@", [NSDate date], msg]];
-    if (g_diagLog.count > kVCamDiagMaxLines) [g_diagLog removeObjectAtIndex:0];
-    NSLog(@"[VCAM][dbg] %@", msg);
-}
 
 #pragma mark - 像素缓冲池
 // 像素缓冲池：复用 CVPixelBuffer，避免每帧 new/释放带来的卡顿与内存抖动。
@@ -208,12 +191,6 @@ static BOOL vcm_loopShouldFreeze(double elapsed) {
     return NO;
 }
 
-// （kSuppressWriting 写文件位已废弃并移除：录制全程保持真实，不再切换替换）
-
-// 拍照/录像判别说明：不依赖任何相机内部控件或类名，仅看 AVCaptureSession 是否挂静态图像输出。
-// 微信相机 session 含 AVCaptureStillImageOutput → 真实（拍照/录像预览与成片均为真实）；
-// 视频通话 session 仅 AVCaptureVideoDataOutput → 素材替换。详见 vcm_sessionHasStillOutput()。
-
 static void vcm_saveSettings(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d setBool:g_isReplace   forKey:@"vcam_replace"];
@@ -243,7 +220,6 @@ static void vcm_loadSettings(void) {
     if (savedVideo.length > 0) g_videoPath = [savedVideo copy];
     NSString *savedAudio = [d stringForKey:@"vcam_audio_path"];
     if (savedAudio.length > 0) g_tempAudioPath = [savedAudio copy];
-    // 拍照模式判别已改为事件驱动，不再从 vcam_photo_mode 恢复
 }
 
 #pragma mark - 停止 reader 与重置
@@ -307,9 +283,6 @@ static UIViewController *vcm_topViewController(void) {
     }
     return vc;
 }
-
-// 拍照/录像：相机 session 含静态图像输出 → 全程真实（预览、长按过程、成片都是真实摄像头画面），不做素材替换。
-// 该判定在采集回调与预览层同步时通过 vcm_sessionHasStillOutput() 实时取 session 完成，与 App 无关。
 
 #pragma mark - 像素缓冲池（替代每帧 CVPixelBufferCreate）
 // 像素缓冲池构建：按宽高/格式创建 CVPixelBufferPool，尺寸或格式变化时重建。
@@ -901,8 +874,6 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
         @autoreleasepool {
             CIImage *img = [self composedImageForTarget:target atTime:elapsed];
             if (!img) {
-                static BOOL sBlack = NO;
-                if (!sBlack) { sBlack = YES; vcm_dbg(@"getVideoFrame BLACK fallback (source nil)"); }
                 img = [self blackImageForTarget:target];
             }
             out = [self makeSampleFromImage:img
@@ -1053,11 +1024,6 @@ static AVCaptureSession *vcm_getOutputSession(AVCaptureOutput *output) {
     // 成片是否替换取决于这一步：素材帧必须交给原始 delegate 才会被写进文件
     BOOL hasOrig = (_originalDelegate &&
                     [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]);
-    if (g_dbgFirstFrame) {
-        g_dbgFirstFrame = NO;
-        vcm_dbg(@"proxy firstFrame isReplace=%d hasStill=%d replacing=%d origDelegate=%d",
-                g_isReplace, hasStill, (newSample != NULL), (hasOrig ? 1 : 0));
-    }
 
     if (hasOrig) {
         [_originalDelegate captureOutput:output
@@ -1084,10 +1050,6 @@ static char kVCamVideoProxyKey;   // 关联对象 key：每个 AVCaptureVideoDat
         objc_setAssociatedObject(self, &kVCamVideoProxyKey, p, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     [p setOriginalDelegate:delegate queue:queue];
-    // 底层判别：真实/素材由采集回调时取 session 的静态输出决定，这里不再按类名估场景
-    NSString *cls = NSStringFromClass([delegate class]);
-    vcm_dbg(@"setSampleBufferDelegate delegate=%@ hasStill=%d",
-            cls, vcm_hasStillForSession(vcm_getOutputSession(self)));
     %orig(p, queue);
 }
 %end
@@ -1175,19 +1137,10 @@ static BOOL vcm_hasStillForSession(AVCaptureSession *session) {
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
     %orig;
-    g_sessionRunning = YES;
     if (g_displayLink) g_displayLink.paused = NO;
-    g_dbgFirstFrame = YES;
-    NSMutableString *outs = [NSMutableString string];
-    for (AVCaptureOutput *o in self.outputs) [outs appendFormat:@"%@ ", NSStringFromClass([o class])];
-    BOOL hasStill = vcm_sessionHasStillOutput(self);
-    vcm_dbg(@"startRunning isReplace=%d hasStill=%d replacing=%d file=%d reader=%@ outputs=[%@]",
-            g_isReplace, hasStill, (g_isReplace && !hasStill),
-            [g_fileManager fileExistsAtPath:vcm_videoPath()], g_videoReader, outs);
 }
 - (void)stopRunning {
     %orig;
-    g_sessionRunning = NO;
     if (g_displayLink) g_displayLink.paused = YES;
     vcm_invalidatePCM();
     vcm_resetClock();
@@ -1408,9 +1361,6 @@ static VCamLinkProxy *g_linkProxy = nil;
                    x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleReplace)];
     y += btnH + gap;
 
-    [self addGridButton:@"导出诊断" x:0 y:y w:btnW h:btnH action:@selector(actionExportDiag)];
-    y += btnH + gap;
-
     [_panelView.heightAnchor constraintEqualToConstant:y + 56 + 16].active = YES;
 }
 
@@ -1435,16 +1385,6 @@ static VCamLinkProxy *g_linkProxy = nil;
 }
 - (void)toggleReplace { g_isReplace  = !g_isReplace;  vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
-- (void)actionExportDiag {
-    NSString *log = g_diagLog ? [g_diagLog componentsJoinedByString:@"\n"] : @"";
-    if (!log.length) log = @"(暂无诊断日志，请先复现问题)";
-    NSString *path = [vcm_documentPath() stringByAppendingPathComponent:@"VCAM_diag.txt"];
-    [log writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    UIActivityViewController *avc = [[UIActivityViewController alloc]
-        initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
-    if (avc.popoverPresentationController) avc.popoverPresentationController.sourceView = self.view;
-    [self presentViewController:avc animated:YES completion:nil];
-}
 
 #pragma mark - 面板刷新
 // 面板刷新：根据当前运行状态刷新按钮标题与高亮样式。
@@ -1621,8 +1561,6 @@ static void vcm_installTapGesture(UIWindow *win) {
         (void **)&g_origAudioUnitRender,
     };
     rebind_symbols(&reb, 1);
-
-    // 旧式快门 API 钩子已移除：拍照/录像判别改为进相机真实 + 录制切换替换的事件驱动。
 }
 
 %dtor {
