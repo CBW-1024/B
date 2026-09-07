@@ -52,6 +52,9 @@
 static BOOL g_isReplace  = NO;      // 默认关：无素材时透传真实摄像头/麦克风；导入素材后自动开启
 static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
 static BOOL g_isSound    = YES;     // 是否替换麦克风采集
+// 拍照 / 拍摄（录制）期间临时置位：此时视频透传真实摄像头画面（拍出来才是真实场景），
+// 拍完 / 录完清位恢复替换。仅作用于视频，声音不受此标志影响。
+static BOOL g_videoSuppress = NO;
 static int  g_rotation   = 90;      // 0 / 90 / 180 / 270（点击旋转按钮循环取值）
 
 #pragma mark - reader 重建标记
@@ -863,11 +866,22 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 // 或回调里 CI 渲染耗时触发丢帧时，素材消费速度就永久落后于真实时间 → 画面慢放并持续漂移。
 // 现在：want = floor(elapsed * 素材fps)，一次补齐落后的帧；落后太多时直接跳位置而不是狂解码。
 + (CVPixelBufferRef)nextSourcePixelAt:(CFTimeInterval)elapsed {
-    if (g_videoReload) [self setupVideoReaderIfNeeded];
-
     double fps = (g_srcFps > 1.0) ? g_srcFps : 30.0;
     double t   = elapsed;
     if (g_isLoop && g_srcDuration > 0.1) t = fmod(t, g_srcDuration);
+
+    // loop 关：素材播完即冻结在末帧，不再重建回卷（与音频静音对齐）。
+    // 否则 want 单调增长到超过素材长度后，reader 末尾 pullVideoFrame 返回 NULL 会置 g_videoReload，
+    // 触发下次重建从头读 → 视频反复从头播放（用户反馈「循环关了视频还在继续播」）。
+    if (!g_isLoop && g_srcDuration > 0.1 && elapsed >= g_srcDuration) {
+        [g_mediaLock lock];
+        CVPixelBufferRef f = g_lastVideoPixel ? CVPixelBufferRetain(g_lastVideoPixel) : NULL;
+        [g_mediaLock unlock];
+        if (f) return f;                 // 已出过图 → 冻结末帧
+        // 尚未锚定（极少见）：降级到下面正常取一帧
+    }
+
+    if (g_videoReload) [self setupVideoReaderIfNeeded];
 
     long long want = (long long)floor(t * fps);
     long long need;
@@ -1201,7 +1215,7 @@ static OSStatus hooked_AudioUnitRender(
      fromConnection:(AVCaptureConnection *)connection {
     g_videoOrientation = connection.videoOrientation;
     CMSampleBufferRef newSample = NULL;
-    if (g_isReplace) {
+    if (g_isReplace && !g_videoSuppress) {   // 拍照/拍摄期间 g_videoSuppress 置位 → 视频透传真实画面
         @try {
             newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
             if (newSample && g_displayLayer) {
@@ -1321,10 +1335,72 @@ static VCamAudioProxy *g_audioProxy = nil;
     // 后台解码线程仍在跑 → 访问已释放资源闪退。统一：停心跳 + 停解码线程 + 清 PCM + 时钟作废。
     // 状态机简化：stop 即清理、start 即重建，去掉「留 PCM 等下次 start」的微妙特例。
     g_sessionRunning = NO;
+    g_videoSuppress = NO;   // 保险：若拍照/录制 proxy 未回调恢复，下次会话不会卡在透传真实画面
     if (g_displayLink) g_displayLink.paused = YES;
     vcm_invalidatePCM();          // 含停解码线程 + 代次失效，关相机后不再有后台解码
     vcm_resetClock();             // 会话结束 → 时钟作废，下次 startRunning 重新锚定
     vcm_log(@"[session] stopRunning（相机已停，显示层心跳与解码线程已暂停）");
+}
+%end
+
+#pragma mark - 拍照 / 拍摄期间暂停视频替换
+// 拍照片 / 录视频时微信从当前 session 取帧，若继续替换会拍出素材而非真实场景。
+// 故在拍照 / 录制入口置 g_videoSuppress=YES，使视频 captureOutput 透传真实画面；
+// 拍完 / 录完由 proxy delegate / stopRecording 清位恢复（stopRunning 也有兜底清位）。
+// 仅作用于视频，声音替换不受影响——用户只要求「视频」真实。
+@interface VCamPhotoDelegateProxy : NSObject <AVCapturePhotoCaptureDelegate>
+- (instancetype)initWithOriginal:(id<AVCapturePhotoCaptureDelegate>)orig;
+@end
+@implementation VCamPhotoDelegateProxy {
+    __weak id<AVCapturePhotoCaptureDelegate> _orig;
+}
+- (instancetype)initWithOriginal:(id<AVCapturePhotoCaptureDelegate>)orig {
+    if (self = [super init]) _orig = orig;
+    return self;
+}
+- (void)capturePhoto:(AVCapturePhoto *)photo
+    didFinishProcessingPhoto:(AVCapturePhoto *)processedPhoto
+                       error:(NSError *)error {
+    g_videoSuppress = NO;   // 拍完：恢复视频替换
+    vcm_log(@"[capture] 拍照完成：视频替换恢复");
+    if ([_orig respondsToSelector:_cmd]) [_orig capturePhoto:photo didFinishProcessingPhoto:processedPhoto error:error];
+}
+- (void)capturePhoto:(AVCapturePhoto *)photo
+    didFinishCaptureForResolvedSettings:(AVCaptureResolvedSettings *)resolvedSettings
+                                   error:(NSError *)error {
+    g_videoSuppress = NO;   // 兜底：以 capture 完成为准恢复
+    vcm_log(@"[capture] 拍照完成(capture)：视频替换恢复");
+    if ([_orig respondsToSelector:_cmd]) [_orig capturePhoto:photo didFinishCaptureForResolvedSettings:resolvedSettings error:error];
+}
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    if (aSelector == @selector(capturePhoto:didFinishProcessingPhoto:error:) ||
+        aSelector == @selector(capturePhoto:didFinishCaptureForResolvedSettings:error:)) return YES;
+    return [_orig respondsToSelector:aSelector];
+}
+- (id)forwardingTargetForSelector:(SEL)aSelector { return _orig; }
+@end
+
+%hook AVCapturePhotoOutput
+- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings
+                        delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
+    g_videoSuppress = YES;   // 拍照期间：视频透传真实画面
+    vcm_log(@"[capture] 拍照开始：视频替换暂停（拍真实画面）");
+    VCamPhotoDelegateProxy *p = [[VCamPhotoDelegateProxy alloc] initWithOriginal:delegate];
+    %orig(settings, p);
+}
+%end
+
+%hook AVCaptureMovieFileOutput
+- (void)startRecordingToOutputFileURL:(NSURL *)url
+                     recordingDelegate:(id<AVCaptureFileOutputRecordingDelegate>)delegate {
+    g_videoSuppress = YES;   // 录制期间：视频透传真实画面
+    vcm_log(@"[capture] 开始录制：视频替换暂停");
+    %orig(url, delegate);
+}
+- (void)stopRecording {
+    %orig;
+    g_videoSuppress = NO;   // 录完：恢复视频替换
+    vcm_log(@"[capture] 结束录制：视频替换恢复");
 }
 %end
 
