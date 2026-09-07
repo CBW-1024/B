@@ -1348,36 +1348,35 @@ static VCamAudioProxy *g_audioProxy = nil;
 // 故在拍照 / 录制入口置 g_videoSuppress=YES，使视频 captureOutput 透传真实画面；
 // 拍完 / 录完由 proxy delegate / stopRecording 清位恢复（stopRunning 也有兜底清位）。
 // 仅作用于视频，声音替换不受影响——用户只要求「视频」真实。
-@interface VCamPhotoDelegateProxy : NSObject <AVCapturePhotoCaptureDelegate>
-- (instancetype)initWithOriginal:(id<AVCapturePhotoCaptureDelegate>)orig;
+@interface VCamPhotoDelegateProxy : NSObject
+- (instancetype)initWithOriginal:(id)orig;
 @end
 @implementation VCamPhotoDelegateProxy {
-    __weak id<AVCapturePhotoCaptureDelegate> _orig;
+    __weak id _orig;
 }
-- (instancetype)initWithOriginal:(id<AVCapturePhotoCaptureDelegate>)orig {
+- (instancetype)initWithOriginal:(id)orig {
     if (self = [super init]) _orig = orig;
     return self;
 }
-- (void)capturePhoto:(AVCapturePhoto *)photo
-    didFinishProcessingPhoto:(AVCapturePhoto *)processedPhoto
-                       error:(NSError *)error {
-    g_videoSuppress = NO;   // 拍完：恢复视频替换
-    vcm_log(@"[capture] 拍照完成：视频替换恢复");
-    if ([_orig respondsToSelector:_cmd]) [_orig capturePhoto:photo didFinishProcessingPhoto:processedPhoto error:error];
-}
-- (void)capturePhoto:(AVCapturePhoto *)photo
-    didFinishCaptureForResolvedSettings:(AVCaptureResolvedSettings *)resolvedSettings
-                                   error:(NSError *)error {
-    g_videoSuppress = NO;   // 兜底：以 capture 完成为准恢复
-    vcm_log(@"[capture] 拍照完成(capture)：视频替换恢复");
-    if ([_orig respondsToSelector:_cmd]) [_orig capturePhoto:photo didFinishCaptureForResolvedSettings:resolvedSettings error:error];
-}
+// 不实现任何具体 delegate 方法：所有回调原样转发给微信原 delegate，仅对「拍照完成」两个 selector 插桩恢复视频替换。
+// 原因：AVCapturePhotoCaptureDelegate 是 informal protocol（方法声明在 NSObject category 而非正式协议），
+// 具体实现会导致编译器报 expected a type（AVCaptureResolvedSettings 未声明）/ no known instance method。
+// 故改用消息转发，方法体里不出现任何具体 delegate 类型名。
 - (BOOL)respondsToSelector:(SEL)aSelector {
-    if (aSelector == @selector(capturePhoto:didFinishProcessingPhoto:error:) ||
-        aSelector == @selector(capturePhoto:didFinishCaptureForResolvedSettings:error:)) return YES;
     return [_orig respondsToSelector:aSelector];
 }
-- (id)forwardingTargetForSelector:(SEL)aSelector { return _orig; }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
+    return [_orig methodSignatureForSelector:aSelector];
+}
+- (void)forwardInvocation:(NSInvocation *)invocation {
+    SEL sel = invocation.selector;
+    if (sel == @selector(capturePhoto:didFinishProcessingPhoto:error:) ||
+        sel == @selector(capturePhoto:didFinishCaptureForResolvedSettings:error:)) {
+        g_videoSuppress = NO;   // 拍完：恢复视频替换
+        vcm_log(@"[capture] 拍照完成：视频替换恢复");
+    }
+    [invocation invokeWithTarget:_orig];
+}
 @end
 
 %hook AVCapturePhotoOutput
