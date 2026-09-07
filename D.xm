@@ -51,7 +51,7 @@
 #pragma mark - 配置开关
 static BOOL g_isReplace  = NO;      // 默认关：无素材时透传真实摄像头/麦克风；导入素材后自动开启
 static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
-static double g_loopEndAt = -1;     // 循环关闭时的终止时刻（elapsed 绝对值）；-1 = 未设置/循环开启
+static long long g_loopStopRound = -1;  // 关闭循环时记录的「当前轮次」；-1 = 未记录/循环开启
 static BOOL g_isSound    = YES;     // 是否替换麦克风采集
 // 拍照 / 拍摄（录制）期间临时置位：此时视频透传真实摄像头画面（拍出来才是真实场景），
 // 拍完 / 录完清位恢复替换。仅作用于视频，声音不受此标志影响。
@@ -132,7 +132,7 @@ static void vcm_resetClock(void) {
     g_clockReady         = NO;   // 下一帧重新锚定
     g_srcFrameIdx        = -1;   // 强迫画面从素材头重新锚定
     g_audioConsumedBytes = 0.0;
-    g_loopEndAt          = -1;   // 新会话：重新按「当前轮播完」计算循环终止时刻
+    g_loopStopRound      = -1;   // 新会话：重新按「当前轮播完」记录循环轮次
 }
 // 清掉素材目录下某个前缀的所有残留文件（扩展名随导入文件变化，不能只删固定的那一个）。
 static void vcm_clearMaterialFiles(NSString *prefix) {
@@ -310,22 +310,44 @@ static void vcm_log(NSString *fmt, ...) {
 
 #pragma mark - 配置存取
 
-// 循环关闭时的终止时刻。不能直接拿 elapsed >= duration 判断——elapsed 是会话累计时长，
-// 循环播过几轮后它早已远超素材时长，那样一点「关」就会立刻冻结（用户反馈的现象）。
-// 正确语义是「当前这一轮播完再停」：首次检测到关闭时，把终止时刻定在当前轮结束边界，
-// 即 elapsed + (duration - 轮内进度) = (k+1) * duration。音视频共用，保证同时停止。
-static double vcm_loopEndAt(double elapsed) {
-    if (g_isLoop) { g_loopEndAt = -1; return -1; }   // 循环重新开启 → 清除
-    if (g_loopEndAt < 0) {
-        if (g_srcDuration > 0.1) {
-            double prog = fmod(elapsed, g_srcDuration);
-            g_loopEndAt = elapsed + (g_srcDuration - prog);
-            vcm_log(@"[loop] 循环已关：当前这一轮播完后冻结（还需 %.2fs）", g_srcDuration - prog);
-        } else {
-            g_loopEndAt = elapsed;   // 时长未知 → 只能立即冻结
-        }
+// 循环关闭后是否该冻结（画面停末帧 + 声音静音）。音视频共用，保证同时停止。
+// 不能直接拿 elapsed >= duration 判断——elapsed 是会话累计时长，循环播过几轮后它早已远超
+// 素材时长，那样一点「关」就会立刻冻结（用户反馈的现象）。正确语义是「当前这一轮播完再停」。
+// 用整数轮次而非浮点时刻比较：round = floor(elapsed / duration)，关闭时记下当前 round，
+// 一旦进入下一轮（round 变大）就冻结。整数比较没有浮点边界误差，比绝对时刻更稳。
+static BOOL vcm_loopShouldFreeze(double elapsed) {
+    static BOOL s_frozenLogged = NO;
+    if (g_isLoop) { g_loopStopRound = -1; s_frozenLogged = NO; return NO; }   // 重新开启 → 清除
+    if (g_srcDuration <= 0.1) return YES;   // 时长未知 → 只能立即冻结
+    long long round = (long long)floor(elapsed / g_srcDuration);
+    if (g_loopStopRound < 0) {
+        g_loopStopRound = round;             // 记下关闭时的轮次：这一轮播完才停
+        vcm_log(@"[loop] 循环已关：当前这一轮播完后冻结（还需 %.2fs）",
+                g_srcDuration - fmod(elapsed, g_srcDuration));
+        return NO;
     }
-    return g_loopEndAt;
+    if (round > g_loopStopRound) {
+        if (!s_frozenLogged) {
+            s_frozenLogged = YES;
+            vcm_log(@"[loop] 当前轮已播完 → 冻结末帧 + 静音");
+        }
+        return YES;
+    }
+    return NO;
+}
+
+// 拍照/录制的 writer 生命周期可能极短：日志实测出现过 startWriting 后 9ms 就 cancelWriting，
+// 若收到结束信号就立刻恢复替换，快门那一帧仍会取到素材画面。
+// 故统一延迟恢复，并带 token 防止「结束→又立刻开始」时的竞态误恢复。
+static int  s_unsuppressToken = 0;
+static void vcm_scheduleUnsuppress(void) {
+    int my = ++s_unsuppressToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (my != s_unsuppressToken) return;   // 期间又有新的拍照/录制 → 放弃本次恢复
+        g_videoSuppress = NO;
+        vcm_log(@"[capture] 延迟恢复：视频替换已恢复");
+    });
 }
 
 static void vcm_saveSettings(void) {
@@ -746,12 +768,12 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
     if (g_pcmBytesPerSec > 0 && len > 0) {
         double want = elapsed * g_pcmBytesPerSec;
         // 无论循环开关都取模：关闭循环时也要把「当前这一轮」播完，不能一点「关」就立刻没声音。
-        // 停止由 endAt（当前轮结束边界）决定，与视频冻结同一时刻，保证音画同时停。
-        double endAt = vcm_loopEndAt(elapsed);
+        // 停止由 vcm_loopShouldFreeze 决定，与视频冻结同一判定，保证音画同时停。
+        BOOL freeze = vcm_loopShouldFreeze(elapsed);
         want = fmod(want, (double)len);
         // 当前轮已播完：保持静音即可，不要再校正——
         // 否则会把游标反复拉回 0 造成「重播 + 每帧刷日志」的怪音/卡顿（关闭循环时声音异常的根因）。
-        if (endAt >= 0 && elapsed >= endAt) {
+        if (freeze) {
             os_unfair_lock_unlock(&g_audioPCMLock);
             memset(outData, 0, length);
             return;
@@ -823,11 +845,10 @@ static void vcm_probeCaptureAudioFormat(CMSampleBufferRef s) {
     // 时钟追平：本次回调应把素材消费到 elapsed * 采集字节率 的位置。
     // 采集端来一次回调就取一帧的旧写法，在丢帧/重建时会掉队且永不补齐 → 音频落后于画面。
     double t = elapsed;
-    // 无论循环开关都取模：关闭循环时也要把「当前这一轮」播完，停止统一由 endAt 决定（与视频同一时刻）。
+    // 无论循环开关都取模：关闭循环时也要把「当前这一轮」播完，停止统一由 vcm_loopShouldFreeze 决定（与视频同一判定）。
     if (g_audioSrcDuration > 0.1) t = fmod(t, g_audioSrcDuration);
     double wantBytes = (g_audioCaptureBytesPerSec > 0) ? (t * g_audioCaptureBytesPerSec) : -1.0;
-    double endAt = vcm_loopEndAt(elapsed);
-    if (endAt >= 0 && elapsed >= endAt) wantBytes = -1.0;
+    if (vcm_loopShouldFreeze(elapsed)) wantBytes = -1.0;
 
     // 循环回卷：已投递满一整段就重建 reader 回到素材头，与画面侧 fmod 回卷对齐。
     // 不重建的话 reader 会继续顺序播到尾才回卷，音频比画面晚整整一个素材长度。
@@ -922,15 +943,14 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 // 现在：want = floor(elapsed * 素材fps)，一次补齐落后的帧；落后太多时直接跳位置而不是狂解码。
 + (CVPixelBufferRef)nextSourcePixelAt:(CFTimeInterval)elapsed {
     double fps = (g_srcFps > 1.0) ? g_srcFps : 30.0;
-    double endAt = vcm_loopEndAt(elapsed);   // 循环关闭时的终止时刻；循环开启返回 -1
+    BOOL freeze = vcm_loopShouldFreeze(elapsed);   // 循环关闭且当前轮已播完
     double t   = elapsed;
-    // 循环开关与否都取模定位（轮内位置）。关闭时靠 endAt 冻结，而不是靠 t 越界——
+    // 循环开关与否都取模定位（轮内位置）。关闭时靠 freeze 冻结，而不是靠 t 越界——
     // elapsed 是会话累计时长，循环播过几轮后它早已远超 duration，若直接比较会一点「关」就立刻冻住。
     if (g_srcDuration > 0.1) t = fmod(t, g_srcDuration);
 
-    // 循环关闭且「当前这一轮」播完 → 冻结在末帧（与音频静音对齐）。
-    // 终止时刻定在当前轮结束边界，所以是播完才停。
-    if (endAt >= 0 && elapsed >= endAt) {
+    // 循环关闭且「当前这一轮」播完 → 冻结在末帧（与音频静音对齐，两者共用同一判定）。
+    if (freeze) {
         [g_mediaLock lock];
         CVPixelBufferRef f = g_lastVideoPixel ? CVPixelBufferRetain(g_lastVideoPixel) : NULL;
         [g_mediaLock unlock];
@@ -1436,10 +1456,29 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 - (void)stopRecording {
     %orig;
-    g_videoSuppress = NO;   // 录完：恢复视频替换
-    vcm_log(@"[capture] 结束录制：视频替换恢复");
+    vcm_scheduleUnsuppress();   // 录完：延迟恢复视频替换
+    vcm_log(@"[capture] 结束录制：1.5s 后恢复替换");
 }
 %end
+
+// 拍照的「快门」信号，比 AVAssetWriter 更早：日志实证微信建了 AVCaptureStillImageOutput
+// （见 [session] addOutput: AVCaptureStillImageOutput）。AVAssetWriter 属于「写文件」阶段，晚于取帧；
+// 第一次拍照时 writer 可能只活 9ms（startWriting → 立刻 cancelWriting），那时才抑制已经来不及，
+// 拍到的仍是素材——这正是「第一次拍照被替换」的根因。必须抢在快门这一刻置位。
+// 该类 iOS 10 起 deprecated，但微信仍在用，用 pragma 屏蔽废弃告警。
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+%hook AVCaptureStillImageOutput
+- (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection
+                                    completionHandler:(void (^)(CMSampleBufferRef, NSError *))handler {
+    g_videoSuppress = YES;   // 快门瞬间：视频透传真实画面
+    vcm_log(@"[capture] 快门(StillImage)：视频替换暂停（拍真实画面）");
+    // block 不能直接写在 %orig(...) 里：Logos 预处理器解析嵌套大括号会失败，必须先赋给局部变量
+    void (^h)(CMSampleBufferRef, NSError *) = handler;
+    %orig(connection, h);
+}
+%end
+#pragma clang diagnostic pop
 
 // 微信拍摄实证走的是「AVCaptureVideoDataOutput 采集 + 自写文件」的自研管线，不是 AVCaptureMovieFileOutput
 // （日志里拍摄期间无 [capture] 条目可证）。帧仍从我们 hook 的采集回调出去，所以录制期间照样被替换。
@@ -1461,7 +1500,7 @@ static VCamAudioProxy *g_audioProxy = nil;
     // block 字面量不能直接写在 %orig(...) 里：Logos 预处理器解析嵌套大括号会失败，
     // 报 “missing closing parenthesis”。必须先赋给局部变量，再传标识符。
     void (^wrapped)(void) = ^{
-        g_videoSuppress = NO;   // 先清位再回调微信，保证微信收尾时链路已恢复
+        vcm_scheduleUnsuppress();   // 延迟恢复：writer 可能极短命，立刻恢复会让快门帧取到素材
         if (handler) handler();
     };
     %orig(wrapped);
@@ -1471,8 +1510,8 @@ static VCamAudioProxy *g_audioProxy = nil;
 // 万一都没走到，stopRunning 还有兜底清位，不会卡在透传。
 - (void)cancelWriting {
     %orig;
-    g_videoSuppress = NO;   // 取消录制也要恢复，否则会一直卡在透传真实画面
-    vcm_log(@"[capture] AVAssetWriter cancelWriting：视频替换恢复");
+    vcm_scheduleUnsuppress();   // 取消也要恢复（延迟），否则会一直卡在透传真实画面
+    vcm_log(@"[capture] AVAssetWriter cancelWriting：1.5s 后恢复替换");
 }
 %end
 
