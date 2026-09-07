@@ -22,25 +22,14 @@ static long long g_loopStopRound = -1;
 static BOOL g_frozen         = NO;   // 冻结锁存：当前轮播完后锁死，不因开关抖动漏冻
 static BOOL g_isSound        = YES;  // 是否替换麦克风采集
 
-// 抑制位（g_videoSuppress = (g_suppressMask != 0) 为真时 = 透传真实画面）：
-//   kSuppressPhotoMode = 1<<0 : 进相机期间全程真实（拍照/录像预览、长按过程、成片均为真实画面）
-typedef NS_ENUM(NSUInteger, VCamSuppressReason) {
-    kSuppressPhotoMode = 1 << 0,   // 进相机期间置位：预览与成片均透传真实相机
-};
-static NSUInteger g_suppressMask = 0;
-static BOOL g_videoSuppress = NO;  // 派生值：g_suppressMask != 0
-static BOOL g_scanActive    = NO;  // 扫码/识别场景（微信为 CameraScannerView）：画面必须真实，否则识别不了码
+// 画面替换判别（底层、与 App 无关）：
+// 不再依赖任何微信类名（MMSightCameraViewController / CameraScannerView）或事件置位，
+// 仅看当前 AVCaptureSession 是否挂“静态图像输出”：
+//   • 挂了静态输出（AVCaptureStillImageOutput / AVCapturePhotoOutput）→ 拍照 / 扫码场景，画面必须真实（含预览）
+//   • 只挂视频输出（AVCaptureVideoDataOutput）→ 视频通话场景，替换为素材
+// 该信号由 vcm_sessionHasStillOutput() 在采集回调与预览层同步时实时取 session 判定。
 
-// 拍照/录像判别不再依赖相机内部控件：当前微信版本下 SightShootingModeSwitchView 在你的相机入口不存在
-// （shootingModeSwitchView 恒为 nil，取不到 currentShootingMode），改为事件驱动——进相机即真实、
-// 开始录制时切换为素材替换（见下方 MMSightCameraViewController / AVAssetWriter 钩子）。
 
-static void vcm_suppressSet(VCamSuppressReason mask, BOOL on) {
-    NSUInteger old = g_suppressMask;
-    if (on) g_suppressMask |=  mask;
-    else    g_suppressMask &= ~mask;
-    if (old != g_suppressMask) g_videoSuppress = (g_suppressMask != 0);
-}
 
 static int g_rotation = 0;  // 0/90/180/270，额外旋转微调（方向对齐会自动补 90°）
 
@@ -217,11 +206,11 @@ static BOOL vcm_loopShouldFreeze(double elapsed) {
     return NO;
 }
 
-// （原写文件位 kSuppressWriting 已废弃：录制不再切换替换，其清理逻辑一并移除）
+// （kSuppressWriting 写文件位已废弃并移除：录制全程保持真实，不再切换替换）
 
-// 拍照/录像判别说明：不再依赖 MMSightCameraViewController.cameraMode（实测恒为 6，非判别信号），
-// 也不再依赖 SightShootingModeSwitchView（当前入口下 shootingModeSwitchView 恒为 nil）。
-// 改为：进相机即真实预览，开始录制切换为素材替换。
+// 拍照/录像判别说明：不依赖任何相机内部控件或类名，仅看 AVCaptureSession 是否挂静态图像输出。
+// 微信相机 session 含 AVCaptureStillImageOutput → 真实（拍照/录像预览与成片均为真实）；
+// 视频通话 session 仅 AVCaptureVideoDataOutput → 素材替换。详见 vcm_sessionHasStillOutput()。
 
 static void vcm_saveSettings(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -316,9 +305,8 @@ static UIViewController *vcm_topViewController(void) {
     return vc;
 }
 
-// 拍照/录像：进相机期间视频全程真实（预览、长按过程、成片都是真实摄像头画面），不再做素材替换。
-// 不再依赖 SightShootingModeSwitchView.currentShootingMode（该控件在当前入口不存在，实测恒为 nil）。
-// 置位逻辑见下方 MMSightCameraViewController.viewWillAppear 与 AVAssetWriter 钩子。
+// 拍照/录像：相机 session 含静态图像输出 → 全程真实（预览、长按过程、成片都是真实摄像头画面），不做素材替换。
+// 该判定在采集回调与预览层同步时通过 vcm_sessionHasStillOutput() 实时取 session 完成，与 App 无关。
 
 #pragma mark - 像素缓冲池（替代每帧 CVPixelBufferCreate）
 // 像素缓冲池构建：按宽高/格式创建 CVPixelBufferPool，尺寸或格式变化时重建。
@@ -1012,6 +1000,8 @@ static OSStatus hooked_AudioUnitRender(
 
 #pragma mark - VCamVideoProxy（相机采集替换）
 // VCamVideoProxy：接管 AVCaptureVideoDataOutput 的采样回调代理，把真实画面换成素材视频帧。
+// 前置声明：vcm_sessionHasStillOutput 定义于下方 AVCaptureSession 段落，此处 proxy 需要先引用。
+static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session);
 @interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
@@ -1024,8 +1014,11 @@ static OSStatus hooked_AudioUnitRender(
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      fromConnection:(AVCaptureConnection *)connection {
     g_videoOrientation = connection.videoOrientation;
+    // 底层判别：session 含静态图像输出 = 拍照/扫码 → 真实；只有视频输出 = 视频通话 → 素材
+    BOOL hasStill   = vcm_sessionHasStillOutput([output session]);
+    BOOL replacing  = (g_isReplace && !hasStill);
     CMSampleBufferRef newSample = NULL;
-    if (g_isReplace && !g_videoSuppress && !g_scanActive) {   // 替换开启、未被抑制、且非扫码场景
+    if (replacing) {   // 替换开启且非拍照/扫码场景
         @try {
             newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
             if (newSample && g_displayLayer) {
@@ -1037,13 +1030,13 @@ static OSStatus hooked_AudioUnitRender(
         }
     }
 
-    // 成片是否替换取决于这一步：素材帧必须交给微信原始 delegate 才会被写进文件
+    // 成片是否替换取决于这一步：素材帧必须交给原始 delegate 才会被写进文件
     BOOL hasOrig = (_originalDelegate &&
                     [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]);
     if (g_dbgFirstFrame) {
         g_dbgFirstFrame = NO;
-        vcm_dbg(@"proxy firstFrame isReplace=%d suppress=%d replacing=%d origDelegate=%d",
-                g_isReplace, g_videoSuppress, (newSample != NULL), (hasOrig ? 1 : 0));
+        vcm_dbg(@"proxy firstFrame isReplace=%d hasStill=%d replacing=%d origDelegate=%d",
+                g_isReplace, hasStill, (newSample != NULL), (hasOrig ? 1 : 0));
     }
 
     if (hasOrig) {
@@ -1064,7 +1057,6 @@ static char kVCamVideoProxyKey;   // 关联对象 key：每个 AVCaptureVideoDat
     if (delegate == nil) {
         %orig(nil, nil);  // detach 时原样透传，避免在已停 session 上塞入 proxy 导致闪退
         [p setOriginalDelegate:nil queue:nil];
-        g_scanActive = NO;
         return;
     }
     if (!p) {
@@ -1072,11 +1064,10 @@ static char kVCamVideoProxyKey;   // 关联对象 key：每个 AVCaptureVideoDat
         objc_setAssociatedObject(self, &kVCamVideoProxyKey, p, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     [p setOriginalDelegate:delegate queue:queue];
-    // 扫码/识别类场景必须透传真实画面：被替换成素材就识别不了码
+    // 底层判别：真实/素材由采集回调时取 session 的静态输出决定，这里不再按类名估场景
     NSString *cls = NSStringFromClass([delegate class]);
-    g_scanActive = ([cls rangeOfString:@"Scan" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                    [cls rangeOfString:@"QR"   options:NSCaseInsensitiveSearch].location != NSNotFound);
-    vcm_dbg(@"setSampleBufferDelegate delegate=%@ scan=%d", cls, g_scanActive);
+    vcm_dbg(@"setSampleBufferDelegate delegate=%@ hasStill=%d",
+            cls, vcm_sessionHasStillOutput([self session]));
     %orig(p, queue);
 }
 %end
@@ -1128,17 +1119,18 @@ static VCamAudioProxy *g_audioProxy = nil;
 
 #pragma mark - AVCaptureSession（会话起停）
 // AVCaptureSession 钩子：监听会话起停。
-// 注：原先用 session 是否挂 AVCaptureStillImageOutput 判断拍照模式、并据此抑制视频替换，
-// 但实测微信所有相机 session 都挂该 output，信号恒真，反而把替换永久关死并导致黑屏，故已弃用该判定。
-// AVCaptureStillImageOutput 自 iOS 10 deprecated，-Werror 下只能以字符串取类。
+// 画面判别核心：session 是否挂“静态图像输出”。AVCaptureStillImageOutput 自 iOS 10 deprecated，
+// -Werror 下只能以字符串取类；同时兼容新 API 的 AVCapturePhotoOutput。
 static Class vcm_stillImageClass(void) { return NSClassFromString(@"AVCaptureStillImageOutput"); }
+static Class vcm_photoOutputClass(void) { return NSClassFromString(@"AVCapturePhotoOutput"); }
 
-// 按 session 实际 outputs 判定是否拍照模式（比事件可靠，微信常 stop 后复用 session 不 removeOutput）
+// 按 session 实际 outputs 判定是否拍照/扫码场景：挂了静态输出 → 真实（含预览），否则 → 替换（视频通话）
 static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     if (!session) return NO;
-    Class c = vcm_stillImageClass();
+    Class c1 = vcm_stillImageClass();
+    Class c2 = vcm_photoOutputClass();
     for (AVCaptureOutput *o in session.outputs)
-        if (c && [o isKindOfClass:c]) return YES;
+        if ((c1 && [o isKindOfClass:c1]) || (c2 && [o isKindOfClass:c2])) return YES;
     return NO;
 }
 %hook AVCaptureSession
@@ -1154,8 +1146,9 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     g_dbgFirstFrame = YES;
     NSMutableString *outs = [NSMutableString string];
     for (AVCaptureOutput *o in self.outputs) [outs appendFormat:@"%@ ", NSStringFromClass([o class])];
-    vcm_dbg(@"startRunning isReplace=%d hasStill=%d suppress=%d file=%d reader=%@ outputs=[%@]",
-            g_isReplace, vcm_sessionHasStillOutput(self), g_videoSuppress,
+    BOOL hasStill = vcm_sessionHasStillOutput(self);
+    vcm_dbg(@"startRunning isReplace=%d hasStill=%d replacing=%d file=%d reader=%@ outputs=[%@]",
+            g_isReplace, hasStill, (g_isReplace && !hasStill),
             [g_fileManager fileExistsAtPath:vcm_videoPath()], g_videoReader, outs);
 }
 - (void)stopRunning {
@@ -1167,48 +1160,12 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 }
 %end
 
-#pragma mark - 微信相机控制器：进相机即真实预览
-// 微信所有相机（聊天/朋友/朋友圈）统一走 MMSightCameraViewController。拍照/录像不再靠内部控件判别：
-// 进相机默认真实预览，开始录制时由 AVAssetWriter.startWriting 切换为素材替换。
-%hook MMSightCameraViewController
-- (void)viewWillAppear:(_Bool)arg1 {
-    %orig;
-    // 进相机即全程真实：不再依赖 shotMode 切换控件（当前入口下不存在），录制期间也不切换
-    vcm_suppressSet(kSuppressPhotoMode, YES);
-    vcm_dbg(@"MMSightCamera viewWillAppear[b20260908c] suppressing=%d", g_videoSuppress);
-}
-- (void)viewWillDisappear:(_Bool)arg1 {
-    %orig;
-    vcm_suppressSet(kSuppressPhotoMode, NO);  // 离开相机复位，避免影响下次会话
-}
-%end
-
-#pragma mark - 录制期间：视频保持真实（不替换）
-// 需求：拍照与录像的预览、长按过程、成片均保持真实摄像头画面，故录制时不切换到素材替换。
-// 如需恢复“录制时替换成素材”，把下面 startWriting 里的 YES 改回 NO 即可。
-%hook AVAssetWriter
-- (BOOL)startWriting {
-    BOOL ok = %orig;
-    vcm_suppressSet(kSuppressPhotoMode, YES);  // 录制期间同样保持真实
-    return ok;
-}
-- (void)finishWritingWithCompletionHandler:(void (^)(void))handler {
-    // block 先赋局部变量再传 %orig，避免 Logos 解析嵌套大括号报 “missing closing parenthesis”
-    void (^wrapped)(void) = ^{
-        vcm_suppressSet(kSuppressPhotoMode, YES);  // 录完回到真实预览
-        if (handler) handler();
-    };
-    %orig(wrapped);
-}
-- (void)cancelWriting {
-    %orig;
-    vcm_suppressSet(kSuppressPhotoMode, YES);
-}
-%end
-
-// 拍照/录像切换与快门确认曾依赖 SightShootingModeSwitchView / 快门 API 反推模式，
-// 但在当前微信版本下该切换控件为 nil、无法可靠判模式，已改为“进相机真实 + 录制切换替换”的事件驱动，
-// 故相关钩子（ShortVideoToolbar.onShootingModeChanged、AVCapturePhotoOutput、AVCaptureStillImageOutput）已移除。
+#pragma mark - 画面判别（底层，与 App 无关）
+// 拍照/扫码与视频通话的区分完全由 AVCaptureSession 的 outputs 决定（vcm_sessionHasStillOutput），
+// 不依赖任何 App 类名或生命周期钩子。因此无需 hook 微信相机 VC 或 AVAssetWriter：
+//   • session 挂静态图像输出（拍照/扫码）→ 采集与预览均真实
+//   • session 仅视频输出（视频通话）→ 采集替换为素材、预览层显示素材
+// 对应逻辑分别在 VCamVideoProxy.captureOutput: 与 AVCaptureVideoPreviewLayer.vcm_syncDisplayLayer 中。
 
 #pragma mark - AVCaptureVideoPreviewLayer（叠加预览显示层）
 // AVCaptureVideoPreviewLayer 钩子：在相机预览层上叠加我们的显示层，并把素材方向对齐到预览方向。
@@ -1246,10 +1203,9 @@ static VCamLinkProxy *g_linkProxy = nil;
 - (void)vcm_syncDisplayLayer {
     if (!g_displayLayer) return;
 
-    // 拍照/录像由进相机与录制事件驱动，无需逐帧轮询模式，故此处不再调用模式判定
-
-    // 拍照/拍摄模式（g_videoSuppress）下代理不再往 g_displayLayer 塞帧，必须隐藏上层露出真实相机，否则空层盖成黑屏
-    BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()] && !g_videoSuppress && !g_scanActive;
+    // 拍照/扫码（session 含静态输出）时采集回调不塞素材帧，必须隐藏上层露出真实相机，否则空层盖成黑屏
+    BOOL hasStill = vcm_sessionHasStillOutput([self session]);
+    BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()] && !hasStill;
     [g_displayLayer setOpacity:(show ? 1.0f : 0.0f)];
     if (!show) return;
 
