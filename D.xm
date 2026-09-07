@@ -1307,6 +1307,10 @@ static VCamLinkProxy *g_linkProxy = nil;
     [navBar addSubview:reset];
     [reset.leadingAnchor constraintEqualToAnchor:navBar.leadingAnchor constant:16].active = YES;
     [reset.centerYAnchor  constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
+    // 长按重置按钮 1 秒 = 静默清空自定义声音文件（点按仍走完整重置 actionReset）
+    UILongPressGestureRecognizer *lpReset = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleResetLongPress:)];
+    lpReset.minimumPressDuration = 1.0;
+    [reset addGestureRecognizer:lpReset];
 }
 
 - (void)setupContent {
@@ -1376,6 +1380,20 @@ static VCamLinkProxy *g_linkProxy = nil;
 - (void)toggleRotate  { g_rotation   = (g_rotation + 90) % 360; vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleLoop    { g_isLoop = !g_isLoop; vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleSound   { g_isSound    = !g_isSound;    vcm_saveSettings(); [self refreshGridButtons]; }
+// 长按重置按钮：静默清空自定义声音文件（无弹窗），恢复为视频自带声音（若素材含音轨）；不影响视频素材与开关
+- (void)handleResetLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateBegan) [self clearCustomSoundNow];
+}
+- (void)clearCustomSoundNow {
+    if (![g_fileManager fileExistsAtPath:g_tempAudioPath]) return;  // 无自定义声音，静默无操作
+    vcm_stopReaders();
+    vcm_reloadReaders();
+    vcm_clearMaterialFiles(@"bear_vcam_audio.");
+    g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
+    vcm_saveSettings();
+    [VCamMediaManager setupAudioReaderIfNeeded];
+    [self refreshGridButtons];
+}
 - (void)toggleReplace { g_isReplace  = !g_isReplace;  vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
 - (void)actionExportDiag {
