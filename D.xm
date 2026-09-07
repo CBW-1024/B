@@ -24,23 +24,25 @@ static BOOL g_isSound        = YES;  // 是否替换麦克风采集
 
 // 抑制（拍照/写文件期间透传真实画面）用位掩码区分两个独立原因，清除时只动自己那一位
 typedef NS_ENUM(NSUInteger, VCamSuppressReason) {
-    kSuppressPhotoMode = 1 << 0,   // 拍照模式位（微信相机 cameraMode 命中拍照取值时置位，预览透传真实相机）
+    kSuppressPhotoMode = 1 << 0,   // 拍照模式位（微信相机处于拍照模式时置位，预览透传真实相机）
     kSuppressWriting   = 1 << 1,   // 正在写文件（AVAssetWriter 活动中）
 };
 static NSUInteger g_suppressMask = 0;
 static BOOL g_videoSuppress = NO;  // 派生值：g_suppressMask != 0
-static unsigned long long g_wechatCameraMode = 0;  // 微信相机当前模式（setCameraMode:/initWithCameraMode: 读取）
-static unsigned long long g_photoCameraMode  = 0;  // 自学习得到的“拍照模式”取值（首张照片反推，默认 0）
+
+// 拍照/录像判别：微信所有相机 session 都挂 AVCaptureStillImageOutput，无法据此区分，
+// 真正判别在 SightShootingModeSwitchView.currentShootingMode（取值随微信版本变，不硬编码）。
+// “拍照取值”由按下快门那一刻反推（captureStillImage/capturePhoto 仅拍照触发），并持久化。
+static unsigned long long g_photoCameraMode  = 0;   // 已确认的“拍照模式”取值（拍照/录像判别基准）
+static int                g_photoModeLearned = 0;   // 0=未学 1=推测(默认进入模式) 2=快门确认(权威)
+static __weak id         g_shootSwitchView  = nil;  // 缓存切换控件，避免每帧遍历视图树
+static CFTimeInterval    s_lastModePoll     = 0;    // 拍摄模式轮询节流时间戳
 
 static void vcm_suppressSet(VCamSuppressReason mask, BOOL on) {
     NSUInteger old = g_suppressMask;
     if (on) g_suppressMask |=  mask;
     else    g_suppressMask &= ~mask;
     if (old != g_suppressMask) g_videoSuppress = (g_suppressMask != 0);
-}
-// 微信相机处于拍照模式时透传真实画面（预览显示真实相机）。拍照取值由首张照片反推，避免硬编码枚举。
-static void vcm_updatePhotoSuppress(void) {
-    vcm_suppressSet(kSuppressPhotoMode, g_wechatCameraMode == g_photoCameraMode);
 }
 
 static int g_rotation = 0;  // 0/90/180/270，额外旋转微调（方向对齐会自动补 90°）
@@ -266,6 +268,10 @@ static void vcm_loadSettings(void) {
     if (savedVideo.length > 0) g_videoPath = [savedVideo copy];
     NSString *savedAudio = [d stringForKey:@"vcam_audio_path"];
     if (savedAudio.length > 0) g_tempAudioPath = [savedAudio copy];
+    if ([d objectForKey:@"vcam_photo_mode"]) {
+        g_photoCameraMode  = (unsigned long long)[d integerForKey:@"vcam_photo_mode"];
+        g_photoModeLearned = 1;  // 上次的推测/确认，本次快门会再确认
+    }
 }
 
 #pragma mark - 停止 reader 与重置
@@ -320,8 +326,53 @@ static UIViewController *vcm_topViewController(void) {
     }
     if (!key) return nil;
     UIViewController *vc = key.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
+    while (vc) {
+        if (vc.presentedViewController) { vc = vc.presentedViewController; continue; }
+        if ([vc isKindOfClass:[UINavigationController class]]) { vc = [(UINavigationController *)vc topViewController]; continue; }
+        if ([vc isKindOfClass:[UITabBarController class]])     { vc = [(UITabBarController *)vc selectedViewController]; continue; }
+        break;
+    }
     return vc;
+}
+
+// 读取当前拍摄模式（拍照/录像取值）。优先用缓存的切换控件，找不到再向上遍历视图树定位一次
+static unsigned long long vcm_currentShootMode(void) {
+    id sw = g_shootSwitchView;
+    if (!sw) {
+        UIViewController *top = vcm_topViewController();
+        if (!top) return ULLONG_MAX;
+        id toolbar = [top valueForKey:@"shortVideoToolbar"];
+        sw = [toolbar valueForKey:@"shootingModeSwitchView"];
+        if (sw) g_shootSwitchView = sw;
+    }
+    if (!sw) return ULLONG_MAX;
+    return (unsigned long long)[[sw valueForKey:@"currentShootingMode"] unsignedLongLongValue];
+}
+
+// 推测拍照取值：打开相机时按默认进入模式猜测（Sight 相机默认进入拍照），可被快门确认覆盖
+static void vcm_guessPhotoMode(unsigned long long m) {
+    if (g_photoModeLearned >= 2) return;
+    g_photoCameraMode  = m;
+    g_photoModeLearned = 1;
+    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)m forKey:@"vcam_photo_mode"];
+}
+
+// 快门确认拍照取值：captureStillImage/capturePhoto 仅在拍照时触发，此刻 currentShootingMode 必为拍照值
+static void vcm_confirmPhotoMode(void) {
+    unsigned long long m = vcm_currentShootMode();
+    if (m == ULLONG_MAX) return;
+    g_photoCameraMode  = m;
+    g_photoModeLearned = 2;
+    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)m forKey:@"vcam_photo_mode"];
+}
+
+// 依据当前拍摄模式更新拍照抑制位：拍照模式→透传真实相机；录像模式→仍显示素材
+static void vcm_applyShootSuppress(void) {
+    if (g_photoModeLearned == 0) { vcm_suppressSet(kSuppressPhotoMode, NO); return; }
+    unsigned long long cur = vcm_currentShootMode();
+    if (cur == ULLONG_MAX) return;
+    vcm_suppressSet(kSuppressPhotoMode, cur == g_photoCameraMode);
+    vcm_dbg(@"shootMode cur=%llu photo=%llu suppressing=%d", cur, g_photoCameraMode, g_videoSuppress);
 }
 
 #pragma mark - 像素缓冲池（替代每帧 CVPixelBufferCreate）
@@ -1158,28 +1209,20 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 %end
 
 #pragma mark - 微信相机控制器：拍照模式透传真实画面
-// 微信所有相机（聊天/朋友/朋友圈）统一走 MMSightCameraViewController，cameraMode 区分拍照/录像。
-// 拍照模式 → 预览透传真实相机（与成片一致）；录像模式 → 仍显示替换素材。
-// cameraMode 取值枚举不在头文件里，故用“首张照片”的 onSightPictureTaken: 反推真实拍照取值，零硬编码。
+// 微信所有相机（聊天/朋友/朋友圈）统一走 MMSightCameraViewController。拍照/录像判别由
+// SightShootingModeSwitchView.currentShootingMode 驱动（见下方的轮询 + onShootingModeChanged）。
+// 此处只在进出相机时做一次性学习/清零，避免依赖单一回调。
 %hook MMSightCameraViewController
-- (void)setCameraMode:(unsigned long long)mode {
+- (void)viewWillAppear:(_Bool)arg1 {
     %orig;
-    g_wechatCameraMode = mode;
-    vcm_updatePhotoSuppress();
-    vcm_dbg(@"MMSightCamera setCameraMode=%llu photoValue=%llu suppressing=%d", mode, g_photoCameraMode, (g_wechatCameraMode == g_photoCameraMode));
+    unsigned long long m = vcm_currentShootMode();
+    if (m != ULLONG_MAX && g_photoModeLearned < 2) vcm_guessPhotoMode(m);  // 默认进入模式多为拍照，先猜
+    vcm_applyShootSuppress();
+    vcm_dbg(@"MMSightCamera viewWillAppear mode=%llu photo=%llu suppressing=%d", m, g_photoCameraMode, g_videoSuppress);
 }
-- (id)initWithCameraMode:(unsigned long long)mode scene:(int)scene {
-    id r = %orig;
-    g_wechatCameraMode = mode;
-    vcm_updatePhotoSuppress();
-    vcm_dbg(@"MMSightCamera initWithCameraMode=%llu scene=%d", mode, scene);
-    return r;
-}
-- (void)onSightPictureTaken:(id)arg1 imageData:(id)arg2 withFrontCamera:(_Bool)arg3 editImageAttr:(id)arg4 {
+- (void)viewWillDisappear:(_Bool)arg1 {
     %orig;
-    g_photoCameraMode = g_wechatCameraMode;  // 反推：此刻处于拍照模式，记下其取值
-    vcm_updatePhotoSuppress();
-    vcm_dbg(@"MMSightCamera photoTaken, learned photoValue=%llu", g_photoCameraMode);
+    vcm_suppressSet(kSuppressPhotoMode, NO);  // 离开相机复位，避免影响下次会话
 }
 %end
 
@@ -1205,6 +1248,32 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     vcm_scheduleUnsuppressWriting();
 }
 %end
+
+#pragma mark - 拍摄模式切换 + 快门确认（驱动拍照抑制）
+// 拍照/录像切换的权威事件：用户拨动分段控件时 onShootingModeChanged: 立即更新抑制（比 0.5s 轮询更跟手）
+%hook ShortVideoToolbar
+- (void)onShootingModeChanged:(unsigned long long)arg1 {
+    %orig;
+    vcm_applyShootSuppress();
+    vcm_dbg(@"onShootingModeChanged=%llu photo=%llu suppressing=%d", arg1, g_photoCameraMode, g_videoSuppress);
+}
+%end
+
+// 快门确认拍照取值：capturePhotoWithDelegate: 仅在拍照时触发，此刻 currentShootingMode 必为拍照值
+%hook AVCapturePhotoOutput
+- (void)capturePhotoWithDelegate:(id)delegate {
+    vcm_confirmPhotoMode();
+    %orig;
+}
+%end
+
+// 旧式快门 API（微信实际仍用 AVCaptureStillImageOutput，见 session outputs 日志）：
+// 以字符串取类 + 运行时 MSHookMessageEx 钩住，避免直接引用 deprecated 类型触发 -Werror
+static void (*g_origCaptureStill)(id, SEL, id, id) = NULL;
+static void vcm_hookCaptureStill(id self, SEL _cmd, id connection, id handler) {
+    vcm_confirmPhotoMode();
+    if (g_origCaptureStill) g_origCaptureStill(self, _cmd, connection, handler);
+}
 
 #pragma mark - AVCaptureVideoPreviewLayer（叠加预览显示层）
 // AVCaptureVideoPreviewLayer 钩子：在相机预览层上叠加我们的显示层，并把素材方向对齐到预览方向。
@@ -1241,6 +1310,10 @@ static VCamLinkProxy *g_linkProxy = nil;
 %new
 - (void)vcm_syncDisplayLayer {
     if (!g_displayLayer) return;
+
+    // 每 0.5s 轮询一次拍摄模式，确保拍照/录像切换时及时透传真实相机（与 onShootingModeChanged 双保险）
+    CFTimeInterval s_now = CACurrentMediaTime();
+    if (s_now - s_lastModePoll > 0.5) { s_lastModePoll = s_now; vcm_applyShootSuppress(); }
 
     // 拍照/拍摄模式（g_videoSuppress）下代理不再往 g_displayLayer 塞帧，必须隐藏上层露出真实相机，否则空层盖成黑屏
     BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()] && !g_videoSuppress;
@@ -1602,6 +1675,13 @@ static void vcm_installTapGesture(UIWindow *win) {
         (void **)&g_origAudioUnitRender,
     };
     rebind_symbols(&reb, 1);
+
+    // 旧式快门 API（微信仍用 AVCaptureStillImageOutput）：运行时钩住，按下快门即确认拍照取值
+    Class stillCls = NSClassFromString(@"AVCaptureStillImageOutput");
+    if (stillCls) {
+        SEL stillSel = @selector(captureStillImageAsynchronouslyFromConnection:completionHandler:);
+        MSHookMessageEx(stillCls, stillSel, (IMP)vcm_hookCaptureStill, (IMP *)&g_origCaptureStill);
+    }
 }
 
 %dtor {
