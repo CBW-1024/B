@@ -5,12 +5,10 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreImage/CoreImage.h>
 #import <QuartzCore/QuartzCore.h>
-#import <ImageIO/ImageIO.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #include <dlfcn.h>
-#include "fishhook.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <os/lock.h>
 
@@ -1491,14 +1489,12 @@ static void vcm_installTapGesture(UIWindow *win) {
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
 
-    // fishhook 重定向 AudioUnitRender：通过 dyld 改写间接符号指针，不依赖构造时取址
+    // substrate 内联钩子 AudioUnitRender：先确保 AudioToolbox 已加载并取址，再改写函数入口，原始实现回存 g_origAudioUnitRender
     dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_NOW);
-    struct rebinding reb = {
-        "AudioUnitRender",
-        (void *)hooked_AudioUnitRender,
-        (void **)&g_origAudioUnitRender,
-    };
-    rebind_symbols(&reb, 1);
+    void *audioUnitRender = dlsym(RTLD_DEFAULT, "AudioUnitRender");
+    if (audioUnitRender) {
+        MSHookFunction(audioUnitRender, (void *)hooked_AudioUnitRender, (void **)&g_origAudioUnitRender);
+    }
 }
 
 %dtor {
