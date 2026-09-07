@@ -102,6 +102,21 @@ static CGSize  g_srcSize     = {0,0}; // 素材原生分辨率（track.naturalSi
 // 清晰度相关（见 composedImageForTarget / getVideoFrame）
 static const CGFloat kVCamMinShortSide = 320.0;  // 输出短边下限，低于此编码器可能拒帧
 
+// 诊断日志：观测微信实际请求的帧尺寸 / 格式，以及我们最终输出的画布尺寸。
+// 仅当「尺寸或格式变化」时才追加，且为内存环形缓冲，不每帧写盘，避免拖慢采集回调。
+// 设置面板「日志:导出」一键通过系统分享面板导出（存文件 / AirDrop）。
+static NSMutableArray<NSString *> *g_diagLog     = nil;
+static NSLock        *g_diagLock   = nil;
+static const NSUInteger kVCamDiagMaxLines = 600;   // 环形上限，超出丢弃最旧
+static CGSize  g_diagLastReqSize = {0,0};  // 上次记录的微信请求帧尺寸（去重用）
+static OSType  g_diagLastReqFmt  = 0;     // 上次记录的微信请求像素格式
+static CGSize  g_diagLastOutSize = {0,0}; // 上次记录的输出画布尺寸
+static BOOL    g_diagFirstFrame  = YES;    // 首帧必定记一条完整诊断
+
+// 前向声明：日志函数定义在文件后方，供前面的时钟 / 同步逻辑调用。
+static void vcm_log(NSString *fmt, ...);
+static NSString *vcm_pixFmtName(OSType t);
+
 // 掉帧追赶上限：一次回调最多补这么多帧。超过说明卡顿严重，直接跳位置而不是疯狂解码，
 // 否则回调耗时进一步变长 → 更容易丢帧 → 正反馈卡死。
 static const long long kVCamMaxCatchUp = 4;
@@ -131,7 +146,11 @@ static void vcm_clearMaterialFiles(NSString *prefix) {
 }
 static CFTimeInterval vcm_elapsed(void) {
     CFTimeInterval now = CACurrentMediaTime();
-    if (!g_clockReady) { g_clockAnchor = now; g_clockReady = YES; }
+    if (!g_clockReady) {
+        g_clockAnchor = now; g_clockReady = YES;
+        // 时钟锚定：音画同步的地基。每次新会话首帧在此对齐，避免一上来跳到素材中段。
+        vcm_log(@"[clock] 会话时钟锚定 t=%.3f", now);
+    }
     return now - g_clockAnchor;
 }
 
@@ -139,6 +158,9 @@ static CFTimeInterval vcm_elapsed(void) {
 static AVSampleBufferDisplayLayer *g_displayLayer     = nil;
 static CADisplayLink              *g_displayLink      = nil;
 static AVCaptureVideoOrientation   g_videoOrientation = AVCaptureVideoOrientationPortrait;
+// 会话是否处于 running：stopRunning（如拍照关相机）后置 NO，作为采集回调 / 显示层心跳的硬护栏，
+// 杜绝在已停 session 上操作显示层或后台解码线程继续跑 → 访问已释放资源闪退。
+static BOOL                        g_sessionRunning    = NO;
 
 #pragma mark - 像素缓冲池
 // 旧实现每帧 CVPixelBufferCreate：分配 + IOSurface 建/拆把采集回调拖长，
@@ -212,6 +234,46 @@ static NSString *vcm_videoPath(void) {
     return g_videoPath;
 }
 
+#pragma mark - 诊断日志
+// 像素格式可读名（四字符码 → 简称），仅用于日志展示。
+static NSString *vcm_pixFmtName(OSType t) {
+    switch (t) {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return @"420v";
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:   return @"420f";
+        case kCVPixelFormatType_422YpCbCr8:                    return @"422";
+        case kCVPixelFormatType_32BGRA:                        return @"BGRA";
+        case kCVPixelFormatType_32ARGB:                        return @"ARGB";
+        case kCVPixelFormatType_4444YpCbCrA8:                  return @"4444";
+        default: return [NSString stringWithFormat:@"0x%X", (unsigned)t];
+    }
+}
+// 追加一条带时间戳的诊断行（线程安全，环形截断）。
+static void vcm_log(NSString *fmt, ...) {
+    if (!fmt) return;
+    static NSMutableArray<NSString *> *s_log = nil;
+    static NSLock *s_lock = nil;
+    static NSDateFormatter *s_fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s_log = [NSMutableArray arrayWithCapacity:64];
+        s_lock = [[NSLock alloc] init];
+        s_fmt = [[NSDateFormatter alloc] init];
+        s_fmt.dateFormat = @"HH:mm:ss.SSS";
+        g_diagLog  = s_log;   // 暴露给导出读取
+        g_diagLock = s_lock;
+    });
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (!msg) return;
+    NSString *line = [NSString stringWithFormat:@"%@  %@",
+                      [s_fmt stringFromDate:[NSDate date]], msg];
+    [s_lock lock];
+    [s_log addObject:line];
+    if (s_log.count > kVCamDiagMaxLines) [s_log removeObjectAtIndex:0];
+    [s_lock unlock];
+}
+
 #pragma mark - 配置存取
 static void vcm_saveSettings(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -259,6 +321,9 @@ static void vcm_stopReaders(void) {
 // 换素材 / 会话重启时让两条链路从头来过。关键是清 g_hasProbedASBD：
 // 不清则麦克风链路认为格式已探测完，既不重新探测新会话 ASBD 也不重新解码，新素材音频进不了麦克风。
 static void vcm_reloadReaders(void) {
+    // 音视频共用同一个时钟：换素材 / 新会话必须重新锚定，否则 elapsed 带着旧会话的
+    // 时间继续推进 → 一上来就按「已播 N 秒」定位，画面与声音瞬间跳到素材中段。
+    vcm_log(@"[reload] 换素材/新会话：作废 PCM + 重置时钟 + 标记重建 reader");
     g_videoReload   = YES;
     g_audioReload   = YES;
     g_hasProbedASBD = NO;
@@ -288,6 +353,10 @@ static void vcm_resetSettings(void) {
     g_videoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
     // 必须在路径回退到默认值之后再存盘，否则存档里留的是刚被删掉的旧素材路径，重启即失效。
     vcm_saveSettings();
+
+    // 重置诊断去重状态：下次会话重新抓首帧完整诊断（尺寸可能不变但想看一遍）。
+    g_diagFirstFrame = YES;
+    g_diagLastReqSize = CGSizeZero; g_diagLastReqFmt = 0; g_diagLastOutSize = CGSizeZero;
 }
 
 #pragma mark - 视图控制器查找
@@ -404,6 +473,10 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
                 double dur = CMTimeGetSeconds(track.timeRange.duration);
                 g_srcDuration = (dur > 0.0 && isfinite(dur)) ? dur : 0.0;
 
+                // 诊断：素材信息变化即记一条（换素材 / reader 重建时触发），用于对照微信请求尺寸。
+                vcm_log(@"[src] 素材 naturalSize=%.0fx%.0f  fps=%.2f  duration=%.2fs",
+                        g_srcSize.width, g_srcSize.height, g_srcFps, g_srcDuration);
+
                 NSDictionary *settings = @{
                     (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
                 };
@@ -463,7 +536,11 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
             }
         }
         // ASBD 探明后 AudioUnit 链路才需要数据：触发整段预解码（幂等，已在跑或已就绪则忽略）。
-        if (g_hasProbedASBD) [self decodeAudioToMemory];
+        if (g_hasProbedASBD) {
+            vcm_log(@"[audio] ASBD 已探测 (rate=%.0f ch=%u)，触发整段预解码",
+                    g_targetASBD.mSampleRate, g_targetASBD.mChannelsPerFrame);
+            [self decodeAudioToMemory];
+        }
     } @catch (NSException *e) {
     } @finally {
         g_audioReload = NO;
@@ -617,8 +694,11 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
         if (g_isLoop) want = fmod(want, (double)len);
         if (fabs(want - (double)g_audioPCMRead) > g_pcmBytesPerSec * 0.5) {
             // 偏差过大才对齐一次，并对齐到帧边界，避免从半个采样点起播导致声道相位翻转
+            size_t oldRead = g_audioPCMRead;
             size_t aligned = (size_t)(want / (double)frameB) * frameB;
             g_audioPCMRead = (aligned < len) ? aligned : 0;
+            vcm_log(@"[audio] 时钟偏差 %.3fs，游标 %zu→%zu / %zu",
+                    (want - (double)oldRead) / g_pcmBytesPerSec, oldRead, g_audioPCMRead, len);
         }
     }
 
@@ -784,6 +864,7 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     long long need;
     if (g_srcFrameIdx < 0) {
         need = 1;                       // reader 刚重建：先取一帧把索引锚到 want
+        vcm_log(@"[video] reader 重建后首帧锚定 want=%lld (fps=%.2f)", want, fps);
     } else {
         need = want - g_srcFrameIdx;
         if (need < 0) {
@@ -792,6 +873,7 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
             [self setupVideoReaderIfNeeded];
             g_srcFrameIdx = -1;
             need = 1;
+            vcm_log(@"[video] 循环回卷：重建 reader 重新锚定");
         } else if (need == 0) {
             // 已追平：复用上一帧，不倒退
             [g_mediaLock lock];
@@ -800,6 +882,8 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
             [g_mediaLock unlock];
             return f;
         } else if (need > kVCamMaxCatchUp) {
+            vcm_log(@"[video] 落后 %lld 帧，跳帧到 %lld（防正反馈卡死）",
+                    need, (long long)kVCamMaxCatchUp);
             need = kVCamMaxCatchUp;  // 掉帧太多 → 跳帧，不一次性补完
         }
     }
@@ -946,6 +1030,20 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
                                (CGFloat)CVPixelBufferGetHeight(camPix));
     OSType pfmt = CVPixelBufferGetPixelFormatType(camPix);
 
+    // 诊断：微信实际请求的帧（来自虚拟设备的真实采集缓冲）。尺寸/格式变化或首帧才记，避免刷屏。
+    {
+        BOOL changed = (target.width  != g_diagLastReqSize.width)
+                    || (target.height != g_diagLastReqSize.height)
+                    || (pfmt           != g_diagLastReqFmt);
+        if (g_diagFirstFrame || changed) {
+            g_diagLastReqSize = target; g_diagLastReqFmt = pfmt;
+            vcm_log(@"[req] 微信请求帧 %dx%d  fmt=%@ (0x%X)%@",
+                    (int)target.width, (int)target.height,
+                    vcm_pixFmtName(pfmt), (unsigned)pfmt,
+                    g_diagFirstFrame ? @"  [首帧]" : @"");
+        }
+    }
+
     // 原生分辨率输出：始终按素材尺寸输出，不再放大到采集尺寸 → 对面最清晰。
     // 无条件生效（无开关、无退回采集尺寸的兜底）；素材比采集大时编码器会把同码率摊到更多像素，
     // 可能更糊/掉帧——这种情况只能换更小素材或改回采集尺寸逻辑，菜单不再提供开关。
@@ -960,6 +1058,22 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
         target = CGSizeMake(round(sw), round(sh));
     }
 
+    // 诊断：输出画布。原生覆盖生效时 target == 素材尺寸；否则退回微信请求尺寸。
+    {
+        BOOL changed = (target.width  != g_diagLastOutSize.width)
+                    || (target.height != g_diagLastOutSize.height);
+        if (g_diagFirstFrame || changed) {
+            g_diagLastOutSize = target;
+            BOOL native = (g_srcSize.width > 0 && g_srcSize.height > 0);
+            vcm_log(@"[out] 输出画布 %dx%d  原生覆盖=%@  srcSize=%.0fx%.0f  fill=%@ sharpen=%d%%",
+                    (int)target.width, (int)target.height,
+                    native ? @"YES" : @"NO",
+                    g_srcSize.width, g_srcSize.height,
+                    g_isFill ? @"铺满" : @"适应", (int)(g_sharpen * 100));
+        }
+        if (g_diagFirstFrame) g_diagFirstFrame = NO;   // 首帧诊断已发，后续仅记录变化
+    }
+
     // 画面位置由会话时钟决定，与音频共用同一个 elapsed
     CFTimeInterval elapsed = vcm_elapsed();
 
@@ -967,7 +1081,7 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     @try {
         @autoreleasepool {
             CIImage *img = [self composedImageForTarget:target atTime:elapsed];
-            if (!img) img = [self blackImageForTarget:target];
+            if (!img) { vcm_log(@"[warn] composedImageForTarget 返回 nil → 黑帧兜底"); img = [self blackImageForTarget:target]; }
             out = [self makeSampleFromImage:img
                                       width:(size_t)target.width
                                      height:(size_t)target.height
@@ -1092,7 +1206,11 @@ static OSStatus hooked_AudioUnitRender(
      fromConnection:(AVCaptureConnection *)connection {
     g_videoOrientation = connection.videoOrientation;
     CMSampleBufferRef newSample = NULL;
-    if (g_isReplace) {
+    // 会话未运行（关相机/拍照）时只透传真实摄像头，不碰 reader / 显示层，避免对已停 session 操作。
+    if (g_isReplace && !g_sessionRunning) {
+        static BOOL s_videoWarned = NO;
+        if (!s_videoWarned) { vcm_log(@"[skip] 视频采集回调到达但会话未运行，本帧透传真实摄像头"); s_videoWarned = YES; }
+    } else if (g_isReplace) {
         @try {
             newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
             if (newSample && g_displayLayer) {
@@ -1138,7 +1256,11 @@ static VCamVideoProxy *g_videoProxy = nil;
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      fromConnection:(AVCaptureConnection *)connection {
     CMSampleBufferRef outBuf = sampleBuffer;
-    if (g_isReplace && g_isSound) {
+    // 会话未运行（关相机/拍照）时只透传真实麦克风，不触发音频解码 / 定位读取。
+    if (g_isReplace && g_isSound && !g_sessionRunning) {
+        static BOOL s_audioWarned = NO;
+        if (!s_audioWarned) { vcm_log(@"[skip] 音频采集回调到达但会话未运行，本帧透传真实麦克风"); s_audioWarned = YES; }
+    } else if (g_isReplace && g_isSound) {
         @try {
             CMSampleBufferRef rep = [VCamMediaManager getAudioFrame:sampleBuffer atTime:vcm_elapsed()];
             if (rep) outBuf = rep;
@@ -1174,13 +1296,26 @@ static VCamAudioProxy *g_audioProxy = nil;
         [VCamMediaManager setupAudioReaderIfNeeded];
     }
     %orig;
+    // 会话真正启动后再标记 running 并恢复显示层心跳。stopRunning 时已暂停心跳 + 停解码线程，
+    // 这里统一恢复：避免关相机（拍照）后显示层仍被主线程每帧操作 → 闪退。
+    g_sessionRunning = YES;
+    if (g_displayLink) g_displayLink.paused = NO;
+    vcm_log(@"[session] startRunning  replace=%@  video=%@ audio=%@",
+            g_isReplace ? @"YES" : @"NO",
+            [g_fileManager fileExistsAtPath:vcm_videoPath()]  ? @"有" : @"无",
+            [g_fileManager fileExistsAtPath:g_tempAudioPath] ? @"有" : @"无");
 }
 - (void)stopRunning {
-    // 只清标志、不 reload。stopRunning 后链路可能还在收尾取帧，此时清 reader 会打断它；
-    // 内存 PCM 留着，等下次 startRunning 再清。
+    // 先让微信真正停掉相机（释放底层采集资源），再清我们这侧。
     %orig;
-    // 会话结束 → 时钟作废，下次 startRunning 重新锚定（不清的话新会话一上来就跳到素材中段）
-    vcm_resetClock();
+    // 关相机（拍照）时若不暂停显示层心跳、不停解码线程，主线程仍每帧操作已停 session 的层、
+    // 后台解码线程仍在跑 → 访问已释放资源闪退。统一：停心跳 + 停解码线程 + 清 PCM + 时钟作废。
+    // 状态机简化：stop 即清理、start 即重建，去掉「留 PCM 等下次 start」的微妙特例。
+    g_sessionRunning = NO;
+    if (g_displayLink) g_displayLink.paused = YES;
+    vcm_invalidatePCM();          // 含停解码线程 + 代次失效，关相机后不再有后台解码
+    vcm_resetClock();             // 会话结束 → 时钟作废，下次 startRunning 重新锚定
+    vcm_log(@"[session] stopRunning（相机已停，显示层心跳与解码线程已暂停）");
 }
 %end
 
@@ -1225,6 +1360,8 @@ static VCamLinkProxy *g_linkProxy = nil;
 %new
 - (void)vcm_syncDisplayLayer {
     if (!g_displayLayer) return;
+    // 会话未运行（关相机/拍照）时不操作显示层，避免对已停 session 的层做变换/透明度设置 → 闪退。
+    if (!g_sessionRunning) { [g_displayLayer setOpacity:0.0f]; return; }
 
     // 素材不存在或不替换时把显示层透明掉，露出真实摄像头
     BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()];
@@ -1264,6 +1401,8 @@ static VCamLinkProxy *g_linkProxy = nil;
     UIButton *_btnReplace;     // g_isReplace
     UIButton *_btnFill;        // g_isFill：填充(铺满裁切) / 适应(留黑边)
     UIButton *_btnSharpen;     // g_sharpen：锐化强度循环
+    UIButton *_btnLog;         // 诊断日志：导出（系统分享面板）
+    UIButton *_btnClear;       // 诊断日志：清空缓冲
 }
 
 #pragma mark - 生命周期
@@ -1390,6 +1529,10 @@ static VCamLinkProxy *g_linkProxy = nil;
                    x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleSharpen)];
     y += btnH + gap;
 
+    _btnLog = [self addGridButton:@"日志:导出" x:0 y:y w:btnW h:btnH action:@selector(actionExportLog)];
+    _btnClear = [self addGridButton:@"日志:清空" x:btnW + gap y:y w:btnW h:btnH action:@selector(actionClearLog)];
+    y += btnH + gap;
+
     [_panelView.heightAnchor constraintEqualToConstant:y + 56 + 16].active = YES;
 }
 
@@ -1408,6 +1551,36 @@ static VCamLinkProxy *g_linkProxy = nil;
     vcm_saveSettings(); [self refreshGridButtons];
 }
 - (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
+
+#pragma mark - 诊断日志导出 / 清空
+// 导出：环形缓冲拼成文本 → 落盘到临时目录 → 系统分享面板（存文件 / AirDrop / 转发）。
+// 用文件 URL 而非纯文本，分享面板能直接「存储到文件」拿到 .log。
+- (void)actionExportLog {
+    if (!g_diagLog)  g_diagLog  = [NSMutableArray array];
+    if (!g_diagLock) g_diagLock = [[NSLock alloc] init];
+    NSString *text;
+    [g_diagLock lock];
+    text = g_diagLog.count ? [g_diagLog componentsJoinedByString:@"\n"]
+                           : @"(暂无日志——进一次视频通话 / 视频号，产生帧请求后才有记录)";
+    [g_diagLock unlock];
+
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"VCAM_diag.log"];
+    [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSURL *url = [NSURL fileURLWithPath:path];
+
+    UIActivityViewController *avc =
+        [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    if ([avc respondsToSelector:@selector(popoverPresentationController)]) {
+        avc.popoverPresentationController.sourceView = _btnLog;
+        avc.popoverPresentationController.sourceRect = _btnLog.bounds;
+    }
+    [self presentViewController:avc animated:YES completion:nil];
+}
+- (void)actionClearLog {
+    [g_diagLock lock]; [g_diagLog removeAllObjects]; [g_diagLock unlock];
+    vcm_log(@"[sys] 日志已清空");
+    [self updateStatusUI];
+}
 
 #pragma mark - 面板刷新
 // UIButtonConfiguration 取出来是副本，改完必须整体赋值回写
