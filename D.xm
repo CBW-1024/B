@@ -24,17 +24,23 @@ static BOOL g_isSound        = YES;  // 是否替换麦克风采集
 
 // 抑制（拍照/写文件期间透传真实画面）用位掩码区分两个独立原因，清除时只动自己那一位
 typedef NS_ENUM(NSUInteger, VCamSuppressReason) {
-    kSuppressPhotoMode = 1 << 0,   // 拍照快门窗口位（按下快门到拍照结束的极短窗口内透传真实画面）
+    kSuppressPhotoMode = 1 << 0,   // 拍照模式位（微信相机 cameraMode 命中拍照取值时置位，预览透传真实相机）
     kSuppressWriting   = 1 << 1,   // 正在写文件（AVAssetWriter 活动中）
 };
 static NSUInteger g_suppressMask = 0;
 static BOOL g_videoSuppress = NO;  // 派生值：g_suppressMask != 0
+static unsigned long long g_wechatCameraMode = 0;  // 微信相机当前模式（setCameraMode:/initWithCameraMode: 读取）
+static unsigned long long g_photoCameraMode  = 0;  // 自学习得到的“拍照模式”取值（首张照片反推，默认 0）
 
 static void vcm_suppressSet(VCamSuppressReason mask, BOOL on) {
     NSUInteger old = g_suppressMask;
     if (on) g_suppressMask |=  mask;
     else    g_suppressMask &= ~mask;
     if (old != g_suppressMask) g_videoSuppress = (g_suppressMask != 0);
+}
+// 微信相机处于拍照模式时透传真实画面（预览显示真实相机）。拍照取值由首张照片反推，避免硬编码枚举。
+static void vcm_updatePhotoSuppress(void) {
+    vcm_suppressSet(kSuppressPhotoMode, g_wechatCameraMode == g_photoCameraMode);
 }
 
 static int g_rotation = 0;  // 0/90/180/270，额外旋转微调（方向对齐会自动补 90°）
@@ -229,18 +235,7 @@ static void vcm_finishWritingNow(void) {
     vcm_suppressSet(kSuppressWriting, NO);
 }
 
-// 拍照快门窗口：按下快门到拍照结束的极短窗口内透传真实画面，预览显示真实相机、与成片一致。
-// token 防竞态：连拍时上一次还没到期的清除会被新一次作废（但位已置上，无需重复清）。
-static int s_photoToken = 0;
-static void vcm_suppressPhotoBriefly(void) {
-    vcm_suppressSet(kSuppressPhotoMode, YES);
-    int my = ++s_photoToken;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (my != s_photoToken) return;
-        vcm_suppressSet(kSuppressPhotoMode, NO);
-    });
-}
+// （拍照模式抑制改由微信相机控制器 MMSightCameraViewController 的 cameraMode 驱动，见下方 %hook）
 
 static void vcm_saveSettings(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -1162,21 +1157,29 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 }
 %end
 
-#pragma mark - 拍照快门：透传真实画面
-// 拍照（快门）时让视频透传真实摄像头，预览显示真实相机、与成片一致。
-// 触发信号用快门调用本身，不依赖“是否挂 StillImageOutput”（该信号在微信恒真，已失效）。
-%hook AVCaptureStillImageOutput
-- (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection completionHandler:(void (^)(CMSampleBufferRef, NSError *)) {
-    vcm_suppressPhotoBriefly();
-    vcm_dbg(@"captureStillImage fired (old API)");
+#pragma mark - 微信相机控制器：拍照模式透传真实画面
+// 微信所有相机（聊天/朋友/朋友圈）统一走 MMSightCameraViewController，cameraMode 区分拍照/录像。
+// 拍照模式 → 预览透传真实相机（与成片一致）；录像模式 → 仍显示替换素材。
+// cameraMode 取值枚举不在头文件里，故用“首张照片”的 onSightPictureTaken: 反推真实拍照取值，零硬编码。
+%hook MMSightCameraViewController
+- (void)setCameraMode:(unsigned long long)mode {
     %orig;
+    g_wechatCameraMode = mode;
+    vcm_updatePhotoSuppress();
+    vcm_dbg(@"MMSightCamera setCameraMode=%llu photoValue=%llu suppressing=%d", mode, g_photoCameraMode, (g_wechatCameraMode == g_photoCameraMode));
 }
-%end
-%hook AVCapturePhotoOutput
-- (void)capturePhotoWithDelegate:(id)delegate {
-    vcm_suppressPhotoBriefly();
-    vcm_dbg(@"capturePhotoWithDelegate fired (new API)");
+- (id)initWithCameraMode:(unsigned long long)mode scene:(int)scene {
+    id r = %orig;
+    g_wechatCameraMode = mode;
+    vcm_updatePhotoSuppress();
+    vcm_dbg(@"MMSightCamera initWithCameraMode=%llu scene=%d", mode, scene);
+    return r;
+}
+- (void)onSightPictureTaken:(id)arg1 imageData:(id)arg2 withFrontCamera:(_Bool)arg3 editImageAttr:(id)arg4 {
     %orig;
+    g_photoCameraMode = g_wechatCameraMode;  // 反推：此刻处于拍照模式，记下其取值
+    vcm_updatePhotoSuppress();
+    vcm_dbg(@"MMSightCamera photoTaken, learned photoValue=%llu", g_photoCameraMode);
 }
 %end
 
