@@ -109,26 +109,6 @@ static void vcm_resetClock(void) {
     g_srcFrameIdx        = -1;   // 强迫画面从素材头重新锚定
     g_audioConsumedBytes = 0.0;
 }
-// 作废已解码 PCM：自增代次让在途解码结果失效、停掉解码线程、持锁释放缓冲区并复位长度。
-// 换素材 / ASBD 变更 / 析构三个场景语义完全一致，统一走这里。
-static void vcm_invalidatePCM(void) {
-    g_audioDecodeGen++;
-    g_audioFeederStop = YES;
-    os_unfair_lock_lock(&g_audioPCMLock);
-    if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
-    g_audioPCMLen   = 0;
-    g_audioPCMReady = NO;
-    os_unfair_lock_unlock(&g_audioPCMLock);
-}
-// 只比较影响字节布局的字段：采样率 / 声道数 / 位深 / float / non-interleaved。
-// PACKED、SIGNED 等不改变排布的位必须忽略，否则同一格式会被误判成变更 → 反复作废重解码。
-static BOOL vcm_asbdMatches(AudioStreamBasicDescription a, AudioStreamBasicDescription b) {
-    return a.mSampleRate       == b.mSampleRate
-        && a.mChannelsPerFrame == b.mChannelsPerFrame
-        && a.mBitsPerChannel   == b.mBitsPerChannel
-        && (((a.mFormatFlags ^ b.mFormatFlags)
-             & (kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved)) == 0);
-}
 // 清掉素材目录下某个前缀的所有残留文件（扩展名随导入文件变化，不能只删固定的那一个）。
 static void vcm_clearMaterialFiles(NSString *prefix) {
     for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
@@ -162,6 +142,7 @@ static OSType               g_poolFmt = 0;
 // 因解码在播放前完成、消费期间 PCM 不被任何写入覆盖，从架构上保证连续性，是清晰度的根本保证。
 static uint8_t       *g_audioPCM      = NULL;  // 整段预解码 PCM
 static size_t         g_audioPCMLen   = 0;     // PCM 总字节数
+static size_t         g_audioPCMRead  = 0;     // 读取游标（顺序推进，保证样本严格连续）
 static os_unfair_lock g_audioPCMLock  = OS_UNFAIR_LOCK_INIT;
 static BOOL           g_audioPCMReady = NO;    // 预解码完成才取数；未就绪则补零静音
 static AudioStreamBasicDescription g_audioPCMFormat = {0};  // 预解码所用 ASBD（变更即需重解码）
@@ -173,6 +154,29 @@ static BOOL           g_audioFeederStop    = NO;  // 通知预解码线程取消
 static int            g_decodeFailCount  = 0;
 static NSTimeInterval g_decodeNextRetry  = 0;
 static const size_t   kAudioPCMMaxBytes = 64u * 1024u * 1024u;  // 64MB 上限，防极端长素材 OOM
+
+// 作废已解码 PCM：自增代次让在途解码结果失效、停掉解码线程、持锁释放缓冲区并复位长度。
+// 换素材 / ASBD 变更 / 析构三个场景语义完全一致，统一走这里。
+// 必须定义在上面这批 PCM 变量之后，否则 C 语言「先声明后使用」报 undeclared identifier。
+static void vcm_invalidatePCM(void) {
+    g_audioDecodeGen++;
+    g_audioFeederStop = YES;
+    os_unfair_lock_lock(&g_audioPCMLock);
+    if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
+    g_audioPCMLen   = 0;
+    g_audioPCMRead  = 0;
+    g_audioPCMReady = NO;
+    os_unfair_lock_unlock(&g_audioPCMLock);
+}
+// 只比较影响字节布局的字段：采样率 / 声道数 / 位深 / float / non-interleaved。
+// PACKED、SIGNED 等不改变排布的位必须忽略，否则同一格式会被误判成变更 → 反复作废重解码。
+static BOOL vcm_asbdMatches(AudioStreamBasicDescription a, AudioStreamBasicDescription b) {
+    return a.mSampleRate       == b.mSampleRate
+        && a.mChannelsPerFrame == b.mChannelsPerFrame
+        && a.mBitsPerChannel   == b.mBitsPerChannel
+        && (((a.mFormatFlags ^ b.mFormatFlags)
+             & (kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved)) == 0);
+}
 
 #pragma mark - AudioUnit 采集状态
 static BOOL                        g_hasProbedASBD = NO;
@@ -545,6 +549,7 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
                 if (g_audioPCM) free(g_audioPCM);
                 g_audioPCM       = buf;
                 g_audioPCMLen    = total;
+                g_audioPCMRead   = 0;
                 g_audioPCMReady  = YES;
                 g_audioPCMFormat = t;
                 g_pcmBytesPerSec  = bytesPerSec;
@@ -564,9 +569,12 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
     });
 }
 
-// 消费者（实时安全）：按「会话已过秒数」换算字节偏移直接从预解码 PCM 取 length 字节。
-// 旧实现是顺序推进读游标 —— 音频本身没错，但它与画面不是同一个时间基准；
-// 现在音频也挂到会话时钟上，两边按同一个 elapsed 走，掉帧时各自独立定位，不会互相拉偏。
+// 消费者（实时安全）：从预解码 PCM 取 length 字节。
+// 以「读游标顺序推进」为主 —— 样本严格连续，接缝处不会出现跳读/重读导致的咔哒声。
+// 音频本来就由硬件时钟驱动（下游按 inNumberFrames 消费），本身不会像画面那样被压帧拖慢，
+// 所以不需要每帧按时钟重定位；每帧重定位反而会因为时钟抖动在接缝处跳掉或重复几个字节。
+// elapsed 只用于「大偏差校正」：偏差超过半秒才把游标拉回时钟位置，吸收长时间累计误差
+// （换素材、通话中切采样率、系统时钟跳变等）。
 // 本函数只读、不修改 PCM，且写入方就绪后不再写入 → 消费期间 PCM 恒定不变。
 + (void)pullAudioData:(uint8_t *)outData length:(NSUInteger)length atTime:(CFTimeInterval)elapsed {
     if (!outData || length == 0) return;
@@ -574,40 +582,38 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
     if (!g_audioPCMReady || !g_audioPCM || g_audioPCMLen == 0) { memset(outData, 0, length); return; }
 
     os_unfair_lock_lock(&g_audioPCMLock);
-    size_t   len       = g_audioPCMLen;
-    size_t   frameB    = (g_audioFrameBytes > 0) ? g_audioFrameBytes : 1;
-    size_t   start     = 0;
-    BOOL     exhausted = NO;
+    size_t len    = g_audioPCMLen;
+    size_t frameB = (g_audioFrameBytes > 0) ? g_audioFrameBytes : 1;
 
     if (g_pcmBytesPerSec > 0 && len > 0) {
-        double wantBytes = elapsed * g_pcmBytesPerSec;
-        if (!g_isLoop && wantBytes >= (double)len) {
-            // 不循环：整段播完后静音（与旧行为一致）
-            exhausted = YES;
-        } else {
-            double pos = fmod(wantBytes, (double)len);
-            if (pos < 0) pos = 0;
-            // 对齐到帧边界：避免从半个采样点开始导致每次读取相位跳变 → 爆音
-            start = ((size_t)pos / frameB) * frameB;
-            if (start > len) start = len;
+        double want = elapsed * g_pcmBytesPerSec;
+        if (g_isLoop) want = fmod(want, (double)len);
+        if (fabs(want - (double)g_audioPCMRead) > g_pcmBytesPerSec * 0.5) {
+            // 偏差过大才对齐一次，并对齐到帧边界，避免从半个采样点起播导致声道相位翻转
+            size_t aligned = (size_t)(want / (double)frameB) * frameB;
+            g_audioPCMRead = (aligned < len) ? aligned : 0;
         }
     }
-    if (exhausted) {
-        os_unfair_lock_unlock(&g_audioPCMLock);
-        memset(outData, 0, length);
-        return;
+
+    if (g_audioPCMRead >= len) {
+        if (g_isLoop) g_audioPCMRead = 0;                       // 回卷重播
+        else {                                                   // 一次性播放：播完静音
+            os_unfair_lock_unlock(&g_audioPCMLock);
+            memset(outData, 0, length);
+            return;
+        }
     }
 
     size_t written = 0;
     while (written < length) {
-        size_t avail = (len > start) ? (len - start) : 0;
-        if (avail == 0) {
-            if (g_isLoop) { start = 0; continue; }  // 回卷重播
-            break;  // 一次性播放：余下补零静音
+        if (g_audioPCMRead >= len) {
+            if (!g_isLoop) break;                                // 余下补零静音
+            g_audioPCMRead = 0;                                  // 回卷重播
         }
+        size_t avail = len - g_audioPCMRead;
         size_t n = (length - written < avail) ? (length - written) : avail;
-        memcpy(outData + written, g_audioPCM + start, n);
-        start += n;
+        memcpy(outData + written, g_audioPCM + g_audioPCMRead, n);
+        g_audioPCMRead += n;
         written += n;
     }
     os_unfair_lock_unlock(&g_audioPCMLock);
@@ -1107,14 +1113,16 @@ static VCamAudioProxy *g_audioProxy = nil;
 
 #pragma mark - AVCaptureVideoPreviewLayer（叠加预览显示层）
 // 预览叠加层用 AVSampleBufferDisplayLayer：帧由采集回调 enqueue，素材位置由会话时钟决定。
-@interface AVCaptureVideoPreviewLayer (VCamSync)
+// 用协议而不是 category 声明：category 声明而无 @implementation 会触发 -Wincomplete-implementation，
+// 这里的方法实际由 Logos 的 %new 注入，编译器看不见。
+@protocol VCamSync <NSObject>
 - (void)vcm_syncDisplayLayer;
 @end
 
 // CADisplayLink 强引用 target，直接拿 preview layer 当 target 会让它被 runloop 永久持有而泄漏。
 // 加一层弱引用代理转发：layer 释放后 proxy.target 自动置 nil，回调变成空转。
 @interface VCamLinkProxy : NSObject
-@property (nonatomic, weak) AVCaptureVideoPreviewLayer *layer;
+@property (nonatomic, weak) AVCaptureVideoPreviewLayer<VCamSync> *layer;
 @end
 @implementation VCamLinkProxy
 - (void)step:(CADisplayLink *)link { [self.layer vcm_syncDisplayLayer]; }
