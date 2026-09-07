@@ -1480,20 +1480,30 @@ static VCamAudioProxy *g_audioProxy = nil;
 // （见 [session] addOutput: AVCaptureStillImageOutput）。AVAssetWriter 属于「写文件」阶段，晚于取帧；
 // 第一次拍照时 writer 可能只活 9ms（startWriting → 立刻 cancelWriting），那时才抑制已经来不及，
 // 拍到的仍是素材——这正是「第一次拍照被替换」的根因。必须抢在快门这一刻置位。
-// 该类 iOS 10 起 deprecated，但微信仍在用，用 pragma 屏蔽废弃告警。
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-%hook AVCaptureStillImageOutput
-- (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection
-                                    completionHandler:(void (^)(CMSampleBufferRef, NSError *))handler {
+//
+// 这里不能用 %hook：该类 iOS 10 起 deprecated，即使加 #pragma ignored，Logos 展开后自动生成的
+// 代码（原 IMP 函数指针声明等）里仍会出现类名类型，pragma 作用域覆盖不到，在 -Werror 下照样报错
+// （CI 实测 D.xm:1365: 'AVCaptureStillImageOutput' is deprecated）。
+// 故改用运行时动态 hook：源码里只出现字符串形式的类名，不产生任何废弃告警；
+// 附带好处是类不存在时自动跳过，不会像 %hook 那样对缺失类做无谓绑定。
+static void (*vcm_orig_shutter)(id, SEL, AVCaptureConnection *, void (^)(CMSampleBufferRef, NSError *));
+static void vcm_shutter(id self, SEL _cmd, AVCaptureConnection *connection,
+                        void (^handler)(CMSampleBufferRef, NSError *)) {
     g_videoSuppress = YES;   // 快门瞬间：视频透传真实画面
     vcm_log(@"[capture] 快门(StillImage)：视频替换暂停（拍真实画面）");
-    // block 不能直接写在 %orig(...) 里：Logos 预处理器解析嵌套大括号会失败，必须先赋给局部变量
-    void (^h)(CMSampleBufferRef, NSError *) = handler;
-    %orig(connection, h);
+    if (vcm_orig_shutter) vcm_orig_shutter(self, _cmd, connection, handler);
+    else if (handler) handler(NULL, nil);   // 取原实现失败时兜底回调，避免微信永远等不到快门结果
 }
-%end
-#pragma clang diagnostic pop
+// 在 %ctor 里按字符串取类挂载，避免编译期出现类名类型
+static void vcm_installShutterHook(void) {
+    Class cls = NSClassFromString(@"AVCaptureStillImageOutput");
+    if (!cls) { vcm_log(@"[init] 未找到 AVCaptureStillImageOutput，跳过快门 hook"); return; }
+    MSHookMessageEx(cls,
+                    @selector(captureStillImageAsynchronouslyFromConnection:completionHandler:),
+                    (IMP)&vcm_shutter,
+                    (IMP *)&vcm_orig_shutter);
+    vcm_log(@"[init] 已挂载快门 hook（AVCaptureStillImageOutput）orig=%d", vcm_orig_shutter != NULL);
+}
 
 // 微信拍摄实证走的是「AVCaptureVideoDataOutput 采集 + 自写文件」的自研管线，不是 AVCaptureMovieFileOutput
 // （日志里拍摄期间无 [capture] 条目可证）。帧仍从我们 hook 的采集回调出去，所以录制期间照样被替换。
@@ -1982,6 +1992,9 @@ static void vcm_installTapGesture(UIWindow *win) {
         (void **)&g_origAudioUnitRender,
     };
     rebind_symbols(&reb, 1);
+
+    // 快门 hook 走运行时挂载（非 %hook），必须在 g_diagFilePath 之后调用，保证日志已可用
+    vcm_installShutterHook();
 }
 
 %dtor {
