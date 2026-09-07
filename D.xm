@@ -365,6 +365,10 @@ static void vcm_scheduleUnsuppress(void) {
     });
 }
 
+// 作废尚未触发的延迟恢复：退出拍照模式时用，防止 pending 定时器在用户已再次进入拍照后
+// 把刚置上的抑制清掉（token 自增即让旧的那次恢复自行放弃）。
+static void vcm_cancelUnsuppress(void) { s_unsuppressToken++; }
+
 static void vcm_saveSettings(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d setBool:g_isReplace   forKey:@"vcam_replace"];
@@ -1441,13 +1445,38 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 // 诊断：微信拍摄时到底往 session 上挂了什么 output。日志实证 AVCaptureMovieFileOutput 未被调用
 // （拍摄时无 [capture] 条目），说明微信走自研录制管线；靠这条日志可确认它真实用的类。
+// 同时兼作「进入 / 退出拍照模式」的信号——见下方 vcm_isStillImageOutput 说明。
+// 用字符串取类而非直接写类型名：AVCaptureStillImageOutput 自 iOS 10 起 deprecated，
+// 写类型名会在 -Werror 下编译失败（Logos 展开生成的原 IMP 声明里也有类名，pragma 盖不住）。
+static BOOL vcm_isStillImageOutput(AVCaptureOutput *output) {
+    if (!output) return NO;
+    Class c = NSClassFromString(@"AVCaptureStillImageOutput");
+    return (c != nil) && [output isKindOfClass:c];
+}
 - (void)addOutput:(AVCaptureOutput *)output {
     %orig;
     vcm_log(@"[session] addOutput: %@", NSStringFromClass([output class]));
+    // 进入拍照模式：微信只在拍照界面挂 AVCaptureStillImageOutput（录制 / 视频通话模式不加，
+    // 日志 22:58:16 那段 startRunning 前无此 addOutput 可证）。
+    // 必须在此就抑制预览：只在快门那一刻置位的话，进拍照界面到按下快门之间（实测 3.8s）
+    // 屏幕显示的仍是素材，与成片不一致——用户反馈「屏幕上显示的是替换的素材」。
+    // 提前到进入拍照模式即抑制，做到所见即所得（预览与成片都是真实画面）。
+    if (vcm_isStillImageOutput(output)) {
+        vcm_cancelUnsuppress();   // 作废上一次拍照遗留的 pending 恢复，避免它稍后误清本次抑制
+        g_videoSuppress = YES;
+        vcm_log(@"[capture] 进入拍照模式：预览切真实画面（视频替换暂停）");
+    }
 }
 - (void)removeOutput:(AVCaptureOutput *)output {
     vcm_log(@"[session] removeOutput: %@", NSStringFromClass([output class]));
     %orig;
+    // 退出拍照模式：摘掉 StillImageOutput 即恢复替换。先作废 pending 的延迟恢复，
+    // 否则定时器可能在用户再次进入拍照、重新置位之后才触发，把抑制误清掉。
+    if (vcm_isStillImageOutput(output)) {
+        vcm_cancelUnsuppress();
+        g_videoSuppress = NO;
+        vcm_log(@"[capture] 退出拍照模式：视频替换恢复");
+    }
 }
 %end
 
@@ -1455,12 +1484,16 @@ static VCamAudioProxy *g_audioProxy = nil;
 // 拍照片 / 录视频时若继续替换，会拍出素材而非真实场景，故期间置 g_videoSuppress=YES 让视频透传真实画面。
 // 仅作用于视频，声音替换不受影响——用户只要求「视频」真实。
 //
-// 日志实证的微信真实路径：
-//   · 拍照取帧用 AVCaptureStillImageOutput（见 [session] addOutput 日志）——它不经过我们 hook 的
-//     VideoDataOutput，所以拍照成片天然是真实画面，无需额外处理。
-//   · 落盘（拍照写图 / 录视频）统一走 AVAssetWriter —— 这才是真正需要拦的抑制入口（见下方 hook）。
+// 日志实证的微信真实路径（22:57~22:58 那份）：
+//   · 拍照取帧用 AVCaptureStillImageOutput —— 它不经过我们 hook 的 VideoDataOutput，
+//     所以「成片」天然是真实画面，与抑不抑制无关（这点早期判断正确）。
+//   · 但「预览」走的是 VideoDataOutput（[req] 1920x1080 出现在 addOutput:StillImage 之后），
+//     不抑制的话进拍照界面到按下快门之间屏幕上一直是素材 —— 这才是用户反馈的
+//     「屏幕上显示的是替换的素材」。抑制点因此前移到 addOutput:StillImage（见 AVCaptureSession hook）。
+//   · 落盘（拍照写图 / 录视频）统一走 AVAssetWriter —— 用于拦「拍摄视频」的画面。
 // 因此原先 hook 的 AVCapturePhotoOutput 是死代码（微信完全不用该类，日志从未出现对应 [capture]），已删除。
 // AVCaptureMovieFileOutput 目前也未被观测到调用，保留作为兜底路径，成本仅几行。
+// 快门 hook（vcm_shutter）在成片上属冗余保险，保留以防微信日后改用 VideoDataOutput 取拍照帧。
 
 %hook AVCaptureMovieFileOutput
 - (void)startRecordingToOutputFileURL:(NSURL *)url
