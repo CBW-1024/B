@@ -23,7 +23,7 @@ static BOOL g_frozen         = NO;   // 冻结锁存：当前轮播完后锁死�
 static BOOL g_isSound        = YES;  // 是否替换麦克风采集
 
 // 抑制位（g_videoSuppress = (g_suppressMask != 0) 为真时 = 透传真实画面）：
-//   kSuppressPhotoMode = 1<<0 : 进相机/未录制期间（拍照态）真实预览 + 真实成片
+//   kSuppressPhotoMode = 1<<0 : 进相机期间全程真实（拍照/录像预览、长按过程、成片均为真实画面）
 //   kSuppressWriting   = 1<<1 : 预留（录制活动标记）
 typedef NS_ENUM(NSUInteger, VCamSuppressReason) {
     kSuppressPhotoMode = 1 << 0,   // 拍照模式位：进相机/拍照态时置位，预览与成片均透传真实相机
@@ -320,9 +320,9 @@ static UIViewController *vcm_topViewController(void) {
     return vc;
 }
 
-// 拍照/录像抑制：进相机即真实预览，开始录制（AVAssetWriter.startWriting）时切换为素材替换，
-// 结束录制恢复真实。不再依赖 SightShootingModeSwitchView.currentShootingMode（该控件在当前入口不存在）。
-// 具体置位逻辑见下方 MMSightCameraViewController.viewWillAppear 与 AVAssetWriter 钩子。
+// 拍照/录像：进相机期间视频全程真实（预览、长按过程、成片都是真实摄像头画面），不再做素材替换。
+// 不再依赖 SightShootingModeSwitchView.currentShootingMode（该控件在当前入口不存在，实测恒为 nil）。
+// 置位逻辑见下方 MMSightCameraViewController.viewWillAppear 与 AVAssetWriter 钩子。
 
 #pragma mark - 像素缓冲池（替代每帧 CVPixelBufferCreate）
 // 像素缓冲池构建：按宽高/格式创建 CVPixelBufferPool，尺寸或格式变化时重建。
@@ -1173,7 +1173,7 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 %hook MMSightCameraViewController
 - (void)viewWillAppear:(_Bool)arg1 {
     %orig;
-    // 进相机即真实预览（拍照态）：不再依赖 shotMode 切换控件（当前入口下不存在），由录制事件切换到替换
+    // 进相机即全程真实：不再依赖 shotMode 切换控件（当前入口下不存在），录制期间也不切换
     vcm_suppressSet(kSuppressPhotoMode, YES);
     vcm_suppressSet(kSuppressWriting, NO);
     vcm_dbg(@"MMSightCamera viewWillAppear[b20260908c] suppressing=%d", g_videoSuppress);
@@ -1184,13 +1184,13 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 }
 %end
 
-#pragma mark - 录制期间切换为素材替换
-// 开始录制即进入替换态（预览显示素材 + 成片替换）；结束/取消录制回到真实预览。
-// 录制文件统一走 AVAssetWriter，故从这里切入切换。
+#pragma mark - 录制期间：视频保持真实（不替换）
+// 需求：拍照与录像的预览、长按过程、成片均保持真实摄像头画面，故录制时不切换到素材替换。
+// 如需恢复“录制时替换成素材”，把下面 startWriting 里的 YES 改回 NO 即可。
 %hook AVAssetWriter
 - (BOOL)startWriting {
     BOOL ok = %orig;
-    vcm_suppressSet(kSuppressPhotoMode, NO);  // 录像：素材替换（预览素材 + 成片假）
+    vcm_suppressSet(kSuppressPhotoMode, YES);  // 录制期间同样保持真实
     vcm_suppressSet(kSuppressWriting, NO);
     return ok;
 }
