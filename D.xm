@@ -60,7 +60,7 @@ static int  g_rotation   = 90;      // 0 / 90 / 180 / 270（点击旋转按钮�
 // 竖屏素材喂横屏采集时差距极大：1080×1920 素材进 1920×1080 画布，
 // 适应模式只有 607×1080 有效（占画布 32% 面积），填充模式是满屏 1920×1080。
 static BOOL   g_isFill   = YES;     // 默认填充：对端清晰度优先
-static CGFloat g_sharpen = 0.4;     // 锐化强度 0~1，0 = 关；过大会振铃 + 放大噪点
+static CGFloat g_sharpen = 0.25;    // 锐化强度 0~1，0 = 关；仅在下采样(scale<1)时生效，过大会振铃 + 放大噪点
 
 #pragma mark - reader 重建标记
 // 置位后由下一帧开头重建对应 reader；不在取帧失败的同帧重建（刚 startReading 的 reader 首帧必取不到）。
@@ -99,9 +99,6 @@ static double  g_srcDuration = 0.0;   // 素材时长（秒），循环回卷用
 static int64_t g_srcFrameIdx = -1;    // 素材已推进到的帧号；-1 = reader 刚重建待锚定
 static CGSize  g_srcSize     = {0,0}; // 素材原生分辨率（track.naturalSize）；0,0 = 未知
 
-// 清晰度相关（见 composedImageForTarget / getVideoFrame）
-static const CGFloat kVCamMinShortSide = 320.0;  // 输出短边下限，低于此编码器可能拒帧
-
 // 诊断日志：观测微信实际请求的帧尺寸 / 格式，以及我们最终输出的画布尺寸。
 // 仅当「尺寸或格式变化」时才追加，且为内存环形缓冲，不每帧写盘，避免拖慢采集回调。
 // 设置面板「日志:导出」一键通过系统分享面板导出（存文件 / AirDrop）。
@@ -112,6 +109,7 @@ static CGSize  g_diagLastReqSize = {0,0};  // 上次记录的微信请求帧尺�
 static OSType  g_diagLastReqFmt  = 0;     // 上次记录的微信请求像素格式
 static CGSize  g_diagLastOutSize = {0,0}; // 上次记录的输出画布尺寸
 static BOOL    g_diagFirstFrame  = YES;    // 首帧必定记一条完整诊断
+static NSString *g_diagFilePath   = nil;   // 落盘路径（沙箱 Documents/VCAM/VCAM_diag.log）：微信重启也不丢历史日志
 
 // 前向声明：日志函数定义在文件后方，供前面的时钟 / 同步逻辑调用。
 static void vcm_log(NSString *fmt, ...);
@@ -261,6 +259,19 @@ static void vcm_log(NSString *fmt, ...) {
         s_fmt.dateFormat = @"HH:mm:ss.SSS";
         g_diagLog  = s_log;   // 暴露给导出读取
         g_diagLock = s_lock;
+        // 启动恢复：从落盘文件读回历史，微信重启也不丢（并回写裁剪后的内容，避免文件无限增长）
+        if (g_diagFilePath) {
+            NSString *hist = [NSString stringWithContentsOfFile:g_diagFilePath
+                                                       encoding:NSUTF8StringEncoding error:nil];
+            if (hist.length) {
+                for (NSString *ln in [hist componentsSeparatedByString:@"\n"]) {
+                    if (ln.length) [s_log addObject:ln];
+                }
+                while (s_log.count > kVCamDiagMaxLines) [s_log removeObjectAtIndex:0];
+                [[s_log componentsJoinedByString:@"\n"] writeToFile:g_diagFilePath
+                                                          atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            }
+        }
     });
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -272,6 +283,11 @@ static void vcm_log(NSString *fmt, ...) {
     [s_log addObject:line];
     if (s_log.count > kVCamDiagMaxLines) [s_log removeObjectAtIndex:0];
     [s_lock unlock];
+    // 落盘追加一行（仅尺寸/格式变化或首帧/异常才记，量很小）；微信重启后仍可查看。
+    if (g_diagFilePath) {
+        FILE *f = fopen([g_diagFilePath UTF8String], "a");
+        if (f) { fprintf(f, "%s\n", [line UTF8String]); fclose(f); }
+    }
 }
 
 #pragma mark - 配置存取
@@ -684,6 +700,7 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
     if (!outData || length == 0) return;
     if (length > 0x100000) { memset(outData, 0, length); return; }  // 超大请求直接静音
     if (!g_audioPCMReady || !g_audioPCM || g_audioPCMLen == 0) { memset(outData, 0, length); return; }
+    memset(outData, 0, length);   // 先清零：素材播完后的剩余字节必须是静音，而非未初始化脏数据
 
     os_unfair_lock_lock(&g_audioPCMLock);
     size_t len    = g_audioPCMLen;
@@ -692,11 +709,19 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
     if (g_pcmBytesPerSec > 0 && len > 0) {
         double want = elapsed * g_pcmBytesPerSec;
         if (g_isLoop) want = fmod(want, (double)len);
+        // loop off 且已过素材末尾：保持静音即可，不要再校正——
+        // 否则会把游标反复拉回 0 造成「重播 + 每帧刷日志」的怪音/卡顿（关闭循环时声音异常的根因）。
+        if (!g_isLoop && want >= (double)len) {
+            os_unfair_lock_unlock(&g_audioPCMLock);
+            memset(outData, 0, length);
+            return;
+        }
         if (fabs(want - (double)g_audioPCMRead) > g_pcmBytesPerSec * 0.5) {
             // 偏差过大才对齐一次，并对齐到帧边界，避免从半个采样点起播导致声道相位翻转
             size_t oldRead = g_audioPCMRead;
             size_t aligned = (size_t)(want / (double)frameB) * frameB;
-            g_audioPCMRead = (aligned < len) ? aligned : 0;
+            // loop off 时偏差若越界则停在末尾(len)保持静音；loop on 则回卷到 0
+            g_audioPCMRead = (aligned < len) ? aligned : (g_isLoop ? 0 : len);
             vcm_log(@"[audio] 时钟偏差 %.3fs，游标 %zu→%zu / %zu",
                     (want - (double)oldRead) / g_pcmBytesPerSec, oldRead, g_audioPCMRead, len);
         }
@@ -921,12 +946,19 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CVPixelBufferRelease(pix);
     if (!img) return nil;
 
-    // 旋转映射：对无 EXIF 元数据的相机帧，屏幕观感与 orientation 数值相反，故 90↔270 对调，
-    // 使点「旋转」时屏幕转向与直觉一致（90°=顺时针、270°=逆时针）。
+    // 自动对齐方向：素材与微信帧「一方竖屏一方横屏」时，补一个 90° 让长宽边一致，
+    // 否则竖屏素材(720x1280)进横屏画布(1280x720)会被拉伸/挤压得严重放大失真（即「填充放很大」）。
+    // g_rotation 作为额外手动微调叠加在自动判断之上。
+    NSInteger rot = g_rotation;
+    CGRect srcExtent = img.extent;
+    BOOL srcPortrait = srcExtent.size.height > srcExtent.size.width;
+    BOOL dstPortrait = targetH > targetW;
+    if (srcPortrait != dstPortrait) rot = (rot + 90) % 360;   // 方向不一致 → 补 90° 对齐
+
     NSInteger orient = 1;
-    if      (g_rotation == 90)  orient = 8;
-    else if (g_rotation == 180) orient = 3;
-    else if (g_rotation == 270) orient = 6;
+    if      (rot == 90)  orient = 8;
+    else if (rot == 180) orient = 3;
+    else if (rot == 270) orient = 6;
     img = [img imageByApplyingOrientation:(CGImagePropertyOrientation)orient];
 
     CGRect e = img.extent;
@@ -962,11 +994,12 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CIImage *canvas = [scaled imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
     img = [canvas imageByCompositingOverImage:[self blackImageForTarget:target]];
 
-    // 锐化放在缩放之后：抵消插值带来的柔化。只做亮度通道，不会放大彩噪。
-    if (g_sharpen > 0.01) {
+    // 锐化放在缩放之后：仅在下采样(scale<1，即素材比画布大)时抵消插值柔化才有正面收益；
+    // 原生/放大(scale≈1)时锐化只会放大噪点、画质更糊，故不启用。
+    if (g_sharpen > 0.01 && fabs(scale - 1.0) > 0.002) {
         CIFilter *s = [CIFilter filterWithName:@"CIUnsharpMask"];
         [s setValue:img forKey:kCIInputImageKey];
-        [s setValue:@(2.5) forKey:kCIInputRadiusKey];
+        [s setValue:@(1.5) forKey:kCIInputRadiusKey];   // 半径过大→振铃/halo，1.5 较稳
         [s setValue:@(g_sharpen) forKey:kCIInputIntensityKey];
         CIImage *out = s.outputImage;
         if (out) img = out;
@@ -1044,30 +1077,20 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
         }
     }
 
-    // 原生分辨率输出：始终按素材尺寸输出，不再放大到采集尺寸 → 对面最清晰。
-    // 无条件生效（无开关、无退回采集尺寸的兜底）；素材比采集大时编码器会把同码率摊到更多像素，
-    // 可能更糊/掉帧——这种情况只能换更小素材或改回采集尺寸逻辑，菜单不再提供开关。
-    // 短边夹到下限，避免极小帧被编码器拒收（编码器硬约束，非兜底）。
-    if (g_srcSize.width > 0 && g_srcSize.height > 0) {
-        CGFloat sw = g_srcSize.width, sh = g_srcSize.height;
-        CGFloat shortSide = MIN(sw, sh);
-        if (shortSide < kVCamMinShortSide) {
-            CGFloat k = kVCamMinShortSide / shortSide;
-            sw *= k; sh *= k;
-        }
-        target = CGSizeMake(round(sw), round(sh));
-    }
+    // 关键：输出尺寸必须严格等于微信请求的采集帧尺寸(camPix)，不能强行用素材原生尺寸。
+    // 微信编码器/采样管线按 camPix 协商，我们控制不了它要多大。强行输出 720x1280 却喂进
+    // 1280x720 的管线 → 被拉伸/裁剪得「放大失真」，且拍照重建采集管线时因尺寸不符直接闪退。
+    // 素材通过 composedImageForTarget: 自动旋转 + 等比缩放映射到该画布，清晰度保持原生(1:1 像素)。
+    // （原「短边下限」保护不再需要：camPix 本身是微信合法尺寸，强行改尺寸才会触发问题。）
 
-    // 诊断：输出画布。原生覆盖生效时 target == 素材尺寸；否则退回微信请求尺寸。
+    // 诊断：输出画布（恒等于微信请求尺寸）。srcSize 供对照原生素材尺寸。
     {
         BOOL changed = (target.width  != g_diagLastOutSize.width)
                     || (target.height != g_diagLastOutSize.height);
         if (g_diagFirstFrame || changed) {
             g_diagLastOutSize = target;
-            BOOL native = (g_srcSize.width > 0 && g_srcSize.height > 0);
-            vcm_log(@"[out] 输出画布 %dx%d  原生覆盖=%@  srcSize=%.0fx%.0f  fill=%@ sharpen=%d%%",
+            vcm_log(@"[out] 输出画布 %dx%d（=微信请求尺寸）  srcSize=%.0fx%.0f  fill=%@ sharpen=%d%%",
                     (int)target.width, (int)target.height,
-                    native ? @"YES" : @"NO",
                     g_srcSize.width, g_srcSize.height,
                     g_isFill ? @"铺满" : @"适应", (int)(g_sharpen * 100));
         }
@@ -1206,11 +1229,7 @@ static OSStatus hooked_AudioUnitRender(
      fromConnection:(AVCaptureConnection *)connection {
     g_videoOrientation = connection.videoOrientation;
     CMSampleBufferRef newSample = NULL;
-    // 会话未运行（关相机/拍照）时只透传真实摄像头，不碰 reader / 显示层，避免对已停 session 操作。
-    if (g_isReplace && !g_sessionRunning) {
-        static BOOL s_videoWarned = NO;
-        if (!s_videoWarned) { vcm_log(@"[skip] 视频采集回调到达但会话未运行，本帧透传真实摄像头"); s_videoWarned = YES; }
-    } else if (g_isReplace) {
+    if (g_isReplace) {
         @try {
             newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
             if (newSample && g_displayLayer) {
@@ -1237,9 +1256,19 @@ static VCamVideoProxy *g_videoProxy = nil;
 
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    if (delegate == nil) {
+        // 与音频 hook 同理：微信 detach（nil）时原样透传，避免在 session 已停时塞入非 nil 的 proxy 导致闪退。
+        %orig(nil, nil);
+        if (g_videoProxy) [g_videoProxy setOriginalDelegate:nil queue:nil];
+        vcm_log(@"[hook] 视频 delegate=nil(detach) → 透传；session=%@",
+                g_sessionRunning ? @"running" : @"stopped");
+        return;
+    }
     if (!g_videoProxy) g_videoProxy = [[VCamVideoProxy alloc] init];
     [g_videoProxy setOriginalDelegate:delegate queue:queue];
     %orig(g_videoProxy, queue);
+    vcm_log(@"[hook] 视频 delegate 已替换为 proxy；session=%@",
+            g_sessionRunning ? @"running" : @"stopped");
 }
 %end
 
@@ -1256,11 +1285,7 @@ static VCamVideoProxy *g_videoProxy = nil;
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
      fromConnection:(AVCaptureConnection *)connection {
     CMSampleBufferRef outBuf = sampleBuffer;
-    // 会话未运行（关相机/拍照）时只透传真实麦克风，不触发音频解码 / 定位读取。
-    if (g_isReplace && g_isSound && !g_sessionRunning) {
-        static BOOL s_audioWarned = NO;
-        if (!s_audioWarned) { vcm_log(@"[skip] 音频采集回调到达但会话未运行，本帧透传真实麦克风"); s_audioWarned = YES; }
-    } else if (g_isReplace && g_isSound) {
+    if (g_isReplace && g_isSound) {
         @try {
             CMSampleBufferRef rep = [VCamMediaManager getAudioFrame:sampleBuffer atTime:vcm_elapsed()];
             if (rep) outBuf = rep;
@@ -1280,9 +1305,21 @@ static VCamAudioProxy *g_audioProxy = nil;
 
 %hook AVCaptureAudioDataOutput
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    if (delegate == nil) {
+        // 关相机/销毁会话时微信把 delegate 设为 nil（detach）。原样透传，绝不替换为 proxy——
+        // 否则非 nil 的 proxy 在 session 已停时被喂给 AVFoundation，触发
+        // 「Session is not running」异常 → SIGABRT（崩溃栈：- [AVCaptureAudioDataOutput sampleBufferDelegate]）
+        %orig(nil, nil);
+        if (g_audioProxy) [g_audioProxy setOriginalDelegate:nil queue:nil];
+        vcm_log(@"[hook] 音频 delegate=nil(detach) → 透传；session=%@",
+                g_sessionRunning ? @"running" : @"stopped");
+        return;
+    }
     if (!g_audioProxy) g_audioProxy = [[VCamAudioProxy alloc] init];
     [g_audioProxy setOriginalDelegate:delegate queue:queue];
     %orig(g_audioProxy, queue);
+    vcm_log(@"[hook] 音频 delegate 已替换为 proxy；session=%@",
+            g_sessionRunning ? @"running" : @"stopped");
 }
 %end
 
@@ -1360,8 +1397,6 @@ static VCamLinkProxy *g_linkProxy = nil;
 %new
 - (void)vcm_syncDisplayLayer {
     if (!g_displayLayer) return;
-    // 会话未运行（关相机/拍照）时不操作显示层，避免对已停 session 的层做变换/透明度设置 → 闪退。
-    if (!g_sessionRunning) { [g_displayLayer setOpacity:0.0f]; return; }
 
     // 素材不存在或不替换时把显示层透明掉，露出真实摄像头
     BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()];
@@ -1578,6 +1613,7 @@ static VCamLinkProxy *g_linkProxy = nil;
 }
 - (void)actionClearLog {
     [g_diagLock lock]; [g_diagLog removeAllObjects]; [g_diagLock unlock];
+    if (g_diagFilePath) [[NSData data] writeToFile:g_diagFilePath atomically:NO];  // 落盘同步清空
     vcm_log(@"[sys] 日志已清空");
     [self updateStatusUI];
 }
@@ -1753,6 +1789,7 @@ static void vcm_installTapGesture(UIWindow *win) {
     }];
     g_videoDir = [[vcm_documentPath() stringByAppendingPathComponent:@"VCAM"] copy];
     [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
+    g_diagFilePath = [[g_videoDir stringByAppendingPathComponent:@"VCAM_diag.log"] copy];  // 日志落盘：重启不丢
     // 先给默认名兜底，再由 vcm_loadSettings 用持久化的真实扩展名覆盖（无存档则保持默认）。
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
     g_videoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
