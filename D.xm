@@ -54,14 +54,6 @@ static BOOL g_isLoop     = YES;     // 素材读完后是否回卷重播
 static BOOL g_isSound    = YES;     // 是否替换麦克风采集
 static int  g_rotation   = 90;      // 0 / 90 / 180 / 270（点击旋转按钮循环取值）
 
-#pragma mark - 画面清晰度
-// 填充模式：NO = 适应（等比缩放 + 黑边，画面完整但有效像素少）；
-//           YES = 填充（等比放大到铺满再裁掉溢出，有效像素最大化 → 对端看到的最清晰）。
-// 竖屏素材喂横屏采集时差距极大：1080×1920 素材进 1920×1080 画布，
-// 适应模式只有 607×1080 有效（占画布 32% 面积），填充模式是满屏 1920×1080。
-static BOOL   g_isFill   = YES;     // 默认填充：对端清晰度优先
-static CGFloat g_sharpen = 0.25;    // 锐化强度 0~1，0 = 关；仅在下采样(scale<1)时生效，过大会振铃 + 放大噪点
-
 #pragma mark - reader 重建标记
 // 置位后由下一帧开头重建对应 reader；不在取帧失败的同帧重建（刚 startReading 的 reader 首帧必取不到）。
 static BOOL g_videoReload = NO;
@@ -297,8 +289,6 @@ static void vcm_saveSettings(void) {
     [d setBool:g_isLoop      forKey:@"vcam_loop"];
     [d setBool:g_isSound     forKey:@"vcam_sound"];
     [d setInteger:g_rotation forKey:@"vcam_rotation"];
-    [d setBool:g_isFill    forKey:@"vcam_fill"];
-    [d setFloat:g_sharpen  forKey:@"vcam_sharpen"];
     // 音视频素材路径持久化：扩展名随导入文件动态变化，不存盘则重启后找不到文件。
     if (g_videoPath) [d setObject:g_videoPath forKey:@"vcam_video_path"];
     else             [d removeObjectForKey:@"vcam_video_path"];
@@ -314,10 +304,6 @@ static void vcm_loadSettings(void) {
     if ([d objectForKey:@"vcam_sound"])    g_isSound   = [d boolForKey:@"vcam_sound"];
     if ([d objectForKey:@"vcam_rotation"]) g_rotation  = (int)[d integerForKey:@"vcam_rotation"];
     else                                   g_rotation  = 90;
-    if ([d objectForKey:@"vcam_fill"])    g_isFill    = [d boolForKey:@"vcam_fill"];
-    else                                   g_isFill    = YES;
-    if ([d objectForKey:@"vcam_sharpen"]) g_sharpen  = [d floatForKey:@"vcam_sharpen"];
-    else                                   g_sharpen  = 0.4f;
     // 恢复素材路径：存在则用持久化路径（动态扩展名），否则回退默认名（由 %ctor 在 loadSettings 前给定）。
     NSString *savedVideo = [d stringForKey:@"vcam_video_path"];
     if (savedVideo.length > 0) g_videoPath = [savedVideo copy];
@@ -356,8 +342,6 @@ static void vcm_resetSettings(void) {
     g_isLoop      = YES;
     g_isSound     = YES;
     g_rotation    = 90;
-    g_isFill      = YES;
-    g_sharpen     = 0.4f;
 
     vcm_stopReaders();
     vcm_reloadReaders();
@@ -964,10 +948,9 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CGRect e = img.extent;
     if (e.size.width <= 0 || e.size.height <= 0) return nil;
 
-    // 填充：取较大比例 → 铺满后裁掉溢出（有效像素最大，对端最清晰）
-    // 适应：取较小比例 → 画面完整，两侧/上下补黑边（有效像素少，编码后偏糊）
-    CGFloat scale = g_isFill ? MAX(targetW / e.size.width, targetH / e.size.height)
-                             : MIN(targetW / e.size.width, targetH / e.size.height);
+    // 固定铺满（scale=MAX）：等比放大到铺满再裁掉溢出，有效像素最大化 → 对端最清晰。
+    // （原「适应」模式会留黑边、有效像素少且编码后偏糊，已移除切换开关。）
+    CGFloat scale = MAX(targetW / e.size.width, targetH / e.size.height);
     if (!(scale > 0) || !isfinite(scale)) return nil;
 
     CIImage *scaled = img;
@@ -990,20 +973,10 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
     CGFloat ty = (targetH - r.size.height) / 2.0 - r.origin.y;
     scaled = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(tx, ty)];
 
-    // 裁到画布尺寸（填充模式裁掉溢出，适应模式留出透明边）；crop 不重采样，无损
+    // 裁到画布尺寸（铺满时裁掉溢出）；crop 不重采样，无损。黑底仅兜底，铺满时不可见。
     CIImage *canvas = [scaled imageByCroppingToRect:CGRectMake(0, 0, targetW, targetH)];
     img = [canvas imageByCompositingOverImage:[self blackImageForTarget:target]];
 
-    // 锐化放在缩放之后：仅在下采样(scale<1，即素材比画布大)时抵消插值柔化才有正面收益；
-    // 原生/放大(scale≈1)时锐化只会放大噪点、画质更糊，故不启用。
-    if (g_sharpen > 0.01 && fabs(scale - 1.0) > 0.002) {
-        CIFilter *s = [CIFilter filterWithName:@"CIUnsharpMask"];
-        [s setValue:img forKey:kCIInputImageKey];
-        [s setValue:@(1.5) forKey:kCIInputRadiusKey];   // 半径过大→振铃/halo，1.5 较稳
-        [s setValue:@(g_sharpen) forKey:kCIInputIntensityKey];
-        CIImage *out = s.outputImage;
-        if (out) img = out;
-    }
     return img;
 }
 
@@ -1089,10 +1062,9 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
                     || (target.height != g_diagLastOutSize.height);
         if (g_diagFirstFrame || changed) {
             g_diagLastOutSize = target;
-            vcm_log(@"[out] 输出画布 %dx%d（=微信请求尺寸）  srcSize=%.0fx%.0f  fill=%@ sharpen=%d%%",
+            vcm_log(@"[out] 输出画布 %dx%d（=微信请求尺寸，铺满裁切）  srcSize=%.0fx%.0f",
                     (int)target.width, (int)target.height,
-                    g_srcSize.width, g_srcSize.height,
-                    g_isFill ? @"铺满" : @"适应", (int)(g_sharpen * 100));
+                    g_srcSize.width, g_srcSize.height);
         }
         if (g_diagFirstFrame) g_diagFirstFrame = NO;   // 首帧诊断已发，后续仅记录变化
     }
@@ -1434,8 +1406,6 @@ static VCamLinkProxy *g_linkProxy = nil;
     UIButton *_btnLoop;        // g_isLoop
     UIButton *_btnSound;       // g_isSound
     UIButton *_btnReplace;     // g_isReplace
-    UIButton *_btnFill;        // g_isFill：填充(铺满裁切) / 适应(留黑边)
-    UIButton *_btnSharpen;     // g_sharpen：锐化强度循环
     UIButton *_btnLog;         // 诊断日志：导出（系统分享面板）
     UIButton *_btnClear;       // 诊断日志：清空缓冲
 }
@@ -1559,9 +1529,6 @@ static VCamLinkProxy *g_linkProxy = nil;
                    x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleReplace)];
     y += btnH + gap;
 
-    _btnFill = [self addGridButton:g_isFill ? @"填充: 开" : @"填充: 关" x:0 y:y w:btnW h:btnH action:@selector(toggleFill)];
-    _btnSharpen = [self addGridButton:[NSString stringWithFormat:@"锐化: %d%%", (int)(g_sharpen * 100)]
-                   x:btnW + gap y:y w:btnW h:btnH action:@selector(toggleSharpen)];
     y += btnH + gap;
 
     _btnLog = [self addGridButton:@"日志:导出" x:0 y:y w:btnW h:btnH action:@selector(actionExportLog)];
@@ -1576,15 +1543,6 @@ static VCamLinkProxy *g_linkProxy = nil;
 - (void)toggleLoop    { g_isLoop     = !g_isLoop;     vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleSound   { g_isSound    = !g_isSound;    vcm_saveSettings(); [self refreshGridButtons]; }
 - (void)toggleReplace { g_isReplace  = !g_isReplace;  vcm_saveSettings(); [self refreshGridButtons]; }
-- (void)toggleFill    { g_isFill     = !g_isFill;     vcm_saveSettings(); [self refreshGridButtons]; }
-// 锐化强度循环：0 → 30% → 60% → 100% → 0。0 即关闭（见 composedImageForTarget 的阈值判断）
-- (void)toggleSharpen {
-    CGFloat steps[] = {0.0f, 0.3f, 0.6f, 1.0f};
-    int  idx = 0;
-    for (int i = 0; i < 4; i++) if (fabs(g_sharpen - steps[i]) < 0.01f) { idx = i; break; }
-    g_sharpen = steps[(idx + 1) % 4];
-    vcm_saveSettings(); [self refreshGridButtons];
-}
 - (void)actionReset   { vcm_resetSettings(); [self refreshGridButtons]; }
 
 #pragma mark - 诊断日志导出 / 清空
@@ -1634,9 +1592,6 @@ static VCamLinkProxy *g_linkProxy = nil;
     [self applyTitle:(g_isLoop     ? @"循环: 开" : @"循环: 关") toButton:_btnLoop    withFont:font];
     [self applyTitle:(g_isSound    ? @"声音: 开" : @"声音: 关") toButton:_btnSound   withFont:font];
     [self applyTitle:(g_isReplace  ? @"替换: 开" : @"替换: 关") toButton:_btnReplace withFont:font];
-    [self applyTitle:(g_isFill     ? @"填充: 开" : @"填充: 关") toButton:_btnFill    withFont:font];
-    [self applyTitle:[NSString stringWithFormat:@"锐化: %d%%", (int)(g_sharpen * 100)]
-            toButton:_btnSharpen withFont:font];
     [self updateStatusUI];
 }
 - (void)updateStatusUI {
