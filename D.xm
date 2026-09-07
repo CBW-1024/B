@@ -17,20 +17,12 @@
 // 其中 AudioUnit 链路采用「整段预解码进内存 + 按时钟定位读取」的方式，
 // 音频在播放前一次性解码完毕，消费期间 PCM 恒定不变、永不被覆盖，从根本上保证清晰度。
 //
-// ============================ 音画同步（本次改动核心） ============================
-// 旧实现的致命缺陷：画面走「帧到帧」（一个采集回调吐一个素材帧），声音走「时钟」
-// （按 ioData 字节数推进）。两者时间基准不同 —— 一旦采集被压帧（微信常把采集压到
-// 15~20fps）或采集回调里 CI 渲染耗时触发 alwaysDiscardsLateVideoFrames 丢帧，
-// 素材消费速度就永久落后于真实时间 → 画面慢放，并与声音持续漂移。
-//
-// 修法：给音视频接同一个会话时钟 CACurrentMediaTime()，两边都按「会话已过多少秒」
-// 定位素材位置（time-to-frame / time-to-sample）：
-//   · 画面  want = floor(elapsed * 素材fps)   → 一次补齐落后的帧（上限 kVCamMaxCatchUp）
-//   · 声音  pos  = fmod(elapsed * 每秒字节数, PCM总长)  → 直接按字节定位，天然循环
-//   · AVCapture 音频同样按 elapsed 追平已消费字节数，且保留素材自身 duration 不再被
-//     采集帧 duration 覆盖（旧代码会导致音频被变速 8%~12%）
-// 采集端掉帧时画面会「跳帧」但速度恒定 —— 速度正确优先于流畅。
-// ==============================================================================
+// 音画同步：画面与声音共用同一个会话时钟 CACurrentMediaTime()，都按「会话已过多少秒」
+// 定位素材位置（time-to-frame / time-to-sample），不随采集帧率漂移：
+//   · 画面  want = floor(elapsed * 素材fps)，一次补齐落后帧（上限 kVCamMaxCatchUp）
+//   · 声音  pos  = fmod(elapsed * 每秒字节数, PCM总长)，按字节定位、天然循环
+//   · AVCapture 音频按 elapsed 追平已投递字节，且保留素材自身 duration
+// 采集被压帧时画面会「跳帧」但速度恒定 —— 速度正确优先于流畅。
 //
 // 画面流向：素材 → AVAssetReader 取帧 → 旋转 / 等比居中 → 合成到与采集帧同尺寸黑底 →
 // CIContext 渲染成同格式 CVPixelBuffer → 套用采集帧时序 → 新的 CMSampleBuffer。
@@ -39,20 +31,18 @@
 // （返回 NULL / 透传真实音视频 / 补零静音），下帧自动重试，不置全局标志、不关总开关。
 // g_mediaLock 为不可重入 NSLock，持锁函数内不得再调用会加锁的函数；
 // 含提前 return 的函数必须用 @finally 解锁，否则异常路径会漏解锁导致后续卡死。
+// UIKit 已包含 Foundation / CoreGraphics / CoreAnimation，不重复引入。
 #import <UIKit/UIKit.h>
-#import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <CoreImage/CoreImage.h>
-#import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
-#import <ImageIO/ImageIO.h>
+#import <ImageIO/ImageIO.h>          // kCGImagePropertyExifDictionary / TIFFDictionary
 #import <AudioToolbox/AudioToolbox.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
+#import <objc/runtime.h>             // objc_getAssociatedObject（手势去重）
 #import <substrate.h>
-#include <dlfcn.h>
+#include <dlfcn.h>                   // dlopen：确保 AudioToolbox 已加载再 rebind
 // fishhook：C 级符号重定向，通过 dyld 改写间接符号指针实现 hook。
 #include "fishhook.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -119,6 +109,34 @@ static void vcm_resetClock(void) {
     g_srcFrameIdx        = -1;   // 强迫画面从素材头重新锚定
     g_audioConsumedBytes = 0.0;
 }
+// 作废已解码 PCM：自增代次让在途解码结果失效、停掉解码线程、持锁释放缓冲区并复位长度。
+// 换素材 / ASBD 变更 / 析构三个场景语义完全一致，统一走这里。
+static void vcm_invalidatePCM(void) {
+    g_audioDecodeGen++;
+    g_audioFeederStop = YES;
+    os_unfair_lock_lock(&g_audioPCMLock);
+    if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
+    g_audioPCMLen   = 0;
+    g_audioPCMReady = NO;
+    os_unfair_lock_unlock(&g_audioPCMLock);
+}
+// 只比较影响字节布局的字段：采样率 / 声道数 / 位深 / float / non-interleaved。
+// PACKED、SIGNED 等不改变排布的位必须忽略，否则同一格式会被误判成变更 → 反复作废重解码。
+static BOOL vcm_asbdMatches(AudioStreamBasicDescription a, AudioStreamBasicDescription b) {
+    return a.mSampleRate       == b.mSampleRate
+        && a.mChannelsPerFrame == b.mChannelsPerFrame
+        && a.mBitsPerChannel   == b.mBitsPerChannel
+        && (((a.mFormatFlags ^ b.mFormatFlags)
+             & (kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved)) == 0);
+}
+// 清掉素材目录下某个前缀的所有残留文件（扩展名随导入文件变化，不能只删固定的那一个）。
+static void vcm_clearMaterialFiles(NSString *prefix) {
+    for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
+        if ([old hasPrefix:prefix]) {
+            [g_fileManager removeItemAtPath:[g_videoDir stringByAppendingPathComponent:old] error:nil];
+        }
+    }
+}
 static CFTimeInterval vcm_elapsed(void) {
     CFTimeInterval now = CACurrentMediaTime();
     if (!g_clockReady) { g_clockAnchor = now; g_clockReady = YES; }
@@ -144,7 +162,6 @@ static OSType               g_poolFmt = 0;
 // 因解码在播放前完成、消费期间 PCM 不被任何写入覆盖，从架构上保证连续性，是清晰度的根本保证。
 static uint8_t       *g_audioPCM      = NULL;  // 整段预解码 PCM
 static size_t         g_audioPCMLen   = 0;     // PCM 总字节数
-static size_t         g_audioPCMRead  = 0;     // 已废弃：改由时钟定位，保留仅为状态一致
 static os_unfair_lock g_audioPCMLock  = OS_UNFAIR_LOCK_INIT;
 static BOOL           g_audioPCMReady = NO;    // 预解码完成才取数；未就绪则补零静音
 static AudioStreamBasicDescription g_audioPCMFormat = {0};  // 预解码所用 ASBD（变更即需重解码）
@@ -189,7 +206,9 @@ static void vcm_saveSettings(void) {
     // 音视频素材路径持久化：扩展名随导入文件动态变化，不存盘则重启后找不到文件。
     if (g_videoPath) [d setObject:g_videoPath forKey:@"vcam_video_path"];
     else             [d removeObjectForKey:@"vcam_video_path"];
-    [d setObject:g_tempAudioPath forKey:@"vcam_audio_path"];
+    // setObject:forKey: 传 nil 会直接抛异常，两条路径都做空值防御。
+    if (g_tempAudioPath) [d setObject:g_tempAudioPath forKey:@"vcam_audio_path"];
+    else                 [d removeObjectForKey:@"vcam_audio_path"];
     [d synchronize];
 }
 static void vcm_loadSettings(void) {
@@ -224,17 +243,9 @@ static void vcm_reloadReaders(void) {
     // 音视频共用同一个时钟：换素材 / 新会话必须重新锚定，否则 elapsed 带着旧会话的
     // 时间继续推进 → 一上来就按「已播 N 秒」定位，画面与声音瞬间跳到素材中段。
     vcm_resetClock();
-    // 自增代次作废在途解码结果，释放旧 PCM 并取消解码线程（持锁释放，避免与消费端竞争）。
-    g_audioDecodeGen++;
     g_decodeFailCount = 0;
     g_decodeNextRetry = 0;
-    os_unfair_lock_lock(&g_audioPCMLock);
-    g_audioFeederStop = YES;
-    if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
-    g_audioPCMLen   = 0;
-    g_audioPCMRead  = 0;
-    g_audioPCMReady = NO;
-    os_unfair_lock_unlock(&g_audioPCMLock);
+    vcm_invalidatePCM();
 }
 // 恢复默认设置，清空已选素材与解码缓存
 static void vcm_resetSettings(void) {
@@ -242,26 +253,17 @@ static void vcm_resetSettings(void) {
     g_isLoop      = YES;
     g_isSound     = YES;
     g_rotation    = 90;
-    vcm_saveSettings();
 
     vcm_stopReaders();
     vcm_reloadReaders();
 
-    if (g_tempAudioPath) [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
-    // 删掉所有 bear_vcam_audio.* 残留（动态扩展名后可能不止 .m4a）
-    for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
-        if ([old hasPrefix:@"bear_vcam_audio."]) {
-            [g_fileManager removeItemAtPath:[g_videoDir stringByAppendingPathComponent:old] error:nil];
-        }
-    }
+    // 删掉所有 bear_vcam_audio.* / bear_vcam_temp.* 残留（动态扩展名后可能不止 .m4a / .mov）
+    vcm_clearMaterialFiles(@"bear_vcam_audio.");
+    vcm_clearMaterialFiles(@"bear_vcam_temp.");
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
     g_videoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
-    // 删掉所有 bear_vcam_temp.* 残留（动态扩展名后可能不止 .mov）
-    for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
-        if ([old hasPrefix:@"bear_vcam_temp."]) {
-            [g_fileManager removeItemAtPath:[g_videoDir stringByAppendingPathComponent:old] error:nil];
-        }
-    }
+    // 必须在路径回退到默认值之后再存盘，否则存档里留的是刚被删掉的旧素材路径，重启即失效。
+    vcm_saveSettings();
 }
 
 #pragma mark - 视图控制器查找
@@ -282,17 +284,8 @@ static UIViewController *vcm_topViewController(void) {
 }
 
 #pragma mark - 像素缓冲池（替代每帧 CVPixelBufferCreate）
-static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
-    NSDictionary *iosurf = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
-
-    if (g_pbPool && g_poolW == w && g_poolH == h && g_poolFmt == pfmt) {
-        CVPixelBufferRef pb = NULL;
-        if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_pbPool, &pb) == kCVReturnSuccess && pb) return pb;
-        if (pb) { CVPixelBufferRelease(pb); pb = NULL; }
-        CVPixelBufferPoolRelease(g_pbPool);
-        g_pbPool = NULL;
-    }
-
+static void vcm_createPool(size_t w, size_t h, OSType pfmt) {
+    if (g_pbPool) { CVPixelBufferPoolRelease(g_pbPool); g_pbPool = NULL; }
     NSDictionary *attrs = @{
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
         (id)kCVPixelBufferWidthKey:  @(w),
@@ -304,14 +297,25 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
     if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
                                 (__bridge CFDictionaryRef)attrs, &g_pbPool) != kCVReturnSuccess || !g_pbPool) {
         g_pbPool = NULL;
-    } else {
-        g_poolW = w; g_poolH = h; g_poolFmt = pfmt;
+        return;
+    }
+    g_poolW = w; g_poolH = h; g_poolFmt = pfmt;
+}
+
+static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
+    NSDictionary *iosurf = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+
+    // 尺寸/格式不符，或 pool 已损坏取不出 buffer → 重建后再试一次；仍不行就退回直接创建。
+    if (g_pbPool && (g_poolW != w || g_poolH != h || g_poolFmt != pfmt)) vcm_createPool(w, h, pfmt);
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!g_pbPool) break;
         CVPixelBufferRef pb = NULL;
         if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_pbPool, &pb) == kCVReturnSuccess && pb) return pb;
-        if (pb) CVPixelBufferRelease(pb);
+        if (pb) { CVPixelBufferRelease(pb); pb = NULL; }
+        vcm_createPool(w, h, pfmt);
     }
 
-    // 兜底：pool 不可用时退回直接创建，功能不受影响
     CVPixelBufferRef pb = NULL;
     CVPixelBufferCreate(kCFAllocatorDefault, w, h, pfmt, (__bridge CFDictionaryRef)iosurf, &pb);
     return pb;
@@ -349,7 +353,7 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
             // 循环关闭 + reader 已读完 → 冻结末帧，不重建；循环开启时此处必须放行，否则播完就再也不动。
             if (!g_isLoop && g_videoReader &&
                 g_videoReader.status == AVAssetReaderStatusCompleted) return;
-            g_videoReload = NO;
+            // 标记统一在 @finally 里清零（异常路径也要清，否则每帧重建）
 
             if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
             NSString *path = vcm_videoPath();
@@ -397,7 +401,7 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
                 g_audioReader.status != AVAssetReaderStatusCompleted) return;
             if (!g_isLoop && g_audioReader &&
                 g_audioReader.status == AVAssetReaderStatusCompleted) return;
-            g_audioReload = NO;
+            // 标记统一在 @finally 里清零（异常路径也要清，否则每帧重建）
 
             if (g_audioReader) {
                 [g_audioReader cancelReading]; g_audioReader = nil; g_audioOutput = nil;
@@ -541,7 +545,6 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
                 if (g_audioPCM) free(g_audioPCM);
                 g_audioPCM       = buf;
                 g_audioPCMLen    = total;
-                g_audioPCMRead   = 0;
                 g_audioPCMReady  = YES;
                 g_audioPCMFormat = t;
                 g_pcmBytesPerSec  = bytesPerSec;
@@ -899,18 +902,10 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 }
 
 + (void)cleanup {
-    g_audioDecodeGen++;                 // 作废在途预解码结果
-    g_audioFeederStop = YES;            // 通知预解码线程取消
+    vcm_invalidatePCM();                // 含自增代次 + 停解码线程 + 释放 PCM
     vcm_stopReaders();
     vcm_resetClock();
     if (g_pbPool) { CVPixelBufferPoolRelease(g_pbPool); g_pbPool = NULL; }
-    g_poolW = 0; g_poolH = 0; g_poolFmt = 0;
-    os_unfair_lock_lock(&g_audioPCMLock);
-    if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
-    g_audioPCMLen   = 0;
-    g_audioPCMRead  = 0;
-    g_audioPCMReady = NO;
-    os_unfair_lock_unlock(&g_audioPCMLock);
 }
 @end
 
@@ -941,26 +936,9 @@ static OSStatus hooked_AudioUnitRender(
                                  &g_targetASBD, &propSize);
         if (perr == noErr && g_targetASBD.mSampleRate > 0) {
             g_hasProbedASBD = YES;
-            // ASBD 探明后即触发「整段预解码进内存」。若已解码但 PCM 格式与当前 ASBD 不符
-            // （换通话类型/格式切换），先作废旧 PCM 再按新格式重解码，否则字节布局错配 → 失真/变速。
-            @try {
-                if (g_audioPCMReady &&
-                    (g_audioPCMFormat.mSampleRate       != g_targetASBD.mSampleRate
-                     || g_audioPCMFormat.mChannelsPerFrame != g_targetASBD.mChannelsPerFrame
-                     || g_audioPCMFormat.mBitsPerChannel   != g_targetASBD.mBitsPerChannel
-                     || ((g_audioPCMFormat.mFormatFlags ^ g_targetASBD.mFormatFlags)
-                         & (kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved)))) {
-                    g_audioDecodeGen++;
-                    os_unfair_lock_lock(&g_audioPCMLock);
-                    if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
-                    g_audioPCMLen   = 0;
-                    g_audioPCMRead  = 0;
-                    g_audioPCMReady = NO;
-                    os_unfair_lock_unlock(&g_audioPCMLock);
-                }
-                if (!g_audioFeederRunning) [VCamMediaManager decodeAudioToMemory];
-            } @catch (NSException *e) {
-            }
+            // PCM 若是按旧格式解码的，字节布局与当前 ASBD 错配 → 失真/变速，必须作废后重解。
+            if (g_audioPCMReady && !vcm_asbdMatches(g_audioPCMFormat, g_targetASBD)) vcm_invalidatePCM();
+            if (!g_audioFeederRunning) [VCamMediaManager decodeAudioToMemory];
         }
     }
     if (!g_hasProbedASBD) return status;
@@ -974,20 +952,9 @@ static OSStatus hooked_AudioUnitRender(
         if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
                 kAudioUnitScope_Output, inOutputBusNumber, &live, &ps) == noErr
                 && live.mSampleRate > 0
-                && (live.mSampleRate        != g_targetASBD.mSampleRate
-                    || live.mChannelsPerFrame  != g_targetASBD.mChannelsPerFrame
-                    || live.mBitsPerChannel    != g_targetASBD.mBitsPerChannel
-                    || ((live.mFormatFlags ^ g_targetASBD.mFormatFlags)
-                        & (kAudioFormatFlagIsFloat | kAudioFormatFlagIsNonInterleaved)))) {
-            g_hasProbedASBD = NO;  // 下一帧重新走探测+重建
-            g_audioDecodeGen++;
-            os_unfair_lock_lock(&g_audioPCMLock);
-            if (g_audioPCM) { free(g_audioPCM); g_audioPCM = NULL; }
-            g_audioPCMLen   = 0;
-            g_audioPCMRead  = 0;
-            g_audioPCMReady = NO;
-            os_unfair_lock_unlock(&g_audioPCMLock);
-            if (g_audioFeederRunning) g_audioFeederStop = YES;  // 停旧解码线程，迫使其用新 ASBD 重解码
+                && !vcm_asbdMatches(live, g_targetASBD)) {
+            g_hasProbedASBD = NO;   // 下一帧重新走探测 + 重建
+            vcm_invalidatePCM();    // 含停旧解码线程，迫使其用新 ASBD 重解码
         }
     }
 
@@ -997,9 +964,6 @@ static OSStatus hooked_AudioUnitRender(
     if (!g_audioFeederRunning && !g_audioPCMReady) {
         [VCamMediaManager decodeAudioToMemory];
     }
-
-    UInt32 size = ioData->mBuffers[0].mDataByteSize;
-    if (size == 0 || size > 0x100000) return status;
 
     // 预解码 PCM 的字节布局 = 微信 ioData->mBuffers[0..n] 的「顺序拼接」
     // （解码器已按真实 ASBD 直出：non-interleaved 即 ch0段+ch1段+…，interleaved 即单段），
@@ -1143,26 +1107,41 @@ static VCamAudioProxy *g_audioProxy = nil;
 
 #pragma mark - AVCaptureVideoPreviewLayer（叠加预览显示层）
 // 预览叠加层用 AVSampleBufferDisplayLayer：帧由采集回调 enqueue，素材位置由会话时钟决定。
+@interface AVCaptureVideoPreviewLayer (VCamSync)
+- (void)vcm_syncDisplayLayer;
+@end
+
+// CADisplayLink 强引用 target，直接拿 preview layer 当 target 会让它被 runloop 永久持有而泄漏。
+// 加一层弱引用代理转发：layer 释放后 proxy.target 自动置 nil，回调变成空转。
+@interface VCamLinkProxy : NSObject
+@property (nonatomic, weak) AVCaptureVideoPreviewLayer *layer;
+@end
+@implementation VCamLinkProxy
+- (void)step:(CADisplayLink *)link { [self.layer vcm_syncDisplayLayer]; }
+@end
+static VCamLinkProxy *g_linkProxy = nil;
+
 %hook AVCaptureVideoPreviewLayer
 - (void)addSublayer:(CALayer *)layer {
     %orig;
 
-    // displayLink 只建一次，target 就是当前 preview layer
+    // displayLink 只建一次；frame / videoGravity / 旋转由 vcm_syncDisplayLayer 每帧对齐
     if (!g_displayLink) {
-        g_displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(vcm_step:)];
+        g_linkProxy = [VCamLinkProxy new];
+        g_linkProxy.layer = self;
+        g_displayLink = [CADisplayLink displayLinkWithTarget:g_linkProxy selector:@selector(step:)];
         [g_displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
     }
     if (![[self sublayers] containsObject:g_displayLayer]) {
         g_displayLayer = [[AVSampleBufferDisplayLayer alloc] init];
         [self insertSublayer:g_displayLayer above:layer];
-        dispatch_async(dispatch_get_main_queue(), ^{ g_displayLayer.frame = self.bounds; });
     }
 }
 
 // 每帧同步显示层的可见性、填充模式、位置和旋转。不在这里取帧——取帧由采集回调驱动，
 // 这里只负责把显示层跟采集层状态对齐。
 %new
-- (void)vcm_step:(CADisplayLink *)link {
+- (void)vcm_syncDisplayLayer {
     if (!g_displayLayer) return;
 
     // 素材不存在或不替换时把显示层透明掉，露出真实摄像头
@@ -1201,7 +1180,6 @@ static VCamAudioProxy *g_audioProxy = nil;
     UIButton *_btnLoop;        // g_isLoop
     UIButton *_btnSound;       // g_isSound
     UIButton *_btnReplace;     // g_isReplace
-    UIButton *_btnReset;
 }
 
 #pragma mark - 生命周期
@@ -1398,52 +1376,40 @@ static VCamAudioProxy *g_audioProxy = nil;
     if (hasVideo) {
         // 按导入文件真实扩展名落地（如 mp4 存 .mp4），与音频逻辑一致，避免写死 .mov 扩展名。
         // 先删掉同前缀的旧扩展名残留文件，再设新路径并持久化。
-        [g_fileManager removeItemAtPath:g_videoPath error:nil];
-        for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
-            if ([old hasPrefix:@"bear_vcam_temp."]) {
-                [g_fileManager removeItemAtPath:[g_videoDir stringByAppendingPathComponent:old] error:nil];
-            }
-        }
+        vcm_clearMaterialFiles(@"bear_vcam_temp.");
         NSString *ext = [src pathExtension].lowercaseString;
         if (ext.length == 0) ext = @"mov";
-        g_videoPath = [[g_videoDir stringByAppendingPathComponent:
-                        [NSString stringWithFormat:@"bear_vcam_temp.%@", ext]] copy];
-        vcm_saveSettings();   // 持久化真实扩展名，否则重启后找不到文件
-        BOOL copied = [g_fileManager copyItemAtPath:src toPath:g_videoPath error:&copyErr];
-        if (!copied) { [self updateStatusUI]; return; }
+        NSString *dst = [g_videoDir stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"bear_vcam_temp.%@", ext]];
+        // 先落盘再换全局路径：拷贝失败时 g_videoPath 仍指向旧素材，不会写进一条不存在的存档。
+        if (![g_fileManager copyItemAtPath:src toPath:dst error:&copyErr]) { [self updateStatusUI]; return; }
+        g_videoPath = [dst copy];
         // 停掉 reader 而不只是清冻结帧：换素材时若循环关闭且旧 reader 已读完，setup 里的 loop 门禁会把重建挡掉。
         vcm_stopReaders();
         g_isReplace = YES;
-        vcm_saveSettings();
+        vcm_saveSettings();   // 扩展名随导入文件变化，必须持久化，否则重启后找不到文件
         [VCamMediaManager setupVideoReaderIfNeeded];
         [VCamMediaManager setupAudioReaderIfNeeded];
     } else if (hasAudio) {
         // 导入声音文件只新增/替换声音源，绝不删视频：画面仍由视频提供，音频优先用本声音文件。
         // 按导入文件的真实扩展名落地（如 mp3 存 .mp3），避免被写死 .m4a 扩展名导致解封装器选错而静音；
         // 并先删掉同前缀的旧扩展名残留文件。
-        [g_fileManager removeItemAtPath:g_tempAudioPath error:nil];
-        for (NSString *old in [g_fileManager contentsOfDirectoryAtPath:g_videoDir error:nil]) {
-            if ([old hasPrefix:@"bear_vcam_audio."]) {
-                [g_fileManager removeItemAtPath:[g_videoDir stringByAppendingPathComponent:old] error:nil];
-            }
-        }
+        vcm_clearMaterialFiles(@"bear_vcam_audio.");
         NSString *ext = [src pathExtension].lowercaseString;
         if (ext.length == 0) ext = @"m4a";
-        g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:
-                            [NSString stringWithFormat:@"bear_vcam_audio.%@", ext]] copy];
-        vcm_saveSettings();   // 持久化真实扩展名，否则重启后找不到文件
-        BOOL copied = [g_fileManager copyItemAtPath:src toPath:g_tempAudioPath error:&copyErr];
-        if (!copied) { [self updateStatusUI]; return; }
+        NSString *dst = [g_videoDir stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"bear_vcam_audio.%@", ext]];
+        if (![g_fileManager copyItemAtPath:src toPath:dst error:&copyErr]) { [self updateStatusUI]; return; }
+        g_tempAudioPath = [dst copy];
 
         // 自动开启替换（用户意图就是替换麦克风声音），否则若 g_isReplace=NO 会被门禁透传真实麦克风。
         g_isReplace = YES;
-        vcm_saveSettings();
+        vcm_saveSettings();   // 扩展名随导入文件变化，必须持久化，否则重启后找不到文件
         vcm_stopReaders();      // 让链路重新 setup（声音源变化需重启解码）
         [self updateStatusUI];
     }
-    // 换素材后重新锚定时钟与像素池尺寸（素材分辨率/帧率可能不同）
+    // 换素材后按新素材重新锚定时钟（vcm_reloadReaders 已 reset 过，这里再补一次以防中途又出了几帧）
     vcm_resetClock();
-    if (g_pbPool) { CVPixelBufferPoolRelease(g_pbPool); g_pbPool = NULL; }
     [self refreshGridButtons];
 }
 
@@ -1470,12 +1436,16 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 
 #pragma mark - UIWindow 手势触发
 static void vcm_installTapGesture(UIWindow *win) {
+    // becomeKeyWindow 会被反复调用（切前后台、弹窗），不判重会一层层叠加手势 → 一次双击弹 N 个面板。
+    static char kVCamTapKey;
+    if (objc_getAssociatedObject(win, &kVCamTapKey)) return;
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
         initWithTarget:win action:@selector(vcm_presentMenu)];
     tap.numberOfTapsRequired    = 2;
     tap.numberOfTouchesRequired = 2;
     tap.cancelsTouchesInView    = NO;
     [win addGestureRecognizer:tap];
+    objc_setAssociatedObject(win, &kVCamTapKey, tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 @interface UIWindow (VCam)
 - (void)vcm_presentMenu;
@@ -1504,13 +1474,12 @@ static void vcm_installTapGesture(UIWindow *win) {
 %ctor {
     g_fileManager = [NSFileManager defaultManager];
     g_mediaLock   = [[NSLock alloc] init];
-    vcm_loadSettings();
     g_ciContext = [CIContext contextWithOptions:@{
         kCIContextWorkingColorSpace: [NSNull null],
     }];
-    g_videoDir = [vcm_documentPath() stringByAppendingPathComponent:@"VCAM"];
+    g_videoDir = [[vcm_documentPath() stringByAppendingPathComponent:@"VCAM"] copy];
     [g_fileManager createDirectoryAtPath:g_videoDir withIntermediateDirectories:YES attributes:nil error:nil];
-    // 素材路径由 vcm_loadSettings 决定（优先用持久化的真实扩展名文件），缺省给默认名兜底。
+    // 先给默认名兜底，再由 vcm_loadSettings 用持久化的真实扩展名覆盖（无存档则保持默认）。
     g_tempAudioPath = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_audio.m4a"] copy];
     g_videoPath     = [[g_videoDir stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
     vcm_loadSettings();
@@ -1532,6 +1501,10 @@ static void vcm_installTapGesture(UIWindow *win) {
 }
 
 %dtor {
+    [g_displayLink invalidate];   // 不放进 runloop 的引用会一直回调到已释放的 layer
+    g_displayLink  = nil;
+    g_displayLayer = nil;
+    g_linkProxy    = nil;
     [VCamMediaManager cleanup];
     g_fileManager = nil;
     g_ciContext   = nil;
