@@ -1465,10 +1465,13 @@ static VCamAudioProxy *g_audioProxy = nil;
 }
 - (void)finishWritingWithCompletionHandler:(void (^)(void))handler {
     vcm_log(@"[capture] AVAssetWriter finishWriting：视频替换恢复");
-    %orig(^{
+    // block 字面量不能直接写在 %orig(...) 里：Logos 预处理器解析嵌套大括号会失败，
+    // 报 “missing closing parenthesis”。必须先赋给局部变量，再传标识符。
+    void (^wrapped)(void) = ^{
         g_videoSuppress = NO;   // 先清位再回调微信，保证微信收尾时链路已恢复
         if (handler) handler();
-    });
+    };
+    %orig(wrapped);
 }
 // 不 hook -finishWriting（同步版）：已 deprecated，-Werror 下有编译风险；
 // 异步 finishWritingWithCompletionHandler / cancelWriting 已覆盖现代录制收尾，
