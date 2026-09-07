@@ -1122,10 +1122,11 @@ static VCamAudioProxy *g_audioProxy = nil;
 // CADisplayLink 强引用 target，直接拿 preview layer 当 target 会让它被 runloop 永久持有而泄漏。
 // 加一层弱引用代理转发：layer 释放后 proxy.target 自动置 nil，回调变成空转。
 @interface VCamLinkProxy : NSObject
-@property (nonatomic, weak) AVCaptureVideoPreviewLayer<VCamSync> *layer;
+// 属性不带协议限定：带限定的话 g_linkProxy.layer = self 会因 protocol-qualified 指针不兼容报 -Werror
+@property (nonatomic, weak) AVCaptureVideoPreviewLayer *layer;
 @end
 @implementation VCamLinkProxy
-- (void)step:(CADisplayLink *)link { [self.layer vcm_syncDisplayLayer]; }
+- (void)step:(CADisplayLink *)link { [(id<VCamSync>)self.layer vcm_syncDisplayLayer]; }
 @end
 static VCamLinkProxy *g_linkProxy = nil;
 
