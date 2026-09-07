@@ -1113,7 +1113,8 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     %orig;
     g_sessionRunning = NO;
     vcm_finishWritingNow();           // 兜底只清写文件位（会话停止≠退出拍照模式）
-    if (g_displayLink) g_displayLink.paused = YES;
+    if (g_displayLink) { [g_displayLink invalidate]; g_displayLink = nil; }  // 退出相机从 runloop 摘除并释放，避免跨场景残留旧 link
+    g_displayLayer = nil;   // 释放上一次的显示层，下个相机入口在 addSublayer: 里重建，杜绝旧层引用泄漏
     vcm_invalidatePCM();
     vcm_resetClock();
 }
@@ -1189,7 +1190,8 @@ static VCamLinkProxy *g_linkProxy = nil;
 - (void)vcm_syncDisplayLayer {
     if (!g_displayLayer) return;
 
-    BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()];
+    // 拍照/拍摄模式（g_videoSuppress）下代理不再往 g_displayLayer 塞帧，必须隐藏上层露出真实相机，否则空层盖成黑屏
+    BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()] && !g_videoSuppress;
     [g_displayLayer setOpacity:(show ? 1.0f : 0.0f)];
     if (!show) return;
 
