@@ -365,6 +365,14 @@ static void vcm_scheduleUnsuppress(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (my != s_unsuppressToken) return;   // 期间又有新的拍照/录制 → 放弃本次恢复
+        // 仍处于拍照模式（session 上还挂着 StillImageOutput）→ 放弃恢复，预览保持真实画面。
+        // 不加这道闸：拍/录完回退到拍照界面时，1.5s 一到就恢复替换，预览立刻切回素材 ——
+        // 「拍摄视频回退回来误伤」的根因（日志 23:33:53.095 恢复 → 23:33:53.100 [req] 1080x1920）。
+        // 真正退出拍照模式时由 removeOutput 恢复（那里 g_stillAttached 已置 NO）。
+        if (g_stillAttached) {
+            vcm_log(@"[capture] 延迟恢复跳过：仍处于拍照模式，预览保持真实画面");
+            return;
+        }
         g_videoSuppress = NO;
         vcm_log(@"[capture] 延迟恢复：视频替换已恢复");
     });
@@ -1581,7 +1589,8 @@ static void vcm_installShutterHook(void) {
     %orig(startTime);
 }
 - (void)finishWritingWithCompletionHandler:(void (^)(void))handler {
-    vcm_log(@"[capture] AVAssetWriter finishWriting：视频替换恢复");
+    // 文案与 cancelWriting 对齐：这里也是延迟恢复，不是立即恢复（延迟期间仍显示真实画面）
+    vcm_log(@"[capture] AVAssetWriter finishWriting：1.5s 后恢复替换");
     // block 字面量不能直接写在 %orig(...) 里：Logos 预处理器解析嵌套大括号会失败，
     // 报 “missing closing parenthesis”。必须先赋给局部变量，再传标识符。
     void (^wrapped)(void) = ^{
