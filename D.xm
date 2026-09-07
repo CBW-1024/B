@@ -44,6 +44,7 @@ static BOOL g_audioReload = NO;
 static NSString *g_videoDir       = nil;
 static NSString *g_tempAudioPath  = nil;
 static NSString *g_videoPath      = nil;
+static BOOL      g_hasVideoMaterial = NO;  // 缓存：素材当前是否可被 reader 成功加载（数据驱动，避免每帧 stat）
 
 #pragma mark - 运行时状态
 // 运行时状态：文件管理器、媒体锁（reader/缓冲并发保护）、CoreImage 上下文（像素合成用）。
@@ -252,6 +253,7 @@ static void vcm_stopReaders(void) {
     if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
     if (g_audioReader) { [g_audioReader cancelReading]; g_audioReader = nil; g_audioOutput = nil; }
     if (g_lastVideoPixel) { CVPixelBufferRelease(g_lastVideoPixel); g_lastVideoPixel = NULL; }
+    g_hasVideoMaterial = NO;  // 素材不可用：reader 已停，热路径据此跳过替换（数据驱动，避免每帧 stat）
     [g_mediaLock unlock];
     g_srcFrameIdx = -1;
 }
@@ -373,6 +375,7 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
                 g_videoReader.status == AVAssetReaderStatusCompleted) return;
 
             if (g_videoReader) { [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil; }
+            g_hasVideoMaterial = NO;  // 进入重建：先假定失效，startReading 成功再置 YES（含文件被删/损坏的自愈）
             NSString *path = vcm_videoPath();
             if (![g_fileManager fileExistsAtPath:path]) return;
             AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
@@ -398,7 +401,7 @@ static CVPixelBufferRef vcm_pooledPixelBuffer(size_t w, size_t h, OSType pfmt) {
                 };
                 g_videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
                 [g_videoReader addOutput:g_videoOutput];
-                if ([g_videoReader startReading]) g_srcFrameIdx = -1;  // reader 回素材头，帧索引重锚定
+                if ([g_videoReader startReading]) { g_srcFrameIdx = -1; g_hasVideoMaterial = YES; }  // reader 回素材头，帧索引重锚定
             }
         }
     } @catch (NSException *e) {
@@ -883,7 +886,7 @@ static CVPixelBufferRef vcm_pullVideoFrame(void) {
 // 画布恒等于采集帧尺寸，旋转只作用于源画面
 + (CMSampleBufferRef)getVideoFrame:(CMSampleBufferRef)origSample {
     if (!origSample) return NULL;
-    if (![g_fileManager fileExistsAtPath:vcm_videoPath()]) return NULL;  // 没素材原样透传
+    if (!g_hasVideoMaterial) return NULL;  // 没素材（reader 未建/文件失效）原样透传，避免每帧 stat
     CVPixelBufferRef camPix = CMSampleBufferGetImageBuffer(origSample);
     if (!camPix) return NULL;
 
@@ -981,8 +984,17 @@ static OSStatus hooked_AudioUnitRender(
     }
     if (need == 0 || need > 0x100000) return status;
 
-    uint8_t *temp = (uint8_t *)calloc(1, need);
-    if (!temp) return status;
+    // 复用 scratch 缓冲：实时音频线程上每帧 calloc/free 会加锁并可能在内存压力下引起卡顿，
+    // 故用一份全局缓冲、仅在 need 超过容量时 realloc（缓冲尺寸通常稳定，realloc 极少触发）。
+    static uint8_t *s_scratch = NULL;
+    static size_t   s_scratchCap = 0;
+    if (need > s_scratchCap) {
+        uint8_t *p = (uint8_t *)realloc(s_scratch, need);
+        if (!p) return status;
+        s_scratch = p; s_scratchCap = need;
+    }
+    uint8_t *temp = s_scratch;
+    memset(temp, 0, need);
     @try {
         [VCamMediaManager pullAudioData:temp length:(UInt32)need atTime:vcm_elapsed()];
         size_t off = 0;
@@ -995,7 +1007,6 @@ static OSStatus hooked_AudioUnitRender(
         }
     } @catch (NSException *e) {
     }
-    free(temp);
     return noErr;
 }
 
@@ -1003,6 +1014,8 @@ static OSStatus hooked_AudioUnitRender(
 // VCamVideoProxy：接管 AVCaptureVideoDataOutput 的采样回调代理，把真实画面换成素材视频帧。
 // 前置声明：vcm_sessionHasStillOutput 定义于下方 AVCaptureSession 段落，此处 proxy 需要先引用。
 static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session);
+// hasStill 判定带 session 级缓存（见下方定义），供采集回调/预览层每帧复用，避免重复遍历 outputs
+static BOOL vcm_hasStillForSession(AVCaptureSession *session);
 // AVCaptureOutput.session 在部分 SDK 头中未声明（如 macOS runner 的 AVFoundation），
 // 直接用 objc_msgSend 取，规避“未声明 selector”的编译错误，且绕开 ARC 下 performSelector 的 leak 警告。
 static AVCaptureSession *vcm_getOutputSession(AVCaptureOutput *output) {
@@ -1022,7 +1035,7 @@ static AVCaptureSession *vcm_getOutputSession(AVCaptureOutput *output) {
      fromConnection:(AVCaptureConnection *)connection {
     g_videoOrientation = connection.videoOrientation;
     // 底层判别：session 含静态图像输出 = 拍照/扫码 → 真实；只有视频输出 = 视频通话 → 素材
-    BOOL hasStill   = vcm_sessionHasStillOutput(vcm_getOutputSession(output));
+    BOOL hasStill   = vcm_hasStillForSession(vcm_getOutputSession(output));
     BOOL replacing  = (g_isReplace && !hasStill);
     CMSampleBufferRef newSample = NULL;
     if (replacing) {   // 替换开启且非拍照/扫码场景
@@ -1074,7 +1087,7 @@ static char kVCamVideoProxyKey;   // 关联对象 key：每个 AVCaptureVideoDat
     // 底层判别：真实/素材由采集回调时取 session 的静态输出决定，这里不再按类名估场景
     NSString *cls = NSStringFromClass([delegate class]);
     vcm_dbg(@"setSampleBufferDelegate delegate=%@ hasStill=%d",
-            cls, vcm_sessionHasStillOutput(vcm_getOutputSession(self)));
+            cls, vcm_hasStillForSession(vcm_getOutputSession(self)));
     %orig(p, queue);
 }
 %end
@@ -1140,6 +1153,20 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
         if ((c1 && [o isKindOfClass:c1]) || (c2 && [o isKindOfClass:c2])) return YES;
     return NO;
 }
+
+// hasStill 缓存：同一 AVCaptureSession 对象的 outputs 在生命周期内恒定（实测微信 stop 后复用 session
+// 也不 removeOutput，故答案不变）。按 session 关联对象缓存一次，采集回调（~60fps）与预览层（displayLink）
+// 每帧直接读缓存，省去重复遍历 outputs + isKindOfClass。session 释放时关联对象自动清理；复用同一
+// session 对象时缓存仍正确（outputs 未变）。
+static void *kVCamHasStillKey = &kVCamHasStillKey;
+static BOOL vcm_hasStillForSession(AVCaptureSession *session) {
+    if (!session) return NO;
+    NSNumber *cached = objc_getAssociatedObject(session, &kVCamHasStillKey);
+    if (cached) return cached.boolValue;
+    BOOL v = vcm_sessionHasStillOutput(session);
+    objc_setAssociatedObject(session, &kVCamHasStillKey, @(v), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return v;
+}
 %hook AVCaptureSession
 - (void)startRunning {
     vcm_reloadReaders();
@@ -1185,7 +1212,12 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 @property (nonatomic, weak) AVCaptureVideoPreviewLayer *layer;
 @end
 @implementation VCamLinkProxy
-- (void)step:(CADisplayLink *)link { [(id<VCamSync>)self.layer vcm_syncDisplayLayer]; }
+- (void)step:(CADisplayLink *)link {
+    // 先强引用捕获 layer：self.layer 为 weak，若直接 [(id)self.layer ...] 在“读出非 nil”与“发消息”
+    // 之间 layer 被其他线程释放，会变成向已释放对象发消息（野指针崩溃）。强捕获可保住生命周期。
+    AVCaptureVideoPreviewLayer *layer = self.layer;
+    if (layer) [(id<VCamSync>)layer vcm_syncDisplayLayer];
+}
 @end
 static VCamLinkProxy *g_linkProxy = nil;
 
@@ -1211,8 +1243,8 @@ static VCamLinkProxy *g_linkProxy = nil;
     if (!g_displayLayer) return;
 
     // 拍照/扫码（session 含静态输出）时采集回调不塞素材帧，必须隐藏上层露出真实相机，否则空层盖成黑屏
-    BOOL hasStill = vcm_sessionHasStillOutput([self session]);
-    BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()] && !hasStill;
+    BOOL hasStill = vcm_hasStillForSession([self session]);
+    BOOL show = g_isReplace && g_hasVideoMaterial && !hasStill;
     [g_displayLayer setOpacity:(show ? 1.0f : 0.0f)];
     if (!show) return;
 
