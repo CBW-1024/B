@@ -24,13 +24,12 @@ static BOOL g_isSound        = YES;  // 是否替换麦克风采集
 
 // 抑制位（g_videoSuppress = (g_suppressMask != 0) 为真时 = 透传真实画面）：
 //   kSuppressPhotoMode = 1<<0 : 进相机期间全程真实（拍照/录像预览、长按过程、成片均为真实画面）
-//   kSuppressWriting   = 1<<1 : 预留（录制活动标记）
 typedef NS_ENUM(NSUInteger, VCamSuppressReason) {
-    kSuppressPhotoMode = 1 << 0,   // 拍照模式位：进相机/拍照态时置位，预览与成片均透传真实相机
-    kSuppressWriting   = 1 << 1,   // 正在写文件（AVAssetWriter 活动中），预留
+    kSuppressPhotoMode = 1 << 0,   // 进相机期间置位：预览与成片均透传真实相机
 };
 static NSUInteger g_suppressMask = 0;
 static BOOL g_videoSuppress = NO;  // 派生值：g_suppressMask != 0
+static BOOL g_scanActive    = NO;  // 扫码/识别场景（微信为 CameraScannerView）：画面必须真实，否则识别不了码
 
 // 拍照/录像判别不再依赖相机内部控件：当前微信版本下 SightShootingModeSwitchView 在你的相机入口不存在
 // （shootingModeSwitchView 恒为 nil，取不到 currentShootingMode），改为事件驱动——进相机即真实、
@@ -218,10 +217,7 @@ static BOOL vcm_loopShouldFreeze(double elapsed) {
     return NO;
 }
 
-// 收尾时立即清除写文件位（stopRunning 调用）。拍照/录像的替换切换统一见 AVAssetWriter 钩子。
-static void vcm_finishWritingNow(void) {
-    vcm_suppressSet(kSuppressWriting, NO);
-}
+// （原写文件位 kSuppressWriting 已废弃：录制不再切换替换，其清理逻辑一并移除）
 
 // 拍照/录像判别说明：不再依赖 MMSightCameraViewController.cameraMode（实测恒为 6，非判别信号），
 // 也不再依赖 SightShootingModeSwitchView（当前入口下 shootingModeSwitchView 恒为 nil）。
@@ -1029,7 +1025,7 @@ static OSStatus hooked_AudioUnitRender(
      fromConnection:(AVCaptureConnection *)connection {
     g_videoOrientation = connection.videoOrientation;
     CMSampleBufferRef newSample = NULL;
-    if (g_isReplace && !g_videoSuppress) {   // 替换开启且未被抑制：把真实帧换成素材帧
+    if (g_isReplace && !g_videoSuppress && !g_scanActive) {   // 替换开启、未被抑制、且非扫码场景
         @try {
             newSample = [VCamMediaManager getVideoFrame:sampleBuffer];
             if (newSample && g_displayLayer) {
@@ -1068,6 +1064,7 @@ static char kVCamVideoProxyKey;   // 关联对象 key：每个 AVCaptureVideoDat
     if (delegate == nil) {
         %orig(nil, nil);  // detach 时原样透传，避免在已停 session 上塞入 proxy 导致闪退
         [p setOriginalDelegate:nil queue:nil];
+        g_scanActive = NO;
         return;
     }
     if (!p) {
@@ -1075,7 +1072,11 @@ static char kVCamVideoProxyKey;   // 关联对象 key：每个 AVCaptureVideoDat
         objc_setAssociatedObject(self, &kVCamVideoProxyKey, p, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     [p setOriginalDelegate:delegate queue:queue];
-    vcm_dbg(@"setSampleBufferDelegate delegate=%@", NSStringFromClass([delegate class]));
+    // 扫码/识别类场景必须透传真实画面：被替换成素材就识别不了码
+    NSString *cls = NSStringFromClass([delegate class]);
+    g_scanActive = ([cls rangeOfString:@"Scan" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                    [cls rangeOfString:@"QR"   options:NSCaseInsensitiveSearch].location != NSNotFound);
+    vcm_dbg(@"setSampleBufferDelegate delegate=%@ scan=%d", cls, g_scanActive);
     %orig(p, queue);
 }
 %end
@@ -1160,7 +1161,6 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 - (void)stopRunning {
     %orig;
     g_sessionRunning = NO;
-    vcm_finishWritingNow();           // 兜底只清写文件位（会话停止≠退出拍照模式）
     if (g_displayLink) g_displayLink.paused = YES;
     vcm_invalidatePCM();
     vcm_resetClock();
@@ -1175,7 +1175,6 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
     %orig;
     // 进相机即全程真实：不再依赖 shotMode 切换控件（当前入口下不存在），录制期间也不切换
     vcm_suppressSet(kSuppressPhotoMode, YES);
-    vcm_suppressSet(kSuppressWriting, NO);
     vcm_dbg(@"MMSightCamera viewWillAppear[b20260908c] suppressing=%d", g_videoSuppress);
 }
 - (void)viewWillDisappear:(_Bool)arg1 {
@@ -1191,14 +1190,12 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 - (BOOL)startWriting {
     BOOL ok = %orig;
     vcm_suppressSet(kSuppressPhotoMode, YES);  // 录制期间同样保持真实
-    vcm_suppressSet(kSuppressWriting, NO);
     return ok;
 }
 - (void)finishWritingWithCompletionHandler:(void (^)(void))handler {
     // block 先赋局部变量再传 %orig，避免 Logos 解析嵌套大括号报 “missing closing parenthesis”
     void (^wrapped)(void) = ^{
         vcm_suppressSet(kSuppressPhotoMode, YES);  // 录完回到真实预览
-        vcm_suppressSet(kSuppressWriting, NO);
         if (handler) handler();
     };
     %orig(wrapped);
@@ -1206,7 +1203,6 @@ static BOOL vcm_sessionHasStillOutput(AVCaptureSession *session) {
 - (void)cancelWriting {
     %orig;
     vcm_suppressSet(kSuppressPhotoMode, YES);
-    vcm_suppressSet(kSuppressWriting, NO);
 }
 %end
 
@@ -1253,7 +1249,7 @@ static VCamLinkProxy *g_linkProxy = nil;
     // 拍照/录像由进相机与录制事件驱动，无需逐帧轮询模式，故此处不再调用模式判定
 
     // 拍照/拍摄模式（g_videoSuppress）下代理不再往 g_displayLayer 塞帧，必须隐藏上层露出真实相机，否则空层盖成黑屏
-    BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()] && !g_videoSuppress;
+    BOOL show = g_isReplace && [g_fileManager fileExistsAtPath:vcm_videoPath()] && !g_videoSuppress && !g_scanActive;
     [g_displayLayer setOpacity:(show ? 1.0f : 0.0f)];
     if (!show) return;
 
