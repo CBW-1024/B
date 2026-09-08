@@ -556,9 +556,9 @@ static BOOL isToday(NSDate *date) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD小丑助手";
+    self.title = @"DD小丑助手设置";
 
-    // 设置导航栏外观（与 DD微信助手 一致）
+    // 设置导航栏外观
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
     appearance.shadowColor = nil;
