@@ -13,6 +13,7 @@
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
 + (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue;
++ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightView:(id)rightView;
 @property (nonatomic, retain) id userInfo;
 @end
 
@@ -548,6 +549,8 @@ static BOOL isToday(NSDate *date) {
 
 @interface DDJokerSettingsViewController : UIViewController <UITableViewDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
+@property (nonatomic, strong) UITextField *stepsField;
+@property (nonatomic, strong) UITextField *contactsField;
 @end
 
 @implementation DDJokerSettingsViewController {
@@ -556,9 +559,9 @@ static BOOL isToday(NSDate *date) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD小丑助手设置";
+    self.title = @"DD小丑助手";
 
-    // 设置导航栏外观
+    // 设置导航栏外观（与 DD微信助手 一致）
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
     appearance.shadowColor = nil;
@@ -577,38 +580,66 @@ static BOOL isToday(NSDate *date) {
     [self buildTable];
 }
 
+// 通用方法：创建右侧输入框+确认按钮
+- (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action placeholder:(NSString *)placeholder text:(NSString *)text {
+    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 200, 30)];
+    
+    field.frame = CGRectMake(0, 0, 150, 30);
+    field.borderStyle = UITextBorderStyleRoundedRect;
+    field.placeholder = placeholder;
+    field.text = text;
+    field.textAlignment = NSTextAlignmentRight;
+    field.keyboardType = UIKeyboardTypeNumberPad;
+    [container addSubview:field];
+    
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = CGRectMake(158, 0, 42, 30);
+    [btn setTitle:@"确认" forState:UIControlStateNormal];
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [container addSubview:btn];
+    
+    return container;
+}
+
 - (void)buildTable {
     [_tableViewManager clearAllSection];
     
+    // 更新 footer 提示
     WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"小丑设置"
-                                                                                                 Footer:@"聊天记录修改长按消息弹窗菜单小丑按钮（支持文字和转账金额），钱包余额修改长按服务页钱包入口或零钱详情页余额数字修改"];
+                                                                                                 Footer:@"聊天记录修改长按消息弹窗菜单小丑按钮（支持文字和转账金额），钱包余额修改长按服务页钱包入口或零钱详情页余额数字修改\n步数和好友数量修改后需重启微信生效"];
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    Class cellCls = objc_getClass("WCTableViewCellManager");
     
     // 1. 聊天记录修改开关
-    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(jokerSwitchChanged:) target:self title:@"聊天记录修改" on:cfg.jokerEnabled]];
+    [section addCell:[cellCls switchCellForSel:@selector(jokerSwitchChanged:) target:self title:@"聊天记录修改" on:cfg.jokerEnabled]];
     
     // 2. 钱包零钱修改开关
-    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(walletSwitchChanged:) target:self title:@"钱包零钱修改" on:cfg.walletEnabled]];
+    [section addCell:[cellCls switchCellForSel:@selector(walletSwitchChanged:) target:self title:@"钱包零钱修改" on:cfg.walletEnabled]];
     
-    // 3. 运动步数开关 + 子项
-    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
+    // 3. 运动步数开关 + 子项（输入框+确认）
+    [section addCell:[cellCls switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
     if (cfg.stepsEnabled) {
-        NSString *right = [cfg hasStepsValue] ? [NSString stringWithFormat:@"%ld 步", (long)[cfg stepsIntegerValue]] : @"未设置";
-        WCTableViewCellManager *stepsSubCell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(stepsCellTapped) target:self title:@"↳步数自定义" rightValue:right];
+        self.stepsField = [[UITextField alloc] init];
+        NSString *currentSteps = [cfg hasStepsValue] ? cfg.stepsValueString : @"";
+        UIView *rightView = [self inputRowWithField:self.stepsField
+                                             action:@selector(stepsConfirm:)
+                                        placeholder:@"输入：如88888"
+                                               text:currentSteps];
+        WCTableViewCellManager *stepsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳步数自定义" rightView:rightView];
         stepsSubCell.userInfo = @"SubCell";
         [section addCell:stepsSubCell];
     }
     
-    // 4. 好友数量开关 + 子项
-    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
+    // 4. 好友数量开关 + 子项（输入框+确认）
+    [section addCell:[cellCls switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
     if (cfg.contactsEnabled) {
-        NSString *right;
-        if ([cfg hasContactsValue]) {
-            right = [NSString stringWithFormat:@"%@ 个", cfg.contactsValue];
-        } else {
-            right = @"未设置";
-        }
-        WCTableViewCellManager *contactsSubCell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(contactsCellTapped) target:self title:@"↳数量自定义" rightValue:right];
+        self.contactsField = [[UITextField alloc] init];
+        NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
+        UIView *rightView = [self inputRowWithField:self.contactsField
+                                             action:@selector(contactsConfirm:)
+                                        placeholder:@"输入：如88888"
+                                               text:currentContacts];
+        WCTableViewCellManager *contactsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳数量自定义" rightView:rightView];
         contactsSubCell.userInfo = @"SubCell";
         [section addCell:contactsSubCell];
     }
@@ -643,7 +674,7 @@ static BOOL isToday(NSDate *date) {
     return UITableViewAutomaticDimension;
 }
 
-#pragma mark - 事件处理（双按钮：稍后重启 / 立即重启）
+#pragma mark - 开关事件
 
 - (void)jokerSwitchChanged:(UISwitch *)sender {
     [DDGlobalConfig shared].jokerEnabled = sender.isOn;
@@ -665,71 +696,27 @@ static BOOL isToday(NSDate *date) {
     [self buildTable];
 }
 
-- (void)stepsCellTapped {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置步数"
-                                                                   message:@"输入小于 100000 的整数，超过十万可能会被和谐，需重启微信生效"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        if ([cfg hasStepsValue]) {
-            tf.text = cfg.stepsValueString;
-        } else {
-            tf.placeholder = @"例如：88888";
-        }
-        tf.keyboardType = UIKeyboardTypeNumberPad;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-    
-    __weak typeof(self) weakSelf = self;
-    
-    [alert addAction:[UIAlertAction actionWithTitle:@"稍后重启" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [weakSelf saveStepsInput:alert.textFields.firstObject.text];
-        [weakSelf buildTable];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"立即重启" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [weakSelf saveStepsInput:alert.textFields.firstObject.text];
-        exit(0);
-    }]];
-    
-    [self presentViewController:alert animated:YES completion:nil];
+#pragma mark - 输入确认事件
+
+- (void)stepsConfirm:(id)sender {
+    NSString *input = self.stepsField.text;
+    [self saveStepsInput:input];
+    [self buildTable];
 }
 
-- (void)contactsCellTapped {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置好友数量"
-                                                                   message:@"输入纯数字，需重启微信生效"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        if ([cfg hasContactsValue]) {
-            tf.text = cfg.contactsValue;
-        } else {
-            tf.placeholder = @"例如：88888";
-        }
-        tf.keyboardType = UIKeyboardTypeNumberPad;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-    
-    __weak typeof(self) weakSelf = self;
-    
-    [alert addAction:[UIAlertAction actionWithTitle:@"稍后重启" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [weakSelf saveContactsInput:alert.textFields.firstObject.text];
-        [weakSelf buildTable];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"立即重启" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [weakSelf saveContactsInput:alert.textFields.firstObject.text];
-        exit(0);
-    }]];
-    
-    [self presentViewController:alert animated:YES completion:nil];
+- (void)contactsConfirm:(id)sender {
+    NSString *input = self.contactsField.text;
+    [self saveContactsInput:input];
+    [self buildTable];
 }
 
-#pragma mark - 保存逻辑辅助方法
+#pragma mark - 保存逻辑（输入为空即关闭）
 
 - (void)saveStepsInput:(NSString *)input {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) {
-        cfg.stepsValueString = nil;
+        cfg.stepsValueString = nil; // 关闭
     } else {
         NSInteger val = [trimmed integerValue];
         if (val < 0) val = 0;
@@ -742,7 +729,7 @@ static BOOL isToday(NSDate *date) {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) {
-        cfg.contactsValue = nil;
+        cfg.contactsValue = nil; // 关闭
     } else {
         NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
         if ([trimmed rangeOfCharacterFromSet:nonDigits].location == NSNotFound) {
