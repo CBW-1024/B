@@ -1,5 +1,4 @@
 #import <UIKit/UIKit.h>
-#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
@@ -45,7 +44,7 @@ static char kAFGestureKey;
 
     BOOL on = ![[NSUserDefaults standardUserDefaults] boolForKey:kAFKey];
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:kAFKey];
-    AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
 
     UIViewController *vc = self.selectedViewController;
     if ([vc isKindOfClass:UINavigationController.class]) vc = [(UINavigationController *)vc topViewController];
