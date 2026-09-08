@@ -561,7 +561,7 @@ static BOOL isToday(NSDate *date) {
     [super viewDidLoad];
     self.title = @"DD小丑助手";
 
-    // 设置导航栏外观（与 DD微信助手 一致）
+    // 设置导航栏外观
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
     appearance.shadowColor = nil;
@@ -580,7 +580,7 @@ static BOOL isToday(NSDate *date) {
     [self buildTable];
 }
 
-// 通用方法：创建右侧输入框+确认按钮（灰色背景，文字使用系统默认颜色）
+// 通用方法：创建右侧输入框+确认按钮（背景颜色统一为 systemGray5Color）
 - (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action placeholder:(NSString *)placeholder text:(NSString *)text {
     UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 220, 34)];
     container.backgroundColor = [UIColor clearColor];
@@ -592,7 +592,7 @@ static BOOL isToday(NSDate *date) {
     field.text = text;
     field.textAlignment = NSTextAlignmentRight;
     field.keyboardType = UIKeyboardTypeNumberPad;
-    field.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    field.backgroundColor = [UIColor systemGray5Color];  // 与按钮背景统一
     field.layer.cornerRadius = 6.0;
     field.layer.masksToBounds = YES;
     field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
@@ -605,7 +605,7 @@ static BOOL isToday(NSDate *date) {
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     btn.frame = CGRectMake(168, 0, 52, 34);
     [btn setTitle:@"确认" forState:UIControlStateNormal];
-    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];  // 系统默认颜色
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
     btn.backgroundColor = [UIColor systemGray5Color];
     btn.layer.cornerRadius = 6.0;
     btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
@@ -637,7 +637,7 @@ static BOOL isToday(NSDate *date) {
         NSString *currentSteps = [cfg hasStepsValue] ? cfg.stepsValueString : @"";
         UIView *rightView = [self inputRowWithField:self.stepsField
                                              action:@selector(stepsConfirm:)
-                                        placeholder:@"输入：如88888"
+                                        placeholder:@"例如：88888"
                                                text:currentSteps];
         WCTableViewCellManager *stepsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳步数自定义" rightView:rightView];
         stepsSubCell.userInfo = @"SubCell";
@@ -651,7 +651,7 @@ static BOOL isToday(NSDate *date) {
         NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
         UIView *rightView = [self inputRowWithField:self.contactsField
                                              action:@selector(contactsConfirm:)
-                                        placeholder:@"输入：如88888"
+                                        placeholder:@"例如：5200"
                                                text:currentContacts];
         WCTableViewCellManager *contactsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳数量自定义" rightView:rightView];
         contactsSubCell.userInfo = @"SubCell";
