@@ -1408,7 +1408,7 @@ static VCamLinkProxy *g_linkProxy = nil;
     BOOL hasAudio = [g_fileManager fileExistsAtPath:g_tempAudioPath];
     NSString *vStat = hasVideo ? @"已加载" : @"未选择";
     NSMutableString *s = [NSMutableString stringWithFormat:@"视频: %@", vStat];
-    if (hasAudio)       [s appendString:@"   声音: 已加载自定义"];
+    if (hasAudio)       [s appendString:@"   声音: 自定义(长按重置可清理）"];
     else if (hasVideo)  [s appendString:@"   声音: 已加载"];
     else                [s appendString:@"   声音: 未加载"];
     _statusLabel.text = s;
