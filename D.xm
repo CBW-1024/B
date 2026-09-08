@@ -1,866 +1,598 @@
+/*
+ * zzAFHidePluginEntry —— 隐藏并关闭微信「插件」入口（单文件 Theos / Logos）
+ *
+ * 目标：wcplugins.dylib 注入到「我」页面的「插件」行 → 隐藏 + 关闭跳转。
+ * 开关：长按底部「我」2 秒切换，存 NSUserDefaults（hidePluginEntryEnable），无设置界面。
+ * 日志：微信沙盒 Documents/AFHidePluginEntry.log（见文件内 AF_LOG_PATH，启动即打印真实绝对路径）
+ *
+ * ── 逆向证据 ────────────────────────────────────────────────────────────────
+ * wcplugins.dylib（ARM64，85,680 B，符号未 strip）
+ *   符号 __ZL45$MoreViewController_addFunctionSection_method      @0x7210  → hook 注入点
+ *   符号 __ZL47$MoreViewController_pushPluginController_method    @0x75EC  → %new 跳转方法
+ *   0x726C valueForKey:@"m_tableViewMgr"   0x72AC imageNamed:@"WeChat_Lab_Logo_light_small"
+ *   0x72D8 @"插件"（入口标题）              0x7358 normalCellForSel:target:leftImage:title:WithDisclosureIndicator:
+ *   0x747C getSectionAt: → 0x74A4 addCell: → 0x74B4 getTableView → 0x74D8 reloadData
+ *   自带类：WCPluginsMgr（+sharedInstance / registerControllerWithTitle:version:controller:）
+ *          WCPluginsViewController、WCPluginModel —— 微信原始头文件里没有，可用来保守判定
+ *
+ * 微信头文件（WeChat/*.h）
+ *   MoreViewController.h     :3 类声明   :9 m_tableViewMgr   :46 pushPluginController
+ *                            :61 reloadMoreView  :64 viewDidAppear:  :83 addFunctionSection
+ *   WCTableViewManager.h     :6 sections   :23 getTableView   :34 reloadTableView
+ *   WCTableViewSectionManager.h :26 cells  :43 addCell:   ← 主拦截点
+ *   WCTableViewCellManager.h :5 cellConfig
+ *   WCTableViewCellBaseConfig.h :7 clickAction(SEL)  :8 clickTarget   ← 不用再 KVC 猜 sel/target
+ *   WCTableViewCellNormalConfig.h :9 leftConfig   WCTableViewCellLeftConfig.h :6 title
+ *   MMTabBarController.h     :4 类   :6 _tabBarBtns   :28 viewDidAppear:
+ *                            :49 getTabBarBtnViews   :65 onTabBarItemViewsRelayout
+ *
+ * ── 为什么主拦截点是 addCell: 而不是 addFunctionSection ──────────────────────
+ *   Substrate 后装者在外层。若本插件先加载：
+ *     wcplugins(后) → 我们(先) → 原实现 → 我们清理 → 返回 → wcplugins 才 addCell: → 清理被覆盖
+ *   而 WCTableViewSectionManager 的 addCell: 只有 wcplugins 在「调用」、没人在 hook，
+ *   不存在互相覆盖 → 与加载顺序无关。dylib 仍用 zz 前缀，让兜底清理也排在 wcplugins 之后。
+ */
+
 #import <UIKit/UIKit.h>
-#import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <substrate.h>
 
-#pragma mark - 微信类声明
+#pragma mark - 可调参数
 
-@interface WCPluginsMgr : NSObject
-+ (instancetype)sharedInstance;
-- (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
+/// 日志总开关（关掉后不再写文件，性能零开销）
+static const BOOL   kAFLogEnabled   = YES;
+/// 日志详细模式：记录每一次 addCell:（微信每次刷新会调几十次，排错时才开）
+static const BOOL   kAFVerboseLog   = NO;
+/// 日志超过这个体积就清空重来（字节）
+static const UInt64 kAFLogMaxBytes  = 512 * 1024;
+/// 是否要求 WCPluginsMgr 存在才生效（YES = 极端保守，绝不误伤微信原生行）
+static const BOOL   kAFRequirePluginsMgr = YES;
+/// 「我」页面清单 dump 的最小间隔（秒），避免刷屏
+static const NSTimeInterval kAFDumpInterval = 60.0;
+
+#pragma mark - 前向声明（Logos 会把 %hook 里的 self 类型写成被 hook 的类名，必须先声明）
+
+@interface MoreViewController : UIViewController
 @end
-
-@interface WCTableViewCellManager : NSObject
-+ (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
-+ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue;
-+ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightView:(id)rightView;
-@property (nonatomic, retain) id userInfo;
+@interface MMTabBarController : UITabBarController
 @end
-
 @interface WCTableViewSectionManager : NSObject
-+ (id)sectionWithHeader:(NSString *)header;
-+ (id)sectionWithFooter:(NSString *)footer;
-+ (id)sectionWithHeader:(NSString *)header Footer:(NSString *)footer;
-- (void)addCell:(id)arg1;
+- (void)addCell:(id)a0;
 @end
 
-@interface WCTableViewManager : NSObject
-- (id)initWithFrame:(CGRect)frame style:(NSInteger)style;
-@property (nonatomic, readonly) UITableView *tableView;
-@property (nonatomic, weak) id delegate;
-- (void)clearAllSection;
-- (void)addSection:(id)arg1;
-- (id)cellInfoAtIndexPath:(NSIndexPath *)indexPath;
-- (void)reloadTableView;
-@end
+#pragma mark - 日志
 
-@interface WCPayInfoItem : NSObject
-@property (nonatomic, retain) NSString *m_nsFeeDesc;
-@property (nonatomic, retain) NSString *m_receiverDesc;
-@property (nonatomic, retain) NSString *m_senderDesc;
-@property (nonatomic, assign) unsigned int m_uiPaySubType;
-@property (nonatomic, retain) NSString *m_nsTransferID;
-@end
+static NSString * const kAFLogFileName = @"AFHidePluginEntry.log";
 
-@interface CMessageWrap : NSObject
-@property (nonatomic, assign) unsigned int m_uiMesLocalID;
-@property (nonatomic, retain) NSString *m_nsContent;
-@property (nonatomic, retain) NSString *m_nsTitle;
-@property (nonatomic, retain) NSString *m_nsFromUsr;
-@property (nonatomic, retain) NSString *m_nsToUsr;
-@property (nonatomic, retain) WCPayInfoItem *m_oWCPayInfoItem;
-- (BOOL)IsTextMsg;
-- (BOOL)isReferMsgType;
-- (NSString *)GetDisplayContent;
-- (void)parseWCPayInfoItemIfNeed;
-@end
-
-@interface CommonMessageViewModel : NSObject
-@property (nonatomic, readonly) CMessageWrap *messageWrap;
-@end
-
-@interface CommonMessageCellView : UIView
-@property (nonatomic, readonly) CommonMessageViewModel *viewModel;
-@end
-
-@interface BaseMsgContentViewController : UIViewController
-- (void)clearNodeLayoutCache;
-- (void)reloadNodeWithMessageWrap:(CMessageWrap *)msgWrap;
-- (void)reloadVisibleNodeWithCellView:(UIView *)cellView;
-- (UITableView *)getMsgTableView;
-@end
-
-@interface TextMessageCellView : CommonMessageCellView @end
-@interface AppMessageCellView : CommonMessageCellView @end
-@interface WCPayTransferMessageCellView : CommonMessageCellView @end
-
-@interface MMMenuItem : UIMenuItem
-- (instancetype)initWithTitle:(NSString *)title icon:(UIImage *)icon target:(id)target action:(SEL)action;
-@end
-
-@interface TimeoutNumber : UIView
-- (void)updateNumber:(unsigned long long)number;
-@end
-
-@interface WCPayWalletEntryHeaderView : UIView
-@property (retain, nonatomic) TimeoutNumber *timeoutNumber;
-@property (retain, nonatomic) UIView *balanceEntryView;
-@end
-
-@interface WCDeviceStepObject : NSObject
-- (unsigned int)m7StepCount;
-- (unsigned int)hkStepCount;
-@end
-
-@interface WCDataItem : NSObject
-- (unsigned int)stepCount;
-@end
-
-@interface MMUILabel : UILabel @end
-
-#pragma mark - 配置管理（接口声明）
-
-// 功能开关配置键
-static NSString * const kDDFeatureJokerEnabled = @"DDFeatureJokerEnabled";
-static NSString * const kDDFeatureWalletEnabled = @"DDFeatureWalletEnabled";
-static NSString * const kDDFeatureStepsEnabled = @"DDFeatureStepsEnabled";
-static NSString * const kDDFeatureContactsEnabled = @"DDFeatureContactsEnabled";
-
-// 存储键
-static NSString * const kDDStepsValueStringKey = @"DDStepsValueString";
-static NSString * const kDDContactsCountValueKey = @"DDContactsCountValue";
-static NSString * const kDDLastStepsUpdateDateKey = @"DDLastStepsUpdateDate";
-static NSString * const kDDCustomBalanceKey = @"DD_Custom_Balance_Fen";
-
-@interface DDGlobalConfig : NSObject
-+ (instancetype)shared;
-@property (nonatomic) BOOL jokerEnabled;
-@property (nonatomic) BOOL walletEnabled;
-@property (nonatomic) BOOL stepsEnabled;
-@property (nonatomic) BOOL contactsEnabled;
-@property (nonatomic, copy) NSString *stepsValueString;
-@property (nonatomic, copy) NSString *contactsValue;
-- (NSInteger)stepsIntegerValue;
-- (BOOL)hasStepsValue;
-- (BOOL)hasContactsValue;
-- (void)saveSteps;
-- (void)saveContacts;
-@end
-
-#pragma mark - ① 聊天记录修改
-
-static CMessageWrap *JokerGetMessageWrapFromCell(CommonMessageCellView *cell) {
-    return cell.viewModel.messageWrap;
+static NSString *AFLogPath(void) {
+    // 在微信进程里，NSDocumentDirectory 就是微信沙盒 Documents
+    static NSString *p;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        p = [doc stringByAppendingPathComponent:kAFLogFileName];
+    });
+    return p;
 }
 
-static id JokerGetViewControllerFromView(UIView *view) {
-    UIResponder *responder = view;
-    while (responder) {
-        if ([responder isKindOfClass:[UIViewController class]]) {
-            return responder;
+static NSFileHandle *gAFLogFH;
+
+static NSString *AFNow(void) {
+    static NSDateFormatter *f;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        f = [[NSDateFormatter alloc] init];
+        f.dateFormat = @"MM-dd HH:mm:ss.SSS";
+    });
+    return [f stringFromDate:[NSDate date]];
+}
+
+static void AFLogOpen(void) {
+    if (gAFLogFH) return;
+    NSString *path = AFLogPath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) {
+        [fm createFileAtPath:path contents:nil attributes:nil];
+    } else {
+        NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+        if ([attr[NSFileSize] unsignedLongLongValue] > kAFLogMaxBytes) {
+            [fm removeItemAtPath:path error:nil];
+            [fm createFileAtPath:path contents:nil attributes:nil];
         }
-        responder = [responder nextResponder];
+    }
+    gAFLogFH = [NSFileHandle fileHandleForWritingAtPath:path];
+    [gAFLogFH seekToEndOfFile];
+}
+
+static void AFLogWrite(NSString *line) {
+    if (!kAFLogEnabled) return;
+    @synchronized ([NSFileHandle class]) {
+        @try {
+            if (!gAFLogFH) AFLogOpen();
+            if (!gAFLogFH) return;
+            NSString *s = [NSString stringWithFormat:@"%@ %@\n", AFNow(), line];
+            [gAFLogFH writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
+        } @catch (NSException *e) {
+            gAFLogFH = nil;
+        }
+    }
+}
+
+#define AFLog(fmt, ...) AFLogWrite([NSString stringWithFormat:(fmt), ##__VA_ARGS__])
+
+#pragma mark - 开关
+
+static NSString * const kAFHideKey = @"hidePluginEntryEnable";
+
+static BOOL AFHideEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kAFHideKey];
+}
+
+static void AFSetHideEnabled(BOOL on) {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setBool:on forKey:kAFHideKey];
+    [ud synchronize];
+}
+
+#pragma mark - 取 cell 信息
+
+static id AFSafeValue(id obj, NSString *key) {
+    if (!obj || key.length == 0) return nil;
+    @try { return [obj valueForKey:key]; }
+    @catch (NSException *e) { return nil; }
+}
+
+/// 读返回 SEL 的 getter —— KVC 对 SEL 类型不可靠，必须用 NSInvocation
+static SEL AFReadSEL(id obj, SEL getter) {
+    if (!obj || ![obj respondsToSelector:getter]) return NULL;
+    NSMethodSignature *sig = [obj methodSignatureForSelector:getter];
+    if (!sig || strcmp(sig.methodReturnType, ":") != 0) return NULL;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    inv.selector = getter;
+    @try { [inv invokeWithTarget:obj]; } @catch (NSException *e) { return NULL; }
+    SEL s = NULL;
+    [inv getReturnValue:&s];
+    return s;
+}
+
+static NSString *AFCellTitle(id cell) {
+    id t = AFSafeValue(AFSafeValue(AFSafeValue(cell, @"cellConfig"), @"leftConfig"), @"title");
+    if ([t isKindOfClass:NSString.class]) return t;
+    t = AFSafeValue(cell, @"title");                       // 旧版 cell 自带 title
+    return [t isKindOfClass:NSString.class] ? t : nil;
+}
+
+static NSString *AFCellActionName(id cell) {
+    SEL s = AFReadSEL(AFSafeValue(cell, @"cellConfig"), NSSelectorFromString(@"clickAction"));
+    if (s) return NSStringFromSelector(s);
+
+    id v = AFSafeValue(cell, @"sel");                      // 老版本回退
+    if ([v isKindOfClass:NSString.class]) return v;
+    if ([v isKindOfClass:NSValue.class]) {
+        SEL s2 = NULL;
+        @try { [v getValue:&s2]; } @catch (NSException *e) { }
+        if (s2) return NSStringFromSelector(s2);
     }
     return nil;
 }
 
-static BOOL JokerIsTextMessage(CMessageWrap *msg) {
-    return [msg IsTextMsg];
-}
-
-static BOOL JokerIsReferMessage(CMessageWrap *msg) {
-    return [msg isReferMsgType];
-}
-
-static BOOL JokerIsTransferMessage(CMessageWrap *msg) {
-    if (!msg) return NO;
-    if ([msg respondsToSelector:@selector(parseWCPayInfoItemIfNeed)]) {
-        [msg parseWCPayInfoItemIfNeed];
+static id AFCellTarget(id cell) {
+    id cfg = AFSafeValue(cell, @"cellConfig");
+    SEL g = NSSelectorFromString(@"clickTarget");
+    if ([cfg respondsToSelector:g]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id t = [cfg performSelector:g];
+#pragma clang diagnostic pop
+        if (t) return t;
     }
-    WCPayInfoItem *payInfo = msg.m_oWCPayInfoItem;
-    if (!payInfo) return NO;
-    return (payInfo.m_uiPaySubType == 3 || payInfo.m_uiPaySubType == 4 || payInfo.m_nsTransferID.length > 0);
+    return AFSafeValue(cell, @"target");
 }
 
-static BOOL JokerIsSupportedMessage(CMessageWrap *msg) {
-    return JokerIsTextMessage(msg) || JokerIsReferMessage(msg) || JokerIsTransferMessage(msg);
+/// 一行描述，日志和排错全靠它
+static NSString *AFDescribeCell(id cell) {
+    id target = AFCellTarget(cell);
+    return [NSString stringWithFormat:@"title=\"%@\" action=%@ target=%@",
+            AFCellTitle(cell) ?: @"(nil)",
+            AFCellActionName(cell) ?: @"(nil)",
+            target ? NSStringFromClass([target class]) : @"(nil)"];
 }
 
-static NSString *JokerGetTransferAmount(CMessageWrap *msg) {
-    if (!JokerIsTransferMessage(msg)) return nil;
-    [msg parseWCPayInfoItemIfNeed];
-    NSString *amount = msg.m_oWCPayInfoItem.m_nsFeeDesc ?: @"";
-    if ([amount hasPrefix:@"¥"]) {
-        amount = [amount substringFromIndex:1];
+#pragma mark - 判定
+
+/// 纯特征判定，不看开关 —— dump 时用它能标出「哪行是插件行」
+static BOOL AFCellLooksLikePlugin(id cell) {
+    if (!cell) return NO;
+
+    NSString *title = AFCellTitle(cell);
+    if (title.length == 0) return NO;
+
+    BOOL exact = [@[@"插件", @"插件管理", @"插件中心", @"插件归纳", @"微信插件", @"插件设置"] containsObject:title];
+    BOOL fuzzy = [title rangeOfString:@"插件"].location != NSNotFound;
+    if (!exact && !fuzzy) return NO;
+
+    NSString *action = AFCellActionName(cell) ?: @"";
+    if ([action isEqualToString:@"pushPluginController"]) return YES;      // wcplugins 字符串铁证
+    if ([action rangeOfString:@"plugin" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+
+    id target = AFCellTarget(cell);
+    NSString *cls = target ? NSStringFromClass([target class]) : @"";
+    if ([cls rangeOfString:@"Plugin" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    // action 读不到时的兜底：标题精确为「插件」且 target 就是「我」页本身
+    if (exact && [cls hasSuffix:@"MoreViewController"]) return YES;
+    return NO;
+}
+
+/// 真正用于拦截的判定：叠加开关 + 插件体系存在性
+static BOOL AFIsPluginEntryCell(id cell) {
+    if (!AFHideEnabled()) return NO;
+    if (kAFRequirePluginsMgr && !NSClassFromString(@"WCPluginsMgr")) return NO;
+    return AFCellLooksLikePlugin(cell);
+}
+
+#pragma mark - 「我」页面：容器、扫描、清理
+
+static NSInteger gAFHitCount = 0;              // 本次拦截计数（Toast 展示用）
+static void AFDumpIfNeeded(id vc, BOOL force); // 定义在文件末尾（节流 dump）
+
+static id AFMgr(id vc) {
+    return AFSafeValue(vc, @"m_tableViewMgr") ?: AFSafeValue(vc, @"m_tableViewInfo");
+}
+
+static NSArray *AFSections(id mgr) {
+    id s = AFSafeValue(mgr, @"sections");
+    return [s isKindOfClass:NSArray.class] ? s : nil;
+}
+
+static void AFReloadMgr(id mgr) {
+    if ([mgr respondsToSelector:NSSelectorFromString(@"reloadTableView")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [mgr performSelector:NSSelectorFromString(@"reloadTableView")];
+#pragma clang diagnostic pop
+        return;
     }
-    return amount;
+    UITableView *tv = AFSafeValue(mgr, @"tableView");
+    if ([tv isKindOfClass:UITableView.class]) [tv reloadData];
 }
 
-static NSString *JokerNormalizeAmount(NSString *amount) {
-    NSString *trimmed = [amount stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (!trimmed.length) return nil;
-    NSMutableString *filtered = [NSMutableString string];
-    for (NSUInteger i = 0; i < trimmed.length; i++) {
-        unichar c = [trimmed characterAtIndex:i];
-        if ((c >= '0' && c <= '9') || c == '.') {
-            [filtered appendFormat:@"%C", c];
+/// 打印「我」页面全部 cell（含命中标记）—— 看日志就知道微信里到底有没有「插件」行、叫什么
+static void AFDumpMoreVC(id vc) {
+    id mgr = AFMgr(vc);
+    NSArray *sections = AFSections(mgr);
+    if (!sections) { AFLog(@"[dump] 取不到 sections（m_tableViewMgr=%@）", mgr ? @"有" : @"无"); return; }
+
+    AFLog(@"[dump] ---- 「我」页面清单 %@ | %lu 段 ----", NSStringFromClass([vc class]), (unsigned long)sections.count);
+    NSUInteger hits = 0, total = 0;
+    for (NSUInteger i = 0; i < sections.count; i++) {
+        NSArray *cells = AFSafeValue(sections[i], @"cells");
+        if (![cells isKindOfClass:NSArray.class]) continue;
+        for (NSUInteger j = 0; j < cells.count; j++) {
+            BOOL hit = AFCellLooksLikePlugin(cells[j]);
+            if (hit) hits++;
+            total++;
+            AFLog(@"[dump] s%lu.c%-2lu %@%@", (unsigned long)i, (unsigned long)j,
+                  AFDescribeCell(cells[j]), hit ? @"   <<< 疑似插件行" : @"");
         }
     }
-    return filtered.length ? filtered : nil;
+    AFLog(@"[dump] 共 %lu 行，疑似插件行 %lu（隐藏开关=%@）",
+          (unsigned long)total, (unsigned long)hits, AFHideEnabled() ? @"开" : @"关");
 }
 
-static void JokerApplyAmountToPayInfo(CMessageWrap *msg, NSString *amount) {
-    if (!msg || !amount) return;
-    [msg parseWCPayInfoItemIfNeed];
-    WCPayInfoItem *payInfo = msg.m_oWCPayInfoItem;
-    if (payInfo) {
-        NSString *final = [@"¥" stringByAppendingString:amount];
-        payInfo.m_nsFeeDesc = final;
-        payInfo.m_receiverDesc = final;
-        payInfo.m_senderDesc = final;
+/// 移除已混进 cells 的插件行，返回移除数量
+static NSInteger AFCleanMoreVC(id vc, const char *tag) {
+    if (!AFHideEnabled()) return 0;
+    NSArray *sections = AFSections(AFMgr(vc));
+    if (!sections) { AFLog(@"[clean:%s] 取不到 sections", tag); return 0; }
+
+    NSInteger removed = 0;
+    for (id section in sections) {
+        NSMutableArray *cells = AFSafeValue(section, @"cells");
+        if (![cells isKindOfClass:NSMutableArray.class]) continue;
+        NSMutableArray *doomed = [NSMutableArray array];
+        for (id cell in cells) {
+            if (AFCellLooksLikePlugin(cell)) [doomed addObject:cell];
+        }
+        if (doomed.count == 0) continue;
+        for (id cell in doomed) AFLog(@"[clean:%s] 移除 %@", tag, AFDescribeCell(cell));
+        [cells removeObjectsInArray:doomed];
+        removed += doomed.count;
     }
+    if (removed) {
+        AFReloadMgr(AFMgr(vc));
+        AFLog(@"[clean:%s] 共移除 %ld 行，已刷新", tag, (long)removed);
+    }
+    return removed;
 }
 
-static NSString *JokerGetDisplayText(CMessageWrap *msg) {
-    if (JokerIsTextMessage(msg)) return [msg GetDisplayContent];
-    if (JokerIsReferMessage(msg)) return msg.m_nsTitle ?: @"";
-    if (JokerIsTransferMessage(msg)) return JokerGetTransferAmount(msg);
-    return nil;
+static void AFCleanLater(id vc, const char *tag) {
+    dispatch_async(dispatch_get_main_queue(), ^{ AFCleanMoreVC(vc, tag); });
 }
 
-static void JokerReloadCellAfterReplace(id vc, CMessageWrap *msg, CommonMessageCellView *cell) {
-    if (!vc || !msg) return;
-    if ([vc respondsToSelector:@selector(clearNodeLayoutCache)]) {
-        [vc clearNodeLayoutCache];
-    }
-    if ([vc respondsToSelector:@selector(reloadNodeWithMessageWrap:)]) {
-        [vc reloadNodeWithMessageWrap:msg];
-    }
-    if ([vc respondsToSelector:@selector(reloadVisibleNodeWithCellView:)]) {
-        [vc reloadVisibleNodeWithCellView:cell];
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (![vc respondsToSelector:@selector(getMsgTableView)]) return;
-        UITableView *tv = [vc getMsgTableView];
-        if (![tv isKindOfClass:[UITableView class]]) return;
-        [UIView performWithoutAnimation:^{
-            [tv beginUpdates];
-            [tv endUpdates];
-        }];
+/// 首次安装完成后提示一次日志在哪（微信沙盒 Documents，爱思/iMazing 导出微信容器即可看到）
+static void AFHintLogPathOnce(void) {
+    NSString *k = @"AFHidePluginEntry.logHinted";
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:k]) return;
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:k];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        AFToast([NSString stringWithFormat:@"日志: Documents/%@", kAFLogFileName]);
     });
 }
 
-static void JokerPresentEditor(CommonMessageCellView *cell) {
-    CMessageWrap *msg = JokerGetMessageWrapFromCell(cell);
-    if (!JokerIsSupportedMessage(msg)) return;
-    id vc = JokerGetViewControllerFromView(cell);
-    if (!vc) return;
-    
-    NSString *current = JokerGetDisplayText(msg) ?: @"";
-    BOOL isTransfer = JokerIsTransferMessage(msg);
-    
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"小丑"
-                                                                   message:@"仅当前页面生效，离开后自动恢复"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = current;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-        if (isTransfer) {
-            tf.keyboardType = UIKeyboardTypeDecimalPad;
-            tf.placeholder = @"例如：888.88";
+static void AFToast(NSString *text) {
+    UIWindow *window = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive &&
+                [scene isKindOfClass:UIWindowScene.class]) {
+                for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                    if (w.isKeyWindow) { window = w; break; }
+                }
+            }
         }
+    }
+    if (!window) window = UIApplication.sharedApplication.keyWindow;
+    if (!window) return;
+
+    UIFont *font = [UIFont systemFontOfSize:14];
+    CGFloat w = [text sizeWithAttributes:@{NSFontAttributeName: font}].width + 32;
+    UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, MIN(w, window.bounds.size.width - 40), 36)];
+    tip.text = text;
+    tip.font = font;
+    tip.textColor = [UIColor whiteColor];
+    tip.textAlignment = NSTextAlignmentCenter;
+    tip.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.78];
+    tip.layer.cornerRadius = 8;
+    tip.layer.masksToBounds = YES;
+    tip.alpha = 0;
+    tip.center = CGPointMake(window.bounds.size.width / 2, window.bounds.size.height - 120);
+    [window addSubview:tip];
+
+    [UIView animateWithDuration:0.18 animations:^{ tip.alpha = 1; } completion:^(BOOL f) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [UIView animateWithDuration:0.25 animations:^{ tip.alpha = 0; } completion:^(BOOL f2) {
+                [tip removeFromSuperview];
+            }];
+        });
     }];
-    __weak typeof(cell) weakCell = cell;
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        typeof(weakCell) strongCell = weakCell;
-        NSString *newText = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (newText.length && ![newText isEqualToString:current]) {
-            if (isTransfer) {
-                newText = JokerNormalizeAmount(newText);
-                if (!newText) return;
-            }
-            if (JokerIsTextMessage(msg)) {
-                msg.m_nsContent = newText;
-            } else if (JokerIsReferMessage(msg)) {
-                msg.m_nsTitle = newText;
-            } else if (JokerIsTransferMessage(msg)) {
-                JokerApplyAmountToPayInfo(msg, newText);
-            }
-            JokerReloadCellAfterReplace(vc, msg, strongCell);
+}
+
+#pragma mark - 长按「我」2 秒
+
+static UIView *AFMeTabButton(id tabBarVC) {
+    NSArray *views = nil;
+    SEL sel = NSSelectorFromString(@"getTabBarBtnViews");       // MMTabBarController.h:49
+    if ([tabBarVC respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id ret = [tabBarVC performSelector:sel];
+#pragma clang diagnostic pop
+        if ([ret isKindOfClass:NSArray.class]) views = ret;
+    }
+    if (views.count == 0) {                                     // 回退：ivar _tabBarBtns
+        Ivar iv = class_getInstanceVariable([tabBarVC class], "_tabBarBtns");
+        if (iv) {
+            id ret = object_getIvar(tabBarVC, iv);
+            if ([ret isKindOfClass:NSArray.class]) views = ret;
         }
-    }]];
-    [vc presentViewController:alert animated:YES completion:nil];
-}
-
-static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
-    if (![DDGlobalConfig shared].jokerEnabled) return original;
-    CMessageWrap *msg = JokerGetMessageWrapFromCell(cell);
-    if (!JokerIsSupportedMessage(msg)) return original;
-    
-    Class menuItemClass = NSClassFromString(@"MMMenuItem");
-    if (!menuItemClass) return original;
-    
-    UIImage *icon = [[UIImage systemImageNamed:@"face.smiling.fill"] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
-    MMMenuItem *newItem = [[menuItemClass alloc] initWithTitle:@"小丑" icon:icon target:cell action:@selector(joker_handleMenuItem:)];
-    NSMutableArray *newItems = [NSMutableArray arrayWithArray:original];
-    [newItems insertObject:newItem atIndex:0];
-    return newItems;
-}
-
-%hook TextMessageCellView
-- (NSArray *)operationMenuItems {
-    return JokerInjectMenuItem(self, %orig);
-}
-- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(joker_handleMenuItem:)) {
-        return [DDGlobalConfig shared].jokerEnabled && JokerIsSupportedMessage(JokerGetMessageWrapFromCell(self));
     }
-    return %orig;
-}
-%new
-- (void)joker_handleMenuItem:(id)sender {
-    JokerPresentEditor(self);
-}
-%end
-
-%hook AppMessageCellView
-- (NSArray *)operationMenuItems {
-    return JokerInjectMenuItem(self, %orig);
-}
-- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(joker_handleMenuItem:)) {
-        return [DDGlobalConfig shared].jokerEnabled && JokerIsSupportedMessage(JokerGetMessageWrapFromCell(self));
+    // 微信 tab：微信/通讯录/发现/我 → 「我」是最后一个
+    UIView *last = [views lastObject];
+    if ([last isKindOfClass:UIView.class]) return last;
+    for (id v in views) {                                       // 再兜底：找带「我」的按钮
+        if ([v isKindOfClass:UIView.class] &&
+            (((UIView *)v).accessibilityLabel.length == 0 ||
+             [((UIView *)v).accessibilityLabel containsString:@"我"])) return v;
     }
-    return %orig;
-}
-%new
-- (void)joker_handleMenuItem:(id)sender {
-    JokerPresentEditor(self);
-}
-%end
-
-%hook WCPayTransferMessageCellView
-- (NSArray *)operationMenuItems {
-    return JokerInjectMenuItem(self, %orig);
-}
-- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(joker_handleMenuItem:)) {
-        return [DDGlobalConfig shared].jokerEnabled && JokerIsSupportedMessage(JokerGetMessageWrapFromCell(self));
-    }
-    return %orig;
-}
-%new
-- (void)joker_handleMenuItem:(id)sender {
-    JokerPresentEditor(self);
-}
-%end
-
-#pragma mark - ② 钱包零钱修改
-
-static BOOL hasCustomWalletBalance(void) {
-    return [[NSUserDefaults standardUserDefaults] objectForKey:kDDCustomBalanceKey] != nil;
+    return nil;
 }
 
-static void saveWalletBalanceFen(unsigned long long fen) {
-    [[NSUserDefaults standardUserDefaults] setObject:[NSString stringWithFormat:@"%llu", fen] forKey:kDDCustomBalanceKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+static char kAFGestureKey;
+
+static void AFInstallGesture(id tabBarVC) {
+    if (!tabBarVC) return;
+    SEL action = NSSelectorFromString(@"af_toggleHidePluginEntryLongPress:");
+    if (![tabBarVC respondsToSelector:action]) return;          // %new 没注入成功就别装
+
+    UIView *meBtn = AFMeTabButton(tabBarVC);
+    if (!meBtn) return;
+    if (objc_getAssociatedObject(meBtn, &kAFGestureKey)) return;
+
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:tabBarVC action:action];
+    lp.minimumPressDuration = 2.0;
+    lp.cancelsTouchesInView = NO;                               // 不吞掉正常点击
+    [meBtn addGestureRecognizer:lp];
+    objc_setAssociatedObject(meBtn, &kAFGestureKey, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    AFLog(@"[gesture] 已装长按手势 → %@ (0x%lx)", NSStringFromClass([meBtn class]), (unsigned long)meBtn);
 }
 
-static void clearWalletBalance(void) {
-    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kDDCustomBalanceKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
+#pragma mark - Hook ①：主拦截点（顺序无关）
 
-static unsigned long long loadWalletBalanceFen(void) {
-    NSString *s = [[NSUserDefaults standardUserDefaults] stringForKey:kDDCustomBalanceKey];
-    if (!s.length) return 0;
-    long long val = [s longLongValue];
-    return val > 0 ? (unsigned long long)val : 0;
-}
+%group AFSectionGroup
 
-%hook TimeoutNumber
-- (void)updateNumber:(unsigned long long)original {
-    if ([DDGlobalConfig shared].walletEnabled && hasCustomWalletBalance()) {
-        unsigned long long custom = loadWalletBalanceFen();
-        %orig(custom);
+%hook WCTableViewSectionManager
+
+// WCTableViewSectionManager.h:43；wcplugins 在 addFunctionSection 里靠它插入「插件」行（0x74A4）
+- (void)addCell:(id)cell {
+    if (kAFVerboseLog) AFLog(@"[addCell] %@", AFDescribeCell(cell));
+    if (AFIsPluginEntryCell(cell)) {
+        AFLog(@"[addCell] ✅ 已拦截 %@", AFDescribeCell(cell));
+        gAFHitCount++;
         return;
     }
-    %orig(original);
+    %orig;
 }
 
-- (void)didMoveToSuperview {
+%end
+
+// ---- end of %group AFSectionGroup ----
+%end
+
+#pragma mark - Hook ②：「我」页面兜底清理
+
+%group AFMoreVCGroup
+
+%hook MoreViewController
+
+- (void)addFunctionSection {
     %orig;
-    if (![DDGlobalConfig shared].walletEnabled) return;
-    if (self.superview) {
-        static const void *kTimeoutNumberLongPressKey = &kTimeoutNumberLongPressKey;
-        if (objc_getAssociatedObject(self, kTimeoutNumberLongPressKey)) return;
-        self.userInteractionEnabled = YES;
-        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(wallet_handleLongPress:)];
-        lp.minimumPressDuration = 0.5;
-        [self addGestureRecognizer:lp];
-        objc_setAssociatedObject(self, kTimeoutNumberLongPressKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
+    AFCleanMoreVC(self, "addFunctionSection");
+}
+
+- (void)reloadMoreView {
+    %orig;
+    AFCleanLater(self, "reloadMoreView");
+    AFDumpIfNeeded(self, NO);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    AFCleanLater(self, "viewDidAppear");
+    AFDumpIfNeeded(self, NO);
+}
+
+%end
+
+// ---- end of %group AFMoreVCGroup ----
+%end
+
+#pragma mark - Hook ③：底部 Tab（长按手势载体）
+
+%group AFTabBarGroup
+
+%hook MMTabBarController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    AFInstallGesture(self);
+}
+
+- (void)onTabBarItemViewsRelayout {
+    %orig;                                  // MMTabBarController.h:65 重建后按钮会换新，要重装
+    AFInstallGesture(self);
 }
 
 %new
-- (void)wallet_handleLongPress:(UILongPressGestureRecognizer *)gesture {
+- (void)af_toggleHidePluginEntryLongPress:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
-    if (![DDGlobalConfig shared].walletEnabled) return;
-    
-    unsigned long long cur = hasCustomWalletBalance() ? loadWalletBalanceFen() : 0;
-    NSString *curYuan = hasCustomWalletBalance() ? [NSString stringWithFormat:@"%.2f", cur / 100.0] : @"";
-    
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"小丑"
-                                                                   message:@"输入纯数字，留空则恢复真实余额"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = curYuan;
-        tf.placeholder = @"例如：888.88";
-        tf.keyboardType = UIKeyboardTypeDecimalPad;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *input = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (input.length == 0) {
-            clearWalletBalance();
-        } else {
-            double yuan = [input doubleValue];
-            if (yuan < 0) yuan = 0;
-            unsigned long long fen = (unsigned long long)(yuan * 100 + 0.5);
-            saveWalletBalanceFen(fen);
-        }
-        [self updateNumber:0];
-    }]];
-    UIResponder *resp = self;
-    while (resp) {
-        if ([resp isKindOfClass:[UIViewController class]]) {
-            [(UIViewController *)resp presentViewController:alert animated:YES completion:nil];
-            break;
-        }
-        resp = [resp nextResponder];
+
+    BOOL on = !AFHideEnabled();
+    AFSetHideEnabled(on);
+    gAFHitCount = 0;
+
+    if (@available(iOS 10.0, *)) {
+        UIImpactFeedbackGenerator *fb = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+        [fb impactOccurred];
     }
+    AFLog(@"[switch] 长按触发 → 隐藏=%@", on ? @"开" : @"关");
+
+    UIViewController *selVC = nil;
+    if ([self isKindOfClass:UITabBarController.class]) {
+        selVC = ((UITabBarController *)self).selectedViewController;
+        if ([selVC isKindOfClass:UINavigationController.class]) {
+            selVC = [(UINavigationController *)selVC topViewController];
+        }
+    }
+    if ([selVC respondsToSelector:NSSelectorFromString(@"reloadMoreView")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [selVC performSelector:NSSelectorFromString(@"reloadMoreView")];
+#pragma clang diagnostic pop
+    }
+    AFDumpIfNeeded(selVC, YES);              // 切换后强制 dump 一次，看日志立知命中情况
+    AFToast(on ? [NSString stringWithFormat:@"已隐藏插件入口 · 拦截 %ld 行", (long)gAFHitCount]
+               : @"已恢复插件入口");
 }
+
 %end
 
-%hook WCPayWalletEntryHeaderView
-- (void)didMoveToSuperview {
-    %orig;
-    if (![DDGlobalConfig shared].walletEnabled) return;
-    if (self.superview && self.balanceEntryView) {
-        self.balanceEntryView.userInteractionEnabled = YES;
-        static const void *kHeaderLongPressKey = &kHeaderLongPressKey;
-        if (objc_getAssociatedObject(self, kHeaderLongPressKey)) return;
-        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(walletHeader_handleLongPress:)];
-        lp.minimumPressDuration = 0.5;
-        [self.balanceEntryView addGestureRecognizer:lp];
-        objc_setAssociatedObject(self, kHeaderLongPressKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-}
-
-%new
-- (void)walletHeader_handleLongPress:(UILongPressGestureRecognizer *)gesture {
-    if (gesture.state != UIGestureRecognizerStateBegan) return;
-    if (![DDGlobalConfig shared].walletEnabled) return;
-    
-    unsigned long long cur = hasCustomWalletBalance() ? loadWalletBalanceFen() : 0;
-    NSString *curYuan = hasCustomWalletBalance() ? [NSString stringWithFormat:@"%.2f", cur / 100.0] : @"";
-    
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"小丑"
-                                                                   message:@"输入纯数字，留空则恢复真实余额"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = curYuan;
-        tf.placeholder = @"例如：888.88";
-        tf.keyboardType = UIKeyboardTypeDecimalPad;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *input = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (input.length == 0) {
-            clearWalletBalance();
-        } else {
-            double yuan = [input doubleValue];
-            if (yuan < 0) yuan = 0;
-            unsigned long long fen = (unsigned long long)(yuan * 100 + 0.5);
-            saveWalletBalanceFen(fen);
-        }
-        if (self.timeoutNumber) {
-            [self.timeoutNumber updateNumber:0];
-        }
-    }]];
-    UIResponder *resp = self;
-    while (resp) {
-        if ([resp isKindOfClass:[UIViewController class]]) {
-            [(UIViewController *)resp presentViewController:alert animated:YES completion:nil];
-            break;
-        }
-        resp = [resp nextResponder];
-    }
-}
+// ---- end of %group AFTabBarGroup ----
 %end
 
-#pragma mark - ③ 运动步数修改
+#pragma mark - 动态 hook：pushPluginController（真正「关闭」跳转）
 
-static BOOL isToday(NSDate *date) {
-    if (!date) return NO;
-    NSCalendar *cal = [NSCalendar currentCalendar];
-    NSDateComponents *dc1 = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay fromDate:date];
-    NSDateComponents *dc2 = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay fromDate:[NSDate date]];
-    return dc1.year == dc2.year && dc1.month == dc2.month && dc1.day == dc2.day;
+// wcplugins 用 %new 加的（0x75EC），编译期不一定存在；用 Logos %hook 会因 orig==NULL 在 %orig 处崩溃，
+// 所以运行时 MSHookMessageEx 挂，并且先判 class_getInstanceMethod。
+static void (*AFOrigPush)(id self, SEL _cmd);
+static void AFHookPush(id self, SEL _cmd) {
+    AFLog(@"[push] pushPluginController 被调用（隐藏=%@）", AFHideEnabled() ? @"开 → 已吞掉" : @"关 → 放行");
+    if (AFHideEnabled()) return;
+    if (AFOrigPush) AFOrigPush(self, _cmd);
 }
 
-%hook WCDeviceStepObject
-- (unsigned int)m7StepCount {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (cfg.stepsEnabled && [cfg hasStepsValue]) {
-        NSDate *last = [[NSUserDefaults standardUserDefaults] objectForKey:kDDLastStepsUpdateDateKey];
-        if (!last || !isToday(last)) {
-            [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
-        }
-        return (unsigned int)[cfg stepsIntegerValue];
-    }
-    return %orig;
+static void (*AFOrigPushAlt)(id self, SEL _cmd);
+static void AFHookPushAlt(id self, SEL _cmd) {
+    if (AFHideEnabled()) return;
+    if (AFOrigPushAlt) AFOrigPushAlt(self, _cmd);
 }
 
-- (unsigned int)hkStepCount {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (cfg.stepsEnabled && [cfg hasStepsValue]) {
-        NSDate *last = [[NSUserDefaults standardUserDefaults] objectForKey:kDDLastStepsUpdateDateKey];
-        if (!last || !isToday(last)) {
-            [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
-        }
-        return (unsigned int)[cfg stepsIntegerValue];
-    }
-    return %orig;
-}
-%end
-
-%hook WCDataItem
-- (unsigned int)stepCount {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (cfg.stepsEnabled && [cfg hasStepsValue]) {
-        return (unsigned int)[cfg stepsIntegerValue];
-    }
-    return %orig;
-}
-%end
-
-#pragma mark - ④ 好友数量修改
-
-%hook MMUILabel
-- (void)setText:(NSString *)text {
-    if (!text) {
-        %orig;
-        return;
-    }
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (cfg.contactsEnabled && [cfg hasContactsValue]) {
-        if ([text hasSuffix:@"个朋友"] && [[text substringToIndex:text.length-3] rangeOfCharacterFromSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
-            %orig([NSString stringWithFormat:@"%@个朋友", cfg.contactsValue]);
-            return;
-        }
-    }
-    %orig;
-}
-%end
-
-#pragma mark - 设置界面
-
-@interface DDJokerSettingsViewController : UIViewController <UITableViewDelegate>
-@property (nonatomic, strong) WCTableViewManager *tableViewManager;
-@property (nonatomic, strong) UITextField *stepsField;
-@property (nonatomic, strong) UITextField *contactsField;
-@end
-
-@implementation DDJokerSettingsViewController {
-    id<UITableViewDelegate> _originalDelegate;
+static void (*AFOrigAltReload)(id self, SEL _cmd);
+static void AFHookAltReload(id self, SEL _cmd) {
+    if (AFOrigAltReload) AFOrigAltReload(self, _cmd);
+    AFCleanLater(self, "alt:reloadMoreView");
+    AFDumpIfNeeded(self, NO);
 }
 
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"DD小丑助手";
+#pragma mark - 计数与 dump 节流
 
-    // 设置导航栏外观
-    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
-    [appearance configureWithDefaultBackground];
-    appearance.shadowColor = nil;
-    self.navigationItem.standardAppearance = appearance;
-    self.navigationItem.scrollEdgeAppearance = appearance;
-    self.navigationItem.compactAppearance = appearance;
+static CFAbsoluteTime gAFLastDump = 0;
 
-    _tableViewManager = [[objc_getClass("WCTableViewManager") alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
-    _tableViewManager.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
-    [self.view addSubview:_tableViewManager.tableView];
-
-    _originalDelegate = _tableViewManager.delegate;
-    _tableViewManager.delegate = self;
-
-    [self buildTable];
+static void AFDumpIfNeeded(id vc, BOOL force) {
+    if (![vc isKindOfClass:UIViewController.class]) return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!force && now - gAFLastDump < kAFDumpInterval) return;
+    gAFLastDump = now;
+    AFDumpMoreVC(vc);
 }
 
-// 通用方法：创建右侧输入框+确认按钮（背景颜色统一为 systemGray5Color）
-- (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action placeholder:(NSString *)placeholder text:(NSString *)text {
-    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 220, 34)];
-    container.backgroundColor = [UIColor clearColor];
-    
-    // 输入框
-    field.frame = CGRectMake(0, 0, 160, 34);
-    field.borderStyle = UITextBorderStyleNone;
-    field.placeholder = placeholder;
-    field.text = text;
-    field.textAlignment = NSTextAlignmentRight;
-    field.keyboardType = UIKeyboardTypeNumberPad;
-    field.backgroundColor = [UIColor systemGray5Color];  // 与按钮背景统一
-    field.layer.cornerRadius = 6.0;
-    field.layer.masksToBounds = YES;
-    field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
-    field.leftViewMode = UITextFieldViewModeAlways;
-    field.rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
-    field.rightViewMode = UITextFieldViewModeAlways;
-    [container addSubview:field];
-    
-    // 确认按钮（灰色背景，文字为系统默认颜色，常规字体）
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(168, 0, 52, 34);
-    [btn setTitle:@"确认" forState:UIControlStateNormal];
-    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
-    btn.backgroundColor = [UIColor systemGray5Color];
-    btn.layer.cornerRadius = 6.0;
-    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
-    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    [container addSubview:btn];
-    
-    return container;
-}
-
-- (void)buildTable {
-    [_tableViewManager clearAllSection];
-    
-    // 更新 footer 提示
-    WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"小丑设置"
-                                                                                                 Footer:@"聊天记录修改长按消息弹窗菜单小丑按钮（支持文字和转账金额），钱包余额修改长按服务页钱包入口或零钱详情页余额数字修改\n步数和好友数量修改后需重启微信生效"];
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    Class cellCls = objc_getClass("WCTableViewCellManager");
-    
-    // 1. 聊天记录修改开关
-    [section addCell:[cellCls switchCellForSel:@selector(jokerSwitchChanged:) target:self title:@"聊天记录修改" on:cfg.jokerEnabled]];
-    
-    // 2. 钱包零钱修改开关
-    [section addCell:[cellCls switchCellForSel:@selector(walletSwitchChanged:) target:self title:@"钱包零钱修改" on:cfg.walletEnabled]];
-    
-    // 3. 运动步数开关 + 子项（输入框+确认）
-    [section addCell:[cellCls switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
-    if (cfg.stepsEnabled) {
-        self.stepsField = [[UITextField alloc] init];
-        NSString *currentSteps = [cfg hasStepsValue] ? cfg.stepsValueString : @"";
-        UIView *rightView = [self inputRowWithField:self.stepsField
-                                             action:@selector(stepsConfirm:)
-                                        placeholder:@"例如：88888"
-                                               text:currentSteps];
-        WCTableViewCellManager *stepsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳步数自定义" rightView:rightView];
-        stepsSubCell.userInfo = @"SubCell";
-        [section addCell:stepsSubCell];
-    }
-    
-    // 4. 好友数量开关 + 子项（输入框+确认）
-    [section addCell:[cellCls switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
-    if (cfg.contactsEnabled) {
-        self.contactsField = [[UITextField alloc] init];
-        NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
-        UIView *rightView = [self inputRowWithField:self.contactsField
-                                             action:@selector(contactsConfirm:)
-                                        placeholder:@"例如：5200"
-                                               text:currentContacts];
-        WCTableViewCellManager *contactsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳数量自定义" rightView:rightView];
-        contactsSubCell.userInfo = @"SubCell";
-        [section addCell:contactsSubCell];
-    }
-    
-    [_tableViewManager addSection:section];
-    [_tableViewManager reloadTableView];
-}
-
-#pragma mark - UITableViewDelegate 转发
-
-- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)]) {
-        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
-    }
-    WCTableViewCellManager *cellInfo = [self.tableViewManager cellInfoAtIndexPath:indexPath];
-    if ([cellInfo.userInfo isEqualToString:@"SubCell"]) {
-        cell.indentationLevel = 1;
-        cell.indentationWidth = 16.0;
-    }
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
-        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
-    }
-}
-
-- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)]) {
-        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
-    }
-    return UITableViewAutomaticDimension;
-}
-
-#pragma mark - 开关事件
-
-- (void)jokerSwitchChanged:(UISwitch *)sender {
-    [DDGlobalConfig shared].jokerEnabled = sender.isOn;
-    [self buildTable];
-}
-
-- (void)walletSwitchChanged:(UISwitch *)sender {
-    [DDGlobalConfig shared].walletEnabled = sender.isOn;
-    [self buildTable];
-}
-
-- (void)stepsSwitchChanged:(UISwitch *)sender {
-    [DDGlobalConfig shared].stepsEnabled = sender.isOn;
-    [self buildTable];
-}
-
-- (void)contactsSwitchChanged:(UISwitch *)sender {
-    [DDGlobalConfig shared].contactsEnabled = sender.isOn;
-    [self buildTable];
-}
-
-#pragma mark - 输入确认事件
-
-- (void)stepsConfirm:(id)sender {
-    NSString *input = self.stepsField.text;
-    [self saveStepsInput:input];
-    [self buildTable];
-}
-
-- (void)contactsConfirm:(id)sender {
-    NSString *input = self.contactsField.text;
-    [self saveContactsInput:input];
-    [self buildTable];
-}
-
-#pragma mark - 保存逻辑（输入为空即关闭）
-
-- (void)saveStepsInput:(NSString *)input {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmed.length == 0) {
-        cfg.stepsValueString = nil; // 关闭
-    } else {
-        NSInteger val = [trimmed integerValue];
-        if (val < 0) val = 0;
-        if (val > 100000) val = 100000;
-        cfg.stepsValueString = [NSString stringWithFormat:@"%ld", (long)val];
-    }
-}
-
-- (void)saveContactsInput:(NSString *)input {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmed.length == 0) {
-        cfg.contactsValue = nil; // 关闭
-    } else {
-        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
-        if ([trimmed rangeOfCharacterFromSet:nonDigits].location == NSNotFound) {
-            cfg.contactsValue = trimmed;
-        }
-    }
-}
-
-@end
-
-#pragma mark - 配置管理（实现）
-
-@implementation DDGlobalConfig
-
-+ (instancetype)shared {
-    static DDGlobalConfig *config = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ config = [DDGlobalConfig new]; });
-    return config;
-}
-
-- (instancetype)init {
-    if (self = [super init]) {
-        NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-        _jokerEnabled = [def boolForKey:kDDFeatureJokerEnabled];
-        _walletEnabled = [def boolForKey:kDDFeatureWalletEnabled];
-        _stepsEnabled = [def boolForKey:kDDFeatureStepsEnabled];
-        _contactsEnabled = [def boolForKey:kDDFeatureContactsEnabled];
-        _stepsValueString = [def stringForKey:kDDStepsValueStringKey];
-        _contactsValue = [def stringForKey:kDDContactsCountValueKey];
-        if (![def objectForKey:kDDLastStepsUpdateDateKey]) {
-            [def setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
-            [def synchronize];
-        }
-    }
-    return self;
-}
-
-- (void)setJokerEnabled:(BOOL)enabled {
-    _jokerEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureJokerEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-- (void)setWalletEnabled:(BOOL)enabled {
-    _walletEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureWalletEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-- (void)setStepsEnabled:(BOOL)enabled {
-    _stepsEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureStepsEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-- (void)setContactsEnabled:(BOOL)enabled {
-    _contactsEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureContactsEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-- (void)setStepsValueString:(NSString *)stepsValueString {
-    _stepsValueString = [stepsValueString copy];
-    [self saveSteps];
-}
-
-- (void)setContactsValue:(NSString *)contactsValue {
-    _contactsValue = [contactsValue copy];
-    [self saveContacts];
-}
-
-- (NSInteger)stepsIntegerValue {
-    if (![self hasStepsValue]) return 0;
-    return [_stepsValueString integerValue];
-}
-
-- (BOOL)hasStepsValue {
-    return _stepsValueString.length > 0;
-}
-
-- (BOOL)hasContactsValue {
-    return _contactsValue.length > 0;
-}
-
-- (void)saveSteps {
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    if (_stepsValueString.length) {
-        [def setObject:_stepsValueString forKey:kDDStepsValueStringKey];
-    } else {
-        [def removeObjectForKey:kDDStepsValueStringKey];
-    }
-    [def setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
-    [def synchronize];
-}
-
-- (void)saveContacts {
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    if (_contactsValue.length) {
-        [def setObject:_contactsValue forKey:kDDContactsCountValueKey];
-    } else {
-        [def removeObjectForKey:kDDContactsCountValueKey];
-    }
-    [def synchronize];
-}
-
-@end
-
-#pragma mark - 插件注册
+#pragma mark - ctor
 
 %ctor {
     @autoreleasepool {
-        id mgr = objc_getClass("WCPluginsMgr");
-        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD小丑助手"
-                                                      version:@"1.0.0"
-                                                   controller:@"DDJokerSettingsViewController"];
+        NSString *ver = [NSBundle mainBundle].infoDictionary[@"CFBundleShortVersionString"];
+        AFLog(@"==== zzAFHidePluginEntry 启动 | 微信 %@ | iOS %@ ====",
+              ver ?: @"?", UIDevice.currentDevice.systemVersion);
+        AFLog(@"[log] 日志路径: %@", AFLogPath());
+        AFLog(@"[log] 用爱思助手 / iMazing 导出微信容器，或 Filza 打开上面路径即可查看");
+        AFLog(@"[switch] 初始状态 隐藏=%@", AFHideEnabled() ? @"开" : @"关");
+
+        const char *probe[] = { "MoreViewController", "WCTableViewSectionManager",
+                                "MMTabBarController", "WCPluginsMgr" };
+        for (int i = 0; i < 4; i++) {
+            AFLog(@"[ctor] %-28s = %@", probe[i], objc_getClass(probe[i]) ? @"存在" : @"不存在");
         }
+
+        if (objc_getClass("WCTableViewSectionManager")) { %init(AFSectionGroup); AFLog(@"[ctor] 已 hook WCTableViewSectionManager -addCell:"); }
+        else AFLog(@"[ctor] !! WCTableViewSectionManager 不存在，主拦截点未安装");
+
+        if (objc_getClass("MoreViewController")) { %init(AFMoreVCGroup); AFLog(@"[ctor] 已 hook MoreViewController"); }
+        else AFLog(@"[ctor] !! MoreViewController 不存在");
+
+        if (objc_getClass("MMTabBarController")) { %init(AFTabBarGroup); AFLog(@"[ctor] 已 hook MMTabBarController"); }
+        else AFLog(@"[ctor] !! MMTabBarController 不存在，长按手势不可用");
+
+        Class moreVC = objc_getClass("MoreViewController");
+        SEL pushSel = NSSelectorFromString(@"pushPluginController");
+        if (moreVC && class_getInstanceMethod(moreVC, pushSel)) {
+            MSHookMessageEx(moreVC, pushSel, (IMP)&AFHookPush, (IMP *)&AFOrigPush);
+            AFLog(@"[ctor] 已 hook -[MoreViewController pushPluginController]（关闭跳转）");
+        } else {
+            AFLog(@"[ctor] !! pushPluginController 不存在，跳转拦截未安装");
+        }
+
+        Class alt = objc_getClass("NewMoreViewController");
+        if (alt && alt != moreVC) {
+            AFLog(@"[ctor] 检测到 NewMoreViewController，启用兜底分支");
+            if (class_getInstanceMethod(alt, NSSelectorFromString(@"reloadMoreView"))) {
+                MSHookMessageEx(alt, NSSelectorFromString(@"reloadMoreView"),
+                                (IMP)&AFHookAltReload, (IMP *)&AFOrigAltReload);
+            }
+            if (class_getInstanceMethod(alt, pushSel)) {
+                MSHookMessageEx(alt, pushSel, (IMP)&AFHookPushAlt, (IMP *)&AFOrigPushAlt);
+            }
+        }
+        AFLog(@"==== ctor 完成 ====");
+        AFHintLogPathOnce();
     }
 }
