@@ -1,10 +1,10 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <substrate.h>
 
-#pragma mark - 通用声明与配置键
+#pragma mark - 微信类声明
 
-// 微信内部类声明
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -32,20 +32,6 @@
 - (id)cellInfoAtIndexPath:(NSIndexPath *)indexPath;
 - (void)reloadTableView;
 @end
-
-// 功能开关配置键
-static NSString * const kDDFeatureJokerEnabled = @"DDFeatureJokerEnabled";
-static NSString * const kDDFeatureWalletEnabled = @"DDFeatureWalletEnabled";
-static NSString * const kDDFeatureStepsEnabled = @"DDFeatureStepsEnabled";
-static NSString * const kDDFeatureContactsEnabled = @"DDFeatureContactsEnabled";
-
-// 存储键
-static NSString * const kDDStepsValueStringKey = @"DDStepsValueString";
-static NSString * const kDDContactsCountValueKey = @"DDContactsCountValue";
-static NSString * const kDDLastStepsUpdateDateKey = @"DDLastStepsUpdateDate";
-static NSString * const kDDCustomBalanceKey = @"DD_Custom_Balance_Fen";
-
-#pragma mark - 聊天记录修改所需声明
 
 @interface WCPayInfoItem : NSObject
 @property (nonatomic, retain) NSString *m_nsFeeDesc;
@@ -83,18 +69,13 @@ static NSString * const kDDCustomBalanceKey = @"DD_Custom_Balance_Fen";
 - (UITableView *)getMsgTableView;
 @end
 
-@interface TextMessageCellView : CommonMessageCellView
-@end
-@interface AppMessageCellView : CommonMessageCellView
-@end
-@interface WCPayTransferMessageCellView : CommonMessageCellView
-@end
+@interface TextMessageCellView : CommonMessageCellView @end
+@interface AppMessageCellView : CommonMessageCellView @end
+@interface WCPayTransferMessageCellView : CommonMessageCellView @end
 
 @interface MMMenuItem : UIMenuItem
 - (instancetype)initWithTitle:(NSString *)title icon:(UIImage *)icon target:(id)target action:(SEL)action;
 @end
-
-#pragma mark - 零钱修改所需声明
 
 @interface TimeoutNumber : UIView
 - (void)updateNumber:(unsigned long long)number;
@@ -105,8 +86,6 @@ static NSString * const kDDCustomBalanceKey = @"DD_Custom_Balance_Fen";
 @property (retain, nonatomic) UIView *balanceEntryView;
 @end
 
-#pragma mark - 步数修改所需声明
-
 @interface WCDeviceStepObject : NSObject
 - (unsigned int)m7StepCount;
 - (unsigned int)hkStepCount;
@@ -116,12 +95,21 @@ static NSString * const kDDCustomBalanceKey = @"DD_Custom_Balance_Fen";
 - (unsigned int)stepCount;
 @end
 
-#pragma mark - 好友数量修改所需声明
+@interface MMUILabel : UILabel @end
 
-@interface MMUILabel : UILabel
-@end
+#pragma mark - 配置管理（接口声明）
 
-#pragma mark - 统一配置辅助类
+// 功能开关配置键
+static NSString * const kDDFeatureJokerEnabled = @"DDFeatureJokerEnabled";
+static NSString * const kDDFeatureWalletEnabled = @"DDFeatureWalletEnabled";
+static NSString * const kDDFeatureStepsEnabled = @"DDFeatureStepsEnabled";
+static NSString * const kDDFeatureContactsEnabled = @"DDFeatureContactsEnabled";
+
+// 存储键
+static NSString * const kDDStepsValueStringKey = @"DDStepsValueString";
+static NSString * const kDDContactsCountValueKey = @"DDContactsCountValue";
+static NSString * const kDDLastStepsUpdateDateKey = @"DDLastStepsUpdateDate";
+static NSString * const kDDCustomBalanceKey = @"DD_Custom_Balance_Fen";
 
 @interface DDGlobalConfig : NSObject
 + (instancetype)shared;
@@ -138,103 +126,7 @@ static NSString * const kDDCustomBalanceKey = @"DD_Custom_Balance_Fen";
 - (void)saveContacts;
 @end
 
-@implementation DDGlobalConfig
-
-+ (instancetype)shared {
-    static DDGlobalConfig *config = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ config = [DDGlobalConfig new]; });
-    return config;
-}
-
-- (instancetype)init {
-    if (self = [super init]) {
-        NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-        _jokerEnabled = [def boolForKey:kDDFeatureJokerEnabled];
-        _walletEnabled = [def boolForKey:kDDFeatureWalletEnabled];
-        _stepsEnabled = [def boolForKey:kDDFeatureStepsEnabled];
-        _contactsEnabled = [def boolForKey:kDDFeatureContactsEnabled];
-        _stepsValueString = [def stringForKey:kDDStepsValueStringKey];
-        _contactsValue = [def stringForKey:kDDContactsCountValueKey];
-        if (![def objectForKey:kDDLastStepsUpdateDateKey]) {
-            [def setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
-            [def synchronize];
-        }
-    }
-    return self;
-}
-
-- (void)setJokerEnabled:(BOOL)enabled {
-    _jokerEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureJokerEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-- (void)setWalletEnabled:(BOOL)enabled {
-    _walletEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureWalletEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-- (void)setStepsEnabled:(BOOL)enabled {
-    _stepsEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureStepsEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-- (void)setContactsEnabled:(BOOL)enabled {
-    _contactsEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureContactsEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-- (void)setStepsValueString:(NSString *)stepsValueString {
-    _stepsValueString = [stepsValueString copy];
-    [self saveSteps];
-}
-
-- (void)setContactsValue:(NSString *)contactsValue {
-    _contactsValue = [contactsValue copy];
-    [self saveContacts];
-}
-
-- (NSInteger)stepsIntegerValue {
-    if (![self hasStepsValue]) return 0;
-    return [_stepsValueString integerValue];
-}
-
-- (BOOL)hasStepsValue {
-    return _stepsValueString.length > 0;
-}
-
-- (BOOL)hasContactsValue {
-    return _contactsValue.length > 0;
-}
-
-- (void)saveSteps {
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    if (_stepsValueString.length) {
-        [def setObject:_stepsValueString forKey:kDDStepsValueStringKey];
-    } else {
-        [def removeObjectForKey:kDDStepsValueStringKey];
-    }
-    [def setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
-    [def synchronize];
-}
-
-- (void)saveContacts {
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    if (_contactsValue.length) {
-        [def setObject:_contactsValue forKey:kDDContactsCountValueKey];
-    } else {
-        [def removeObjectForKey:kDDContactsCountValueKey];
-    }
-    [def synchronize];
-}
-
-@end
-
-#pragma mark - 聊天记录修改辅助函数
+#pragma mark - ① 聊天记录修改
 
 static CMessageWrap *JokerGetMessageWrapFromCell(CommonMessageCellView *cell) {
     return cell.viewModel.messageWrap;
@@ -395,250 +287,6 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
     return newItems;
 }
 
-#pragma mark - 钱包零钱辅助函数
-
-static BOOL hasCustomWalletBalance(void) {
-    return [[NSUserDefaults standardUserDefaults] objectForKey:kDDCustomBalanceKey] != nil;
-}
-
-static void saveWalletBalanceFen(unsigned long long fen) {
-    [[NSUserDefaults standardUserDefaults] setObject:[NSString stringWithFormat:@"%llu", fen] forKey:kDDCustomBalanceKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-static void clearWalletBalance(void) {
-    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kDDCustomBalanceKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-static unsigned long long loadWalletBalanceFen(void) {
-    NSString *s = [[NSUserDefaults standardUserDefaults] stringForKey:kDDCustomBalanceKey];
-    if (!s.length) return 0;
-    long long val = [s longLongValue];
-    return val > 0 ? (unsigned long long)val : 0;
-}
-
-#pragma mark - 步数辅助函数
-
-static BOOL isToday(NSDate *date) {
-    if (!date) return NO;
-    NSCalendar *cal = [NSCalendar currentCalendar];
-    NSDateComponents *dc1 = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay fromDate:date];
-    NSDateComponents *dc2 = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay fromDate:[NSDate date]];
-    return dc1.year == dc2.year && dc1.month == dc2.month && dc1.day == dc2.day;
-}
-
-#pragma mark - 主设置控制器（双按钮弹窗已集成）
-
-@interface DDJokerSettingsViewController : UIViewController <UITableViewDelegate>
-@property (nonatomic, strong) WCTableViewManager *tableViewManager;
-@end
-
-@implementation DDJokerSettingsViewController {
-    id<UITableViewDelegate> _originalDelegate;
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"DD小丑助手";
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
-    
-    _tableViewManager = [[objc_getClass("WCTableViewManager") alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
-    _tableViewManager.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
-    [self.view addSubview:_tableViewManager.tableView];
-    
-    _originalDelegate = _tableViewManager.delegate;
-    _tableViewManager.delegate = self;
-    
-    [self buildTable];
-}
-
-- (void)buildTable {
-    [_tableViewManager clearAllSection];
-    
-    WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"小丑设置"
-                                                                                                 Footer:@"聊天记录修改长按消息弹窗菜单小丑按钮（支持文字和转账金额），钱包余额修改长按服务页钱包入口或零钱详情页余额数字修改"];
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    
-    // 1. 聊天记录修改开关
-    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(jokerSwitchChanged:) target:self title:@"聊天记录修改" on:cfg.jokerEnabled]];
-    
-    // 2. 钱包零钱修改开关
-    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(walletSwitchChanged:) target:self title:@"钱包零钱修改" on:cfg.walletEnabled]];
-    
-    // 3. 运动步数开关 + 子项
-    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
-    if (cfg.stepsEnabled) {
-        NSString *right = [cfg hasStepsValue] ? [NSString stringWithFormat:@"%ld 步", (long)[cfg stepsIntegerValue]] : @"未设置";
-        WCTableViewCellManager *stepsSubCell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(stepsCellTapped) target:self title:@"↳步数自定义" rightValue:right];
-        stepsSubCell.userInfo = @"SubCell";
-        [section addCell:stepsSubCell];
-    }
-    
-    // 4. 好友数量开关 + 子项
-    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
-    if (cfg.contactsEnabled) {
-        NSString *right;
-        if ([cfg hasContactsValue]) {
-            right = [NSString stringWithFormat:@"%@ 个", cfg.contactsValue];
-        } else {
-            right = @"未设置";
-        }
-        WCTableViewCellManager *contactsSubCell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(contactsCellTapped) target:self title:@"↳数量自定义" rightValue:right];
-        contactsSubCell.userInfo = @"SubCell";
-        [section addCell:contactsSubCell];
-    }
-    
-    [_tableViewManager addSection:section];
-    [_tableViewManager reloadTableView];
-}
-
-#pragma mark - UITableViewDelegate 转发
-
-- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)]) {
-        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
-    }
-    WCTableViewCellManager *cellInfo = [self.tableViewManager cellInfoAtIndexPath:indexPath];
-    if ([cellInfo.userInfo isEqualToString:@"SubCell"]) {
-        cell.indentationLevel = 1;
-        cell.indentationWidth = 16.0;
-    }
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
-        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
-    }
-}
-
-- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)]) {
-        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
-    }
-    return UITableViewAutomaticDimension;
-}
-
-#pragma mark - 事件处理（双按钮：稍后重启 / 立即重启）
-
-- (void)jokerSwitchChanged:(UISwitch *)sender {
-    [DDGlobalConfig shared].jokerEnabled = sender.isOn;
-    [self buildTable];
-}
-
-- (void)walletSwitchChanged:(UISwitch *)sender {
-    [DDGlobalConfig shared].walletEnabled = sender.isOn;
-    [self buildTable];
-}
-
-- (void)stepsSwitchChanged:(UISwitch *)sender {
-    [DDGlobalConfig shared].stepsEnabled = sender.isOn;
-    [self buildTable];
-}
-
-- (void)contactsSwitchChanged:(UISwitch *)sender {
-    [DDGlobalConfig shared].contactsEnabled = sender.isOn;
-    [self buildTable];
-}
-
-- (void)stepsCellTapped {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置步数"
-                                                                   message:@"输入小于 100000 的整数，超过十万可能会被和谐，需重启微信生效"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        if ([cfg hasStepsValue]) {
-            tf.text = cfg.stepsValueString;
-        } else {
-            tf.placeholder = @"例如：88888";
-        }
-        tf.keyboardType = UIKeyboardTypeNumberPad;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-    
-    __weak typeof(self) weakSelf = self;
-    
-    // 稍后重启（保存并刷新设置页）
-    [alert addAction:[UIAlertAction actionWithTitle:@"稍后重启" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [weakSelf saveStepsInput:alert.textFields.firstObject.text];
-        [weakSelf buildTable];
-    }]];
-    
-    // 立即重启（保存并退出微信）
-    [alert addAction:[UIAlertAction actionWithTitle:@"立即重启" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [weakSelf saveStepsInput:alert.textFields.firstObject.text];
-        exit(0);
-    }]];
-    
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
-- (void)contactsCellTapped {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置好友数量"
-                                                                   message:@"输入纯数字，需重启微信生效"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        if ([cfg hasContactsValue]) {
-            tf.text = cfg.contactsValue;
-        } else {
-            tf.placeholder = @"例如：88888";
-        }
-        tf.keyboardType = UIKeyboardTypeNumberPad;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-    }];
-    
-    __weak typeof(self) weakSelf = self;
-    
-    // 稍后重启（保存并刷新设置页）
-    [alert addAction:[UIAlertAction actionWithTitle:@"稍后重启" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [weakSelf saveContactsInput:alert.textFields.firstObject.text];
-        [weakSelf buildTable];
-    }]];
-    
-    // 立即重启（保存并退出微信）
-    [alert addAction:[UIAlertAction actionWithTitle:@"立即重启" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [weakSelf saveContactsInput:alert.textFields.firstObject.text];
-        exit(0);
-    }]];
-    
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
-#pragma mark - 保存逻辑辅助方法
-
-- (void)saveStepsInput:(NSString *)input {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmed.length == 0) {
-        cfg.stepsValueString = nil;
-    } else {
-        NSInteger val = [trimmed integerValue];
-        if (val < 0) val = 0;
-        if (val > 100000) val = 100000;
-        cfg.stepsValueString = [NSString stringWithFormat:@"%ld", (long)val];
-    }
-}
-
-- (void)saveContactsInput:(NSString *)input {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmed.length == 0) {
-        cfg.contactsValue = nil;
-    } else {
-        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
-        if ([trimmed rangeOfCharacterFromSet:nonDigits].location == NSNotFound) {
-            cfg.contactsValue = trimmed;
-        }
-    }
-}
-
-@end
-
-#pragma mark - Hooks
-
-// ---------- 1. 聊天记录修改 ----------
 %hook TextMessageCellView
 - (NSArray *)operationMenuItems {
     return JokerInjectMenuItem(self, %orig);
@@ -687,7 +335,29 @@ static BOOL isToday(NSDate *date) {
 }
 %end
 
-// ---------- 2. 钱包零钱修改 ----------
+#pragma mark - ② 钱包零钱修改
+
+static BOOL hasCustomWalletBalance(void) {
+    return [[NSUserDefaults standardUserDefaults] objectForKey:kDDCustomBalanceKey] != nil;
+}
+
+static void saveWalletBalanceFen(unsigned long long fen) {
+    [[NSUserDefaults standardUserDefaults] setObject:[NSString stringWithFormat:@"%llu", fen] forKey:kDDCustomBalanceKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+static void clearWalletBalance(void) {
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kDDCustomBalanceKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+static unsigned long long loadWalletBalanceFen(void) {
+    NSString *s = [[NSUserDefaults standardUserDefaults] stringForKey:kDDCustomBalanceKey];
+    if (!s.length) return 0;
+    long long val = [s longLongValue];
+    return val > 0 ? (unsigned long long)val : 0;
+}
+
 %hook TimeoutNumber
 - (void)updateNumber:(unsigned long long)original {
     if ([DDGlobalConfig shared].walletEnabled && hasCustomWalletBalance()) {
@@ -809,7 +479,16 @@ static BOOL isToday(NSDate *date) {
 }
 %end
 
-// ---------- 3. 运动步数修改 ----------
+#pragma mark - ③ 运动步数修改
+
+static BOOL isToday(NSDate *date) {
+    if (!date) return NO;
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDateComponents *dc1 = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay fromDate:date];
+    NSDateComponents *dc2 = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay fromDate:[NSDate date]];
+    return dc1.year == dc2.year && dc1.month == dc2.month && dc1.day == dc2.day;
+}
+
 %hook WCDeviceStepObject
 - (unsigned int)m7StepCount {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
@@ -846,7 +525,8 @@ static BOOL isToday(NSDate *date) {
 }
 %end
 
-// ---------- 4. 好友数量修改 ----------
+#pragma mark - ④ 好友数量修改
+
 %hook MMUILabel
 - (void)setText:(NSString *)text {
     if (!text) {
@@ -864,12 +544,322 @@ static BOOL isToday(NSDate *date) {
 }
 %end
 
-#pragma mark - 插件入口
+#pragma mark - 设置界面
+
+@interface DDJokerSettingsViewController : UIViewController <UITableViewDelegate>
+@property (nonatomic, strong) WCTableViewManager *tableViewManager;
+@end
+
+@implementation DDJokerSettingsViewController {
+    id<UITableViewDelegate> _originalDelegate;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"DD小丑助手";
+
+    // 设置导航栏外观（与 DD微信助手 一致）
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    [appearance configureWithDefaultBackground];
+    appearance.shadowColor = nil;
+    self.navigationItem.standardAppearance = appearance;
+    self.navigationItem.scrollEdgeAppearance = appearance;
+    self.navigationItem.compactAppearance = appearance;
+
+    _tableViewManager = [[objc_getClass("WCTableViewManager") alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
+    _tableViewManager.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
+    [self.view addSubview:_tableViewManager.tableView];
+
+    _originalDelegate = _tableViewManager.delegate;
+    _tableViewManager.delegate = self;
+
+    [self buildTable];
+}
+
+- (void)buildTable {
+    [_tableViewManager clearAllSection];
+    
+    WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"小丑设置"
+                                                                                                 Footer:@"聊天记录修改长按消息弹窗菜单小丑按钮（支持文字和转账金额），钱包余额修改长按服务页钱包入口或零钱详情页余额数字修改"];
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    
+    // 1. 聊天记录修改开关
+    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(jokerSwitchChanged:) target:self title:@"聊天记录修改" on:cfg.jokerEnabled]];
+    
+    // 2. 钱包零钱修改开关
+    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(walletSwitchChanged:) target:self title:@"钱包零钱修改" on:cfg.walletEnabled]];
+    
+    // 3. 运动步数开关 + 子项
+    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
+    if (cfg.stepsEnabled) {
+        NSString *right = [cfg hasStepsValue] ? [NSString stringWithFormat:@"%ld 步", (long)[cfg stepsIntegerValue]] : @"未设置";
+        WCTableViewCellManager *stepsSubCell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(stepsCellTapped) target:self title:@"↳步数自定义" rightValue:right];
+        stepsSubCell.userInfo = @"SubCell";
+        [section addCell:stepsSubCell];
+    }
+    
+    // 4. 好友数量开关 + 子项
+    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
+    if (cfg.contactsEnabled) {
+        NSString *right;
+        if ([cfg hasContactsValue]) {
+            right = [NSString stringWithFormat:@"%@ 个", cfg.contactsValue];
+        } else {
+            right = @"未设置";
+        }
+        WCTableViewCellManager *contactsSubCell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(contactsCellTapped) target:self title:@"↳数量自定义" rightValue:right];
+        contactsSubCell.userInfo = @"SubCell";
+        [section addCell:contactsSubCell];
+    }
+    
+    [_tableViewManager addSection:section];
+    [_tableViewManager reloadTableView];
+}
+
+#pragma mark - UITableViewDelegate 转发
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)]) {
+        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+    }
+    WCTableViewCellManager *cellInfo = [self.tableViewManager cellInfoAtIndexPath:indexPath];
+    if ([cellInfo.userInfo isEqualToString:@"SubCell"]) {
+        cell.indentationLevel = 1;
+        cell.indentationWidth = 16.0;
+    }
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
+        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
+    }
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)]) {
+        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
+    }
+    return UITableViewAutomaticDimension;
+}
+
+#pragma mark - 事件处理（双按钮：稍后重启 / 立即重启）
+
+- (void)jokerSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].jokerEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)walletSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].walletEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)stepsSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].stepsEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)contactsSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].contactsEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)stepsCellTapped {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置步数"
+                                                                   message:@"输入小于 100000 的整数，超过十万可能会被和谐，需重启微信生效"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        if ([cfg hasStepsValue]) {
+            tf.text = cfg.stepsValueString;
+        } else {
+            tf.placeholder = @"例如：88888";
+        }
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    
+    __weak typeof(self) weakSelf = self;
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"稍后重启" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [weakSelf saveStepsInput:alert.textFields.firstObject.text];
+        [weakSelf buildTable];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"立即重启" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [weakSelf saveStepsInput:alert.textFields.firstObject.text];
+        exit(0);
+    }]];
+    
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)contactsCellTapped {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置好友数量"
+                                                                   message:@"输入纯数字，需重启微信生效"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        if ([cfg hasContactsValue]) {
+            tf.text = cfg.contactsValue;
+        } else {
+            tf.placeholder = @"例如：88888";
+        }
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    
+    __weak typeof(self) weakSelf = self;
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"稍后重启" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [weakSelf saveContactsInput:alert.textFields.firstObject.text];
+        [weakSelf buildTable];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"立即重启" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [weakSelf saveContactsInput:alert.textFields.firstObject.text];
+        exit(0);
+    }]];
+    
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - 保存逻辑辅助方法
+
+- (void)saveStepsInput:(NSString *)input {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) {
+        cfg.stepsValueString = nil;
+    } else {
+        NSInteger val = [trimmed integerValue];
+        if (val < 0) val = 0;
+        if (val > 100000) val = 100000;
+        cfg.stepsValueString = [NSString stringWithFormat:@"%ld", (long)val];
+    }
+}
+
+- (void)saveContactsInput:(NSString *)input {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) {
+        cfg.contactsValue = nil;
+    } else {
+        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+        if ([trimmed rangeOfCharacterFromSet:nonDigits].location == NSNotFound) {
+            cfg.contactsValue = trimmed;
+        }
+    }
+}
+
+@end
+
+#pragma mark - 配置管理（实现）
+
+@implementation DDGlobalConfig
+
++ (instancetype)shared {
+    static DDGlobalConfig *config = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ config = [DDGlobalConfig new]; });
+    return config;
+}
+
+- (instancetype)init {
+    if (self = [super init]) {
+        NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+        _jokerEnabled = [def boolForKey:kDDFeatureJokerEnabled];
+        _walletEnabled = [def boolForKey:kDDFeatureWalletEnabled];
+        _stepsEnabled = [def boolForKey:kDDFeatureStepsEnabled];
+        _contactsEnabled = [def boolForKey:kDDFeatureContactsEnabled];
+        _stepsValueString = [def stringForKey:kDDStepsValueStringKey];
+        _contactsValue = [def stringForKey:kDDContactsCountValueKey];
+        if (![def objectForKey:kDDLastStepsUpdateDateKey]) {
+            [def setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
+            [def synchronize];
+        }
+    }
+    return self;
+}
+
+- (void)setJokerEnabled:(BOOL)enabled {
+    _jokerEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureJokerEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setWalletEnabled:(BOOL)enabled {
+    _walletEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureWalletEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setStepsEnabled:(BOOL)enabled {
+    _stepsEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureStepsEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setContactsEnabled:(BOOL)enabled {
+    _contactsEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureContactsEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setStepsValueString:(NSString *)stepsValueString {
+    _stepsValueString = [stepsValueString copy];
+    [self saveSteps];
+}
+
+- (void)setContactsValue:(NSString *)contactsValue {
+    _contactsValue = [contactsValue copy];
+    [self saveContacts];
+}
+
+- (NSInteger)stepsIntegerValue {
+    if (![self hasStepsValue]) return 0;
+    return [_stepsValueString integerValue];
+}
+
+- (BOOL)hasStepsValue {
+    return _stepsValueString.length > 0;
+}
+
+- (BOOL)hasContactsValue {
+    return _contactsValue.length > 0;
+}
+
+- (void)saveSteps {
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    if (_stepsValueString.length) {
+        [def setObject:_stepsValueString forKey:kDDStepsValueStringKey];
+    } else {
+        [def removeObjectForKey:kDDStepsValueStringKey];
+    }
+    [def setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
+    [def synchronize];
+}
+
+- (void)saveContacts {
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    if (_contactsValue.length) {
+        [def setObject:_contactsValue forKey:kDDContactsCountValueKey];
+    } else {
+        [def removeObjectForKey:kDDContactsCountValueKey];
+    }
+    [def synchronize];
+}
+
+@end
+
+#pragma mark - 插件注册
 
 %ctor {
     @autoreleasepool {
-        if (NSClassFromString(@"WCPluginsMgr")) {
-            [[objc_getClass("WCPluginsMgr") sharedInstance] registerControllerWithTitle:@"DD小丑助手" version:@"1.0.0" controller:@"DDJokerSettingsViewController"];
+        id mgr = objc_getClass("WCPluginsMgr");
+        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD小丑助手"
+                                                      version:@"1.0.0"
+                                                   controller:@"DDJokerSettingsViewController"];
         }
     }
 }
