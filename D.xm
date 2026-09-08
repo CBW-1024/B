@@ -580,21 +580,35 @@ static BOOL isToday(NSDate *date) {
     [self buildTable];
 }
 
-// 通用方法：创建右侧输入框+确认按钮
+// 通用方法：创建右侧输入框+确认按钮（灰色背景，文字使用系统默认颜色）
 - (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action placeholder:(NSString *)placeholder text:(NSString *)text {
-    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 200, 30)];
+    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 220, 34)];
+    container.backgroundColor = [UIColor clearColor];
     
-    field.frame = CGRectMake(0, 0, 150, 30);
-    field.borderStyle = UITextBorderStyleRoundedRect;
+    // 输入框
+    field.frame = CGRectMake(0, 0, 160, 34);
+    field.borderStyle = UITextBorderStyleNone;
     field.placeholder = placeholder;
     field.text = text;
     field.textAlignment = NSTextAlignmentRight;
     field.keyboardType = UIKeyboardTypeNumberPad;
+    field.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    field.layer.cornerRadius = 6.0;
+    field.layer.masksToBounds = YES;
+    field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
+    field.leftViewMode = UITextFieldViewModeAlways;
+    field.rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
+    field.rightViewMode = UITextFieldViewModeAlways;
     [container addSubview:field];
     
+    // 确认按钮（灰色背景，文字为系统默认颜色，常规字体）
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(158, 0, 42, 30);
+    btn.frame = CGRectMake(168, 0, 52, 34);
     [btn setTitle:@"确认" forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];  // 系统默认颜色
+    btn.backgroundColor = [UIColor systemGray5Color];
+    btn.layer.cornerRadius = 6.0;
+    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
     [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     [container addSubview:btn];
     
