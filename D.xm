@@ -1,4 +1,4 @@
-// VCAM — 微信相机画面与麦克风声音的虚拟替换（Theos / Logos）
+// VCAM — 相机画面与麦克风声音的虚拟替换（Theos / Logos）
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
@@ -23,7 +23,7 @@ static BOOL g_frozen         = NO;   // 冻结锁存：当前轮播完后锁死�
 static BOOL g_isSound        = YES;  // 是否替换麦克风采集
 
 // 画面替换判别（底层、与 App 无关）：
-// 不再依赖任何微信类名（MMSightCameraViewController / CameraScannerView）或事件置位，
+// 不依赖任何类名
 // 仅看当前 AVCaptureSession 是否挂“静态图像输出”：
 //   • 挂了静态输出（AVCaptureStillImageOutput / AVCapturePhotoOutput）→ 拍照 / 扫码场景，画面必须真实（含预览）
 //   • 只挂视频输出（AVCaptureVideoDataOutput）→ 视频通话场景，替换为素材
@@ -1037,7 +1037,7 @@ static char kVCamVideoProxyKey;   // 关联对象 key：每个 AVCaptureVideoDat
 
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
-    // 每个 output 独立持有 proxy：微信可能同时存在预览与录制两个 video data output，
+    // 每个 output 独立持有 proxy：app可能同时存在预览与录制两个 video data output，
     // 共用单例会让 _originalDelegate 互相覆盖，素材帧转发错对象、导致成片不被替换
     VCamVideoProxy *p = objc_getAssociatedObject(self, &kVCamVideoProxyKey);
     if (delegate == nil) {
@@ -1149,7 +1149,7 @@ static BOOL vcm_hasStillForSession(AVCaptureSession *session) {
 
 #pragma mark - 画面判别（底层，与 App 无关）
 // 拍照/扫码与视频通话的区分完全由 AVCaptureSession 的 outputs 决定（vcm_sessionHasStillOutput），
-// 不依赖任何 App 类名或生命周期钩子。因此无需 hook 微信相机 VC 或 AVAssetWriter：
+// 不依赖任何 App 类名或生命周期钩子。因此无需 hook 相机 VC 或 AVAssetWriter：
 //   • session 挂静态图像输出（拍照/扫码）→ 采集与预览均真实
 //   • session 仅视频输出（视频通话）→ 采集替换为素材、预览层显示素材
 // 对应逻辑分别在 VCamVideoProxy.captureOutput: 与 AVCaptureVideoPreviewLayer.vcm_syncDisplayLayer 中。
