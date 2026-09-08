@@ -37,6 +37,11 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
+#include <string.h>
+
+// 越狱插件要兼容多个 iOS 版本，弃用告警统一在源码内关掉，
+// 不依赖外部 CFLAGS（TWEAK_NAME 改了名字后 *_CFLAGS 变量容易对不上而失效）
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 #pragma mark - 可调参数
 
@@ -311,14 +316,8 @@ static void AFCleanLater(id vc, const char *tag) {
 }
 
 /// 首次安装完成后提示一次日志在哪（微信沙盒 Documents，爱思/iMazing 导出微信容器即可看到）
-static void AFHintLogPathOnce(void) {
-    NSString *k = @"AFHidePluginEntry.logHinted";
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:k]) return;
-    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:k];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        AFToast([NSString stringWithFormat:@"日志: Documents/%@", kAFLogFileName]);
-    });
-}
+/// 注意：必须在 AFToast 之后定义
+static void AFHintLogPathOnce(void);
 
 static void AFToast(NSString *text) {
     UIWindow *window = nil;
@@ -332,7 +331,13 @@ static void AFToast(NSString *text) {
             }
         }
     }
-    if (!window) window = UIApplication.sharedApplication.keyWindow;
+    if (!window) {
+        // keyWindow 自 iOS 13 起弃用；这里用 pragma 就地压制，避免外部 CFLAGS 没带 -Wno- 时被 -Werror 卡住
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        window = UIApplication.sharedApplication.keyWindow;
+#pragma clang diagnostic pop
+    }
     if (!window) return;
 
     UIFont *font = [UIFont systemFontOfSize:14];
@@ -356,6 +361,15 @@ static void AFToast(NSString *text) {
             }];
         });
     }];
+}
+
+static void AFHintLogPathOnce(void) {
+    NSString *k = @"AFHidePluginEntry.logHinted";
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:k]) return;
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:k];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        AFToast([NSString stringWithFormat:@"日志: Documents/%@", kAFLogFileName]);
+    });
 }
 
 #pragma mark - 长按「我」2 秒
