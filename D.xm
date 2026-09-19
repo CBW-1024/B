@@ -158,13 +158,12 @@
 - (void)doForward;
 @end
 
-// VoiceMessageCellView.h：operationMenuItems / canPerformAction: / getViewController 均由头文件确认
-// getViewController 用于从 cell 取到所在聊天 VC；doForward 是 BaseMessageCellView 声明的原生转发动作。
+// VoiceMessageCellView.h：operationMenuItems / canPerformAction: 均由头文件确认
+// doForward / forwardMenuItem / onForward: 是 BaseMessageCellView 声明的原生转发动作。
 // 这里让它继承 BaseMessageCellView，以便直接调用其转发生态方法（forwardMenuItem / doForward / onForward:）。
 @interface VoiceMessageCellView : BaseMessageCellView
 - (id)operationMenuItems;
 - (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;
-- (id)getViewController;
 @end
 
 #pragma mark - 配置（两个独立开关，默认均 OFF）
