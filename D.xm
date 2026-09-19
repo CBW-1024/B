@@ -53,6 +53,7 @@
 @property(nonatomic) unsigned int m_uiVoiceTime;
 @property(nonatomic) unsigned int m_uiVoiceFormat;
 @property(nonatomic) unsigned int m_uiVoiceEndFlag;
+@property(nonatomic) unsigned int m_uiVoiceForwardFlag;
 @property(retain, nonatomic) NSData *m_dtVoice;
 @property(nonatomic, weak) CMessageWrap *m_refMessageWrap;
 @end
@@ -112,6 +113,9 @@ static const unsigned int kDDVoiceEndFlag = 1;
 // 0x7901b4 轮询上限 0xf0 次，每次 sleep 0.25s
 static const int kDDDownloadWaitMax = 240;
 static const NSTimeInterval kDDDownloadWaitStep = 0.25;
+// 语音时长单位换算：锤子变声补丁 0x78eaa0 用 changedVoiceTime * 1000，证明发送链路 m_uiVoiceTime 是毫秒；
+// 而收藏数据 FavoritesItemDataField.duration 存的是秒，低于 1000 一律按秒处理
+static const unsigned int kDDVoiceTimeMsMin = 1000;
 
 @interface DDFavVoiceConfig : NSObject
 + (instancetype)sharedConfig;
@@ -201,6 +205,8 @@ static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int durati
     if ([ext respondsToSelector:@selector(setM_uiVoiceEndFlag:)]) [ext setM_uiVoiceEndFlag:kDDVoiceEndFlag];
     if ([ext respondsToSelector:@selector(setM_uiVoiceTime:)]) [ext setM_uiVoiceTime:duration];
     if ([ext respondsToSelector:@selector(setM_dtVoice:)]) [ext setM_dtVoice:voiceData];
+    // 转发语音标记：告诉上传链路这是转发而非新录音
+    if ([ext respondsToSelector:@selector(setM_uiVoiceForwardFlag:)]) [ext setM_uiVoiceForwardFlag:1];
     return YES;
 }
 
@@ -219,6 +225,7 @@ static id dd_voiceMsgWrapFromData(id favData) {
     NSData *voiceData = [NSData dataWithContentsOfFile:path];
     if (!voiceData || [voiceData length] == 0) return nil;
     unsigned int duration = field.duration;
+    if (duration > 0 && duration < kDDVoiceTimeMsMin) duration = duration * kDDVoiceTimeMsMin;
     if (duration == 0) return nil;
     Class wrapCls = objc_getClass("CMessageWrap");
     if (!wrapCls) return nil;
@@ -249,14 +256,47 @@ static id dd_voiceMsgWrapFromItem(id item) {
     return dd_voiceMsgWrapFromData([list firstObject]);
 }
 
-// 对齐锤子 0x7907ec：把语音消息塞进 m_messageWrapList（用 MSHookIvar，不用 KVC）
-static void dd_appendMsgToController(id ctrl, id msg) {
-    if (!ctrl || !msg) return;
-    if (!class_getInstanceVariable([ctrl class], "m_messageWrapList")) return;
+// 对齐锤子 0x7907ec：用 MSHookIvar 取 m_messageWrapList（不用 KVC）
+static NSMutableArray *dd_msgListOfController(id ctrl) {
+    if (!ctrl) return nil;
+    if (!class_getInstanceVariable([ctrl class], "m_messageWrapList")) return nil;
     NSMutableArray *list = MSHookIvar<NSMutableArray *>(ctrl, "m_messageWrapList");
-    if (![list isKindOfClass:[NSMutableArray class]]) return;
-    if ([list containsObject:msg]) return;
-    [list addObject:msg];
+    if (![list isKindOfClass:[NSMutableArray class]]) return nil;
+    return list;
+}
+
+static BOOL dd_isVoiceMsg(id msg) {
+    if (!msg) return NO;
+    Class wrapCls = objc_getClass("CMessageWrap");
+    if (!wrapCls) return NO;
+    if (![msg isKindOfClass:wrapCls]) return NO;
+    if (![msg respondsToSelector:@selector(m_uiMessageType)]) return NO;
+    return ((CMessageWrap *)msg).m_uiMessageType == (unsigned int)kDDVoiceMsgType;
+}
+
+// 判断语音消息是否真的带了语音数据，原生降级产生的空壳会被这里识破
+static BOOL dd_msgHasVoiceData(id msg) {
+    if (!dd_isVoiceMsg(msg)) return NO;
+    id ext = dd_voiceExtendInfo(msg, NO);
+    if (!ext) return NO;
+    if (![ext respondsToSelector:@selector(m_dtVoice)]) return NO;
+    NSData *d = [ext m_dtVoice];
+    return [d length] > 0;
+}
+
+// 校正转发列表：剔除没有语音数据的空壳语音，补入完整语音消息
+static void dd_fixupVoiceMsgList(id ctrl, id msg) {
+    NSMutableArray *list = dd_msgListOfController(ctrl);
+    if (!list) return;
+    NSMutableArray *dead = [NSMutableArray array];
+    BOOL hasGood = NO;
+    for (id m in list) {
+        if (dd_msgHasVoiceData(m)) { hasGood = YES; continue; }
+        if (dd_isVoiceMsg(m)) [dead addObject:m];
+    }
+    if ([dead count] > 0) [list removeObjectsInArray:dead];
+    if (hasGood) return;
+    if (msg && ![list containsObject:msg]) [list addObject:msg];
 }
 
 #pragma mark - 一 收藏项转发闸门
@@ -302,36 +342,36 @@ static void dd_appendMsgToController(id ctrl, id msg) {
 // 锤子 0x78f4e8：命中后额外把语音消息塞进 m_messageWrapList，原实现照常调用
 %hook FavForwardLogicController
 - (void)addMsgFromItem:(id)arg1 {
-    if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1)) {
-        BOOL need = NO;
-        if ([arg1 respondsToSelector:@selector(needDownLoad)]) {
-            need = ((FavoritesItem *)arg1).needDownLoad;
-        }
-        if (need) {
-            // 对齐 0x790320：先下载，后台轮询等待完成后再补消息
-            dd_startDownloadFavItem(arg1);
-            id item = arg1;
-            __weak FavForwardLogicController *weakSelf = self;
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                for (int i = 0; i < kDDDownloadWaitMax; i++) {
-                    [NSThread sleepForTimeInterval:kDDDownloadWaitStep];
-                    if (![item respondsToSelector:@selector(needDownLoad)]) break;
-                    if (!((FavoritesItem *)item).needDownLoad) break;
-                }
-                id msg = dd_voiceMsgWrapFromItem(item);
-                if (msg) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        dd_appendMsgToController(weakSelf, msg);
-                    });
-                }
-            });
-        } else {
-            // 对齐 0x790484：已下载，直接构造语音消息并追加
-            id msg = dd_voiceMsgWrapFromItem(arg1);
-            dd_appendMsgToController(self, msg);
-        }
+    if (!ddFavVoiceEnabled() || !dd_isFavVoiceItem(arg1)) { %orig; return; }
+    BOOL need = NO;
+    if ([arg1 respondsToSelector:@selector(needDownLoad)]) {
+        need = ((FavoritesItem *)arg1).needDownLoad;
     }
+    if (need) {
+        // 对齐 0x790320：先触发下载。下载完成前原生只会产出空壳，这里剔掉，后台下载完再补
+        dd_startDownloadFavItem(arg1);
+        id item = arg1;
+        __weak FavForwardLogicController *weakSelf = self;
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            for (int i = 0; i < kDDDownloadWaitMax; i++) {
+                [NSThread sleepForTimeInterval:kDDDownloadWaitStep];
+                if (![item respondsToSelector:@selector(needDownLoad)]) break;
+                if (!((FavoritesItem *)item).needDownLoad) break;
+            }
+            id msg = dd_voiceMsgWrapFromItem(item);
+            if (msg) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    dd_fixupVoiceMsgList(weakSelf, msg);
+                });
+            }
+        });
+        %orig;
+        dd_fixupVoiceMsgList(self, nil);
+        return;
+    }
+    // 对齐 0x790484：已下载，先让原生走完，再校正列表（剔除空壳、补入完整语音）
     %orig;
+    dd_fixupVoiceMsgList(self, dd_voiceMsgWrapFromItem(arg1));
 }
 %end
 
