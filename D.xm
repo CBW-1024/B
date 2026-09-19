@@ -207,15 +207,18 @@ static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int durati
 // 对齐锤子 0x790570：GetDataPath -> NSData -> initWithMsgType:0x22
 static id dd_voiceMsgWrapFromData(id favData) {
     if (!favData) return nil;
-    if (![favData respondsToSelector:@selector(GetDataPath)]) return nil;
-    id pathObj = [favData GetDataPath];
+    Class fieldCls = objc_getClass("FavoritesItemDataField");
+    if (!fieldCls) return nil;
+    if (![favData isKindOfClass:fieldCls]) return nil;
+    FavoritesItemDataField *field = (FavoritesItemDataField *)favData;
+    if (![field respondsToSelector:@selector(GetDataPath)]) return nil;
+    id pathObj = [field GetDataPath];
     if (![pathObj isKindOfClass:[NSString class]]) return nil;
     NSString *path = (NSString *)pathObj;
     if ([path length] == 0) return nil;
     NSData *voiceData = [NSData dataWithContentsOfFile:path];
     if (!voiceData || [voiceData length] == 0) return nil;
-    unsigned int duration = 0;
-    if ([favData respondsToSelector:@selector(duration)]) duration = [favData duration];
+    unsigned int duration = field.duration;
     if (duration == 0) return nil;
     Class wrapCls = objc_getClass("CMessageWrap");
     if (!wrapCls) return nil;
@@ -237,10 +240,11 @@ static id dd_voiceMsgWrapFromData(id favData) {
 // 对齐锤子 0x790484/0x7907a8：[[item dataList] firstObject] -> 语音 CMessageWrap
 static id dd_voiceMsgWrapFromItem(id item) {
     if (!item) return nil;
-    if (![item respondsToSelector:@selector(dataList)]) return nil;
-    id dl = [item dataList];
-    if (![dl isKindOfClass:[NSArray class]]) return nil;
-    NSArray *list = (NSArray *)dl;
+    Class itemCls = objc_getClass("FavoritesItem");
+    if (!itemCls) return nil;
+    if (![item isKindOfClass:itemCls]) return nil;
+    NSArray *list = ((FavoritesItem *)item).dataList;
+    if (![list isKindOfClass:[NSArray class]]) return nil;
     if ([list count] == 0) return nil;
     return dd_voiceMsgWrapFromData([list firstObject]);
 }
@@ -281,9 +285,10 @@ static void dd_appendMsgToController(id ctrl, id msg) {
             dd_startDownloadFavItem(arg1);
             id vc = self;
             if ([vc respondsToSelector:@selector(startLoadingWithText:)]) {
-                [vc startLoadingWithText:@"语音下载中，完成后请重新转发"];
+                MMUIViewController *mmvc = (MMUIViewController *)vc;
+                [mmvc startLoadingWithText:@"语音下载中，完成后请重新转发"];
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    if ([vc respondsToSelector:@selector(stopLoading)]) [vc stopLoading];
+                    if ([mmvc respondsToSelector:@selector(stopLoading)]) [mmvc stopLoading];
                 });
             }
             return;
