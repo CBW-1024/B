@@ -221,6 +221,33 @@ static NSString *const    kZDYSilkMagic      = @"#!SILK_V3";  /* [Z3] */
 - (id)getChatUserName;                                      /* [8] */
 @end
 
+/* UIViewController 树遍历所需的选择器：让 ZDYWalkForChatUser 能在 `id` 接收者上
+ * 直接发消息（避免 performSelector: 触发 -Warc-performSelector-leaks，
+ * 在 CI 的 -Werror 下直接报 error）。以下均为 UIKit / 微信既有方法。 */
+@interface UIViewController (ZDYWalk)
+- (id)getChatUserName;                                      /* 微信：BaseMsgContentViewController */
+- (UIViewController *)presentedViewController;
+- (NSArray <UIViewController *> *)viewControllers;
+- (NSArray <UIViewController *> *)childViewControllers;
+- (id)delegate;
+- (UIViewController *)presentingViewController;
+@end
+
+/* 收藏语音节点统一协议：FavoritesItemDataField / FavAudioInfo 均实现这些方法。
+ * 用 id<ZDYFavNode> 强转后调用 [node duration]，可消歧与系统 duration
+ * （返回 NSTimeInterval / CFTimeInterval / CGFloat 等多个签名冲突）的编译错误。 */
+@protocol ZDYFavNode <NSObject>
+- (id)GetDataPathForFav;
+- (id)GetDataPath;
+- (id)m_nsAudioPath;
+- (unsigned int)duration;
+- (float)getVoiceDuration;
+- (unsigned int)m_uiAudioDuration;
+- (int)dataType;
+- (int)getDataType;
+- (id)dataFmt;
+@end
+
 @interface UploadVoiceCDNMgr : NSObject                     /* [9] */
 - (void)AddNewPart:(id)chatName
                 LocalID:(unsigned int)lid
@@ -347,8 +374,8 @@ static NSString *ZDYCurrentUserName(void) {
     } @catch (NSException *e) { }
     @try {
         Class helper = objc_getClass("MainWeChatHelper");        /* [Z3] */
-        if (helper && [helper respondsToSelector:NSSelectorFromString(@"getCurrentWxid")]) {
-            id u = [helper performSelector:NSSelectorFromString(@"getCurrentWxid")];
+        if (helper && [helper respondsToSelector:@selector(getCurrentWxid)]) {
+            id u = [helper getCurrentWxid];
             if (ZDYIsStr(u)) return u;
         }
     } @catch (NSException *e) { }
@@ -381,38 +408,38 @@ static NSString *ZDYWalkForChatUser(id vc, int depth) {
             }
         }
         /* presented */
-        if ([vc respondsToSelector:NSSelectorFromString(@"presentedViewController")]) {
-            id p = [vc performSelector:NSSelectorFromString(@"presentedViewController")];
+        if ([vc respondsToSelector:@selector(presentedViewController)]) {
+            UIViewController *p = [vc presentedViewController];
             NSString *r = ZDYWalkForChatUser(p, depth + 1);
             if (r) return r;
         }
         /* nav stack */
-        if ([vc respondsToSelector:NSSelectorFromString(@"viewControllers")]) {
-            id arr = [vc performSelector:NSSelectorFromString(@"viewControllers")];
+        if ([vc respondsToSelector:@selector(viewControllers)]) {
+            NSArray *arr = [vc viewControllers];
             if ([arr isKindOfClass:[NSArray class]]) {
-                for (id c in (NSArray *)arr) {
+                for (id c in arr) {
                     NSString *r = ZDYWalkForChatUser(c, depth + 1);
                     if (r) return r;
                 }
             }
         }
         /* childViewControllers */
-        if ([vc respondsToSelector:NSSelectorFromString(@"childViewControllers")]) {
-            id arr = [vc performSelector:NSSelectorFromString(@"childViewControllers")];
+        if ([vc respondsToSelector:@selector(childViewControllers)]) {
+            NSArray *arr = [vc childViewControllers];
             if ([arr isKindOfClass:[NSArray class]]) {
-                for (id c in (NSArray *)arr) {
+                for (id c in arr) {
                     NSString *r = ZDYWalkForChatUser(c, depth + 1);
                     if (r) return r;
                 }
             }
         }
         /* delegate / presenting */
-        if ([vc respondsToSelector:NSSelectorFromString(@"delegate")]) {
-            id d = [vc performSelector:NSSelectorFromString(@"delegate")];
+        if ([vc respondsToSelector:@selector(delegate)]) {
+            id d = [vc delegate];
             if (d && d != vc) { NSString *r = ZDYWalkForChatUser(d, depth + 1); if (r) return r; }
         }
-        if ([vc respondsToSelector:NSSelectorFromString(@"presentingViewController")]) {
-            id p = [vc performSelector:NSSelectorFromString(@"presentingViewController")];
+        if ([vc respondsToSelector:@selector(presentingViewController)]) {
+            UIViewController *p = [vc presentingViewController];
             if (p && p != vc) { NSString *r = ZDYWalkForChatUser(p, depth + 1); if (r) return r; }
         }
     } @catch (NSException *e) { }
@@ -428,10 +455,11 @@ static NSString *ZDYResolveToUser(id host, id arg) {
     /* 2) 当前聊天 VC（ZDY 走的就是这条：BaseMsgContentViewController getChatUserName） */
     @try {
         Class appCls = objc_getClass("UIApplication");
-        if (appCls && [appCls respondsToSelector:NSSelectorFromString(@"sharedApplication")]) {
-            id app = [appCls performSelector:NSSelectorFromString(@"sharedApplication")];
-            id win = [app performSelector:NSSelectorFromString(@"keyWindow")];
-            NSString *r = ZDYWalkForChatUser([win performSelector:NSSelectorFromString(@"rootViewController")], 0);
+        if (appCls && [appCls respondsToSelector:@selector(sharedApplication)]) {
+            UIApplication *app = [appCls sharedApplication];
+            UIWindow *win = [app keyWindow];
+            UIViewController *rvc = [win rootViewController];
+            NSString *r = ZDYWalkForChatUser(rvc, 0);
             if (r) return r;
         }
     } @catch (NSException *e) { }
@@ -449,8 +477,8 @@ static NSString *ZDYResolveToUser(id host, id arg) {
         if ([host respondsToSelector:@selector(getFavForawrdViewController)]) {
             id fwd = [host getFavForawrdViewController];
             if (fwd) {
-                if ([fwd respondsToSelector:NSSelectorFromString(@"delegate")]) {
-                    id d = [fwd performSelector:NSSelectorFromString(@"delegate")];
+                if ([fwd respondsToSelector:@selector(delegate)]) {
+                    id d = [fwd delegate];
                     NSString *u = ZDYResolveToUser(d, nil);
                     if (u) return u;
                 }
@@ -537,7 +565,7 @@ static BOOL ZDYLooksLikeVoice(id node, NSString **outPath, int *outMs) {
         if (!path) return NO;
 
         if ([node respondsToSelector:@selector(duration)]) {                   /* [3] :151 */
-            unsigned int d = [node duration];
+            unsigned int d = [(id<ZDYFavNode>)node duration];
             if (d > 0) ms = (int)d;
         }
         if (ms <= 0 && [node respondsToSelector:@selector(getVoiceDuration)]) {/* [3] :40 */
