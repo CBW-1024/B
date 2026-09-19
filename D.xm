@@ -233,6 +233,14 @@ static NSString *const    kZDYSilkMagic      = @"#!SILK_V3";  /* [Z3] */
 - (UIViewController *)presentingViewController;
 @end
 
+/* 取 key window 用的 iOS 13+ 非弃用 API（UIApplication.keyWindow / .windows 均已弃用）。
+ * 直接用 SDK 自带的 UIScene / UIWindowScene（不重声明，避免与系统头冲突），
+ * 仅用 objc_getClass("UIScene") 做类判断、用 id 调 activationState / windows。
+ * ZDYSceneActive 对齐 UISceneActivationStateForegroundActive (=0)。 */
+enum {
+    ZDYSceneActive = 0,
+};
+
 /* 收藏语音节点统一协议：FavoritesItemDataField / FavAudioInfo 均实现这些方法。
  * 用 id<ZDYFavNode> 强转后调用 [node duration]，可消歧与系统 duration
  * （返回 NSTimeInterval / CFTimeInterval / CGFloat 等多个签名冲突）的编译错误。 */
@@ -304,6 +312,21 @@ static NSString *const    kZDYSilkMagic      = @"#!SILK_V3";  /* [Z3] */
 - (id)getFavForawrdViewController;
 - (void)OnForwardDone;
 - (void)OnCancelModalView:(id)arg;
+@end
+
+/* 多选菜单 cell（UI 层级实测：FavMultiMenuTableViewCell → MMFavCellComponent）。
+ * ZDY 不碰这一层，此处仅作兜底：若某版本转发动作停在 cell 上未汇聚到 VC，
+ * 由 -forwardAction: 直接接管；正常情况走 VC 的 -forwardData:，两处都命中同一条语音。 */
+@interface FavMultiMenuTableViewCell : NSObject
+- (void)forwardAction:(id)arg;                              /* [10] */
+- (id)delegate;
+- (id)indexPath;
+@end
+
+@interface MMFavCellComponent : NSObject
+- (id)favItem;                                              /* [11] 持有收藏数据 */
+- (id)delegate;
+- (id)parentCellView;
 @end
 
 #pragma mark - 去重守卫（两个入口 / 逐条转发时可能重复进来）
@@ -457,11 +480,19 @@ static NSString *ZDYResolveToUser(id host, id arg) {
         Class appCls = objc_getClass("UIApplication");
         if (appCls && [appCls respondsToSelector:@selector(sharedApplication)]) {
             UIApplication *app = [appCls sharedApplication];
-            /* iOS 13+：UIApplication.keyWindow 已弃用，改用 windows 遍历找 isKeyWindow
-             * （UIApplication.windows 未弃用；无需兼容旧系统）。 */
+            /* iOS 13+ 非弃用路径：UIApplication.keyWindow / .windows 均已弃用，
+             * 改用 connectedScenes → UIWindowScene.windows 找 isKeyWindow。
+             * scene 用 id 接收（SDK 自带的 UIScene / UIWindowScene 不重声明），
+             * activationState / windows 通过 id 直接发消息，避免与系统头属性类型冲突。 */
             UIWindow *win = nil;
-            for (UIWindow *w in app.windows) {
-                if (w.isKeyWindow) { win = w; break; }
+            Class uiSceneCls = objc_getClass("UIScene");
+            for (id scene in app.connectedScenes) {
+                if (uiSceneCls && ![scene isKindOfClass:uiSceneCls]) continue;
+                if ((NSInteger)[scene activationState] != ZDYSceneActive) continue;
+                for (UIWindow *w in [scene windows]) {
+                    if (w.isKeyWindow) { win = w; break; }
+                }
+                if (win) break;
             }
             UIViewController *rvc = [win rootViewController];
             NSString *r = ZDYWalkForChatUser(rvc, 0);
@@ -491,6 +522,30 @@ static NSString *ZDYResolveToUser(id host, id arg) {
                     id v = ZDYIvar(fwd, n.UTF8String);
                     if (ZDYIsStr(v)) return v;
                 }
+            }
+        }
+    } @catch (NSException *e) { }
+    /* 6) 多选菜单 cell 链（兜底入口用）：cell → delegate → MMFavCellComponent.parentCellView → VC。
+     *    实测层级 MyFavoritesListViewController → MMTableView → FavMultiMenuTableViewCell → MMFavCellComponent，
+     *    转发最终由 VC 承载，这里顺链上溯即可拿到会话名。 */
+    @try {
+        Class cellCls = objc_getClass("FavMultiMenuTableViewCell");
+        Class compCls = objc_getClass("MMFavCellComponent");
+        id node = host;
+        for (int i = 0; i < 3 && node; i++) {
+            if ([node respondsToSelector:@selector(delegate)]) {
+                id d = [node delegate];
+                if (!d) { node = nil; break; }
+                if (cellCls && [d isKindOfClass:cellCls]) d = [d delegate];   /* VC */
+                if (compCls && [d isKindOfClass:compCls]) {
+                    if ([d respondsToSelector:@selector(parentCellView)])
+                        d = [d parentCellView];
+                }
+                NSString *u = ZDYResolveToUser(d, nil);
+                if (u) return u;
+                node = d;
+            } else {
+                break;
             }
         }
     } @catch (NSException *e) { }
@@ -727,6 +782,14 @@ static BOOL ZDYSendFavVoice(id host, id arg) {
         if (!container) container = ZDYIvar(host, "_selectedItems");
         if (!container) container = ZDYIvar(host, "_selectedDataItems");
         if (!container) container = arg;
+        /* 兜底入口（FavMultiMenuTableViewCell）：cell 自身/其 delegate(MMFavCellComponent)
+         * 上的 favItem 就是本条收藏数据，见 [10] [11]。 */
+        if (!container && [host respondsToSelector:@selector(favItem)])
+            container = [host favItem];
+        if (!container && [host respondsToSelector:@selector(delegate)]) {
+            id d = [host delegate];
+            if (d && [d respondsToSelector:@selector(favItem)]) container = [d favItem];
+        }
         if (!container) return NO;
 
         /* 2) 找语音项（同时兼容直接传入单个 item） */
@@ -833,12 +896,26 @@ static BOOL ZDYSendFavVoice(id host, id arg) {
     return NO;
 }
 
-#pragma mark - HOOK：收藏列表的「发送到对话」入口（ZDY 唯一落点，见 [Z1] [1]）
+#pragma mark - HOOK ①：收藏列表的「发送到对话」入口（ZDY 唯一落点，见 [Z1] [1]）
 
 %hook MyFavoritesListViewController
 
 - (void)forwardData:(id)data {
     if (ZDYSendFavVoice(self, data)) return;   /* 是语音 → 已按真实语音发出，不再走原生 */
+    %orig;
+}
+
+%end
+
+#pragma mark - HOOK ②：多选菜单 cell 的「转发」动作（兜底，UI 层级实测见 [10] [11]）
+
+/* 正常路径由 HOOK ① 覆盖（所有转发入口都会汇聚到 VC 的 forwardData:）。
+ * 若某微信版本的转发动作停在 cell 上、未回落到 VC，则由本 hook 接管。
+ * 去重守卫保证两个入口同一条语音只发一次。 */
+%hook FavMultiMenuTableViewCell
+
+- (void)forwardAction:(id)arg {
+    if (ZDYSendFavVoice(self, arg)) return;
     %orig;
 }
 
