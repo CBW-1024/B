@@ -37,11 +37,6 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 accessoryType:(long long)arg4;
 @end
 
-// MMMenuItem.h:29（DD小丑助手同样用法）：直接吃微信内置 svg 资源名，由微信内部渲染
-@interface MMMenuItem : NSObject
-- (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
-@end
-
 @interface MMUIViewController : UIViewController
 - (void)startLoadingWithText:(id)arg1;
 - (void)stopLoading;
@@ -151,11 +146,24 @@
 @end
 
 // VoiceMessageCellView.h：operationMenuItems / canPerformAction: / getViewController 均由头文件确认
-// getViewController 用于从 cell 取到所在聊天 VC；doForward 是 BaseMessageCellView 声明的原生转发动作
-@interface VoiceMessageCellView : NSObject
+// getViewController 用于从 cell 取到所在聊天 VC；doForward 是 BaseMessageCellView 声明的原生转发动作。
+// 这里让它继承 BaseMessageCellView，以便直接调用其转发生态方法（forwardMenuItem / doForward / onForward:）。
+@interface VoiceMessageCellView : BaseMessageCellView
 - (id)operationMenuItems;
 - (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;
 - (id)getViewController;
+@end
+
+// BaseMessageCellView.h + 8.0.76 反汇编双重确认：原生转发按钮相关方法。
+// -canShowForwardMenuItem 是转发"可见性"闸门（语音默认返回 NO，见 0x1002a248c 的委派包装）；
+// -forwardMenuItem 构造原生转发项（动作固定为 onForward:，见 0x1002a2300 的 initWithType:action:）；
+// -onForward: 内部先校验 [messageWrap respondsToSelector:tryHandleMenu:withViewModel:]（0x1002a2384/0x1002a2394
+//   的 tbz w22 分支），语音会被判为不可转发而直接跳走；-doForward 是已实测可用的转发触发入口。
+@interface BaseMessageCellView : NSObject
+- (BOOL)canShowForwardMenuItem;
+- (id)forwardMenuItem;
+- (void)onForward:(id)arg1;
+- (void)doForward;
 @end
 
 #pragma mark - 配置（两个独立开关，默认均 OFF）
@@ -804,41 +812,49 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 六 普通语音消息长按菜单加「转发」按钮（仅受「语音消息转发」开关门控）
-// 参考 DD小丑助手：hook 语音 cell 的 operationMenuItems 注入 MMMenuItem，图标用微信内置 svg。
-// 点击复用 cell 原生 doForward（BaseMessageCellView 声明），弹出微信选人/选群选择器；
-// 选完会走 ForwardMessageLogicController -ForwardMsg:ToContact:，该路径在实测日志中已证明
-// 会把 type=34 语音送达我们接管的发送汇点（见第四节）。
+#pragma mark - 六 普通语音消息长按菜单加「原生转发」按钮（仅受「语音消息转发」开关门控）
+// 用微信原生转发按钮：复用 BaseMessageCellView -forwardMenuItem（动作 onForward:，与正常消息完全一致），
+// 注入到语音 cell 长按菜单的首位置。这样语音消息长按弹出的"转发"就是微信原生那一项，而非自定义项。
+// 限制解除分两层（均对 8.0.76 反汇编确认）：
+//  1) -canShowForwardMenuItem 是转发可见性闸门，语音默认返回 NO；hook 后对语音返回 YES；
+//  2) -onForward: 内部校验 [messageWrap respondsToSelector:tryHandleMenu:withViewModel:] 会把语音判为不可转发
+//     而直接跳走（0x1002a2394 的 tbz w22）；hook 后对语音改走已实测可用的 -doForward，触发微信选人/选群，
+//     最终落到第四节 ForwardMessageLogicController 接管发送 type=34 语音。
+%hook BaseMessageCellView
+- (BOOL)canShowForwardMenuItem {
+    if (ddVoiceMsgEnabled() && [self isKindOfClass:%c(VoiceMessageCellView)]) {
+        return YES;
+    }
+    return %orig;
+}
+- (void)onForward:(id)arg1 {
+    if (ddVoiceMsgEnabled() && [self isKindOfClass:%c(VoiceMessageCellView)]) {
+        DDLog(@"语音消息原生 onForward: 被拦截，改走 doForward 触发选人器");
+        [self doForward];
+        return;
+    }
+    %orig;
+}
+%end
+
 %hook VoiceMessageCellView
 - (NSArray *)operationMenuItems {
     NSArray *original = %orig;
     if (!ddVoiceMsgEnabled()) return original;
-    MMMenuItem *item = [%c(MMMenuItem) alloc];
-    item = [item initWithTitle:@"转发"
-                       svgName:@"icons_filled_share"
-                         target:self
-                         action:@selector(dd_forwardVoice:)];
-    if (!item) return original;
+    // 原生转发项：BaseMessageCellView -forwardMenuItem 构造，动作 onForward:、目标即 cell 自身
+    id item = [self forwardMenuItem];
+    if (item == nil) return original;
     NSMutableArray *items = [NSMutableArray arrayWithCapacity:[original count] + 1];
     [items addObjectsFromArray:original];
     [items insertObject:item atIndex:0];
     return items;
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(dd_forwardVoice:)) {
-        return ddVoiceMsgEnabled();
+    // 允许 iOS 显示并启用注入的原生 onForward: 菜单项（UIMenuController 会据此决定是否展示）
+    if (action == @selector(onForward:) && ddVoiceMsgEnabled()) {
+        return YES;
     }
     return %orig;
-}
-%new
-- (void)dd_forwardVoice:(id)sender {
-    if (!ddVoiceMsgEnabled()) return;
-    if ([self respondsToSelector:@selector(doForward)]) {
-        DDLog(@"长按菜单点「转发」，调用原生 doForward 弹选人器");
-        [self doForward];
-    } else {
-        DDLog(@"VoiceMessageCellView 未响应 doForward，转发未触发");
-    }
 }
 %end
 
