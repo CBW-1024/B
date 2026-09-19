@@ -736,7 +736,15 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
+// 收藏语音构建尝试标记：防止下载失败时 addMsgFromItem: 重入无限循环下载
+static const void *kDDFavAddMsgAttemptedKey = &kDDFavAddMsgAttemptedKey;
+
 #pragma mark - 三 把收藏语音做成待转发消息（0x78f4e8，仅受「收藏语音转发」开关门控）
+// 修复「点两次才转发」：原实现 needDownLoad 时异步下载、却同步调用 %orig，
+// 原生在下载完成前拿到未就绪 item，转发项不完整，需再点一次才生效（见 07:30:39.880 与 07:30:46.187 两次进入）。
+// 现改为 needDownLoad 时先下载，下载完成（主线程，见 dd_downloadFavItemThen 0x78fed0）后重入 addMsgFromItem:，
+// 重入时 needDownLoad 已翻转为 NO（dd_waitDownloadFinish 0x7901b4），再构建语音消息并 %orig，
+// 保证原生始终拿到就绪数据，一次点击即「下载→构建→弹出选人器」。tried 标记兜底下载失败避免无限重入。
 %hook FavForwardLogicController
 - (void)addMsgFromItem:(id)arg1 {
     if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1)) {
@@ -744,15 +752,23 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
         id ctrl = self;
         DDLog(@"进入转发流程，收藏语音 type=%d", item.type);
         if (item.needDownLoad) {
-            // 0x7903d0 先发起下载；0x78fed0 是 DispatchQueue.global(qos:.utility).async{轮询→回主线程回调}
-            DDLog(@"收藏语音需要先下载，已发起后台下载");
+            NSNumber *tried = objc_getAssociatedObject(item, kDDFavAddMsgAttemptedKey);
+            if (tried && [tried boolValue]) {
+                DDLog(@"收藏语音下载尝试已过仍需要下载，走原实现兜底");
+                %orig;
+                return;
+            }
+            objc_setAssociatedObject(item, kDDFavAddMsgAttemptedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            DDLog(@"收藏语音需要先下载，下载完成后再构建并加入转发");
+            __weak typeof(self) wself = self;
             dd_downloadFavItemThen(item, ^{
-                DDLog(@"下载等待结束，needDownLoad=%d", (int)((FavoritesItem *)item).needDownLoad);
-                dd_appendVoiceMsg(item, ctrl);
+                [wself addMsgFromItem:arg1];
             });
-        } else {
-            dd_appendVoiceMsg(item, ctrl);
+            // 0x78f5cc：本次不调用原实现，等下载完成后重入再构建
+            return;
         }
+        // needDownLoad == NO：数据已就绪，正常构建
+        dd_appendVoiceMsg(item, ctrl);
     }
     // 0x78f5cc：原实现无条件调用
     %orig;
