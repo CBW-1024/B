@@ -457,7 +457,12 @@ static NSString *ZDYResolveToUser(id host, id arg) {
         Class appCls = objc_getClass("UIApplication");
         if (appCls && [appCls respondsToSelector:@selector(sharedApplication)]) {
             UIApplication *app = [appCls sharedApplication];
-            UIWindow *win = [app keyWindow];
+            /* iOS 13+：UIApplication.keyWindow 已弃用，改用 windows 遍历找 isKeyWindow
+             * （UIApplication.windows 未弃用；无需兼容旧系统）。 */
+            UIWindow *win = nil;
+            for (UIWindow *w in app.windows) {
+                if (w.isKeyWindow) { win = w; break; }
+            }
             UIViewController *rvc = [win rootViewController];
             NSString *r = ZDYWalkForChatUser(rvc, 0);
             if (r) return r;
