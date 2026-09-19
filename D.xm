@@ -360,16 +360,17 @@ static id ZDYIvar(id obj, const char *name) {
     return nil;
 }
 
-static id ZDYIvarAny(id obj, NSArray<NSString *> *names) {
-    for (NSString *n in names) {
-        id v = ZDYIvar(obj, n.UTF8String);
-        if (v) return v;
-    }
-    return nil;
-}
-
 static BOOL ZDYIsStr(id o) {
     return o && [o isKindOfClass:[NSString class]] && [(NSString *)o length] > 0;
+}
+
+/* 在 obj 上按名字列表取第一个「非空字符串」ivar（找不到返回 nil）。 */
+static NSString *ZDYIvarStr(id obj, NSArray<NSString *> *names) {
+    for (NSString *n in names) {
+        id v = ZDYIvar(obj, n.UTF8String);
+        if (ZDYIsStr(v)) return v;
+    }
+    return nil;
 }
 
 static NSString *ZDYDocumentPath(void) {
@@ -501,11 +502,9 @@ static NSString *ZDYResolveToUser(id host, id arg) {
     NSString *r = ZDYWalkForChatUser(host, 0);
     if (r) return r;
     /* 4) 宿主 ivar */
-    for (NSString *n in @[@"_toUser", @"_nsToUsr", @"_chatName", @"_userName",
-                          @"_toUserName", @"_curChatUsrName", @"_chatUserName"]) {
-        id v = ZDYIvar(host, n.UTF8String);
-        if (ZDYIsStr(v)) return v;
-    }
+    NSString *v = ZDYIvarStr(host, @[@"_toUser", @"_nsToUsr", @"_chatName", @"_userName",
+                                     @"_toUserName", @"_curChatUsrName", @"_chatUserName"]);
+    if (v) return v;
     /* 5) getFavForawrdViewController 的 delegate / 转发控制器上的 ToUser */
     @try {
         if ([host respondsToSelector:@selector(getFavForawrdViewController)]) {
@@ -516,10 +515,8 @@ static NSString *ZDYResolveToUser(id host, id arg) {
                     NSString *u = ZDYResolveToUser(d, nil);
                     if (u) return u;
                 }
-                for (NSString *n in @[@"_toUser", @"m_toUser", @"toUser"]) {
-                    id v = ZDYIvar(fwd, n.UTF8String);
-                    if (ZDYIsStr(v)) return v;
-                }
+                NSString *t = ZDYIvarStr(fwd, @[@"_toUser", @"m_toUser", @"toUser"]);
+                if (t) return t;
             }
         }
     } @catch (NSException *e) { }
