@@ -37,6 +37,11 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 accessoryType:(long long)arg4;
 @end
 
+// MMMenuItem.h:29（DD小丑助手同样用法）：直接吃微信内置 svg 资源名，由微信内部渲染
+@interface MMMenuItem : NSObject
+- (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
+@end
+
 @interface MMUIViewController : UIViewController
 - (void)startLoadingWithText:(id)arg1;
 - (void)stopLoading;
@@ -145,6 +150,14 @@
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3;
 @end
 
+// VoiceMessageCellView.h：operationMenuItems / canPerformAction: / getViewController 均由头文件确认
+// getViewController 用于从 cell 取到所在聊天 VC；doForward 是 BaseMessageCellView 声明的原生转发动作
+@interface VoiceMessageCellView : NSObject
+- (id)operationMenuItems;
+- (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;
+- (id)getViewController;
+@end
+
 #pragma mark - 配置（两个独立开关，默认均 OFF）
 // 对齐锤子双开关：enableVoiceForward(0x8d2fc0) 与 enableFavoritesVoiceForward(0x8d2920)
 #define kDDFVEnableFav @"kDDFV_enableFavVoiceForward"   // 收藏语音转发
@@ -205,15 +218,23 @@ static const unsigned int kDDVoiceLocalIDRange = 0x15f90;
 }
 @end
 
-// 收藏语音转发：需「收藏语音转发」与「语音消息转发」同时开启，对齐锤子
-// FavoritesItem(0x78f0f4/0x78f100) / forwardData(0x78f27c/0x78f288) / addMsgFromItem(0x78f51c/0x78f528) 的两道闸门
+// 收藏语音转发：仅由「收藏语音转发」开关控制（不依赖语音消息转发）
+// FavoritesItem(0x78f0f4/0x78f100) / forwardData(0x78f27c/0x78f288) / addMsgFromItem(0x78f51c/0x78f528)
+// 原二进制里收藏三件套确实还读了 enableVoiceForward(0x8d2fc0)，但用户要求两个开关可独立控制，
+// 故收藏链路只认 favEnabled；发送汇点另由 ddForwardSendEnabled 兜底，保证只开收藏也能真正发出去。
 static BOOL ddFavVoiceEnabled(void) {
-    DDFavVoiceConfig *c = [DDFavVoiceConfig sharedConfig];
-    return c.favEnabled && c.msgEnabled;
+    return [DDFavVoiceConfig sharedConfig].favEnabled;
 }
-// 语音消息转发：对应 enableVoiceForward(0x8d2fc0)，门控发送终点与降级防护
+// 语音消息转发：对应 enableVoiceForward(0x8d2fc0)，门控长按菜单「转发」按钮 + 原生降级防护
 static BOOL ddVoiceMsgEnabled(void) {
     return [DDFavVoiceConfig sharedConfig].msgEnabled;
+}
+// 发送汇点（ForwardMessageLogicController）+ 降级防护（ForwardMsgUtil）：只要任一开关开启就接管。
+// 因为收藏语音最终也会被构造成 type=34、走发送汇点发出；只开收藏时若汇点不接管就会静默失败，
+// 所以这里取 fav || msg。这是两个开关之间唯一无法彻底拆开的点，已按证据与意图取舍。
+static BOOL ddForwardSendEnabled(void) {
+    DDFavVoiceConfig *c = [DDFavVoiceConfig sharedConfig];
+    return c.favEnabled || c.msgEnabled;
 }
 
 #pragma mark - 日志
@@ -696,35 +717,30 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 二 阻止语音被降级成文本（0x78f628，仅受 enableVoiceForward 0x78f654 门控）
+#pragma mark - 二 阻止语音被降级成文本（0x78f628，受 enableVoiceForward 0x78f654 门控，收藏/语音任一开关开启即生效）
 %hook ForwardMsgUtil
 + (id)ConvertMsgToTextIfCannotSend:(id)arg1 {
-    if (ddVoiceMsgEnabled() && dd_isVoiceMsg(arg1)) return nil;
+    if (ddForwardSendEnabled() && dd_isVoiceMsg(arg1)) return nil;
     return %orig;
 }
 %end
 
-#pragma mark - 三 把收藏语音做成待转发消息（0x78f4e8，需两开关同时开：0x78f51c/0x78f528）
+#pragma mark - 三 把收藏语音做成待转发消息（0x78f4e8，仅受「收藏语音转发」开关门控）
 %hook FavForwardLogicController
 - (void)addMsgFromItem:(id)arg1 {
-    if (dd_isFavVoiceItem(arg1)) {
-        // 对齐锤子：收藏语音转发依赖「语音消息转发」也开启，否则构造步骤被跳过
-        if (!ddVoiceMsgEnabled()) {
-            DDLog(@"收藏语音转发已开，但语音消息转发未开：收藏语音无法发送（需两者同时开启）");
-        } else {
-            FavoritesItem *item = (FavoritesItem *)arg1;
-            id ctrl = self;
-            DDLog(@"进入转发流程，收藏语音 type=%d", item.type);
-            if (item.needDownLoad) {
-                // 0x7903d0 先发起下载；0x78fed0 是 DispatchQueue.global(qos:.utility).async{轮询→回主线程回调}
-                DDLog(@"收藏语音需要先下载，已发起后台下载");
-                dd_downloadFavItemThen(item, ^{
-                    DDLog(@"下载等待结束，needDownLoad=%d", (int)((FavoritesItem *)item).needDownLoad);
-                    dd_appendVoiceMsg(item, ctrl);
-                });
-            } else {
+    if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1)) {
+        FavoritesItem *item = (FavoritesItem *)arg1;
+        id ctrl = self;
+        DDLog(@"进入转发流程，收藏语音 type=%d", item.type);
+        if (item.needDownLoad) {
+            // 0x7903d0 先发起下载；0x78fed0 是 DispatchQueue.global(qos:.utility).async{轮询→回主线程回调}
+            DDLog(@"收藏语音需要先下载，已发起后台下载");
+            dd_downloadFavItemThen(item, ^{
+                DDLog(@"下载等待结束，needDownLoad=%d", (int)((FavoritesItem *)item).needDownLoad);
                 dd_appendVoiceMsg(item, ctrl);
-            }
+            });
+        } else {
+            dd_appendVoiceMsg(item, ctrl);
         }
     }
     // 0x78f5cc：原实现无条件调用
@@ -732,11 +748,11 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 四 接管语音消息的发送（0x78f6c8 / 0x78f77c / 0x78f8b0 / 0x78f9f8，仅受 enableVoiceForward 0x78f700 门控）
+#pragma mark - 四 接管语音消息的发送（0x78f6c8 / 0x78f77c / 0x78f8b0 / 0x78f9f8，受 enableVoiceForward 0x78f700 门控，收藏/语音任一开关开启即接管）
 %hook ForwardMessageLogicController
 - (void)ForwardMsg:(id)arg1 ToContact:(id)arg2 {
     if (dd_isVoiceMsg(arg1)) {
-        if (!ddVoiceMsgEnabled()) { DDLog(@"语音消息转发开关关闭，走原生转发"); %orig; return; }
+        if (!ddForwardSendEnabled()) { DDLog(@"语音转发两个开关均未开，走原生转发"); %orig; return; }
         // 0x78f718 ~ 0x78f724：命中即接管，无论成败都不再走原实现
         DDLog(@"单条转发命中语音，接管发送");
         BOOL ok = dd_takeOverVoiceMsg(arg1, arg2);
@@ -746,49 +762,83 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     %orig;
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 {
-    if (!ddVoiceMsgEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    if (!ddForwardSendEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
     DDLog(@"批量转发 %lu 条，开始逐条接管", (unsigned long)[(NSArray *)arg1 count]);
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 WithRevokeBatchId:(id)arg3 {
-    if (!ddVoiceMsgEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    if (!ddForwardSendEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2, arg3);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3 {
-    if (!ddVoiceMsgEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    if (!ddForwardSendEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2, arg3);
 }
 %end
 
-#pragma mark - 五 收藏列表转发前先完成下载（0x78f244，需两开关同时开：0x78f27c/0x78f288）
+#pragma mark - 五 收藏列表转发前先完成下载（0x78f244，仅受「收藏语音转发」开关门控）
 %hook MyFavoritesListViewController
 - (void)forwardData:(id)arg1 {
-    if (dd_isFavVoiceItem(arg1) && ((FavoritesItem *)arg1).needDownLoad) {
-        if (!ddVoiceMsgEnabled()) {
-            DDLog(@"收藏语音转发已开，但语音消息转发未开：收藏列表语音未走下载分支");
+    if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1) && ((FavoritesItem *)arg1).needDownLoad) {
+        FavoritesItem *item = (FavoritesItem *)arg1;
+        DDLog(@"收藏列表转发：语音未下载，先下载");
+        if ([self respondsToSelector:@selector(startLoadingWithText:)]) {
+            MMUIViewController *vc = (MMUIViewController *)self;
+            [vc startLoadingWithText:@"语音下载中"];
+            dd_downloadFavItemThen(item, ^{
+                if ([vc respondsToSelector:@selector(stopLoading)]) [vc stopLoading];
+            });
         } else {
-            FavoritesItem *item = (FavoritesItem *)arg1;
-            DDLog(@"收藏列表转发：语音未下载，先下载");
-            if ([self respondsToSelector:@selector(startLoadingWithText:)]) {
-                MMUIViewController *vc = (MMUIViewController *)self;
-                [vc startLoadingWithText:@"语音下载中"];
-                dd_downloadFavItemThen(item, ^{
-                    if ([vc respondsToSelector:@selector(stopLoading)]) [vc stopLoading];
-                });
-            } else {
-                dd_downloadFavItemThen(item, ^{});
-            }
-            // 0x78f458：命中后直接收尾，不调用原实现
-            return;
+            dd_downloadFavItemThen(item, ^{});
         }
+        // 0x78f458：命中后直接收尾，不调用原实现
+        return;
     }
     %orig;
+}
+%end
+
+#pragma mark - 六 普通语音消息长按菜单加「转发」按钮（仅受「语音消息转发」开关门控）
+// 参考 DD小丑助手：hook 语音 cell 的 operationMenuItems 注入 MMMenuItem，图标用微信内置 svg。
+// 点击复用 cell 原生 doForward（BaseMessageCellView 声明），弹出微信选人/选群选择器；
+// 选完会走 ForwardMessageLogicController -ForwardMsg:ToContact:，该路径在实测日志中已证明
+// 会把 type=34 语音送达我们接管的发送汇点（见第四节）。
+%hook VoiceMessageCellView
+- (NSArray *)operationMenuItems {
+    NSArray *original = %orig;
+    if (!ddVoiceMsgEnabled()) return original;
+    MMMenuItem *item = [%c(MMMenuItem) alloc];
+    item = [item initWithTitle:@"转发"
+                       svgName:@"icons_filled_share"
+                         target:self
+                         action:@selector(dd_forwardVoice:)];
+    if (!item) return original;
+    NSMutableArray *items = [NSMutableArray arrayWithCapacity:[original count] + 1];
+    [items addObjectsFromArray:original];
+    [items insertObject:item atIndex:0];
+    return items;
+}
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(dd_forwardVoice:)) {
+        return ddVoiceMsgEnabled();
+    }
+    return %orig;
+}
+%new
+- (void)dd_forwardVoice:(id)sender {
+    if (!ddVoiceMsgEnabled()) return;
+    if ([self respondsToSelector:@selector(doForward)]) {
+        DDLog(@"长按菜单点「转发」，调用原生 doForward 弹选人器");
+        [self doForward];
+    } else {
+        DDLog(@"VoiceMessageCellView 未响应 doForward，转发未触发");
+    }
 }
 %end
 
