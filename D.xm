@@ -145,6 +145,19 @@
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3;
 @end
 
+// BaseMessageCellView.h + 8.0.76 反汇编双重确认：原生转发按钮相关方法。
+// -canShowForwardMenuItem 是转发"可见性"闸门（语音默认返回 NO，见 0x1002a248c 的委派包装）；
+// -forwardMenuItem 构造原生转发项（动作固定为 onForward:，见 0x1002a2300 的 initWithType:action:）；
+// -onForward: 内部先校验 [messageWrap respondsToSelector:tryHandleMenu:withViewModel:]（0x1002a2384/0x1002a2394
+//   的 tbz w22 分支），语音会被判为不可转发而直接跳走；-doForward 是已实测可用的转发触发入口。
+// 本接口必须写在 VoiceMessageCellView 之前，因为后者继承它。
+@interface BaseMessageCellView : NSObject
+- (BOOL)canShowForwardMenuItem;
+- (id)forwardMenuItem;
+- (void)onForward:(id)arg1;
+- (void)doForward;
+@end
+
 // VoiceMessageCellView.h：operationMenuItems / canPerformAction: / getViewController 均由头文件确认
 // getViewController 用于从 cell 取到所在聊天 VC；doForward 是 BaseMessageCellView 声明的原生转发动作。
 // 这里让它继承 BaseMessageCellView，以便直接调用其转发生态方法（forwardMenuItem / doForward / onForward:）。
@@ -152,18 +165,6 @@
 - (id)operationMenuItems;
 - (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;
 - (id)getViewController;
-@end
-
-// BaseMessageCellView.h + 8.0.76 反汇编双重确认：原生转发按钮相关方法。
-// -canShowForwardMenuItem 是转发"可见性"闸门（语音默认返回 NO，见 0x1002a248c 的委派包装）；
-// -forwardMenuItem 构造原生转发项（动作固定为 onForward:，见 0x1002a2300 的 initWithType:action:）；
-// -onForward: 内部先校验 [messageWrap respondsToSelector:tryHandleMenu:withViewModel:]（0x1002a2384/0x1002a2394
-//   的 tbz w22 分支），语音会被判为不可转发而直接跳走；-doForward 是已实测可用的转发触发入口。
-@interface BaseMessageCellView : NSObject
-- (BOOL)canShowForwardMenuItem;
-- (id)forwardMenuItem;
-- (void)onForward:(id)arg1;
-- (void)doForward;
 @end
 
 #pragma mark - 配置（两个独立开关，默认均 OFF）
@@ -331,6 +332,9 @@ static void dd_logClear(void) {
 }
 
 #pragma mark - 判定工具
+
+// 前向声明：定义见下方 dd_isInstanceOf（在首次使用前需先声明，否则 .mm 下报 undeclared）
+static BOOL dd_isInstanceOf(id obj, const char *clsName);
 
 static BOOL dd_isVoiceMsg(id msg) {
     if (!dd_isInstanceOf(msg, "CMessageWrap")) return NO;
