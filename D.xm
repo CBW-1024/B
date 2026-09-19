@@ -32,6 +32,11 @@
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 on:(_Bool)arg4;
 @end
 
+// WCTableViewNormalCellManager.h:29
+@interface WCTableViewNormalCellManager : NSObject
++ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 accessoryType:(long long)arg4;
+@end
+
 @interface MMUIViewController : UIViewController
 - (void)startLoadingWithText:(id)arg1;
 - (void)stopLoading;
@@ -194,6 +199,91 @@ static BOOL ddFavVoiceEnabled(void) {
     return [DDFavVoiceConfig sharedConfig].enabled;
 }
 
+#pragma mark - 日志
+/* 证书注入环境读不到 syslog，所以日志同时写内存和 Documents/ddfavvoice.log，
+ * 由「运行日志」页展示，可复制或通过系统分享导出到「文件」App。 */
+#define kDDFVLogMaxLines 800
+
+static NSMutableArray<NSString *> *gDDFVLogs = nil;
+static NSObject *gDDFVLogLock = nil;
+
+static NSObject *dd_logLock(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gDDFVLogLock = [NSObject new]; });
+    return gDDFVLogLock;
+}
+
+static NSString *dd_logPath(void) {
+    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if ([dirs count] == 0) return nil;
+    return [(NSString *)[dirs firstObject] stringByAppendingPathComponent:@"ddfavvoice.log"];
+}
+
+static NSString *dd_timeStamp(void) {
+    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+    [f setDateFormat:@"MM-dd HH:mm:ss.SSS"];
+    return [f stringFromDate:[NSDate date]];
+}
+
+static void dd_logInit(void) {
+    @synchronized (dd_logLock()) {
+        if (gDDFVLogs) return;
+        gDDFVLogs = [NSMutableArray array];
+        NSString *p = dd_logPath();
+        NSData *old = [NSData dataWithContentsOfFile:p];
+        if ([old length] == 0) return;
+        NSString *txt = [[NSString alloc] initWithData:old encoding:NSUTF8StringEncoding];
+        if ([txt length] == 0) return;
+        NSArray *lines = [txt componentsSeparatedByString:@"\n"];
+        NSRange r = NSMakeRange(0, [lines count]);
+        if ([lines count] > kDDFVLogMaxLines) r = NSMakeRange([lines count] - kDDFVLogMaxLines, kDDFVLogMaxLines);
+        [gDDFVLogs addObjectsFromArray:[lines subarrayWithRange:r]];
+    }
+}
+
+static void dd_logLine(NSString *line) {
+    if ([line length] == 0) return;
+    NSLog(@"[DDFavVoice] %@", line);          // 越狱/带控制台时仍然打到系统日志
+    @synchronized (dd_logLock()) {
+        dd_logInit();
+        NSString *record = [NSString stringWithFormat:@"%@ %@", dd_timeStamp(), line];
+        [gDDFVLogs addObject:record];
+        if ([gDDFVLogs count] > kDDFVLogMaxLines) {
+            [gDDFVLogs removeObjectsInRange:NSMakeRange(0, [gDDFVLogs count] - kDDFVLogMaxLines)];
+        }
+        NSString *p = dd_logPath();
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (!fh) {
+            [[NSFileManager defaultManager] createFileAtPath:p contents:nil attributes:nil];
+            fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        }
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[[record stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    }
+}
+
+#define DDLog(fmt, ...) dd_logLine(([NSString stringWithFormat:(fmt), ##__VA_ARGS__]))
+
+static NSString *dd_logText(void) {
+    @synchronized (dd_logLock()) {
+        dd_logInit();
+        if ([gDDFVLogs count] == 0) return @"暂无日志记录。开关打开后去聊天里转发一条收藏语音，再回到本页下拉刷新。";
+        return [gDDFVLogs componentsJoinedByString:@"\n"];
+    }
+}
+
+static void dd_logClear(void) {
+    @synchronized (dd_logLock()) {
+        dd_logInit();
+        [gDDFVLogs removeAllObjects];
+        [[NSFileManager defaultManager] removeItemAtPath:dd_logPath() error:nil];
+        dd_logLine(@"日志已清空");
+    }
+}
+
 #pragma mark - 判定工具
 
 static BOOL dd_isVoiceMsg(id msg) {
@@ -339,9 +429,10 @@ static NSString *dd_audioPathForMsg(id msg) {
     if (![msg respondsToSelector:@selector(m_uiMesLocalID)]) return nil;
     unsigned int localID = ((CMessageWrap *)msg).m_uiMesLocalID;
     // 0x7596e0：localID 为 0 直接返回 nil
-    if (localID == 0) return nil;
+    if (localID == 0) { DDLog(@"localID 为 0，拿不到音频路径"); return nil; }
     NSString *usr = dd_ownerUserForVoice(msg);
-    if ([usr length] == 0) return nil;
+    if ([usr length] == 0) { DDLog(@"归属用户名为空，拿不到音频路径"); return nil; }
+    DDLog(@"取音频路径 usr=%@ localID=%u", usr, localID);
 
     // 0x759714 ~ 0x759794：优先 CUtility GetPathOfMesAudio:LocalID:DocPath:
     Class cu = objc_getClass("CUtility");
@@ -350,21 +441,28 @@ static NSString *dd_audioPathForMsg(id msg) {
         id doc = [cu GetDocPath];
         if ([doc isKindOfClass:[NSString class]]) {
             id p = [cu GetPathOfMesAudio:usr LocalID:localID DocPath:doc];
-            if ([p isKindOfClass:[NSString class]] && dd_fileExists((NSString *)p)) return (NSString *)p;
+            if ([p isKindOfClass:[NSString class]] && dd_fileExists((NSString *)p)) {
+                DDLog(@"音频路径命中 CUtility");
+                return (NSString *)p;
+            }
         }
     }
     // 0x759840 ~ 0x75987c：其次 AudioSender getAudioFileName:LocalID:
     id sender = dd_mmService(@"AudioSender");
     if (sender && [sender respondsToSelector:@selector(getAudioFileName:LocalID:)]) {
         id p = [sender getAudioFileName:usr LocalID:localID];
-        if ([p isKindOfClass:[NSString class]] && dd_fileExists((NSString *)p)) return (NSString *)p;
+        if ([p isKindOfClass:[NSString class]] && dd_fileExists((NSString *)p)) {
+            DDLog(@"音频路径命中 AudioSender");
+            return (NSString *)p;
+        }
     }
     // 0x759888 ~ 0x759994：兜底，把 m_dtVoice 写成 NSTemporaryDirectory 下 UUID.aud
     NSData *data = dd_voiceData(msg);
-    if ([data length] == 0) return nil;
+    if ([data length] == 0) { DDLog(@"m_dtVoice 为空，无法导出临时音频"); return nil; }
     NSString *name = [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"];
     NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
-    if (![data writeToFile:tmp atomically:YES]) return nil;
+    if (![data writeToFile:tmp atomically:YES]) { DDLog(@"写临时音频失败 %@", tmp); return nil; }
+    DDLog(@"音频路径走临时文件 %lu 字节", (unsigned long)[data length]);
     return dd_fileExists(tmp) ? tmp : nil;
 }
 
@@ -381,7 +479,7 @@ static NSString *dd_installAudioFile(id wrap, NSString *src) {
     // 0x75a2cc ~ 0x75a2e8：目录不存在就直接失败，锤子不会新建目录
     BOOL isDir = NO;
     if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) {
-        NSLog(@"[DDFavVoice] Audio 目录不存在 %@", dir);
+        DDLog(@"Audio 目录不存在 %@", dir);
         return nil;
     }
     if ([fm fileExistsAtPath:p]) [fm removeItemAtPath:p error:nil];
@@ -399,7 +497,7 @@ static unsigned int dd_newVoiceLocalID(void) {
 static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration) {
     if ([usr length] == 0 || !dd_fileExists(audPath)) return NO;
     id sender = dd_mmService(@"AudioSender");
-    if (!sender) return NO;
+    if (!sender) { DDLog(@"AudioSender 服务取不到"); return NO; }
     if (![sender respondsToSelector:@selector(addMessageToDB:)]) return NO;
     if (![sender respondsToSelector:@selector(ResendVoiceMsg:MsgWrap:)]) return NO;
 
@@ -408,7 +506,7 @@ static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration
     id raw = [wrapCls alloc];
     if (![raw respondsToSelector:@selector(initWithMsgType:)]) return NO;
     CMessageWrap *wrap = [raw initWithMsgType:kDDVoiceMsgType];
-    if (!wrap) return NO;
+    if (!wrap) { DDLog(@"initWithMsgType 返回 nil"); return NO; }
     // 0x759ebc ~ 0x759ec4
     [wrap setM_uiMessageType:(unsigned int)kDDVoiceMsgType];
 
@@ -419,7 +517,7 @@ static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration
         id u = [settingCls getCurUsrName];
         if ([u isKindOfClass:[NSString class]]) fromUsr = (NSString *)u;
     }
-    if ([fromUsr length] == 0) return NO;
+    if ([fromUsr length] == 0) { DDLog(@"取不到当前登录用户名"); return NO; }
     [wrap setM_nsFromUsr:fromUsr];
     [wrap setM_nsToUsr:usr];
 
@@ -435,16 +533,19 @@ static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration
 
     // 0x75a030 ~ 0x75a054
     NSData *d = [NSData dataWithContentsOfFile:audPath];
-    if (!dd_configureVoiceMsg(wrap, d, duration)) return NO;
-    if (![sender addMessageToDB:wrap]) return NO;
+    if ([d length] == 0) { DDLog(@"音频文件读不出来 %@", audPath); return NO; }
+    if (!dd_configureVoiceMsg(wrap, d, duration)) { DDLog(@"配置语音消息失败 duration=%u", duration); return NO; }
+    if (![sender addMessageToDB:wrap]) { DDLog(@"addMessageToDB 失败"); return NO; }
 
     NSString *installed = dd_installAudioFile(wrap, audPath);
     if ([installed length] == 0) {
+        DDLog(@"音频落盘失败 %@", audPath);
         if ([sender respondsToSelector:@selector(deleteMessageFromDB:)]) [sender deleteMessageFromDB:wrap];
         return NO;
     }
-    NSLog(@"[DDFavVoice] 发送语音 -> %@ 时长=%ums 文件=%@", usr, duration, installed);
+    DDLog(@"发送语音 -> %@ 时长=%ums 文件=%@", usr, duration, installed);
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
+    DDLog(@"ResendVoiceMsg 已调用");
     return YES;
 }
 
@@ -457,18 +558,19 @@ static BOOL dd_takeOverVoiceMsg(id msg, id contact) {
         id u = [(CBaseContact *)contact m_nsUsrName];
         if ([u isKindOfClass:[NSString class]]) usr = (NSString *)u;
     }
-    if ([usr length] == 0) return NO;
+    if ([usr length] == 0) { DDLog(@"拿不到目标联系人用户名"); return NO; }
     NSString *audPath = dd_audioPathForMsg(msg);
     if ([audPath length] == 0) {
-        NSLog(@"[DDFavVoice] 拿不到语音文件，取消发送");
+        DDLog(@"拿不到语音文件，取消发送");
         return NO;
     }
     unsigned int duration = dd_voiceDuration(msg);
     // 0x790950：时长为 0 不发送
     if (duration == 0) {
-        NSLog(@"[DDFavVoice] 语音时长为 0，取消发送");
+        DDLog(@"语音时长为 0，取消发送");
         return NO;
     }
+    DDLog(@"准备接管发送 -> %@ 文件=%@", usr, audPath);
     return dd_sendVoice(usr, audPath, duration);
 }
 
@@ -498,18 +600,19 @@ static id dd_msgWrapFromFavData(id favData) {
     if (![field respondsToSelector:@selector(GetDataPath)]) return nil;
 
     id pathObj = [field GetDataPath];
-    if (![pathObj isKindOfClass:[NSString class]]) return nil;
+    if (![pathObj isKindOfClass:[NSString class]]) { DDLog(@"收藏数据 GetDataPath 没返回路径"); return nil; }
+    DDLog(@"收藏语音路径 %@", pathObj);
     NSData *data = [NSData dataWithContentsOfFile:(NSString *)pathObj
                                           options:NSDataReadingMappedIfSafe
                                             error:nil];
-    if ([data length] == 0) return nil;
+    if ([data length] == 0) { DDLog(@"收藏语音文件读不出来"); return nil; }
 
     Class wrapCls = objc_getClass("CMessageWrap");
     if (!wrapCls) return nil;
     id raw = [wrapCls alloc];
     if (![raw respondsToSelector:@selector(initWithMsgType:)]) return nil;
     CMessageWrap *wrap = [raw initWithMsgType:kDDVoiceMsgType];
-    if (!wrap) return nil;
+    if (!wrap) { DDLog(@"构造待转发消息失败"); return nil; }
 
     // 0x790644 ~ 0x79065c
     NSString *me = nil;
@@ -524,7 +627,8 @@ static id dd_msgWrapFromFavData(id favData) {
 
     // 0x790688 ~ 0x79069c：时长直接用收藏数据里的 duration，不做换算
     unsigned int duration = field.duration;
-    if (!dd_configureVoiceMsg(wrap, data, duration)) return nil;
+    DDLog(@"收藏语音 %lu 字节 时长=%u", (unsigned long)[data length], duration);
+    if (!dd_configureVoiceMsg(wrap, data, duration)) { DDLog(@"配置语音失败，可能 duration 为 0"); return nil; }
     // 0x7906a4 ~ 0x7906bc
     [wrap setM_uiMesLocalID:dd_newVoiceLocalID()];
     return wrap;
@@ -533,20 +637,21 @@ static id dd_msgWrapFromFavData(id favData) {
 // 对齐锤子 0x790484 ~ 0x7904e8：取 dataList 首项构造消息，append 进 m_messageWrapList
 static void dd_appendVoiceMsg(id favItem, id controller) {
     NSArray *list = ((FavoritesItem *)favItem).dataList;
-    if (![list isKindOfClass:[NSArray class]] || [list count] == 0) return;
+    if (![list isKindOfClass:[NSArray class]] || [list count] == 0) { DDLog(@"收藏项 dataList 为空"); return; }
+    DDLog(@"收藏语音 dataList 共 %lu 项", (unsigned long)[list count]);
     id wrap = dd_msgWrapFromFavData([list firstObject]);
     if (!wrap) {
-        NSLog(@"[DDFavVoice] 收藏语音没有可用数据");
+        DDLog(@"收藏语音没有可用数据");
         return;
     }
     Class ctrlCls = objc_getClass("FavForwardLogicController");
-    if (ctrlCls && ![[controller class] isSubclassOfClass:ctrlCls]) return;
+    if (ctrlCls && ![[controller class] isSubclassOfClass:ctrlCls]) { DDLog(@"控制器类型不符"); return; }
     Ivar iv = class_getInstanceVariable([controller class], "m_messageWrapList");
-    if (!iv) return;
+    if (!iv) { DDLog(@"找不到 m_messageWrapList 成员变量"); return; }
     id store = object_getIvar(controller, iv);
-    if (![store isKindOfClass:[NSMutableArray class]]) return;
+    if (![store isKindOfClass:[NSMutableArray class]]) { DDLog(@"m_messageWrapList 尚未初始化"); return; }
     [(NSMutableArray *)store addObject:wrap];
-    NSLog(@"[DDFavVoice] 已加入待转发语音消息");
+    DDLog(@"已加入待转发语音消息，列表现有 %lu 条", (unsigned long)[(NSMutableArray *)store count]);
 }
 
 #pragma mark - 一 收藏项转发闸门（0x78f0d4 / 0x78f14c / 0x78f1c4）
@@ -579,12 +684,15 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1)) {
         FavoritesItem *item = (FavoritesItem *)arg1;
         id ctrl = self;
+        DDLog(@"进入转发流程，收藏语音 type=%d", item.type);
         if (item.needDownLoad) {
             // 0x7903d0 先发起下载；0x78fed0 是 DispatchQueue.global(qos:.utility).async{轮询→回主线程回调}
             // 轮询体见 0x79019c：最多 240 次、每次 sleepForTimeInterval:0.25
-            dd_startDownloadFavItem(item);
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        dd_startDownloadFavItem(item);
+        DDLog(@"收藏语音需要先下载，已发起后台下载");
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 dd_waitDownloadFinish(item);
+                DDLog(@"下载等待结束，needDownLoad=%d", (int)((FavoritesItem *)item).needDownLoad);
                 dispatch_async(dispatch_get_main_queue(), ^{ dd_appendVoiceMsg(item, ctrl); });
             });
         } else {
@@ -601,13 +709,16 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 - (void)ForwardMsg:(id)arg1 ToContact:(id)arg2 {
     if (ddFavVoiceEnabled() && dd_isVoiceMsg(arg1)) {
         // 0x78f718 ~ 0x78f724：命中即接管，无论成败都不再走原实现
-        dd_takeOverVoiceMsg(arg1, arg2);
+        DDLog(@"单条转发命中语音，接管发送");
+        BOOL ok = dd_takeOverVoiceMsg(arg1, arg2);
+        DDLog(@"单条接管结果=%@", ok ? @"成功" : @"失败");
         return;
     }
     %orig;
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 {
     if (!ddFavVoiceEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    DDLog(@"批量转发 %lu 条，开始逐条接管", (unsigned long)[(NSArray *)arg1 count]);
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2);
@@ -632,6 +743,7 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1) && ((FavoritesItem *)arg1).needDownLoad) {
         FavoritesItem *item = (FavoritesItem *)arg1;
         dd_startDownloadFavItem(item);
+        DDLog(@"收藏列表转发：语音未下载，先下载");
         if ([self respondsToSelector:@selector(startLoadingWithText:)]) {
             MMUIViewController *vc = (MMUIViewController *)self;
             [vc startLoadingWithText:@"语音下载中"];
@@ -648,6 +760,86 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     %orig;
 }
 %end
+
+#pragma mark - 日志查看页
+@interface DDFavVoiceLogViewController : UIViewController
+@property (nonatomic, strong) UITextView *textView;
+@end
+
+@implementation DDFavVoiceLogViewController
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"运行日志";
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+
+    UITextView *tv = [[UITextView alloc] initWithFrame:self.view.bounds];
+    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    tv.editable = NO;
+    tv.alwaysBounceVertical = YES;
+    tv.autocorrectionType = UITextAutocorrectionTypeNo;
+    tv.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    tv.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
+    tv.font = [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightRegular];
+    [self.view addSubview:tv];
+    self.textView = tv;
+
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAction
+                                                      target:self
+                                                      action:@selector(onExport:)];
+    UIBarButtonItem *copyItem = [[UIBarButtonItem alloc] initWithTitle:@"复制"
+                                                                 style:UIBarButtonItemStylePlain
+                                                                target:self
+                                                                action:@selector(onCopy:)];
+    UIBarButtonItem *clearItem = [[UIBarButtonItem alloc] initWithTitle:@"清空"
+                                                                  style:UIBarButtonItemStylePlain
+                                                                 target:self
+                                                                 action:@selector(onClear:)];
+    UIBarButtonItem *flex = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
+                                                                          target:nil
+                                                                          action:nil];
+    [self setToolbarItems:@[copyItem, flex, clearItem] animated:NO];
+}
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self.navigationController setToolbarHidden:NO animated:animated];
+    [self reloadLog];
+}
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self.navigationController setToolbarHidden:YES animated:animated];
+}
+- (void)reloadLog {
+    NSString *text = dd_logText();
+    self.textView.text = text;
+    if ([text length] > 0) {
+        NSRange tail = NSMakeRange([text length] - 1, 1);
+        [self.textView scrollRangeToVisible:tail];
+    }
+}
+- (void)onCopy:(id)sender {
+    [UIPasteboard generalPasteboard].string = dd_logText();
+    DDLog(@"日志已复制到剪贴板");
+    [self reloadLog];
+}
+- (void)onClear:(id)sender {
+    dd_logClear();
+    [self reloadLog];
+}
+- (void)onExport:(id)sender {
+    NSString *path = dd_logPath();
+    if ([path length] == 0) return;
+    // 导出前用内存里的最新内容重写一次，保证分享出去的是完整日志
+    [[dd_logText() dataUsingEncoding:NSUTF8StringEncoding] writeToFile:path atomically:YES];
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url]
+                                                                     applicationActivities:nil];
+    if (av.popoverPresentationController) {
+        av.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
+    }
+    [self presentViewController:av animated:YES completion:nil];
+}
+@end
 
 #pragma mark - 设置界面
 @interface DDFavVoiceSettingsViewController : UIViewController <UITableViewDelegate>
@@ -696,7 +888,28 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     [sec addCell:[cellMgr switchCellForSel:@selector(onEnableSwitch:) target:self title:@"启用收藏语音转发" on:[DDFavVoiceConfig sharedConfig].enabled]];
     [_tableViewManager addSection:sec];
 
+    Class normMgr = objc_getClass("WCTableViewNormalCellManager");
+    if (normMgr) {
+        WCTableViewSectionManager *dbg = [secMgr defaultSection];
+        [dbg addCell:[normMgr normalCellForSel:@selector(onOpenLogPage)
+                                        target:self
+                                         title:@"运行日志"
+                                accessoryType:UITableViewCellAccessoryDisclosureIndicator]];
+        [dbg addCell:[normMgr normalCellForSel:@selector(onClearLogNow)
+                                        target:self
+                                         title:@"清空日志"
+                                accessoryType:UITableViewCellAccessoryNone]];
+        [_tableViewManager addSection:dbg];
+    }
+
     [_tableViewManager reloadTableView];
+}
+- (void)onOpenLogPage {
+    DDFavVoiceLogViewController *vc = [DDFavVoiceLogViewController new];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+- (void)onClearLogNow {
+    dd_logClear();
 }
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
     if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)])
@@ -717,11 +930,15 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 #pragma mark - 插件注册
 %ctor {
     @autoreleasepool {
+        dd_logLine(@"插件载入 DD收藏语音转发 1.0.0");
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
             [[mgr sharedInstance] registerControllerWithTitle:@"DD收藏语音转发"
                                                       version:@"1.0.0"
                                                    controller:@"DDFavVoiceSettingsViewController"];
+            DDLog(@"设置入口注册成功，当前开关=%@", ddFavVoiceEnabled() ? @"开" : @"关");
+        } else {
+            DDLog(@"WCPluginsMgr 缺失，设置入口未注册");
         }
     }
 }
