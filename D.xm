@@ -145,9 +145,10 @@
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3;
 @end
 
-#pragma mark - 配置（单开关，默认 OFF）
-#define kDDFVEnable @"kDDFV_enableFavVoiceForward"
-static const BOOL kDDFVDefaultEnable = NO;
+#pragma mark - 配置（两个独立开关，默认均 OFF）
+// 对齐锤子双开关：enableVoiceForward(0x8d2fc0) 与 enableFavoritesVoiceForward(0x8d2920)
+#define kDDFVEnableFav @"kDDFV_enableFavVoiceForward"   // 收藏语音转发
+#define kDDFVEnableMsg @"kDDFV_enableVoiceMsgForward"    // 语音消息转发
 
 // 锤子常量全部来自反汇编实测，不是约定的猜测值
 // 0x78f0d4 / 0x78f110 / 0x78f2dc : type == 3 判定收藏语音
@@ -169,7 +170,8 @@ static const unsigned int kDDVoiceLocalIDRange = 0x15f90;
 
 @interface DDFavVoiceConfig : NSObject
 + (instancetype)sharedConfig;
-@property (assign, nonatomic) BOOL enabled;
+@property (assign, nonatomic) BOOL favEnabled;  // 收藏语音转发
+@property (assign, nonatomic) BOOL msgEnabled;  // 语音消息转发
 @end
 
 @implementation DDFavVoiceConfig
@@ -181,22 +183,37 @@ static const unsigned int kDDVoiceLocalIDRange = 0x15f90;
 }
 + (void)initialize {
     if (self != [DDFavVoiceConfig class]) return;
-    [NSUserDefaults.standardUserDefaults registerDefaults:@{ kDDFVEnable: @(kDDFVDefaultEnable) }];
+    [NSUserDefaults.standardUserDefaults registerDefaults:@{
+        kDDFVEnableFav: @NO,
+        kDDFVEnableMsg: @NO,
+    }];
 }
 - (instancetype)init {
     if (self = [super init]) {
-        _enabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDFVEnable];
+        _favEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDFVEnableFav];
+        _msgEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDFVEnableMsg];
     }
     return self;
 }
-- (void)setEnabled:(BOOL)v {
-    _enabled = v;
-    [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDFVEnable];
+- (void)setFavEnabled:(BOOL)v {
+    _favEnabled = v;
+    [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDFVEnableFav];
+}
+- (void)setMsgEnabled:(BOOL)v {
+    _msgEnabled = v;
+    [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDFVEnableMsg];
 }
 @end
 
+// 收藏语音转发：需「收藏语音转发」与「语音消息转发」同时开启，对齐锤子
+// FavoritesItem(0x78f0f4/0x78f100) / forwardData(0x78f27c/0x78f288) / addMsgFromItem(0x78f51c/0x78f528) 的两道闸门
 static BOOL ddFavVoiceEnabled(void) {
-    return [DDFavVoiceConfig sharedConfig].enabled;
+    DDFavVoiceConfig *c = [DDFavVoiceConfig sharedConfig];
+    return c.favEnabled && c.msgEnabled;
+}
+// 语音消息转发：对应 enableVoiceForward(0x8d2fc0)，门控发送终点与降级防护
+static BOOL ddVoiceMsgEnabled(void) {
+    return [DDFavVoiceConfig sharedConfig].msgEnabled;
 }
 
 #pragma mark - 日志
@@ -287,19 +304,13 @@ static void dd_logClear(void) {
 #pragma mark - 判定工具
 
 static BOOL dd_isVoiceMsg(id msg) {
-    if (!msg) return NO;
-    Class wrapCls = objc_getClass("CMessageWrap");
-    if (!wrapCls) return NO;
-    if (![msg isKindOfClass:wrapCls]) return NO;
+    if (!dd_isInstanceOf(msg, "CMessageWrap")) return NO;
     if (![msg respondsToSelector:@selector(m_uiMessageType)]) return NO;
     return ((CMessageWrap *)msg).m_uiMessageType == (unsigned int)kDDVoiceMsgType;
 }
 
 static BOOL dd_isFavVoiceItem(id obj) {
-    if (!obj) return NO;
-    Class itemCls = objc_getClass("FavoritesItem");
-    if (!itemCls) return NO;
-    if (![obj isKindOfClass:itemCls]) return NO;
+    if (!dd_isInstanceOf(obj, "FavoritesItem")) return NO;
     if (![obj respondsToSelector:@selector(type)]) return NO;
     return ((FavoritesItem *)obj).type == kDDFavVoiceItemType;
 }
@@ -308,6 +319,21 @@ static BOOL dd_fileExists(NSString *path) {
     if (![path isKindOfClass:[NSString class]]) return NO;
     if ([path length] == 0) return NO;
     return [[NSFileManager defaultManager] fileExistsAtPath:path];
+}
+
+// 共享的类型判定样板：objc_getClass + isKindOfClass
+static BOOL dd_isInstanceOf(id obj, const char *clsName) {
+    if (!obj) return NO;
+    Class cls = objc_getClass(clsName);
+    return cls && [obj isKindOfClass:cls];
+}
+
+// 对齐锤子 0x790644 / 0x759ecc：取当前登录用户名（SettingUtil getCurUsrName）
+static NSString *dd_currentUsrName(void) {
+    Class settingCls = objc_getClass("SettingUtil");
+    if (!settingCls || ![settingCls respondsToSelector:@selector(getCurUsrName)]) return nil;
+    id u = [settingCls getCurUsrName];
+    return [u isKindOfClass:[NSString class]] ? (NSString *)u : nil;
 }
 
 static id dd_mmService(NSString *serviceName) {
@@ -342,6 +368,16 @@ static void dd_waitDownloadFinish(id item) {
         if (!need) break;
         [NSThread sleepForTimeInterval:kDDDownloadWaitStep];
     }
+}
+
+// 对齐锤子 0x7903b4 发起下载 + 0x78fed0 DispatchQueue.global(qos:.utility).async{轮询→回主线程}
+// 集中两处（addMsgFromItem: / forwardData:）重复的「后台轮询 + 主线程回调」样板
+static void dd_downloadFavItemThen(id item, void (^done)(void)) {
+    dd_startDownloadFavItem(item);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        dd_waitDownloadFinish(item);
+        dispatch_async(dispatch_get_main_queue(), done);
+    });
 }
 
 #pragma mark - 语音扩展信息
@@ -511,12 +547,7 @@ static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration
     [wrap setM_uiMessageType:(unsigned int)kDDVoiceMsgType];
 
     // 0x759ecc ~ 0x759ed4
-    NSString *fromUsr = nil;
-    Class settingCls = objc_getClass("SettingUtil");
-    if (settingCls && [settingCls respondsToSelector:@selector(getCurUsrName)]) {
-        id u = [settingCls getCurUsrName];
-        if ([u isKindOfClass:[NSString class]]) fromUsr = (NSString *)u;
-    }
+    NSString *fromUsr = dd_currentUsrName();
     if ([fromUsr length] == 0) { DDLog(@"取不到当前登录用户名"); return NO; }
     [wrap setM_nsFromUsr:fromUsr];
     [wrap setM_nsToUsr:usr];
@@ -615,12 +646,7 @@ static id dd_msgWrapFromFavData(id favData) {
     if (!wrap) { DDLog(@"构造待转发消息失败"); return nil; }
 
     // 0x790644 ~ 0x79065c
-    NSString *me = nil;
-    Class settingCls = objc_getClass("SettingUtil");
-    if (settingCls && [settingCls respondsToSelector:@selector(getCurUsrName)]) {
-        id u = [settingCls getCurUsrName];
-        if ([u isKindOfClass:[NSString class]]) me = (NSString *)u;
-    }
+    NSString *me = dd_currentUsrName();
     if ([me length] > 0) [wrap setM_nsFromUsr:me];
     // 0x790668 ~ 0x790678
     [wrap setM_uiCreateTime:(unsigned int)time(NULL)];
@@ -670,33 +696,35 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 二 阻止语音被降级成文本（0x78f628）
+#pragma mark - 二 阻止语音被降级成文本（0x78f628，仅受 enableVoiceForward 0x78f654 门控）
 %hook ForwardMsgUtil
 + (id)ConvertMsgToTextIfCannotSend:(id)arg1 {
-    if (ddFavVoiceEnabled() && dd_isVoiceMsg(arg1)) return nil;
+    if (ddVoiceMsgEnabled() && dd_isVoiceMsg(arg1)) return nil;
     return %orig;
 }
 %end
 
-#pragma mark - 三 把收藏语音做成待转发消息（0x78f4e8）
+#pragma mark - 三 把收藏语音做成待转发消息（0x78f4e8，需两开关同时开：0x78f51c/0x78f528）
 %hook FavForwardLogicController
 - (void)addMsgFromItem:(id)arg1 {
-    if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1)) {
-        FavoritesItem *item = (FavoritesItem *)arg1;
-        id ctrl = self;
-        DDLog(@"进入转发流程，收藏语音 type=%d", item.type);
-        if (item.needDownLoad) {
-            // 0x7903d0 先发起下载；0x78fed0 是 DispatchQueue.global(qos:.utility).async{轮询→回主线程回调}
-            // 轮询体见 0x79019c：最多 240 次、每次 sleepForTimeInterval:0.25
-        dd_startDownloadFavItem(item);
-        DDLog(@"收藏语音需要先下载，已发起后台下载");
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                dd_waitDownloadFinish(item);
-                DDLog(@"下载等待结束，needDownLoad=%d", (int)((FavoritesItem *)item).needDownLoad);
-                dispatch_async(dispatch_get_main_queue(), ^{ dd_appendVoiceMsg(item, ctrl); });
-            });
+    if (dd_isFavVoiceItem(arg1)) {
+        // 对齐锤子：收藏语音转发依赖「语音消息转发」也开启，否则构造步骤被跳过
+        if (!ddVoiceMsgEnabled()) {
+            DDLog(@"收藏语音转发已开，但语音消息转发未开：收藏语音无法发送（需两者同时开启）");
         } else {
-            dd_appendVoiceMsg(item, ctrl);
+            FavoritesItem *item = (FavoritesItem *)arg1;
+            id ctrl = self;
+            DDLog(@"进入转发流程，收藏语音 type=%d", item.type);
+            if (item.needDownLoad) {
+                // 0x7903d0 先发起下载；0x78fed0 是 DispatchQueue.global(qos:.utility).async{轮询→回主线程回调}
+                DDLog(@"收藏语音需要先下载，已发起后台下载");
+                dd_downloadFavItemThen(item, ^{
+                    DDLog(@"下载等待结束，needDownLoad=%d", (int)((FavoritesItem *)item).needDownLoad);
+                    dd_appendVoiceMsg(item, ctrl);
+                });
+            } else {
+                dd_appendVoiceMsg(item, ctrl);
+            }
         }
     }
     // 0x78f5cc：原实现无条件调用
@@ -704,10 +732,11 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 四 接管语音消息的发送（0x78f6c8 / 0x78f77c / 0x78f8b0 / 0x78f9f8）
+#pragma mark - 四 接管语音消息的发送（0x78f6c8 / 0x78f77c / 0x78f8b0 / 0x78f9f8，仅受 enableVoiceForward 0x78f700 门控）
 %hook ForwardMessageLogicController
 - (void)ForwardMsg:(id)arg1 ToContact:(id)arg2 {
-    if (ddFavVoiceEnabled() && dd_isVoiceMsg(arg1)) {
+    if (dd_isVoiceMsg(arg1)) {
+        if (!ddVoiceMsgEnabled()) { DDLog(@"语音消息转发开关关闭，走原生转发"); %orig; return; }
         // 0x78f718 ~ 0x78f724：命中即接管，无论成败都不再走原实现
         DDLog(@"单条转发命中语音，接管发送");
         BOOL ok = dd_takeOverVoiceMsg(arg1, arg2);
@@ -717,45 +746,47 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     %orig;
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 {
-    if (!ddFavVoiceEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    if (!ddVoiceMsgEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
     DDLog(@"批量转发 %lu 条，开始逐条接管", (unsigned long)[(NSArray *)arg1 count]);
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 WithRevokeBatchId:(id)arg3 {
-    if (!ddFavVoiceEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    if (!ddVoiceMsgEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2, arg3);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3 {
-    if (!ddFavVoiceEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    if (!ddVoiceMsgEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2, arg3);
 }
 %end
 
-#pragma mark - 五 收藏列表转发前先完成下载（0x78f244）
+#pragma mark - 五 收藏列表转发前先完成下载（0x78f244，需两开关同时开：0x78f27c/0x78f288）
 %hook MyFavoritesListViewController
 - (void)forwardData:(id)arg1 {
-    if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1) && ((FavoritesItem *)arg1).needDownLoad) {
-        FavoritesItem *item = (FavoritesItem *)arg1;
-        dd_startDownloadFavItem(item);
-        DDLog(@"收藏列表转发：语音未下载，先下载");
-        if ([self respondsToSelector:@selector(startLoadingWithText:)]) {
-            MMUIViewController *vc = (MMUIViewController *)self;
-            [vc startLoadingWithText:@"语音下载中"];
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                dd_waitDownloadFinish(item);
-                dispatch_async(dispatch_get_main_queue(), ^{
+    if (dd_isFavVoiceItem(arg1) && ((FavoritesItem *)arg1).needDownLoad) {
+        if (!ddVoiceMsgEnabled()) {
+            DDLog(@"收藏语音转发已开，但语音消息转发未开：收藏列表语音未走下载分支");
+        } else {
+            FavoritesItem *item = (FavoritesItem *)arg1;
+            DDLog(@"收藏列表转发：语音未下载，先下载");
+            if ([self respondsToSelector:@selector(startLoadingWithText:)]) {
+                MMUIViewController *vc = (MMUIViewController *)self;
+                [vc startLoadingWithText:@"语音下载中"];
+                dd_downloadFavItemThen(item, ^{
                     if ([vc respondsToSelector:@selector(stopLoading)]) [vc stopLoading];
                 });
-            });
+            } else {
+                dd_downloadFavItemThen(item, ^{});
+            }
+            // 0x78f458：命中后直接收尾，不调用原实现
+            return;
         }
-        // 0x78f458：命中后直接收尾，不调用原实现
-        return;
     }
     %orig;
 }
@@ -885,7 +916,9 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     Class secMgr  = objc_getClass("WCTableViewSectionManager");
 
     WCTableViewSectionManager *sec = [secMgr defaultSection];
-    [sec addCell:[cellMgr switchCellForSel:@selector(onEnableSwitch:) target:self title:@"启用收藏语音转发" on:[DDFavVoiceConfig sharedConfig].enabled]];
+    DDFavVoiceConfig *cfg = [DDFavVoiceConfig sharedConfig];
+    [sec addCell:[cellMgr switchCellForSel:@selector(onFavSwitch:) target:self title:@"收藏语音转发" on:cfg.favEnabled]];
+    [sec addCell:[cellMgr switchCellForSel:@selector(onMsgSwitch:) target:self title:@"语音消息转发" on:cfg.msgEnabled]];
     [_tableViewManager addSection:sec];
 
     Class normMgr = objc_getClass("WCTableViewNormalCellManager");
@@ -924,7 +957,8 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
         return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
     return UITableViewAutomaticDimension;
 }
-- (void)onEnableSwitch:(UISwitch *)s { [DDFavVoiceConfig sharedConfig].enabled = s.on; }
+- (void)onFavSwitch:(UISwitch *)s { [DDFavVoiceConfig sharedConfig].favEnabled = s.on; }
+- (void)onMsgSwitch:(UISwitch *)s { [DDFavVoiceConfig sharedConfig].msgEnabled = s.on; }
 @end
 
 #pragma mark - 插件注册
@@ -936,7 +970,9 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
             [[mgr sharedInstance] registerControllerWithTitle:@"DD收藏语音转发"
                                                       version:@"1.0.0"
                                                    controller:@"DDFavVoiceSettingsViewController"];
-            DDLog(@"设置入口注册成功，当前开关=%@", ddFavVoiceEnabled() ? @"开" : @"关");
+            DDFavVoiceConfig *c = [DDFavVoiceConfig sharedConfig];
+            DDLog(@"设置入口注册成功，收藏语音转发=%@ 语音消息转发=%@",
+                  c.favEnabled ? @"开" : @"关", c.msgEnabled ? @"开" : @"关");
         } else {
             DDLog(@"WCPluginsMgr 缺失，设置入口未注册");
         }
