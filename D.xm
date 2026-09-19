@@ -793,22 +793,36 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 五 收藏列表转发前先完成下载（0x78f244，仅受「收藏语音转发」开关门控）
+// 收藏语音下载尝试标记：防止下载失败时 forwardData: 重入无限循环下载
+static const void *kDDFavDownloadAttemptedKey = &kDDFavDownloadAttemptedKey;
+
+#pragma mark - 五 收藏列表转发：未下载则先下完再一次性转发（0x78f244，仅受「收藏语音转发」开关门控）
+// 修复「点两次才转发」：原实现只下载、return 不转发，需第二次点击才走 %orig。
+// 现改为下载完成后（done 已在主线程，见 dd_downloadFavItemThen 0x78fed0）重入 forwardData:，
+// 此时 needDownLoad 已被轮询翻转为 NO（dd_waitDownloadFinish 0x7901b4），自然落到 %orig 进入选人器，
+// 从而实现「点一次 = 下载 + 转发」。tried 标记兜底下载失败场景，避免无限重入下载。
 %hook MyFavoritesListViewController
 - (void)forwardData:(id)arg1 {
-    if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1) && ((FavoritesItem *)arg1).needDownLoad) {
-        FavoritesItem *item = (FavoritesItem *)arg1;
-        DDLog(@"收藏列表转发：语音未下载，先下载");
-        if ([self respondsToSelector:@selector(startLoadingWithText:)]) {
-            MMUIViewController *vc = (MMUIViewController *)self;
-            [vc startLoadingWithText:@"语音下载中"];
-            dd_downloadFavItemThen(item, ^{
-                if ([vc respondsToSelector:@selector(stopLoading)]) [vc stopLoading];
-            });
-        } else {
-            dd_downloadFavItemThen(item, ^{});
+    FavoritesItem *item = (FavoritesItem *)arg1;
+    if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1) && item.needDownLoad) {
+        NSNumber *tried = objc_getAssociatedObject(item, kDDFavDownloadAttemptedKey);
+        if (tried && [tried boolValue]) {
+            DDLog(@"收藏语音下载尝试已过仍需要下载，走原实现兜底");
+            %orig;
+            return;
         }
-        // 0x78f458：命中后直接收尾，不调用原实现
+        objc_setAssociatedObject(item, kDDFavDownloadAttemptedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        DDLog(@"收藏列表转发：语音未下载，下载完成后再自动转发（一次性）");
+        MMUIViewController *vc = (MMUIViewController *)self;
+        if ([vc respondsToSelector:@selector(startLoadingWithText:)]) {
+            [vc startLoadingWithText:@"语音下载中"];
+        }
+        __weak typeof(self) wself = self;
+        dd_downloadFavItemThen(item, ^{
+            if ([vc respondsToSelector:@selector(stopLoading)]) [vc stopLoading];
+            [wself forwardData:arg1];
+        });
+        // 0x78f458：本次不调用原实现，等下载完成后重入再转发
         return;
     }
     %orig;
