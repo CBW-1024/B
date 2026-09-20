@@ -188,6 +188,8 @@ static const NSTimeInterval kDDDownloadWaitStep = 0.25;
 // 0x7906a4 ~ 0x7906bc : localID = X + 0x2710(10000)，X 由外部函数生成于 [0, 0x15f90) 区间
 static const unsigned int kDDVoiceLocalIDBase = 10000;
 static const unsigned int kDDVoiceLocalIDRange = 0x15f90;
+// 收藏语音来源：把 FavoritesItem 绑到构造出的语音 wrap 上，供「发送时下载」反查并下载
+static const void *kDDFavSourceKey = &kDDFavSourceKey;
 
 @interface DDFavVoiceConfig : NSObject
 + (instancetype)sharedConfig;
@@ -700,9 +702,6 @@ static NSArray *dd_takeOverVoiceList(NSArray *src, id contact) {
 }
 
 #pragma mark - 收藏语音消息构造
-
-// 收藏语音来源：把 FavoritesItem 绑到构造出的语音 wrap 上，供「发送时下载」反查并下载
-static const void *kDDFavSourceKey = &kDDFavSourceKey;
 
 // 对齐锤子 0x790570：把收藏语音数据构造成一条待转发的语音消息。
 // 「发送时下载」：文件未就绪时不读数据，只构造成"外壳"（含时长/localID，足以让选人器正常弹出），
