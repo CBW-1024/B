@@ -559,11 +559,16 @@ static NSString *dd_installAudioFile(id wrap, NSString *src) {
                                        stringByReplacingOccurrencesOfString:@".pic" withString:@".aud"];
     NSString *dir = [p stringByDeletingLastPathComponent];
     NSFileManager *fm = [NSFileManager defaultManager];
-    // 0x75a2cc ~ 0x75a2e8：目录不存在就直接失败，锤子不会新建目录
+    // 0x75a2cc ~ 0x75a2e8：锤子原逻辑在目录不存在时直接失败（其前提是录音已落盘、对应 Audio 子目录必已建立）。
+    // 本插件凭空构造语音消息，对应 Audio 子目录往往尚未建立，必须主动创建，否则随机落盘失败
+    // （见日志：转发给自己/群聊时 Audio 目录不存在 → 音频落盘失败 → ResendVoiceMsg 未触发 → 无消息）。
     BOOL isDir = NO;
     if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) {
-        DDLog(@"Audio 目录不存在 %@", dir);
-        return nil;
+        NSError *mkErr = nil;
+        if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&mkErr]) {
+            DDLog(@"Audio 目录创建失败 %@ %@", dir, mkErr);
+            return nil;
+        }
     }
     if ([fm fileExistsAtPath:p]) [fm removeItemAtPath:p error:nil];
     return [fm copyItemAtPath:src toPath:p error:nil] ? p : nil;
