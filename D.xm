@@ -456,19 +456,32 @@ static unsigned int dd_voiceDuration(id wrap) {
 }
 
 // 对齐锤子 0x7594d0 configureVoiceMessageWrap:voiceData:duration:
-static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int duration) {
-    if (!wrap || !voiceData) return NO;
-    // 0x75951c / 0x759520：wrap 为空或 duration 为 0 直接失败
-    if (duration == 0) return NO;
-    if ([voiceData length] == 0) return NO;
+// 对齐锤子 0x75951c：只写语音元信息（格式/结束标志/时长），不写音频数据，用于数据缺失时先构造"外壳"
+static BOOL dd_configureVoiceMeta(id wrap, unsigned int duration) {
+    if (!wrap || duration == 0) return NO;
     id ext = dd_voiceExtendInfo(wrap, YES);
     if (!ext) return NO;
     [ext setM_refMessageWrap:wrap];
     [ext setM_uiVoiceFormat:kDDVoiceFormat];
     [ext setM_uiVoiceEndFlag:kDDVoiceEndFlag];
     [ext setM_uiVoiceTime:duration];
+    return YES;
+}
+
+// 对齐锤子 0x75951c：把音频数据写进 m_dtVoice，供「发送时下载」在发送前补数据
+static BOOL dd_injectVoiceData(id wrap, NSData *voiceData) {
+    if (!wrap || [voiceData length] == 0) return NO;
+    id ext = dd_voiceExtendInfo(wrap, YES);
+    if (!ext) return NO;
     [ext setM_dtVoice:voiceData];
     return YES;
+}
+
+// 对齐锤子 0x75951c / 0x759520：元信息 + 数据，等价于旧版单函数
+static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int duration) {
+    if (duration == 0 || [voiceData length] == 0) return NO;
+    if (!dd_configureVoiceMeta(wrap, duration)) return NO;
+    return dd_injectVoiceData(wrap, voiceData);
 }
 
 #pragma mark - 音频路径
@@ -613,6 +626,24 @@ static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration
 }
 
 // 对齐锤子 0x7908c8：接管语音消息的发送
+// 对齐锤子 0x790950：发送前若收藏语音数据尚未就绪，下载后注入 m_dtVoice（「发送时下载」）
+static BOOL dd_ensureFavVoiceData(id msg) {
+    if ([dd_voiceData(msg) length] > 0) return YES;
+    id favItem = objc_getAssociatedObject(msg, kDDFavSourceKey);
+    if (!favItem || ![favItem respondsToSelector:@selector(dataList)]) return NO;
+    NSArray *list = [favItem dataList];
+    if (![list isKindOfClass:[NSArray class]] || [list count] == 0) return NO;
+    id field = [list firstObject];
+    if (![field respondsToSelector:@selector(GetDataPath)]) return NO;
+    id p = [field GetDataPath];
+    if (![p isKindOfClass:[NSString class]]) return NO;
+    NSData *d = [NSData dataWithContentsOfFile:(NSString *)p
+                                        options:NSDataReadingMappedIfSafe
+                                          error:nil];
+    if ([d length] == 0) return NO;
+    return dd_injectVoiceData(msg, d);
+}
+
 static BOOL dd_takeOverVoiceMsg(id msg, id contact) {
     if (!dd_isVoiceMsg(msg)) return NO;
     if (!contact) return NO;
@@ -622,15 +653,31 @@ static BOOL dd_takeOverVoiceMsg(id msg, id contact) {
         if ([u isKindOfClass:[NSString class]]) usr = (NSString *)u;
     }
     if ([usr length] == 0) { DDLog(@"拿不到目标联系人用户名"); return NO; }
-    NSString *audPath = dd_audioPathForMsg(msg);
-    if ([audPath length] == 0) {
-        DDLog(@"拿不到语音文件，取消发送");
-        return NO;
-    }
     unsigned int duration = dd_voiceDuration(msg);
     // 0x790950：时长为 0 不发送
     if (duration == 0) {
         DDLog(@"语音时长为 0，取消发送");
+        return NO;
+    }
+    NSString *audPath = dd_audioPathForMsg(msg);
+    if ([audPath length] == 0) {
+        // 数据缺失：发送时下载收藏语音，注入后再发送，避免首次点转发被下载闸门挡住选人器
+        id favItem = objc_getAssociatedObject(msg, kDDFavSourceKey);
+        if (favItem && [favItem respondsToSelector:@selector(dataList)]) {
+            DDLog(@"发送时语音数据缺失，现下载收藏语音再发送");
+            // 一次性 block（跑完即释放，不形成循环引用），强持有 msg 以保证 shell wrap 在下载期间不被释放
+            dd_downloadFavItemThen(favItem, ^{
+                if (dd_ensureFavVoiceData(msg)) {
+                    NSString *p = dd_audioPathForMsg(msg);
+                    if ([p length] > 0) dd_sendVoice(usr, p, duration);
+                    else DDLog(@"发送时下载后仍拿不到音频路径，取消发送");
+                } else {
+                    DDLog(@"发送时下载后仍未取到语音数据，取消发送");
+                }
+            });
+            return YES; // 已异步处理，勿走原实现
+        }
+        DDLog(@"拿不到语音文件，取消发送");
         return NO;
     }
     DDLog(@"准备接管发送 -> %@ 文件=%@", usr, audPath);
@@ -654,21 +701,18 @@ static NSArray *dd_takeOverVoiceList(NSArray *src, id contact) {
 
 #pragma mark - 收藏语音消息构造
 
-// 对齐锤子 0x790570：把收藏语音数据构造成一条待转发的语音消息
-static id dd_msgWrapFromFavData(id favData) {
+// 收藏语音来源：把 FavoritesItem 绑到构造出的语音 wrap 上，供「发送时下载」反查并下载
+static const void *kDDFavSourceKey = &kDDFavSourceKey;
+
+// 对齐锤子 0x790570：把收藏语音数据构造成一条待转发的语音消息。
+// 「发送时下载」：文件未就绪时不读数据，只构造成"外壳"（含时长/localID，足以让选人器正常弹出），
+// 并把 FavoritesItem 绑到 wrap；真正的音频数据在发送接管处（dd_takeOverVoiceMsg）下载后注入 m_dtVoice。
+static id dd_msgWrapFromFavData(id favData, id favItem) {
     if (!favData) return nil;
     Class fieldCls = objc_getClass("FavoritesItemDataField");
     if (!fieldCls || ![favData isKindOfClass:fieldCls]) return nil;
     FavoritesItemDataField *field = (FavoritesItemDataField *)favData;
     if (![field respondsToSelector:@selector(GetDataPath)]) return nil;
-
-    id pathObj = [field GetDataPath];
-    if (![pathObj isKindOfClass:[NSString class]]) { DDLog(@"收藏数据 GetDataPath 没返回路径"); return nil; }
-    DDLog(@"收藏语音路径 %@", pathObj);
-    NSData *data = [NSData dataWithContentsOfFile:(NSString *)pathObj
-                                          options:NSDataReadingMappedIfSafe
-                                            error:nil];
-    if ([data length] == 0) { DDLog(@"收藏语音文件读不出来"); return nil; }
 
     Class wrapCls = objc_getClass("CMessageWrap");
     if (!wrapCls) return nil;
@@ -682,13 +726,33 @@ static id dd_msgWrapFromFavData(id favData) {
     if ([me length] > 0) [wrap setM_nsFromUsr:me];
     // 0x790668 ~ 0x790678
     [wrap setM_uiCreateTime:(unsigned int)time(NULL)];
-
-    // 0x790688 ~ 0x79069c：时长直接用收藏数据里的 duration，不做换算
-    unsigned int duration = field.duration;
-    DDLog(@"收藏语音 %lu 字节 时长=%u", (unsigned long)[data length], duration);
-    if (!dd_configureVoiceMsg(wrap, data, duration)) { DDLog(@"配置语音失败，可能 duration 为 0"); return nil; }
     // 0x7906a4 ~ 0x7906bc
     [wrap setM_uiMesLocalID:dd_newVoiceLocalID()];
+
+    // 0x790688 ~ 0x79069c：时长直接用收藏数据里的 duration，不依赖文件是否下载
+    unsigned int duration = field.duration;
+    if (duration == 0) { DDLog(@"收藏语音 duration 为 0，放弃"); return nil; }
+    if (!dd_configureVoiceMeta(wrap, duration)) { DDLog(@"配置语音元信息失败"); return nil; }
+
+    // 绑定来源，供发送时下载反查
+    if (favItem) objc_setAssociatedObject(wrap, kDDFavSourceKey, favItem, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // 文件已就绪则直接读数据；否则留到发送时下载
+    id pathObj = [field GetDataPath];
+    if ([pathObj isKindOfClass:[NSString class]] && dd_fileExists((NSString *)pathObj)) {
+        DDLog(@"收藏语音路径 %@", pathObj);
+        NSData *data = [NSData dataWithContentsOfFile:(NSString *)pathObj
+                                              options:NSDataReadingMappedIfSafe
+                                                error:nil];
+        if ([data length] > 0) {
+            DDLog(@"收藏语音 %lu 字节 时长=%u", (unsigned long)[data length], duration);
+            dd_injectVoiceData(wrap, data);
+            return wrap;
+        }
+        DDLog(@"收藏语音文件暂未就绪，留待发送时下载");
+    } else {
+        DDLog(@"收藏语音文件不存在，留待发送时下载");
+    }
     return wrap;
 }
 
@@ -697,7 +761,7 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     NSArray *list = ((FavoritesItem *)favItem).dataList;
     if (![list isKindOfClass:[NSArray class]] || [list count] == 0) { DDLog(@"收藏项 dataList 为空"); return; }
     DDLog(@"收藏语音 dataList 共 %lu 项", (unsigned long)[list count]);
-    id wrap = dd_msgWrapFromFavData([list firstObject]);
+    id wrap = dd_msgWrapFromFavData([list firstObject], favItem);
     if (!wrap) {
         DDLog(@"收藏语音没有可用数据");
         return;
@@ -736,41 +800,20 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
-// 收藏语音构建尝试标记：防止下载失败时 addMsgFromItem: 重入无限循环下载
-static const void *kDDFavAddMsgAttemptedKey = &kDDFavAddMsgAttemptedKey;
-
 #pragma mark - 三 把收藏语音做成待转发消息（0x78f4e8，仅受「收藏语音转发」开关门控）
-// 修复「点两次才转发」：原实现 needDownLoad 时异步下载、却同步调用 %orig，
-// 原生在下载完成前拿到未就绪 item，转发项不完整，需再点一次才生效（见 07:30:39.880 与 07:30:46.187 两次进入）。
-// 现改为 needDownLoad 时先下载，下载完成（主线程，见 dd_downloadFavItemThen 0x78fed0）后重入 addMsgFromItem:，
-// 重入时 needDownLoad 已翻转为 NO（dd_waitDownloadFinish 0x7901b4），再构建语音消息并 %orig，
-// 保证原生始终拿到就绪数据，一次点击即「下载→构建→弹出选人器」。tried 标记兜底下载失败避免无限重入。
+// 「发送时下载」架构：addMsgFromItem 必须同步把 item 加入列表并调用 %orig——
+// 弹选人器的调用方是在本方法同步返回时判定就绪的，任何把 %orig 推迟（下载+重入）的写法都会让调用方在同步
+// 返回时看不到就绪项，导致选人器不弹、必须再点一次（见 07:49:20.498 与 07:49:23.220 两次进入的现象）。
+// 因此这里只构建语音消息（数据缺失时构造成"外壳"并绑定来源，见 dd_msgWrapFromFavData），不触发下载；
+// 真正的下载 + 注入数据推迟到发送接管处（dd_takeOverVoiceMsg），从而一次点击即可弹出选人器。
 %hook FavForwardLogicController
 - (void)addMsgFromItem:(id)arg1 {
     if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1)) {
         FavoritesItem *item = (FavoritesItem *)arg1;
-        id ctrl = self;
         DDLog(@"进入转发流程，收藏语音 type=%d", item.type);
-        if (item.needDownLoad) {
-            NSNumber *tried = objc_getAssociatedObject(item, kDDFavAddMsgAttemptedKey);
-            if (tried && [tried boolValue]) {
-                DDLog(@"收藏语音下载尝试已过仍需要下载，走原实现兜底");
-                %orig;
-                return;
-            }
-            objc_setAssociatedObject(item, kDDFavAddMsgAttemptedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            DDLog(@"收藏语音需要先下载，下载完成后再构建并加入转发");
-            __weak typeof(self) wself = self;
-            dd_downloadFavItemThen(item, ^{
-                [wself addMsgFromItem:arg1];
-            });
-            // 0x78f5cc：本次不调用原实现，等下载完成后重入再构建
-            return;
-        }
-        // needDownLoad == NO：数据已就绪，正常构建
-        dd_appendVoiceMsg(item, ctrl);
+        dd_appendVoiceMsg(item, self);
     }
-    // 0x78f5cc：原实现无条件调用
+    // 0x78f5cc：原实现无条件调用（同步，确保选人器正常弹出）
     %orig;
 }
 %end
@@ -809,38 +852,13 @@ static const void *kDDFavAddMsgAttemptedKey = &kDDFavAddMsgAttemptedKey;
 }
 %end
 
-// 收藏语音下载尝试标记：防止下载失败时 forwardData: 重入无限循环下载
-static const void *kDDFavDownloadAttemptedKey = &kDDFavDownloadAttemptedKey;
-
-#pragma mark - 五 收藏列表转发：未下载则先下完再一次性转发（0x78f244，仅受「收藏语音转发」开关门控）
-// 修复「点两次才转发」：原实现只下载、return 不转发，需第二次点击才走 %orig。
-// 现改为下载完成后（done 已在主线程，见 dd_downloadFavItemThen 0x78fed0）重入 forwardData:，
-// 此时 needDownLoad 已被轮询翻转为 NO（dd_waitDownloadFinish 0x7901b4），自然落到 %orig 进入选人器，
-// 从而实现「点一次 = 下载 + 转发」。tried 标记兜底下载失败场景，避免无限重入下载。
+#pragma mark - 五 MyFavoritesListViewController -forwardData: 直通（0x78f244）
+// 注意：本方法在「收藏详情页」转发手势中并未被命中（见日志，转发入口直接走 addMsgFromItem:）。
+// 早期曾在此处「先下载再转发」，但那会推迟 %orig，而弹选人器的调用方是在 addMsgFromItem: 同步返回时
+// 判定就绪的——推迟 %orig 会让选人器不弹、必须再点一次。故这里改为直接 %orig 直通，
+// 不触发下载、不推迟，真正的「发送时下载」已下沉到 addMsgFromItem:/dd_takeOverVoiceMsg。
 %hook MyFavoritesListViewController
 - (void)forwardData:(id)arg1 {
-    FavoritesItem *item = (FavoritesItem *)arg1;
-    if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1) && item.needDownLoad) {
-        NSNumber *tried = objc_getAssociatedObject(item, kDDFavDownloadAttemptedKey);
-        if (tried && [tried boolValue]) {
-            DDLog(@"收藏语音下载尝试已过仍需要下载，走原实现兜底");
-            %orig;
-            return;
-        }
-        objc_setAssociatedObject(item, kDDFavDownloadAttemptedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        DDLog(@"收藏列表转发：语音未下载，下载完成后再自动转发（一次性）");
-        MMUIViewController *vc = (MMUIViewController *)self;
-        if ([vc respondsToSelector:@selector(startLoadingWithText:)]) {
-            [vc startLoadingWithText:@"语音下载中"];
-        }
-        __weak typeof(self) wself = self;
-        dd_downloadFavItemThen(item, ^{
-            if ([vc respondsToSelector:@selector(stopLoading)]) [vc stopLoading];
-            [wself forwardData:arg1];
-        });
-        // 0x78f458：本次不调用原实现，等下载完成后重入再转发
-        return;
-    }
     %orig;
 }
 %end
