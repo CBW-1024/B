@@ -82,6 +82,7 @@
 - (_Bool)deleteMessageFromDB:(id)arg1;
 - (_Bool)addMessageToDB:(id)arg1;
 - (id)getAudioFileName:(id)arg1 LocalID:(unsigned int)arg2;
+- (BOOL)prepareSend:(id);
 @end
 
 @interface MMNewSessionMgr : NSObject
@@ -557,6 +558,22 @@ static void dd_append_voice_msg(id favItem, id controller) {
         return YES;
     }
     return %orig;
+}
+%end
+
+#pragma mark - 自己录制发送的语音也支持自定义秒数
+%hook AudioSender
+// 自己按住录音并发送：prepareSend: 在录制结束后、正式发送前调用，
+// 此时语音 CMessageWrap 已带真实录制时长；在此覆盖 m_uiVoiceTime 即可生效。
+// 复用 dd_voiceDuration（真实录制时长）+ dd_effectiveVoiceDuration（开关/1~60/B 兜底）。
+- (BOOL)prepareSend:(id)wrap {
+    BOOL r = %orig;
+    if (r && wrap) {
+        unsigned int real = dd_voiceDuration(wrap);
+        unsigned int eff = dd_effectiveVoiceDuration(real);
+        if (eff != real) dd_configureVoiceMeta(wrap, eff);   // 仅在覆盖或 B 回退时写入
+    }
+    return r;
 }
 %end
 
