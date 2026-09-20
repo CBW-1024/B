@@ -42,12 +42,12 @@
 - (void)stopLoading;
 @end
 
-// YTProgressHUD.h（微信对 MBProgressHUD 的封装，全局加载 HUD）
-@interface YTProgressHUD : NSObject
-+ (id)showHUDAddedTo:(id)arg1 animated:(_Bool)arg2;
-+ (unsigned long long)hideAllHUDsForView:(id)arg1 animated:(_Bool)arg2;
-- (void)setLabelText:(id)arg1;
-- (void)setRemoveFromSuperViewOnHide:(_Bool)arg1;
+// MMStringToastView.h（微信屏幕/滚动文字提示：addScrollingString 入队，showScreenTips 显示，hideToast 收起）
+@interface MMStringToastView : NSObject
+- (id)initWithFrame:(CGRect)arg1 isUsingMPUI:(CGSize)arg2;
+- (void)addScrollingString:(id)arg1 withDisplayTime:(double)arg2;
+- (void)showScreenTips;
+- (void)hideToast;
 @end
 
 // FavoritesItemDataField.h:192 duration / :245 GetDataPath
@@ -393,22 +393,21 @@ static void dd_downloadFavItemThen(id item, void (^done)(void)) {
     });
 }
 
-// 微信全局加载 HUD：YTProgressHUD 即微信对 MBProgressHUD 的封装，挂 keyWindow。
-// 仅作下载期间的视觉提示，不参与成功/失败判定（下载逻辑本身无失败分支）。
+// 微信原生屏幕文字提示：addScrollingString 入队“下载中…”（displayTime 兜底不过期），showScreenTips 显示，
+// 下载完成才 hideToast；不参与成功/失败判定。
+static id g_ddLoadingToast = nil;
 static void dd_showLoading(NSString *text) {
-    id app = [objc_getClass("UIApplication") sharedApplication];
-    id window = [app keyWindow];
-    if (!window) return;
-    id hud = [objc_getClass("YTProgressHUD") showHUDAddedTo:window animated:YES];
-    [hud setLabelText:text];
-    [hud setRemoveFromSuperViewOnHide:YES];
+    id toast = [[objc_getClass("MMStringToastView") alloc] initWithFrame:CGRectZero isUsingMPUI:CGSizeZero];
+    [toast addScrollingString:text withDisplayTime:3600.0];
+    [toast showScreenTips];
+    g_ddLoadingToast = toast;
 }
 
 static void dd_hideLoading(void) {
-    id app = [objc_getClass("UIApplication") sharedApplication];
-    id window = [app keyWindow];
-    if (!window) return;
-    [objc_getClass("YTProgressHUD") hideAllHUDsForView:window animated:YES];
+    if (g_ddLoadingToast) {
+        [g_ddLoadingToast hideToast];
+        g_ddLoadingToast = nil;
+    }
 }
 
 #pragma mark - 语音扩展信息
