@@ -455,17 +455,17 @@ static NSString *dd_audioPathForMsg(id msg) {
 
     // 0x759714 ~ 0x759794：优先 CUtility GetPathOfMesAudio:LocalID:DocPath:
     Class cu = objc_getClass("CUtility");
-    id p = [cu GetPathOfMesAudio:usr LocalID:localID DocPath:[cu GetDocPath]];
-    if (dd_fileExists((NSString *)p)) {
+    NSString *cuPath = (NSString *)[cu GetPathOfMesAudio:usr LocalID:localID DocPath:[cu GetDocPath]];
+    if (dd_fileExists(cuPath)) {
         DDLog(@"音频路径命中 CUtility");
-        return (NSString *)p;
+        return cuPath;
     }
     // 0x759840 ~ 0x75987c：其次 AudioSender getAudioFileName:LocalID:
     id sender = dd_mmService(@"AudioSender");
-    id p = [sender getAudioFileName:usr LocalID:localID];
-    if (dd_fileExists((NSString *)p)) {
+    NSString *p = (NSString *)[sender getAudioFileName:usr LocalID:localID];
+    if (dd_fileExists(p)) {
         DDLog(@"音频路径命中 AudioSender");
-        return (NSString *)p;
+        return p;
     }
     // 0x759888 ~ 0x759994：兜底，把 m_dtVoice 写成 NSTemporaryDirectory 下 UUID.aud
     NSData *data = dd_voiceData(msg);
@@ -744,13 +744,13 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 //     最终落到第四节 ForwardMessageLogicController 接管发送 type=34 语音。
 %hook BaseMessageCellView
 - (BOOL)canShowForwardMenuItem {
-    if (ddVoiceMsgEnabled() && [self isKindOfClass:%c(VoiceMessageCellView)]) {
+    if (ddVoiceMsgEnabled() && [self isKindOfClass:objc_getClass("VoiceMessageCellView")]) {
         return YES;
     }
     return %orig;
 }
 - (void)onForward:(id)arg1 {
-    if (ddVoiceMsgEnabled() && [self isKindOfClass:%c(VoiceMessageCellView)]) {
+    if (ddVoiceMsgEnabled() && [self isKindOfClass:objc_getClass("VoiceMessageCellView")]) {
         DDLog(@"语音消息原生 onForward: 被拦截，改走 doForward 触发选人器");
         [self doForward];
         return;
