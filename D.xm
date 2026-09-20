@@ -387,6 +387,24 @@ static void dd_downloadFavItemThen(id item, void (^done)(void)) {
     });
 }
 
+// 微信全局加载 HUD：YTProgressHUD 即微信对 MBProgressHUD 的封装，挂 keyWindow。
+// 仅作下载期间的视觉提示，不参与成功/失败判定（下载逻辑本身无失败分支）。
+static void dd_showLoading(NSString *text) {
+    id app = [objc_getClass("UIApplication") sharedApplication];
+    id window = [app keyWindow];
+    if (!window) return;
+    id hud = [objc_getClass("YTProgressHUD") showHUDAddedTo:window animated:YES];
+    [hud setLabelText:text];
+    [hud setRemoveFromSuperViewOnHide:YES];
+}
+
+static void dd_hideLoading(void) {
+    id app = [objc_getClass("UIApplication") sharedApplication];
+    id window = [app keyWindow];
+    if (!window) return;
+    [objc_getClass("YTProgressHUD") hideAllHUDsForView:window animated:YES];
+}
+
 #pragma mark - 语音扩展信息
 
 // 对齐锤子 0x75909c voiceExtendInfoForMessageWrap:createIfNeeded:
@@ -559,16 +577,25 @@ static BOOL dd_takeOverVoiceMsg(id msg, id contact) {
     unsigned int duration = dd_voiceDuration(msg);
     NSString *audPath = dd_audioPathForMsg(msg);
     if ([audPath length] == 0) {
-        // 收藏语音外壳：音频未就绪，下载后注入 m_dtVoice 再发送（下载必定成功，不做失败分支）
+        // 仅当确属收藏外壳（绑定了 kDDFavSourceKey）才触发「发送时下载」；
+        // 聊天语音本地 .aud 缺失不走此分支，以免误用收藏下载器（拿 nil 下载无效）
         id favItem = objc_getAssociatedObject(msg, kDDFavSourceKey);
-        DDLog(@"发送时语音数据缺失，现下载收藏语音再发送");
-        // 一次性 block（跑完即释放，不形成循环引用），强持有 msg 以保证 shell wrap 在下载期间不被释放
-        dd_downloadFavItemThen(favItem, ^{
-            dd_ensureFavVoiceData(msg);
-            NSString *p = dd_audioPathForMsg(msg);
-            dd_sendVoice(usr, p, duration);
-        });
-        return YES; // 已异步处理，勿走原实现
+        if (favItem) {
+            // 收藏语音外壳：音频未就绪，下载后注入 m_dtVoice 再发送（下载必定成功，不做失败分支）
+            DDLog(@"发送时语音数据缺失，现下载收藏语音再发送");
+            // 长语音下载可能耗时，挂微信原生加载 HUD 提示，避免静默间隙被误判为卡死
+            dd_showLoading(@"下载中…");
+            // 一次性 block（跑完即释放，不形成循环引用），强持有 msg 以保证 shell wrap 在下载期间不被释放
+            dd_downloadFavItemThen(favItem, ^{
+                dd_hideLoading();
+                dd_ensureFavVoiceData(msg);
+                NSString *p = dd_audioPathForMsg(msg);
+                dd_sendVoice(usr, p, duration);
+            });
+            return YES; // 已异步处理，勿走原实现
+        }
+        // 聊天语音本地 .aud 缺失：按当前（空）路径直接发送，无日志
+        return dd_sendVoice(usr, audPath, duration);
     }
     DDLog(@"准备接管发送 -> %@ 文件=%@", usr, audPath);
     return dd_sendVoice(usr, audPath, duration);
