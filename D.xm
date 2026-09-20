@@ -1,7 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <time.h>
 #import <substrate.h>
 
 // ===== 微信私有类前向声明 =====
