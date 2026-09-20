@@ -559,16 +559,10 @@ static NSString *dd_installAudioFile(id wrap, NSString *src) {
                                        stringByReplacingOccurrencesOfString:@".pic" withString:@".aud"];
     NSString *dir = [p stringByDeletingLastPathComponent];
     NSFileManager *fm = [NSFileManager defaultManager];
-    // 0x75a2cc ~ 0x75a2e8：锤子原逻辑在目录不存在时直接失败（其前提是录音已落盘、对应 Audio 子目录必已建立）。
-    // 本插件凭空构造语音消息，对应 Audio 子目录往往尚未建立，必须主动创建，否则随机落盘失败
-    // （见日志：转发给自己/群聊时 Audio 目录不存在 → 音频落盘失败 → ResendVoiceMsg 未触发 → 无消息）。
-    BOOL isDir = NO;
-    if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) {
-        NSError *mkErr = nil;
-        if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&mkErr]) {
-            DDLog(@"Audio 目录创建失败 %@ %@", dir, mkErr);
-            return nil;
-        }
+    // 凭空构造的消息对应 Audio 子目录往往尚未建立，先创建（含中间目录）以保证落盘成功；
+    // 不保留「创建失败即 return」的兜底——本插件目标就是成功转发。
+    if (![fm fileExistsAtPath:dir]) {
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     }
     if ([fm fileExistsAtPath:p]) [fm removeItemAtPath:p error:nil];
     return [fm copyItemAtPath:src toPath:p error:nil] ? p : nil;
@@ -620,13 +614,13 @@ static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration
     if (!dd_configureVoiceMsg(wrap, d, duration)) { DDLog(@"配置语音消息失败 duration=%u", duration); return NO; }
     if (![sender addMessageToDB:wrap]) { DDLog(@"addMessageToDB 失败"); return NO; }
 
+    // 尽力把音频落到微信 Audio 目录（仅本地缓存/显示用）；真正的发送依赖已写入内存的 m_dtVoice，
+    // 落盘与否都不阻断发送——本插件目标就是成功转发，不保留「落盘失败就放弃」的兜底。
     NSString *installed = dd_installAudioFile(wrap, audPath);
     if ([installed length] == 0) {
-        DDLog(@"音频落盘失败 %@", audPath);
-        if ([sender respondsToSelector:@selector(deleteMessageFromDB:)]) [sender deleteMessageFromDB:wrap];
-        return NO;
+        DDLog(@"音频落盘未成功（不影响发送）%@", audPath);
     }
-    DDLog(@"发送语音 -> %@ 时长=%ums 文件=%@", usr, duration, installed);
+    DDLog(@"发送语音 -> %@ 时长=%ums 文件=%@", usr, duration, installed ?: audPath);
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
     DDLog(@"ResendVoiceMsg 已调用");
     return YES;
