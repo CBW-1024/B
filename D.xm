@@ -290,9 +290,11 @@ static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int durati
     dd_configureVoiceMeta(wrap, duration);
     return dd_injectVoiceData(wrap, voiceData);
 }
-// 自定义语音秒数：开关开 + 有效数字（1~60）→ 无条件覆盖真实时长；
-// 空字符串或 0 视为不覆盖（等价于关闭）。
-// 注：不做"报长回退真实"的兜底——"自定义"即按输入值显示（含把短录音报长）。
+// 自定义语音秒数：开关开 + 有效数字（1~60）→ 覆盖真实时长；
+// 空串/0 视为不覆盖（等价于关闭）。
+// B 一致性兜底：自定义值 > 真实音频时长时回退真实时长，
+// 避免接收方声明白长、实际音频短导致空播/进度条错位（即"报长"被禁止）。
+// 输入层已保证 1~60；自定义值 ≤ 真实时长时按输入值显示（含把长录音报短）。
 static unsigned int dd_effectiveVoiceDuration(unsigned int realDuration) {
     DDVoiceConfig *c = [DDVoiceConfig sharedConfig];
     if (!c.voiceSecondsEnabled) return realDuration;
@@ -300,6 +302,7 @@ static unsigned int dd_effectiveVoiceDuration(unsigned int realDuration) {
     if ([s length] == 0) return realDuration;
     unsigned int v = (unsigned int)[s integerValue];
     if (v == 0) return realDuration;        // 0（含旧配置残留）视为不覆盖
+    if (realDuration > 0 && v > realDuration) return realDuration;  // B：声明时长不超过真实音频
     return v;                               // 输入层已保证 1~60，直接覆盖真实时长
 }
 
