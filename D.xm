@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <stdarg.h>
 #import <substrate.h>
 
 // 微信类前向声明
@@ -233,53 +234,6 @@ static BOOL dd_voice_forward_enabled(void) {
     return c.favEnabled || c.msgEnabled;
 }
 
-#pragma mark - 工具
-
-// 优先用微信自己的判定（跨版本稳），取不到再回退硬编码 34
-static BOOL dd_voice_is_msg(id msg) {
-    if ([msg respondsToSelector:@selector(IsVoiceMsg)]) return [(CMessageWrap *)msg IsVoiceMsg];
-    return ((CMessageWrap *)msg).m_uiMessageType == (unsigned int)kDDVoiceMsgType;
-}
-static BOOL dd_voice_is_fav_item(id obj) {
-    return ((FavoritesItem *)obj).type == kDDVoiceFavItemType;
-}
-static BOOL dd_file_exists(NSString *path) {
-    if ([path length] == 0) return NO;
-    return [[NSFileManager defaultManager] fileExistsAtPath:path];
-}
-static NSString *dd_current_usr_name(void) {
-    return [objc_getClass("SettingUtil") getCurUsrName];
-}
-static id dd_mm_service(NSString *serviceName) {
-    Class ctxCls = objc_getClass("MMContext");
-    id ctx = [ctxCls currentContext];
-    Class svc = objc_getClass([serviceName UTF8String]);
-    return [ctx getService:svc];
-}
-static void dd_start_download_fav_item(id item) {
-    Class ctxCls = objc_getClass("MMContext");
-    Class mgrCls = objc_getClass("FavoritesMgr");
-    id ctx = [ctxCls currentContext];
-    id mgr = [ctx getService:mgrCls];
-    [mgr startDownloadFavoritesItem:item IsPriority:YES];
-}
-// 轮询 needDownLoad 直至下载完成；不设上限
-static void dd_wait_download_finish(id item) {
-    while (((FavoritesItem *)item).needDownLoad) {
-        [NSThread sleepForTimeInterval:kDDDownloadWaitStep];
-    }
-}
-// 发起下载，后台轮询完成后回主线程回调
-static void dd_download_fav_item_then(id item, void (^done)(void)) {
-    DDVHit(kEvFavWait);
-    DDVLog(@"收藏语音数据未就绪，等待下载完成");
-    dd_start_download_fav_item(item);
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        dd_wait_download_finish(item);
-        dispatch_async(dispatch_get_main_queue(), done);
-    });
-}
-
 #pragma mark - 日志
 
 // 证书注入的机器看不到系统日志，改为插件内落盘 + 设置界面「导出 / 清空」。
@@ -469,6 +423,53 @@ static NSArray<NSString *> *ddv_event_table(void) {
     return _path;
 }
 @end
+
+#pragma mark - 工具
+
+// 优先用微信自己的判定（跨版本稳），取不到再回退硬编码 34
+static BOOL dd_voice_is_msg(id msg) {
+    if ([msg respondsToSelector:@selector(IsVoiceMsg)]) return [(CMessageWrap *)msg IsVoiceMsg];
+    return ((CMessageWrap *)msg).m_uiMessageType == (unsigned int)kDDVoiceMsgType;
+}
+static BOOL dd_voice_is_fav_item(id obj) {
+    return ((FavoritesItem *)obj).type == kDDVoiceFavItemType;
+}
+static BOOL dd_file_exists(NSString *path) {
+    if ([path length] == 0) return NO;
+    return [[NSFileManager defaultManager] fileExistsAtPath:path];
+}
+static NSString *dd_current_usr_name(void) {
+    return [objc_getClass("SettingUtil") getCurUsrName];
+}
+static id dd_mm_service(NSString *serviceName) {
+    Class ctxCls = objc_getClass("MMContext");
+    id ctx = [ctxCls currentContext];
+    Class svc = objc_getClass([serviceName UTF8String]);
+    return [ctx getService:svc];
+}
+static void dd_start_download_fav_item(id item) {
+    Class ctxCls = objc_getClass("MMContext");
+    Class mgrCls = objc_getClass("FavoritesMgr");
+    id ctx = [ctxCls currentContext];
+    id mgr = [ctx getService:mgrCls];
+    [mgr startDownloadFavoritesItem:item IsPriority:YES];
+}
+// 轮询 needDownLoad 直至下载完成；不设上限
+static void dd_wait_download_finish(id item) {
+    while (((FavoritesItem *)item).needDownLoad) {
+        [NSThread sleepForTimeInterval:kDDDownloadWaitStep];
+    }
+}
+// 发起下载，后台轮询完成后回主线程回调
+static void dd_download_fav_item_then(id item, void (^done)(void)) {
+    DDVHit(kEvFavWait);
+    DDVLog(@"收藏语音数据未就绪，等待下载完成");
+    dd_start_download_fav_item(item);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        dd_wait_download_finish(item);
+        dispatch_async(dispatch_get_main_queue(), done);
+    });
+}
 
 #pragma mark - 语音扩展信息
 
