@@ -334,49 +334,28 @@ static void dd_logClear(void) {
 
 #pragma mark - 判定工具
 
-// 前向声明：定义见下方 dd_isInstanceOf（在首次使用前需先声明，否则 .mm 下报 undeclared）
-static BOOL dd_isInstanceOf(id obj, const char *clsName);
-
 static BOOL dd_isVoiceMsg(id msg) {
-    if (!dd_isInstanceOf(msg, "CMessageWrap")) return NO;
-    if (![msg respondsToSelector:@selector(m_uiMessageType)]) return NO;
     return ((CMessageWrap *)msg).m_uiMessageType == (unsigned int)kDDVoiceMsgType;
 }
 
 static BOOL dd_isFavVoiceItem(id obj) {
-    if (!dd_isInstanceOf(obj, "FavoritesItem")) return NO;
-    if (![obj respondsToSelector:@selector(type)]) return NO;
     return ((FavoritesItem *)obj).type == kDDFavVoiceItemType;
 }
 
 static BOOL dd_fileExists(NSString *path) {
-    if (![path isKindOfClass:[NSString class]]) return NO;
     if ([path length] == 0) return NO;
     return [[NSFileManager defaultManager] fileExistsAtPath:path];
 }
 
-// 共享的类型判定样板：objc_getClass + isKindOfClass
-static BOOL dd_isInstanceOf(id obj, const char *clsName) {
-    if (!obj) return NO;
-    Class cls = objc_getClass(clsName);
-    return cls && [obj isKindOfClass:cls];
-}
-
 // 对齐锤子 0x790644 / 0x759ecc：取当前登录用户名（SettingUtil getCurUsrName）
 static NSString *dd_currentUsrName(void) {
-    Class settingCls = objc_getClass("SettingUtil");
-    if (!settingCls || ![settingCls respondsToSelector:@selector(getCurUsrName)]) return nil;
-    id u = [settingCls getCurUsrName];
-    return [u isKindOfClass:[NSString class]] ? (NSString *)u : nil;
+    return [objc_getClass("SettingUtil") getCurUsrName];
 }
 
 static id dd_mmService(NSString *serviceName) {
     Class ctxCls = objc_getClass("MMContext");
-    if (!ctxCls || ![ctxCls respondsToSelector:@selector(currentContext)]) return nil;
     id ctx = [ctxCls currentContext];
-    if (!ctx || ![ctx respondsToSelector:@selector(getService:)]) return nil;
     Class svc = objc_getClass([serviceName UTF8String]);
-    if (!svc) return nil;
     return [ctx getService:svc];
 }
 
@@ -384,12 +363,8 @@ static id dd_mmService(NSString *serviceName) {
 static void dd_startDownloadFavItem(id item) {
     Class ctxCls = objc_getClass("MMContext");
     Class mgrCls = objc_getClass("FavoritesMgr");
-    if (!ctxCls || !mgrCls) return;
-    if (![ctxCls respondsToSelector:@selector(currentContext)]) return;
     id ctx = [ctxCls currentContext];
-    if (!ctx || ![ctx respondsToSelector:@selector(getService:)]) return;
     id mgr = [ctx getService:mgrCls];
-    if (!mgr || ![mgr respondsToSelector:@selector(startDownloadFavoritesItem:IsPriority:)]) return;
     [mgr startDownloadFavoritesItem:item IsPriority:YES];
 }
 
@@ -397,9 +372,7 @@ static void dd_startDownloadFavItem(id item) {
 static void dd_waitDownloadFinish(id item) {
     int remain = kDDDownloadWaitMax;
     while (remain-- > 0) {
-        BOOL need = NO;
-        if ([item respondsToSelector:@selector(needDownLoad)]) need = ((FavoritesItem *)item).needDownLoad;
-        if (!need) break;
+        if (!((FavoritesItem *)item).needDownLoad) break;
         [NSThread sleepForTimeInterval:kDDDownloadWaitStep];
     }
 }
@@ -418,24 +391,11 @@ static void dd_downloadFavItemThen(id item, void (^done)(void)) {
 
 // 对齐锤子 0x75909c voiceExtendInfoForMessageWrap:createIfNeeded:
 static id dd_voiceExtendInfo(id wrap, BOOL create) {
-    if (!wrap) return nil;
     Class vcls = objc_getClass("CExtendInfoOfVoiceMsg");
-    if (!vcls) return nil;
-    if (![wrap respondsToSelector:@selector(m_extendInfoWithMsgType)]) return nil;
     id ext = [wrap m_extendInfoWithMsgType];
-    if (ext && [ext isKindOfClass:vcls]) return ext;
+    if (ext) return ext;
     if (!create) return nil;
-    if (![wrap respondsToSelector:@selector(setM_extendInfoWithMsgType:)]) return nil;
     id nv = [[vcls alloc] init];
-    if (!nv) return nil;
-    // 0x7591a4 要求 5 个 setter 全部可用才继续
-    if (![nv respondsToSelector:@selector(setM_uiVoiceTime:)] ||
-        ![nv respondsToSelector:@selector(setM_uiVoiceFormat:)] ||
-        ![nv respondsToSelector:@selector(setM_uiVoiceEndFlag:)] ||
-        ![nv respondsToSelector:@selector(setM_dtVoice:)] ||
-        ![nv respondsToSelector:@selector(setM_refMessageWrap:)]) {
-        return nil;
-    }
     [nv setM_refMessageWrap:wrap];
     [wrap setM_extendInfoWithMsgType:nv];
     return nv;
@@ -443,26 +403,18 @@ static id dd_voiceExtendInfo(id wrap, BOOL create) {
 
 // 对齐锤子 0x759474 voiceDataForMessageWrap:
 static NSData *dd_voiceData(id wrap) {
-    id ext = dd_voiceExtendInfo(wrap, NO);
-    if (!ext) return nil;
-    if (![ext respondsToSelector:@selector(m_dtVoice)]) return nil;
-    return [ext m_dtVoice];
+    return [dd_voiceExtendInfo(wrap, NO) m_dtVoice];
 }
 
 // 对齐锤子 0x759420 voiceDurationForMessageWrap: —— 直接返回 m_uiVoiceTime，无单位换算
 static unsigned int dd_voiceDuration(id wrap) {
-    id ext = dd_voiceExtendInfo(wrap, NO);
-    if (!ext) return 0;
-    if (![ext respondsToSelector:@selector(m_uiVoiceTime)]) return 0;
-    return [ext m_uiVoiceTime];
+    return [dd_voiceExtendInfo(wrap, NO) m_uiVoiceTime];
 }
 
 // 对齐锤子 0x7594d0 configureVoiceMessageWrap:voiceData:duration:
 // 对齐锤子 0x75951c：只写语音元信息（格式/结束标志/时长），不写音频数据，用于数据缺失时先构造"外壳"
 static BOOL dd_configureVoiceMeta(id wrap, unsigned int duration) {
-    if (!wrap || duration == 0) return NO;
     id ext = dd_voiceExtendInfo(wrap, YES);
-    if (!ext) return NO;
     [ext setM_refMessageWrap:wrap];
     [ext setM_uiVoiceFormat:kDDVoiceFormat];
     [ext setM_uiVoiceEndFlag:kDDVoiceEndFlag];
@@ -472,17 +424,14 @@ static BOOL dd_configureVoiceMeta(id wrap, unsigned int duration) {
 
 // 对齐锤子 0x75951c：把音频数据写进 m_dtVoice，供「发送时下载」在发送前补数据
 static BOOL dd_injectVoiceData(id wrap, NSData *voiceData) {
-    if (!wrap || [voiceData length] == 0) return NO;
     id ext = dd_voiceExtendInfo(wrap, YES);
-    if (!ext) return NO;
     [ext setM_dtVoice:voiceData];
     return YES;
 }
 
 // 对齐锤子 0x75951c / 0x759520：元信息 + 数据，等价于旧版单函数
 static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int duration) {
-    if (duration == 0 || [voiceData length] == 0) return NO;
-    if (!dd_configureVoiceMeta(wrap, duration)) return NO;
+    dd_configureVoiceMeta(wrap, duration);
     return dd_injectVoiceData(wrap, voiceData);
 }
 
@@ -491,71 +440,47 @@ static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int durati
 // 对齐锤子 0x759a9c：决定语音文件归属哪个用户名
 // 注意：MMService 侧还声明了返回 const void* 的同名类方法，必须走静态类型避免签名冲突
 static NSString *dd_ownerUserForVoice(id msg) {
-    if (![msg respondsToSelector:@selector(m_nsToUsr)]) return nil;
-    id to = ((CMessageWrap *)msg).m_nsToUsr;
-    if ([to isKindOfClass:[NSString class]]) {
-        NSString *toStr = (NSString *)to;
-        if ([toStr containsString:@"@chatroom"]) return toStr;
-    }
+    NSString *to = (NSString *)((CMessageWrap *)msg).m_nsToUsr;
+    if ([to containsString:@"@chatroom"]) return to;
     Class wrapCls = objc_getClass("CMessageWrap");
-    if (wrapCls && [wrapCls respondsToSelector:@selector(isSenderFromMsgWrap:)]) {
-        if ([wrapCls isSenderFromMsgWrap:msg] && [to isKindOfClass:[NSString class]]) return (NSString *)to;
-    }
-    if (![msg respondsToSelector:@selector(m_nsFromUsr)]) return nil;
-    id from = ((CMessageWrap *)msg).m_nsFromUsr;
-    return [from isKindOfClass:[NSString class]] ? (NSString *)from : nil;
+    if ([wrapCls isSenderFromMsgWrap:msg]) return to;
+    return (NSString *)((CMessageWrap *)msg).m_nsFromUsr;
 }
 
 // 对齐锤子 0x7596a8 voiceAudioPathForMessageWrap:
 static NSString *dd_audioPathForMsg(id msg) {
-    if (!msg) return nil;
-    if (![msg respondsToSelector:@selector(m_uiMesLocalID)]) return nil;
     unsigned int localID = ((CMessageWrap *)msg).m_uiMesLocalID;
-    // 0x7596e0：localID 为 0 直接返回 nil
-    if (localID == 0) { DDLog(@"localID 为 0，拿不到音频路径"); return nil; }
     NSString *usr = dd_ownerUserForVoice(msg);
-    if ([usr length] == 0) { DDLog(@"归属用户名为空，拿不到音频路径"); return nil; }
     DDLog(@"取音频路径 usr=%@ localID=%u", usr, localID);
 
     // 0x759714 ~ 0x759794：优先 CUtility GetPathOfMesAudio:LocalID:DocPath:
     Class cu = objc_getClass("CUtility");
-    if (cu && [cu respondsToSelector:@selector(GetDocPath)] &&
-        [cu respondsToSelector:@selector(GetPathOfMesAudio:LocalID:DocPath:)]) {
-        id doc = [cu GetDocPath];
-        if ([doc isKindOfClass:[NSString class]]) {
-            id p = [cu GetPathOfMesAudio:usr LocalID:localID DocPath:doc];
-            if ([p isKindOfClass:[NSString class]] && dd_fileExists((NSString *)p)) {
-                DDLog(@"音频路径命中 CUtility");
-                return (NSString *)p;
-            }
-        }
+    id p = [cu GetPathOfMesAudio:usr LocalID:localID DocPath:[cu GetDocPath]];
+    if (dd_fileExists((NSString *)p)) {
+        DDLog(@"音频路径命中 CUtility");
+        return (NSString *)p;
     }
     // 0x759840 ~ 0x75987c：其次 AudioSender getAudioFileName:LocalID:
     id sender = dd_mmService(@"AudioSender");
-    if (sender && [sender respondsToSelector:@selector(getAudioFileName:LocalID:)]) {
-        id p = [sender getAudioFileName:usr LocalID:localID];
-        if ([p isKindOfClass:[NSString class]] && dd_fileExists((NSString *)p)) {
-            DDLog(@"音频路径命中 AudioSender");
-            return (NSString *)p;
-        }
+    id p = [sender getAudioFileName:usr LocalID:localID];
+    if (dd_fileExists((NSString *)p)) {
+        DDLog(@"音频路径命中 AudioSender");
+        return (NSString *)p;
     }
     // 0x759888 ~ 0x759994：兜底，把 m_dtVoice 写成 NSTemporaryDirectory 下 UUID.aud
     NSData *data = dd_voiceData(msg);
     if ([data length] == 0) { DDLog(@"m_dtVoice 为空，无法导出临时音频"); return nil; }
     NSString *name = [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"];
     NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
-    if (![data writeToFile:tmp atomically:YES]) { DDLog(@"写临时音频失败 %@", tmp); return nil; }
+    [data writeToFile:tmp atomically:YES];
     DDLog(@"音频路径走临时文件 %lu 字节", (unsigned long)[data length]);
-    return dd_fileExists(tmp) ? tmp : nil;
+    return tmp;
 }
 
 // 对齐锤子 0x75a184：临时文件落到微信认的 Audio 目录（Img->Audio, .pic->.aud）
 static NSString *dd_installAudioFile(id wrap, NSString *src) {
     Class wrapCls = objc_getClass("CMessageWrap");
-    if (!wrapCls || ![wrapCls respondsToSelector:@selector(getPathOfMsgImg:)]) return nil;
-    id imgObj = [wrapCls getPathOfMsgImg:wrap];
-    if (![imgObj isKindOfClass:[NSString class]]) return nil;
-    NSString *p = [[(NSString *)imgObj stringByReplacingOccurrencesOfString:@"Img" withString:@"Audio"]
+    NSString *p = [[(NSString *)[wrapCls getPathOfMsgImg:wrap] stringByReplacingOccurrencesOfString:@"Img" withString:@"Audio"]
                                        stringByReplacingOccurrencesOfString:@".pic" withString:@".aud"];
     NSString *dir = [p stringByDeletingLastPathComponent];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -565,7 +490,8 @@ static NSString *dd_installAudioFile(id wrap, NSString *src) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     }
     if ([fm fileExistsAtPath:p]) [fm removeItemAtPath:p error:nil];
-    return [fm copyItemAtPath:src toPath:p error:nil] ? p : nil;
+    [fm copyItemAtPath:src toPath:p error:nil];
+    return p;
 }
 
 #pragma mark - 语音发送
@@ -577,50 +503,36 @@ static unsigned int dd_newVoiceLocalID(void) {
 
 // 对齐锤子 0x759cc4 sendVoiceWithUser:audPath:mp3Time:
 static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration) {
-    if ([usr length] == 0 || !dd_fileExists(audPath)) return NO;
     id sender = dd_mmService(@"AudioSender");
-    if (!sender) { DDLog(@"AudioSender 服务取不到"); return NO; }
-    if (![sender respondsToSelector:@selector(addMessageToDB:)]) return NO;
-    if (![sender respondsToSelector:@selector(ResendVoiceMsg:MsgWrap:)]) return NO;
 
     Class wrapCls = objc_getClass("CMessageWrap");
-    if (!wrapCls) return NO;
     id raw = [wrapCls alloc];
-    if (![raw respondsToSelector:@selector(initWithMsgType:)]) return NO;
     CMessageWrap *wrap = [raw initWithMsgType:kDDVoiceMsgType];
-    if (!wrap) { DDLog(@"initWithMsgType 返回 nil"); return NO; }
     // 0x759ebc ~ 0x759ec4
     [wrap setM_uiMessageType:(unsigned int)kDDVoiceMsgType];
 
     // 0x759ecc ~ 0x759ed4
-    NSString *fromUsr = dd_currentUsrName();
-    if ([fromUsr length] == 0) { DDLog(@"取不到当前登录用户名"); return NO; }
-    [wrap setM_nsFromUsr:fromUsr];
+    [wrap setM_nsFromUsr:dd_currentUsrName()];
     [wrap setM_nsToUsr:usr];
 
     // 0x759fdc ~ 0x75a00c：GenSendMsgTime 优先，拿不到退回time(NULL)
     unsigned int createTime = (unsigned int)time(NULL);
     id sessionMgr = dd_mmService(@"MMNewSessionMgr");
-    if (sessionMgr && [sessionMgr respondsToSelector:@selector(GenSendMsgTime)]) {
-        unsigned int t = [sessionMgr GenSendMsgTime];
-        if (t != 0) createTime = t;
-    }
+    unsigned int t = [sessionMgr GenSendMsgTime];
+    if (t != 0) createTime = t;
     [wrap setM_uiCreateTime:createTime];
     [wrap setM_uiStatus:kDDMsgStatusSending];
 
     // 0x75a030 ~ 0x75a054
+    // 数据非空由上游保证：audPath 经存在性闸门确认（527/537/580），收藏语音则经下载成功才进到这里
     NSData *d = [NSData dataWithContentsOfFile:audPath];
-    if ([d length] == 0) { DDLog(@"音频文件读不出来 %@", audPath); return NO; }
-    if (!dd_configureVoiceMsg(wrap, d, duration)) { DDLog(@"配置语音消息失败 duration=%u", duration); return NO; }
-    if (![sender addMessageToDB:wrap]) { DDLog(@"addMessageToDB 失败"); return NO; }
+    dd_configureVoiceMsg(wrap, d, duration);
+    [sender addMessageToDB:wrap];
 
     // 尽力把音频落到微信 Audio 目录（仅本地缓存/显示用）；真正的发送依赖已写入内存的 m_dtVoice，
     // 落盘与否都不阻断发送——本插件目标就是成功转发，不保留「落盘失败就放弃」的兜底。
     NSString *installed = dd_installAudioFile(wrap, audPath);
-    if ([installed length] == 0) {
-        DDLog(@"音频落盘未成功（不影响发送）%@", audPath);
-    }
-    DDLog(@"发送语音 -> %@ 时长=%ums 文件=%@", usr, duration, installed ?: audPath);
+    DDLog(@"发送语音 -> %@ 时长=%ums 文件=%@", usr, duration, installed);
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
     DDLog(@"ResendVoiceMsg 已调用");
     return YES;
@@ -628,58 +540,35 @@ static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration
 
 // 对齐锤子 0x7908c8：接管语音消息的发送
 // 对齐锤子 0x790950：发送前若收藏语音数据尚未就绪，下载后注入 m_dtVoice（「发送时下载」）
-static BOOL dd_ensureFavVoiceData(id msg) {
-    if ([dd_voiceData(msg) length] > 0) return YES;
+// 下载必定成功：数据已就绪则跳过，未就绪则下载后注入 m_dtVoice（无失败分支）
+static void dd_ensureFavVoiceData(id msg) {
+    if ([dd_voiceData(msg) length] > 0) return;
     id favItem = objc_getAssociatedObject(msg, kDDFavSourceKey);
-    if (!favItem || ![favItem respondsToSelector:@selector(dataList)]) return NO;
     NSArray *list = [favItem dataList];
-    if (![list isKindOfClass:[NSArray class]] || [list count] == 0) return NO;
     id field = [list firstObject];
-    if (![field respondsToSelector:@selector(GetDataPath)]) return NO;
-    id p = [field GetDataPath];
-    if (![p isKindOfClass:[NSString class]]) return NO;
-    NSData *d = [NSData dataWithContentsOfFile:(NSString *)p
+    NSData *d = [NSData dataWithContentsOfFile:(NSString *)[field GetDataPath]
                                         options:NSDataReadingMappedIfSafe
                                           error:nil];
-    if ([d length] == 0) return NO;
-    return dd_injectVoiceData(msg, d);
+    dd_injectVoiceData(msg, d);
 }
 
 static BOOL dd_takeOverVoiceMsg(id msg, id contact) {
     if (!dd_isVoiceMsg(msg)) return NO;
-    if (!contact) return NO;
-    NSString *usr = nil;
-    if ([contact respondsToSelector:@selector(m_nsUsrName)]) {
-        id u = [(CBaseContact *)contact m_nsUsrName];
-        if ([u isKindOfClass:[NSString class]]) usr = (NSString *)u;
-    }
-    if ([usr length] == 0) { DDLog(@"拿不到目标联系人用户名"); return NO; }
+    NSString *usr = (NSString *)[(CBaseContact *)contact m_nsUsrName];
+    // 真实语音必然带时长（聊天语音 m_uiVoiceTime / 收藏 field.duration），不判空
     unsigned int duration = dd_voiceDuration(msg);
-    // 0x790950：时长为 0 不发送
-    if (duration == 0) {
-        DDLog(@"语音时长为 0，取消发送");
-        return NO;
-    }
     NSString *audPath = dd_audioPathForMsg(msg);
     if ([audPath length] == 0) {
-        // 数据缺失：发送时下载收藏语音，注入后再发送，避免首次点转发被下载闸门挡住选人器
+        // 收藏语音外壳：音频未就绪，下载后注入 m_dtVoice 再发送（下载必定成功，不做失败分支）
         id favItem = objc_getAssociatedObject(msg, kDDFavSourceKey);
-        if (favItem && [favItem respondsToSelector:@selector(dataList)]) {
-            DDLog(@"发送时语音数据缺失，现下载收藏语音再发送");
-            // 一次性 block（跑完即释放，不形成循环引用），强持有 msg 以保证 shell wrap 在下载期间不被释放
-            dd_downloadFavItemThen(favItem, ^{
-                if (dd_ensureFavVoiceData(msg)) {
-                    NSString *p = dd_audioPathForMsg(msg);
-                    if ([p length] > 0) dd_sendVoice(usr, p, duration);
-                    else DDLog(@"发送时下载后仍拿不到音频路径，取消发送");
-                } else {
-                    DDLog(@"发送时下载后仍未取到语音数据，取消发送");
-                }
-            });
-            return YES; // 已异步处理，勿走原实现
-        }
-        DDLog(@"拿不到语音文件，取消发送");
-        return NO;
+        DDLog(@"发送时语音数据缺失，现下载收藏语音再发送");
+        // 一次性 block（跑完即释放，不形成循环引用），强持有 msg 以保证 shell wrap 在下载期间不被释放
+        dd_downloadFavItemThen(favItem, ^{
+            dd_ensureFavVoiceData(msg);
+            NSString *p = dd_audioPathForMsg(msg);
+            dd_sendVoice(usr, p, duration);
+        });
+        return YES; // 已异步处理，勿走原实现
     }
     DDLog(@"准备接管发送 -> %@ 文件=%@", usr, audPath);
     return dd_sendVoice(usr, audPath, duration);
@@ -689,9 +578,7 @@ static BOOL dd_takeOverVoiceMsg(id msg, id contact) {
 static NSArray *dd_takeOverVoiceList(NSArray *src, id contact) {
     NSMutableArray *rest = [NSMutableArray array];
     for (id m in src) {
-        if ([m isKindOfClass:objc_getClass("CMessageWrap")] &&
-            [m respondsToSelector:@selector(m_uiMessageType)] &&
-            ((CMessageWrap *)m).m_uiMessageType == (unsigned int)kDDVoiceMsgType) {
+        if (dd_isVoiceMsg(m)) {
             dd_takeOverVoiceMsg(m, contact);
             continue;
         }
@@ -706,18 +593,11 @@ static NSArray *dd_takeOverVoiceList(NSArray *src, id contact) {
 // 「发送时下载」：文件未就绪时不读数据，只构造成"外壳"（含时长/localID，足以让选人器正常弹出），
 // 并把 FavoritesItem 绑到 wrap；真正的音频数据在发送接管处（dd_takeOverVoiceMsg）下载后注入 m_dtVoice。
 static id dd_msgWrapFromFavData(id favData, id favItem) {
-    if (!favData) return nil;
-    Class fieldCls = objc_getClass("FavoritesItemDataField");
-    if (!fieldCls || ![favData isKindOfClass:fieldCls]) return nil;
     FavoritesItemDataField *field = (FavoritesItemDataField *)favData;
-    if (![field respondsToSelector:@selector(GetDataPath)]) return nil;
 
     Class wrapCls = objc_getClass("CMessageWrap");
-    if (!wrapCls) return nil;
     id raw = [wrapCls alloc];
-    if (![raw respondsToSelector:@selector(initWithMsgType:)]) return nil;
     CMessageWrap *wrap = [raw initWithMsgType:kDDVoiceMsgType];
-    if (!wrap) { DDLog(@"构造待转发消息失败"); return nil; }
 
     // 0x790644 ~ 0x79065c
     NSString *me = dd_currentUsrName();
@@ -729,15 +609,14 @@ static id dd_msgWrapFromFavData(id favData, id favItem) {
 
     // 0x790688 ~ 0x79069c：时长直接用收藏数据里的 duration，不依赖文件是否下载
     unsigned int duration = field.duration;
-    if (duration == 0) { DDLog(@"收藏语音 duration 为 0，放弃"); return nil; }
-    if (!dd_configureVoiceMeta(wrap, duration)) { DDLog(@"配置语音元信息失败"); return nil; }
+    dd_configureVoiceMeta(wrap, duration);
 
     // 绑定来源，供发送时下载反查
     if (favItem) objc_setAssociatedObject(wrap, kDDFavSourceKey, favItem, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     // 文件已就绪则直接读数据；否则留到发送时下载
     id pathObj = [field GetDataPath];
-    if ([pathObj isKindOfClass:[NSString class]] && dd_fileExists((NSString *)pathObj)) {
+    if (dd_fileExists((NSString *)pathObj)) {
         DDLog(@"收藏语音路径 %@", pathObj);
         NSData *data = [NSData dataWithContentsOfFile:(NSString *)pathObj
                                               options:NSDataReadingMappedIfSafe
@@ -747,23 +626,17 @@ static id dd_msgWrapFromFavData(id favData, id favItem) {
             dd_injectVoiceData(wrap, data);
             return wrap;
         }
-        DDLog(@"收藏语音文件暂未就绪，留待发送时下载");
-    } else {
-        DDLog(@"收藏语音文件不存在，留待发送时下载");
     }
+    DDLog(@"收藏语音文件暂未就绪，留待发送时下载");
     return wrap;
 }
 
 // 对齐锤子 0x790484 ~ 0x7904e8：取 dataList 首项构造消息，append 进 m_messageWrapList
 static void dd_appendVoiceMsg(id favItem, id controller) {
     NSArray *list = ((FavoritesItem *)favItem).dataList;
-    if (![list isKindOfClass:[NSArray class]] || [list count] == 0) { DDLog(@"收藏项 dataList 为空"); return; }
+    if ([list count] == 0) { DDLog(@"收藏项 dataList 为空"); return; }
     DDLog(@"收藏语音 dataList 共 %lu 项", (unsigned long)[list count]);
     id wrap = dd_msgWrapFromFavData([list firstObject], favItem);
-    if (!wrap) {
-        DDLog(@"收藏语音没有可用数据");
-        return;
-    }
     Class ctrlCls = objc_getClass("FavForwardLogicController");
     if (ctrlCls && ![[controller class] isSubclassOfClass:ctrlCls]) { DDLog(@"控制器类型不符"); return; }
     Ivar iv = class_getInstanceVariable([controller class], "m_messageWrapList");
@@ -830,20 +703,20 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     %orig;
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 {
-    if (!ddForwardSendEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    if (!ddForwardSendEnabled()) { %orig; return; }
     DDLog(@"批量转发 %lu 条，开始逐条接管", (unsigned long)[(NSArray *)arg1 count]);
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 WithRevokeBatchId:(id)arg3 {
-    if (!ddForwardSendEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    if (!ddForwardSendEnabled()) { %orig; return; }
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2, arg3);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3 {
-    if (!ddForwardSendEnabled() || ![arg1 isKindOfClass:[NSArray class]]) { %orig; return; }
+    if (!ddForwardSendEnabled()) { %orig; return; }
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2, arg3);
@@ -892,7 +765,6 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     if (!ddVoiceMsgEnabled()) return original;
     // 原生转发项：BaseMessageCellView -forwardMenuItem 构造，动作 onForward:、目标即 cell 自身
     id item = [self forwardMenuItem];
-    if (item == nil) return original;
     NSMutableArray *items = [NSMutableArray arrayWithCapacity:[original count] + 1];
     [items addObjectsFromArray:original];
     [items insertObject:item atIndex:0];
@@ -1081,15 +953,11 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     @autoreleasepool {
         dd_logLine(@"插件载入 DD收藏语音转发 1.0.0");
         id mgr = objc_getClass("WCPluginsMgr");
-        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD收藏语音转发"
-                                                      version:@"1.0.0"
-                                                   controller:@"DDFavVoiceSettingsViewController"];
-            DDFavVoiceConfig *c = [DDFavVoiceConfig sharedConfig];
-            DDLog(@"设置入口注册成功，收藏语音转发=%@ 语音消息转发=%@",
-                  c.favEnabled ? @"开" : @"关", c.msgEnabled ? @"开" : @"关");
-        } else {
-            DDLog(@"WCPluginsMgr 缺失，设置入口未注册");
-        }
+        [[mgr sharedInstance] registerControllerWithTitle:@"DD收藏语音转发"
+                                                  version:@"1.0.0"
+                                               controller:@"DDFavVoiceSettingsViewController"];
+        DDFavVoiceConfig *c = [DDFavVoiceConfig sharedConfig];
+        DDLog(@"设置入口注册成功，收藏语音转发=%@ 语音消息转发=%@",
+              c.favEnabled ? @"开" : @"关", c.msgEnabled ? @"开" : @"关");
     }
 }
