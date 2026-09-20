@@ -271,12 +271,204 @@ static void dd_wait_download_finish(id item) {
 }
 // 发起下载，后台轮询完成后回主线程回调
 static void dd_download_fav_item_then(id item, void (^done)(void)) {
+    DDVHit(kEvFavWait);
+    DDVLog(@"收藏语音数据未就绪，等待下载完成");
     dd_start_download_fav_item(item);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         dd_wait_download_finish(item);
         dispatch_async(dispatch_get_main_queue(), done);
     });
 }
+
+#pragma mark - 日志
+
+// 证书注入的机器看不到系统日志，改为插件内落盘 + 设置界面「导出 / 清空」。
+// 埋点表预置初值 0：导出时计数仍为 0 的即「从未被调用」，可直接判定为冗余代码。
+#define kDDVLogMaxLines 2000
+#define kDDVLogHitStep  25          // 同一埋点每 25 次汇总一行，避免刷屏
+
+#define DDVHit(e)    [[DDVoiceLog shared] hit:(e)]
+#define DDVLog(...)  [[DDVoiceLog shared] log:__VA_ARGS__]
+
+static NSString * const kEvUploadSet      = @"①上传链 UploadVoiceWrap.setM_uiVoiceTime";
+static NSString * const kEvExtSet         = @"②存储   CExtendInfoOfVoiceMsg.setM_uiVoiceTime";
+static NSString * const kEvExtGet         = @"③读取   CExtendInfoOfVoiceMsg.m_uiVoiceTime";
+static NSString * const kEvGatePass       = @"闸门·通过(本人且语音)";
+static NSString * const kEvGateDenyMine   = @"闸门·拒绝(非本人或非语音)";
+static NSString * const kEvGateDenyNoRef  = @"闸门·拒绝(m_refMessageWrap为空)";
+static NSString * const kEvMsOverride     = @"换算·覆盖生效";
+static NSString * const kEvMsOff          = @"换算·不覆盖(开关关闭)";
+static NSString * const kEvMsEmpty        = @"换算·不覆盖(秒数为空或0)";
+static NSString * const kEvMsClamp        = @"换算·被B兜底裁剪(声明>真实)";
+static NSString * const kEvSendVoice      = @"发送·dd_send_voice";
+static NSString * const kEvFavWait        = @"发送·收藏等待下载";
+static NSString * const kEvFavCanFwd      = @"hook FavoritesItem.canBeForward";
+static NSString * const kEvFavCanFwdMsg   = @"hook FavoritesItem.canBeForwardWithMsg";
+static NSString * const kEvFavCanFwdMsg1  = @"hook FavoritesItem.canBeForwardWithMsg:";
+static NSString * const kEvConvertText    = @"hook ForwardMsgUtil.ConvertMsgToTextIfCannotSend";
+static NSString * const kEvFavAddMsg      = @"hook FavForwardLogicController.addMsgFromItem";
+static NSString * const kEvFwdMsg         = @"hook ForwardMessageLogicController.ForwardMsg";
+static NSString * const kEvFwdList        = @"hook ForwardMessageLogicController.ForwardMsgList";
+static NSString * const kEvFwdListBatch   = @"hook ForwardMessageLogicController.ForwardMsgList+RevokeBatchId";
+static NSString * const kEvFwdListScene   = @"hook ForwardMessageLogicController.ForwardMsgList+batchRevokeScene";
+static NSString * const kEvCellCanFwd     = @"hook BaseMessageCellView.canShowForwardMenuItem";
+static NSString * const kEvCellOnFwd      = @"hook BaseMessageCellView.onForward";
+static NSString * const kEvVoiceMenu      = @"hook VoiceMessageCellView.operationMenuItems";
+static NSString * const kEvVoiceCanPerf   = @"hook VoiceMessageCellView.canPerformAction";
+
+static NSArray<NSString *> *ddv_event_table(void) {
+    static NSArray<NSString *> *t = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        t = @[ kEvUploadSet, kEvExtSet, kEvExtGet,
+               kEvGatePass, kEvGateDenyMine, kEvGateDenyNoRef,
+               kEvMsOverride, kEvMsOff, kEvMsEmpty, kEvMsClamp,
+               kEvSendVoice, kEvFavWait,
+               kEvFavCanFwd, kEvFavCanFwdMsg, kEvFavCanFwdMsg1,
+               kEvConvertText, kEvFavAddMsg,
+               kEvFwdMsg, kEvFwdList, kEvFwdListBatch, kEvFwdListScene,
+               kEvCellCanFwd, kEvCellOnFwd, kEvVoiceMenu, kEvVoiceCanPerf ];
+    });
+    return t;
+}
+
+@interface DDVoiceLog : NSObject
++ (instancetype)shared;
+- (void)hit:(NSString *)event;                 // 计数埋点（首次 + 每 25 次各一行）
+- (void)log:(NSString *)fmt, ...;              // 明细（相邻相同内容自动合并 xN）
+- (NSString *)flush;                           // 落盘，返回文件路径
+- (void)clear;
+- (NSInteger)lineCount;
+- (NSString *)path;
+@end
+
+@implementation DDVoiceLog {
+    NSMutableArray<NSString *> *_lines;
+    NSMutableDictionary<NSString *, NSNumber *> *_counts;
+    NSString *_lastMsg;
+    NSString *_lastStamp;
+    NSInteger _lastRepeat;
+    NSString *_path;
+}
++ (instancetype)shared {
+    static DDVoiceLog *l = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ l = [DDVoiceLog new]; });
+    return l;
+}
+- (instancetype)init {
+    if (self = [super init]) {
+        _lines  = [NSMutableArray array];
+        _counts = [NSMutableDictionary dictionary];
+        for (NSString *e in ddv_event_table()) _counts[e] = @0;
+        NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if ([doc length] == 0) doc = NSTemporaryDirectory();
+        _path = [doc stringByAppendingPathComponent:@"DDVoiceLog.txt"];
+    }
+    return self;
+}
+- (NSString *)path { return _path; }
+- (NSInteger)lineCount { @synchronized (self) { return (NSInteger)[_lines count]; } }
+// 注意：getter 埋点会被后台线程（消息解析/落库）调用，共享状态必须加锁
+- (NSString *)stamp {
+    static NSDateFormatter *f = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ f = [NSDateFormatter new]; f.dateFormat = @"HH:mm:ss.SSS"; });
+    return [f stringFromDate:[NSDate date]];
+}
+// 相邻相同内容合并成 xN，避免高频 hook 把日志刷爆
+- (void)appendMsg:(NSString *)msg {
+    @synchronized (self) {
+        if (_lastMsg && [msg isEqualToString:_lastMsg]) {
+            _lastRepeat += 1;
+            [_lines removeLastObject];
+            [_lines addObject:[NSString stringWithFormat:@"%@ %@   (x%ld)", _lastStamp, msg, (long)_lastRepeat]];
+        } else {
+            _lastMsg = msg; _lastStamp = [self stamp]; _lastRepeat = 1;
+            [_lines addObject:[NSString stringWithFormat:@"%@ %@", _lastStamp, msg]];
+        }
+        NSUInteger over = 0;
+        if ([_lines count] > kDDVLogMaxLines) over = [_lines count] - kDDVLogMaxLines;
+        if (over > 0) [_lines removeObjectsInRange:NSMakeRange(0, over)];
+    }
+}
+- (void)log:(NSString *)fmt, ... {
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    [self appendMsg:msg];
+}
+- (void)hit:(NSString *)event {
+    NSInteger c;
+    @synchronized (self) {
+        c = [_counts[event] integerValue] + 1;
+        _counts[event] = @(c);
+    }
+    if (c == 1) [self appendMsg:[NSString stringWithFormat:@"[首次命中] %@", event]];
+    else if (c % kDDVLogHitStep == 0) [self appendMsg:[NSString stringWithFormat:@"[命中x%ld] %@", (long)c, event]];
+}
+- (void)clear {
+    @synchronized (self) {
+        [_lines removeAllObjects];
+        for (NSString *e in ddv_event_table()) _counts[e] = @0;
+        _lastMsg = nil; _lastRepeat = 0;
+        [[NSFileManager defaultManager] removeItemAtPath:_path error:nil];
+    }
+    [self log:@"日志已清空"];
+}
+- (NSString *)flush {
+    NSMutableString *s = [NSMutableString string];
+    @synchronized (self) {
+        [s appendString:@"DD语音助手 · 运行日志\n"];
+        [s appendFormat:@"导出时间: %@\n", [NSDate date]];
+        DDVoiceConfig *c = [DDVoiceConfig sharedConfig];
+        [s appendFormat:@"当前配置: 收藏语音转发=%@ / 语音消息转发=%@ / 自定义秒数=%@(%@)\n",
+        c.favEnabled ? @"开" : @"关",
+        c.msgEnabled ? @"开" : @"关",
+        c.voiceSecondsEnabled ? @"开" : @"关",
+        [c.voiceSeconds length] ? c.voiceSeconds : @"空"];
+        [s appendFormat:@"日志文件: %@\n", _path];
+
+        [s appendString:@"\n================ 一、埋点计数（0 = 从未被调用，可判定冗余）================\n"];
+        for (NSString *e in ddv_event_table()) {
+        [s appendFormat:@"%6ld  %@\n", (long)[_counts[e] integerValue], e];
+        }
+
+        [s appendString:@"\n================ 二、自动诊断 ================\n"];
+        long nUpload = [_counts[kEvUploadSet] integerValue];
+        long nExtSet = [_counts[kEvExtSet] integerValue];
+        long nExtGet = [_counts[kEvExtGet] integerValue];
+        long nPass   = [_counts[kEvGatePass] integerValue];
+        long nNoRef  = [_counts[kEvGateDenyNoRef] integerValue];
+        if (nUpload == 0 && nExtSet == 0 && nExtGet == 0) {
+        [s appendString:@"※ 三条写入/读取链全部未命中：本次操作未触发任何语音时长写入（需实际录一条语音并发送）。\n"];
+        } else {
+        if (nUpload == 0) [s appendString:@"※ UploadVoiceWrap 未命中：自己录音的上传链没走这个 hook，可考虑移除。\n"];
+        if (nExtSet == 0) [s appendString:@"※ CExtendInfoOfVoiceMsg.setM_uiVoiceTime 未命中：落库值不是从这里写入的。\n"];
+        if (nExtGet == 0) [s appendString:@"※ CExtendInfoOfVoiceMsg.m_uiVoiceTime 未命中：气泡显示不读这个存储（需改 hook 显示层 VoiceMessageViewModel）。\n"];
+        }
+        if (nNoRef > 0 && nPass == 0) {
+        [s appendString:@"※ 闸门全部因 m_refMessageWrap 为空被拒 → 把 Tweak.xm 里 kDDVoiceApplyWhenNoRef 改成 1。\n"];
+        }
+        NSMutableArray<NSString *> *dead = [NSMutableArray array];
+        for (NSString *e in ddv_event_table()) {
+        if ([_counts[e] integerValue] == 0) [dead addObject:e];
+        }
+        if ([dead count] > 0) {
+        [s appendFormat:@"※ 以下 %lu 个埋点计数为 0（若已充分操作过全部功能，对应代码即冗余）：\n", (unsigned long)[dead count]];
+        for (NSString *e in dead) [s appendFormat:@"     - %@\n", e];
+        } else {
+        [s appendString:@"※ 所有埋点均有命中，无冗余。\n"];
+        }
+
+        [s appendString:@"\n================ 三、明细（按时间）================\n"];
+        for (NSString *l in _lines) [s appendFormat:@"%@\n", l];
+
+        [s writeToFile:_path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    return _path;
+}
+@end
 
 #pragma mark - 语音扩展信息
 
@@ -322,16 +514,18 @@ static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int durati
 // 开关关闭 / 输入为空 / 输入为 0 → 原样返回（等价于不覆盖）
 static unsigned int dd_voiceTimeMs(unsigned int realMs) {
     DDVoiceConfig *c = [DDVoiceConfig sharedConfig];
-    if (!c.voiceSecondsEnabled) return realMs;
+    if (!c.voiceSecondsEnabled) { DDVHit(kEvMsOff); return realMs; }
     NSString *s = c.voiceSeconds;
-    if ([s length] == 0) return realMs;
+    if ([s length] == 0) { DDVHit(kEvMsEmpty); return realMs; }
     NSInteger sec = [s integerValue];
-    if (sec <= 0) return realMs;                    // 0（含旧配置残留）视为不覆盖
+    if (sec <= 0) { DDVHit(kEvMsEmpty); return realMs; }   // 0（含旧配置残留）视为不覆盖
     if (sec < 1)  sec = 1;
     if (sec > kDDVoiceMaxSeconds) sec = kDDVoiceMaxSeconds;
     unsigned int target = (unsigned int)sec * 1000; // ★ 秒 → 毫秒
     // B 兜底：声明时长不超过真实音频时长，避免接收方空播/进度条错位
-    if (realMs > 0 && target > realMs) return realMs;
+    if (realMs > 0 && target > realMs) { DDVHit(kEvMsClamp); return realMs; }
+    DDVHit(kEvMsOverride);
+    DDVLog(@"时长覆盖 %u ms → %u ms（设定 %ld s）", realMs, target, (long)sec);
     return target;
 }
 
@@ -401,6 +595,8 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     dd_configureVoiceMsg(wrap, d, duration);
     [sender addMessageToDB:wrap];
     dd_install_audio_file(wrap, audPath);
+    DDVHit(kEvSendVoice);
+    DDVLog(@"发送语音 → %@ 时长=%u ms 文件=%@", usr, duration, [audPath lastPathComponent]);
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
     return YES;
 }
@@ -506,14 +702,22 @@ static BOOL dd_voice_is_mine(id wrap) {
 // m_refMessageWrap 尚未绑定时是否仍覆盖：
 //   0 = 保守（默认）。只改已归属且来自自己的语音。
 //   1 = 激进。若自己录音时先写时长、后绑 wrap，导致本地气泡仍显示真实秒数，把这里改成 1。
+//   判定依据看导出日志里的「闸门·拒绝(m_refMessageWrap为空)」计数。
 #define kDDVoiceApplyWhenNoRef 0
-// 从语音扩展信息反查归属消息
-static BOOL dd_voice_ext_is_mine(id ext) {
+// 归属闸门（带埋点：区分「通过 / 非本人 / ref 为空」三种结果）
+static BOOL dd_voice_gate(id ext) {
     id wrap = [(CExtendInfoOfVoiceMsg *)ext m_refMessageWrap];
+    if (!wrap) {
+        DDVHit(kEvGateDenyNoRef);
 #if kDDVoiceApplyWhenNoRef
-    if (!wrap) return YES;
+        return YES;
+#else
+        return NO;
 #endif
-    return dd_voice_is_mine(wrap);
+    }
+    if (!dd_voice_is_mine(wrap)) { DDVHit(kEvGateDenyMine); return NO; }
+    DDVHit(kEvGatePass);
+    return YES;
 }
 
 // ① 上传链路：自己录音发送的必经点。
@@ -525,7 +729,10 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 //    该结构只在上传自己语音时创建，无需归属闸门。
 %hook UploadVoiceWrap
 - (void)setM_uiVoiceTime:(unsigned int)v {
-    %orig(dd_voiceTimeMs(v));
+    DDVHit(kEvUploadSet);
+    unsigned int out = dd_voiceTimeMs(v);
+    DDVLog(@"上传链 写入 %u → %u ms%@", v, out, out == v ? @"（未改动）" : @"");
+    %orig(out);
 }
 %end
 
@@ -536,11 +743,19 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 //    头文件证据：CExtendInfoOfVoiceMsg.h（m_uiVoiceTime 为 @synthesize，有真实 ivar）
 %hook CExtendInfoOfVoiceMsg
 - (void)setM_uiVoiceTime:(unsigned int)v {
-    %orig(dd_voice_ext_is_mine(self) ? dd_voiceTimeMs(v) : v);
+    DDVHit(kEvExtSet);
+    BOOL mine = dd_voice_gate(self);
+    unsigned int out = mine ? dd_voiceTimeMs(v) : v;
+    DDVLog(@"落库 写入 %u → %u ms（闸门=%@）", v, out, mine ? @"通过" : @"拒绝");
+    %orig(out);
 }
 - (unsigned int)m_uiVoiceTime {
+    DDVHit(kEvExtGet);
     unsigned int v = %orig;
-    return dd_voice_ext_is_mine(self) ? dd_voiceTimeMs(v) : v;
+    BOOL mine = dd_voice_gate(self);
+    unsigned int out = mine ? dd_voiceTimeMs(v) : v;
+    if (out != v) DDVLog(@"读取 %u → %u ms（闸门=通过）", v, out);
+    return out;
 }
 %end
 
@@ -548,14 +763,17 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 
 %hook FavoritesItem
 - (_Bool)canBeForward {
+    DDVHit(kEvFavCanFwd);
     if (dd_voice_fav_enabled() && self.type == kDDVoiceFavItemType) return YES;
     return %orig;
 }
 - (id)canBeForwardWithMsg {
+    DDVHit(kEvFavCanFwdMsg);
     if (dd_voice_fav_enabled() && self.type == kDDVoiceFavItemType) return nil;
     return %orig;
 }
 - (id)canBeForwardWithMsg:(_Bool)arg1 {
+    DDVHit(kEvFavCanFwdMsg1);
     if (dd_voice_fav_enabled() && self.type == kDDVoiceFavItemType) return nil;
     return %orig;
 }
@@ -565,6 +783,7 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 
 %hook ForwardMsgUtil
 + (id)ConvertMsgToTextIfCannotSend:(id)arg1 {
+    DDVHit(kEvConvertText);
     if (dd_voice_forward_enabled() && dd_voice_is_msg(arg1)) return nil;
     return %orig;
 }
@@ -574,6 +793,7 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 
 %hook FavForwardLogicController
 - (void)addMsgFromItem:(id)arg1 {
+    DDVHit(kEvFavAddMsg);
     if (dd_voice_fav_enabled() && dd_voice_is_fav_item(arg1)) {
         dd_append_voice_msg(arg1, self);
     }
@@ -585,6 +805,7 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 
 %hook ForwardMessageLogicController
 - (void)ForwardMsg:(id)arg1 ToContact:(id)arg2 {
+    DDVHit(kEvFwdMsg);
     if (dd_voice_is_msg(arg1)) {
         if (!dd_voice_forward_enabled()) { %orig; return; }
         dd_take_over_voice_msg(arg1, arg2);
@@ -593,18 +814,21 @@ static BOOL dd_voice_ext_is_mine(id ext) {
     %orig;
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 {
+    DDVHit(kEvFwdList);
     if (!dd_voice_forward_enabled()) { %orig; return; }
     NSArray *rest = dd_take_over_voice_list((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 WithRevokeBatchId:(id)arg3 {
+    DDVHit(kEvFwdListBatch);
     if (!dd_voice_forward_enabled()) { %orig; return; }
     NSArray *rest = dd_take_over_voice_list((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2, arg3);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3 {
+    DDVHit(kEvFwdListScene);
     if (!dd_voice_forward_enabled()) { %orig; return; }
     NSArray *rest = dd_take_over_voice_list((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
@@ -616,12 +840,14 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 
 %hook BaseMessageCellView
 - (BOOL)canShowForwardMenuItem {
+    DDVHit(kEvCellCanFwd);
     if (dd_voice_msg_enabled() && [self isKindOfClass:objc_getClass("VoiceMessageCellView")]) {
         return YES;
     }
     return %orig;
 }
 - (void)onForward:(id)arg1 {
+    DDVHit(kEvCellOnFwd);
     if (dd_voice_msg_enabled() && [self isKindOfClass:objc_getClass("VoiceMessageCellView")]) {
         [self doForward];
         return;
@@ -632,6 +858,7 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 
 %hook VoiceMessageCellView
 - (NSArray *)operationMenuItems {
+    DDVHit(kEvVoiceMenu);
     NSArray *original = %orig;
     if (!dd_voice_msg_enabled()) return original;
     id item = [self forwardMenuItem];
@@ -641,6 +868,7 @@ static BOOL dd_voice_ext_is_mine(id ext) {
     return items;
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    DDVHit(kEvVoiceCanPerf);
     if (action == @selector(onForward:) && dd_voice_msg_enabled()) {
         return YES;
     }
@@ -653,6 +881,9 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 @interface DDVoiceSettingsViewController : UIViewController <UITableViewDelegate, UITextFieldDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @property (nonatomic, strong) UITextField *secondsField;
+- (void)onExportLog:(id)sender;
+- (void)onClearLog:(id)sender;
+- (void)dd_alert:(NSString *)title msg:(NSString *)msg;
 @end
 
 @implementation DDVoiceSettingsViewController {
@@ -713,6 +944,13 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 
     [sec addCell:[cellMgr switchCellForSel:@selector(onFavSwitch:) target:self title:@"收藏语音转发" on:cfg.favEnabled]];
     [sec addCell:[cellMgr switchCellForSel:@selector(onMsgSwitch:) target:self title:@"语音消息转发" on:cfg.msgEnabled]];
+
+    // 日志（证书注入看不到系统日志，用导出文件代替）
+    NSInteger n = [[DDVoiceLog shared] lineCount];
+    [sec addCell:[cellMgr normalCellForSel:@selector(onExportLog:) target:self
+                                     title:[NSString stringWithFormat:@"导出日志（%ld 行）", (long)n]
+                                 rightView:nil]];
+    [sec addCell:[cellMgr normalCellForSel:@selector(onClearLog:) target:self title:@"清空日志" rightView:nil]];
     [_tableViewManager addSection:sec];
     [_tableViewManager reloadTableView];
 }
@@ -729,11 +967,45 @@ static BOOL dd_voice_ext_is_mine(id ext) {
         return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
     return UITableViewAutomaticDimension;
 }
-- (void)onFavSwitch:(UISwitch *)s { [DDVoiceConfig sharedConfig].favEnabled = s.on; }
-- (void)onMsgSwitch:(UISwitch *)s { [DDVoiceConfig sharedConfig].msgEnabled = s.on; }
+- (void)onFavSwitch:(UISwitch *)s {
+    [DDVoiceConfig sharedConfig].favEnabled = s.on;
+    DDVLog(@"配置 收藏语音转发 → %@", s.on ? @"开" : @"关");
+}
+- (void)onMsgSwitch:(UISwitch *)s {
+    [DDVoiceConfig sharedConfig].msgEnabled = s.on;
+    DDVLog(@"配置 语音消息转发 → %@", s.on ? @"开" : @"关");
+}
+// 导出日志：落盘后用系统分享面板发出（可存「文件」App / 发给自己 / 备忘录）
+- (void)onExportLog:(id)sender {
+    NSString *path = [[DDVoiceLog shared] flush];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [self dd_alert:@"导出失败" msg:path];
+        return;
+    }
+    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+                                                                     applicationActivities:nil];
+    av.popoverPresentationController.sourceView = self.view;
+    av.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
+                                                             CGRectGetMidY(self.view.bounds), 1, 1);
+    [self presentViewController:av animated:YES completion:nil];
+}
+// 清空日志
+- (void)onClearLog:(id)sender {
+    [[DDVoiceLog shared] clear];
+    [self buildTable];
+    [self dd_alert:@"已清空" msg:[[DDVoiceLog shared] path]];
+}
+- (void)dd_alert:(NSString *)title msg:(NSString *)msg {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                                                                message:msg
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
 // 设置语音秒数：开关切换即重建表格（开启则展开输入框）
 - (void)onSecondsSwitch:(UISwitch *)s {
     [DDVoiceConfig sharedConfig].voiceSecondsEnabled = s.isOn;
+    DDVLog(@"配置 自定义语音秒数 → %@", s.isOn ? @"开" : @"关");
     [self buildTable];
 }
 // 输入即自动生效（空字符串视为不覆盖，等价于关闭）
@@ -743,6 +1015,7 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 // 确认：收起键盘并确认当前输入
 - (void)onSecondsConfirmed:(id)sender {
     [DDVoiceConfig sharedConfig].voiceSeconds = self.secondsField.text;
+    DDVLog(@"配置 自定义秒数 = %@", [self.secondsField.text length] ? self.secondsField.text : @"空(不覆盖)");
     [self.secondsField resignFirstResponder];
 }
 // 限制：仅允许数字、且不超过微信语音上限（60 秒）；空串保留（表示不覆盖/关闭）
@@ -792,6 +1065,7 @@ static BOOL dd_voice_ext_is_mine(id ext) {
 
 %ctor {
     @autoreleasepool {
+        DDVLog(@"插件载入（kDDVoiceApplyWhenNoRef=%d）", kDDVoiceApplyWhenNoRef);
         id mgr = objc_getClass("WCPluginsMgr");
         [[mgr sharedInstance] registerControllerWithTitle:@"DD语音助手"
                                                   version:@"1.0.0"
