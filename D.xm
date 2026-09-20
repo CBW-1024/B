@@ -82,7 +82,7 @@
 - (_Bool)deleteMessageFromDB:(id)arg1;
 - (_Bool)addMessageToDB:(id)arg1;
 - (id)getAudioFileName:(id)arg1 LocalID:(unsigned int)arg2;
-- (BOOL)prepareSend:(id);
+- (BOOL)prepareSend:(id)arg1;
 @end
 
 @interface MMNewSessionMgr : NSObject
