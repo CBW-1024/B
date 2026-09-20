@@ -5,7 +5,7 @@
 #import <substrate.h>
 
 /* ============================================================================
- * DD收藏语音转发 1.0.0
+ * DD语音转发 1.0.0
  * 全部逻辑逐条对齐锤子二进制反汇编结果，每条源码都标注了证据地址。
  * ==========================================================================*/
 
@@ -40,6 +40,14 @@
 @interface MMUIViewController : UIViewController
 - (void)startLoadingWithText:(id)arg1;
 - (void)stopLoading;
+@end
+
+// YTProgressHUD.h（微信对 MBProgressHUD 的封装，全局加载 HUD）
+@interface YTProgressHUD : NSObject
++ (id)showHUDAddedTo:(id)arg1 animated:(_Bool)arg2;
++ (unsigned long long)hideAllHUDsForView:(id)arg1 animated:(_Bool)arg2;
+- (void)setLabelText:(id)arg1;
+- (void)setRemoveFromSuperViewOnHide:(_Bool)arg1;
 @end
 
 // FavoritesItemDataField.h:192 duration / :245 GetDataPath
@@ -182,8 +190,8 @@ static const unsigned int kDDVoiceFormat = 4;
 static const unsigned int kDDVoiceEndFlag = 1;
 // 0x75a018 setM_uiStatus: mov w2,#1
 static const unsigned int kDDMsgStatusSending = 1;
-// 0x7901b4 轮询上限 0xf0 次；0x7901d0 每次 sleepForTimeInterval: 0.25
-static const int kDDDownloadWaitMax = 240;
+// 0x7901b4 起下载；0x7901d0 每次 sleepForTimeInterval: 0.25
+// 不设轮询上限：needDownLoad 变 false（下载真正完成）才返回，HUD 随之停止
 static const NSTimeInterval kDDDownloadWaitStep = 0.25;
 // 0x7906a4 ~ 0x7906bc : localID = X + 0x2710(10000)，X 由外部函数生成于 [0, 0x15f90) 区间
 static const unsigned int kDDVoiceLocalIDBase = 10000;
@@ -368,11 +376,9 @@ static void dd_startDownloadFavItem(id item) {
     [mgr startDownloadFavoritesItem:item IsPriority:YES];
 }
 
-// 对齐锤子 0x7901b4 ~ 0x7901dc：轮询 needDownLoad，最多 240 次，每次 0.25s
+// 轮询 needDownLoad 直到变 false（下载真正完成）才返回，每次 0.25s；不设上限
 static void dd_waitDownloadFinish(id item) {
-    int remain = kDDDownloadWaitMax;
-    while (remain-- > 0) {
-        if (!((FavoritesItem *)item).needDownLoad) break;
+    while (((FavoritesItem *)item).needDownLoad) {
         [NSThread sleepForTimeInterval:kDDDownloadWaitStep];
     }
 }
@@ -906,7 +912,7 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD收藏语音转发";
+    self.title = @"DD语音转发";
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
     appearance.shadowColor = nil;
@@ -978,9 +984,9 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 #pragma mark - 插件注册
 %ctor {
     @autoreleasepool {
-        dd_logLine(@"插件载入 DD收藏语音转发 1.0.0");
+        dd_logLine(@"插件载入 DD语音转发 1.0.0");
         id mgr = objc_getClass("WCPluginsMgr");
-        [[mgr sharedInstance] registerControllerWithTitle:@"DD收藏语音转发"
+        [[mgr sharedInstance] registerControllerWithTitle:@"DD语音转发"
                                                   version:@"1.0.0"
                                                controller:@"DDFavVoiceSettingsViewController"];
         DDFavVoiceConfig *c = [DDFavVoiceConfig sharedConfig];
