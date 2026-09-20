@@ -162,10 +162,6 @@
 #define kDDVoiceEnableMsg @"kDDVoiceEnableMsg"
 #define kDDVoiceSecondsEnabled @"kDDVoiceSecondsEnabled"
 #define kDDVoiceSeconds @"kDDVoiceSeconds"
-// 「自定义秒数」最近一次被打开的时刻（Unix 秒）。
-// 它就是新旧消息的分界线：只改这个时刻之后创建的语音消息。
-// 开关打开之前发出去的历史语音，创建时间更早，天然不满足 —— 不需要任何名单/记账。
-#define kDDVoiceSecondsSince @"kDDVoiceSecondsSince"
 
 // 微信语音最大时长（秒）：录制系统硬上限。
 // 头文件证据：MMTapRecordButton.maxSeconds、TingAudioRecordConfiguration.maxTimeInSecond、
@@ -189,7 +185,6 @@ static const void *kDDVoiceFavSourceKey = &kDDVoiceFavSourceKey;
 @property (assign, nonatomic) BOOL msgEnabled;  // 语音消息转发
 @property (assign, nonatomic) BOOL voiceSecondsEnabled;  // 设置语音秒数
 @property (copy, nonatomic) NSString *voiceSeconds;      // 自定义秒数（数字文本，空=不覆盖）
-@property (assign, nonatomic) unsigned int voiceSecondsSince;  // 开关最近一次打开的时刻
 @end
 
 @implementation DDVoiceConfig
@@ -206,7 +201,6 @@ static const void *kDDVoiceFavSourceKey = &kDDVoiceFavSourceKey;
         kDDVoiceEnableMsg: @NO,
         kDDVoiceSecondsEnabled: @NO,
         kDDVoiceSeconds: @"",
-        kDDVoiceSecondsSince: @0,
     }];
 }
 - (instancetype)init {
@@ -215,7 +209,6 @@ static const void *kDDVoiceFavSourceKey = &kDDVoiceFavSourceKey;
     _msgEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceEnableMsg];
     _voiceSecondsEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceSecondsEnabled];
     _voiceSeconds = [[NSUserDefaults.standardUserDefaults stringForKey:kDDVoiceSeconds] copy] ?: @"";
-    _voiceSecondsSince = (unsigned int)[[NSUserDefaults.standardUserDefaults objectForKey:kDDVoiceSecondsSince] unsignedIntValue];
     }
     return self;
 }
@@ -229,14 +222,7 @@ static const void *kDDVoiceFavSourceKey = &kDDVoiceFavSourceKey;
 }
 - (void)setVoiceSecondsEnabled:(BOOL)v {
     _voiceSecondsEnabled = v;
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    [d setBool:v forKey:kDDVoiceSecondsEnabled];
-    if (v) {                                    // 打开开关 = 划下分界线
-        unsigned int now = (unsigned int)time(NULL);
-        _voiceSecondsSince = now;
-        [d setObject:@(now) forKey:kDDVoiceSecondsSince];
-        [d synchronize];
-    }
+    [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVoiceSecondsEnabled];
 }
 - (void)setVoiceSeconds:(NSString *)v {
     _voiceSeconds = [v copy];
@@ -263,18 +249,7 @@ static BOOL dd_voice_forward_enabled(void) {
 #define DDVLog(...)  [[DDVoiceLog shared] log:__VA_ARGS__]
 
 static NSString * const kEvUploadSet      = @"①上传链 UploadVoiceWrap.setM_uiVoiceTime";
-static NSString * const kEvExtSet         = @"②本地存储 CExtendInfoOfVoiceMsg.setM_uiVoiceTime";
-static NSString * const kEvExtGet         = @"③本地读取 CExtendInfoOfVoiceMsg.m_uiVoiceTime";
-static NSString * const kEvGatePass       = @"闸门·通过(本次发送的本人语音)";
-static NSString * const kEvGateDenyMine   = @"闸门·拒绝(非本人或非语音)";
-static NSString * const kEvGateDenyNoRef  = @"闸门·拒绝(m_refMessageWrap为空)";
-static NSString * const kEvGateDenyHistory  = @"闸门·拒绝(开关打开前发的历史语音)";
-static NSString * const kEvAudioAddDB     = @"AudioSender.addMessageToDB(入库)";
-static NSString * const kEvAudioUpdDB     = @"AudioSender.updateMessageToDB";
-static NSString * const kEvAudioUploader  = @"AudioSender.uploaderForMsgWrap";
-static NSString * const kEvAudioResend    = @"AudioSender.ResendVoiceMsg";
-static NSString * const kEvGateCtimeZero  = @"闸门·放行(正在发送,创建时间尚未填)";
-static NSString * const kEvGateDenyNeverOn  = @"闸门·拒绝(开关从未打开过)";
+static NSString * const kEvAudioUpdDB     = @"AudioSender.updateMessageToDB(回填本地库)";
 static NSString * const kEvMsOverride     = @"换算·覆盖生效";
 static NSString * const kEvMsOff          = @"换算·不覆盖(开关关闭)";
 static NSString * const kEvMsEmpty        = @"换算·不覆盖(秒数为空或0)";
@@ -299,11 +274,8 @@ static NSArray<NSString *> *ddv_event_table(void) {
     static NSArray<NSString *> *t = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        t = @[ kEvUploadSet, kEvExtSet, kEvExtGet,
-               kEvGatePass, kEvGateDenyMine, kEvGateDenyNoRef, kEvGateCtimeZero,
-               kEvGateDenyHistory, kEvGateDenyNeverOn,
+        t = @[ kEvUploadSet, kEvAudioUpdDB,
                kEvMsOverride, kEvMsOff, kEvMsEmpty, kEvMsClamp,
-               kEvAudioAddDB, kEvAudioUpdDB, kEvAudioUploader, kEvAudioResend,
                kEvSendVoice, kEvFavWait,
                kEvFavCanFwd, kEvFavCanFwdMsg, kEvFavCanFwdMsg1,
                kEvConvertText, kEvFavAddMsg,
@@ -408,14 +380,6 @@ static NSArray<NSString *> *ddv_event_table(void) {
         c.msgEnabled ? @"开" : @"关",
         c.voiceSecondsEnabled ? @"开" : @"关",
         [c.voiceSeconds length] ? c.voiceSeconds : @"空"];
-        if (c.voiceSecondsSince > 0) {
-            NSDate *d = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)c.voiceSecondsSince];
-            NSDateFormatter *fm = [[NSDateFormatter alloc] init];
-            [fm setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
-            [s appendFormat:@"分界线: %@（此后创建的语音才改写；此前的一律保留真实秒数）\n", [fm stringFromDate:d]];
-        } else {
-            [s appendString:@"分界线: 未设置（开关从未打开过 → 任何本地改写都不会发生）\n"];
-        }
         [s appendFormat:@"日志文件: %@\n", _path];
 
         [s appendString:@"\n================ 一、埋点计数（0 = 从未被调用，可判定冗余）================\n"];
@@ -425,45 +389,22 @@ static NSArray<NSString *> *ddv_event_table(void) {
 
         [s appendString:@"\n================ 二、自动诊断 ================\n"];
         long nUpload = [_counts[kEvUploadSet] integerValue];
-        long nExtSet = [_counts[kEvExtSet] integerValue];
-        long nExtGet = [_counts[kEvExtGet] integerValue];
-        long nPass   = [_counts[kEvGatePass] integerValue];
-        long nNoRef  = [_counts[kEvGateDenyNoRef] integerValue];
-        long nNeverOn= [_counts[kEvGateDenyNeverOn] integerValue];
-        long nDenyHs = [_counts[kEvGateDenyHistory] integerValue];
+        long nUpdDB  = [_counts[kEvAudioUpdDB] integerValue];
         long nOverride = [_counts[kEvMsOverride] integerValue];
         long nClamp    = [_counts[kEvMsClamp] integerValue];
-        if (nUpload == 0 && nExtSet == 0 && nExtGet == 0) {
-        [s appendString:@"※ 三条链全部未命中：本次没发出也没加载任何语音。\n"];
+        if (nUpload == 0) {
+        [s appendString:@"※ UploadVoiceWrap 未命中：本次没录也没发语音，或上传链没走这个 hook。\n"];
         } else {
-        if (nUpload == 0) [s appendString:@"※ UploadVoiceWrap 未命中：自己录音的上传链没走这个 hook。\n"];
-        if (nExtSet == 0) [s appendString:@"※ CExtendInfoOfVoiceMsg.setM_uiVoiceTime 未命中：落库值不是从这里写入的。\n"];
-        if (nExtGet == 0) [s appendString:@"※ CExtendInfoOfVoiceMsg.m_uiVoiceTime 未命中：气泡不读这个存储（需改 hook VoiceMessageViewModel）。\n"];
+        [s appendFormat:@"※ 上传链命中 %ld 次：这是唯一决定「对面看到的秒数」的点。\n", nUpload];
+        }
+        if (nUpdDB == 0) {
+        [s appendString:@"※ updateMessageToDB 未命中：无法确认服务器回填，本地是否同步显示自定义请直接看气泡。\n"];
+        } else {
+        [s appendFormat:@"※ updateMessageToDB 命中 %ld 次：明细里最后一次写入该语音的值若 = 自定义秒数，\n"
+                         "  说明服务端已把自定义时长回填进本地库 → 本地气泡自动也是自定义，无需改本地存储。\n", nUpdDB];
         }
         if (nOverride == 0 && nUpload > 0) {
         [s appendString:@"※ 换算一次都没生效：检查开关是否开启、秒数是否为空/0。\n"];
-        }
-        if (nNoRef > 0 && nPass == 0) {
-        [s appendString:@"※ 闸门全部因 m_refMessageWrap 为空被拒 → 把 kDDVoiceApplyWhenNoRef 改成 1。\n"];
-        }
-        long nAudioAddDB = [_counts[kEvAudioAddDB] integerValue];
-        long nAudioResend = [_counts[kEvAudioResend] integerValue];
-        if (nAudioAddDB > 0) {
-        [s appendFormat:@"※ addMessageToDB 命中 %ld 次 —— 它就是「本次发送」的自然入库点：\n"
-                         "  在这里改一次即可让本地气泡显示自定义，且永远碰不到历史消息，\n"
-                         "  从而可以删掉 CExtendInfoOfVoiceMsg 两条 hook + 全部闸门/分界线代码。\n", nAudioAddDB];
-        } else {
-        [s appendString:@"※ addMessageToDB 一次都没命中：本次没录过音/发过语音，或入库走了别的点（继续看下面三条）。\n"];
-        }
-        if (nAudioResend > 0) {
-        [s appendFormat:@"※ ResendVoiceMsg 命中 %ld 次 —— 收藏语音转发走的就是这条重发通道。\n", nAudioResend];
-        }
-        if (nNeverOn > 0) {
-        [s appendString:@"※ 闸门全部因「开关从未打开过」被拒：voiceSecondsSince = 0。\n"
-                         "  正常路径是打开一次自定义秒数开关后才会写入分界线，若这里非 0 说明 NSUserDefaults 未持久化。\n"];
-        }
-        if (nDenyHs > 0) {
-        [s appendFormat:@"※ 历史消息拦截 %ld 次 —— 这些「开关打开之前发的语音」已被正确放过（保持真实秒数）。\n", nDenyHs];
         }
         if (nClamp > 0) {
         [s appendString:@"※ 有若干次被「B 兜底」拦下：设定秒数 > 真实录音时长。\n"
@@ -753,64 +694,18 @@ static void dd_append_voice_msg(id favItem, id controller) {
 
 #pragma mark - 自定义语音秒数（单位：毫秒）
 
-// 归属判定：必须是「语音」且「来自自己」（收到的语音不动）。
-// 头文件证据（4 份 dump 均一致）：
-//   CExtendInfoOfVoiceMsg.h —— @property(nonatomic, weak) CMessageWrap *m_refMessageWrap; // @synthesize
-//   CMessageWrap.h          —— m_uiMessageType / m_nsFromUsr
-// 逆向证据：WCRefine 0x8f8484 / 0x8f82f8 —— m_uiMessageType == 0x22(34) 且 m_nsFromUsr == 当前登录用户
-//           （注意它用的是 m_nsFromUsr，不是 +isSenderFromMsgWrap:）
-static BOOL dd_voice_is_mine(id wrap) {
-    if (!wrap) return NO;                                                   // 无归属：保守不动
-    if (!dd_voice_is_msg(wrap)) return NO;
-    NSString *me = dd_current_usr_name();
-    if ([me length] == 0) return NO;
-    return [((CMessageWrap *)wrap).m_nsFromUsr isEqualToString:me];
-}
-// m_refMessageWrap 尚未绑定时是否仍覆盖：
-//   0 = 保守（默认）。日志实测「闸门·拒绝(m_refMessageWrap为空)」= 0，说明微信先绑 ref 再写时长，保持 0。
-//   1 = 激进。仅在个别版本出现本地气泡不改时才需要。
-#define kDDVoiceApplyWhenNoRef 0
 
-// 新旧分界：只改「开关打开之后才创建」的语音。
-//   - 历史语音：m_uiCreateTime 早于开关打开时刻 → 不动（这就是「开启前发的保持真实」）
-//   - 自己刚发的：m_uiCreateTime 晚于开关打开时刻 → 本地气泡和对方看到的都是自定义值
-// 不维护任何名单、不依赖 localID，只看消息自带的创建时间。
-static BOOL dd_voice_is_after_enable(id wrap) {
-    unsigned int since = [DDVoiceConfig sharedConfig].voiceSecondsSince;
-    if (since == 0) { DDVHit(kEvGateDenyNeverOn); return NO; }   // 开关从未打开过
-    unsigned int ct = ((CMessageWrap *)wrap).m_uiCreateTime;
-    if (ct == 0) {
-        // 创建时间尚未填 = 这条消息正在被构造/发送（此刻必然晚于开关打开时刻），放行。
-        // 从数据库反序列化出来的历史语音一定有创建时间，不会被这条误伤。
-        DDVHit(kEvGateCtimeZero);
-        return YES;
-    }
-    return ct >= since;
-}
-// 闸门：本地改动是否被允许（对方那份由 UploadVoiceWrap 单独改，与这里无关）
-static BOOL dd_voice_gate(id ext) {
-    id wrap = [(CExtendInfoOfVoiceMsg *)ext m_refMessageWrap];
-    if (!wrap) {
-        DDVHit(kEvGateDenyNoRef);
-#if kDDVoiceApplyWhenNoRef
-        return YES;
-#else
-        return NO;
-#endif
-    }
-    if (!dd_voice_is_mine(wrap)) { DDVHit(kEvGateDenyMine); return NO; }
-    if (dd_voice_is_after_enable(wrap)) { DDVHit(kEvGatePass); return YES; }
-    DDVHit(kEvGateDenyHistory);
-    return NO;
-}
-
-// ① 上传链路：发给对方的那份时长。
+// ★ 唯一落点：改这里一份 PB，对面和本地都会变成自定义秒数。
 //    链路：AudioSender -OnRecorderPart:Offset:Len:EndFlag:ForceDelete:Duration:
-//       → MMNewUploadVoiceMgr -AddNewPart:... VoiceTime:...
-//       → UploadVoiceWrap -setM_uiVoiceTime:   ← 上传前的最后一次写入
+//       → UploadVoiceCDNMgr / MMNewUploadVoiceMgr -AddNewPart:... VoiceTime:...
+//       → UploadVoiceWrap -setM_uiVoiceTime:   ← 上行前的最后一次写入
 //    头文件证据：UploadVoiceWrap.h（4 份 dump 均有 m_uiVoiceTime / setM_uiVoiceTime:）
-//              、MMNewUploadVoiceMgr.h、BaseUploadVoiceMgr.h
-//    该结构只在上传自己语音时创建，无需归属闸门 —— 这里就是「对方看到的那份」。
+//              UploadVoiceCDNMgr.h:15、MMNewUploadVoiceMgr.h、BaseUploadVoiceMgr.h
+//              三者 AddNewPart 签名完全一致 → 时长不可能从别的口子进来
+//    日志实锤（本次导出）：录音 4.6s 上传完全过程里该 setter 被调用 40 次，
+//    最后一次把 4600 → 1000；随后 AudioSender -updateMessageToDB: 用同一个 localID=9
+//    把本地库里的 4600 覆写成 1000 —— 服务端按上行 PB 合成后回填，本地也就跟着是自定义的。
+//    ⇒ 因此不再 hook 任何本地存储类，历史语音也就不可能被误改。
 %hook UploadVoiceWrap
 - (void)setM_uiVoiceTime:(unsigned int)v {
     DDVHit(kEvUploadSet);
@@ -820,70 +715,18 @@ static BOOL dd_voice_gate(id ext) {
 }
 %end
 
-// ④ 纯诊断（不改任何值）：搞清「本地这条语音到底从哪个点入库」以及「上传器从哪拿时长」。
-//    AudioSender 头文件证据（四份 dump 一致）：
-//      wechat_dump/AudioSender.h:13,27,39,52 / wechat76:33,66,75 / wcd76_new:56,57,66,99 / wechat_new:59,60,69,102
-//    addMessageToDB 是「本次发送」唯一天然的入库点 —— 若它命中，本地就用不着再 hook 通用存储类。
+// ④ 纯诊断（不改值）：观察服务端把上传结果回填进本地库的最后一步。
+//    AudioSender -updateMessageToDB: 头文件证据：wechat_dump/AudioSender.h:27、
+//    wechat76:75、wcd76_new:57、wechat_new:60
+//    上一版日志已证实：同一个 localID 会先写真实值（4600），上传成功后改写回自定义值（1000）→
+//    即「对面看到的」和「本地显示的」都由 ① 的 UploadVoiceWrap 决定，本地无需任何 hook。
 %hook AudioSender
-- (BOOL)addMessageToDB:(id)wrap {
-    DDVHit(kEvAudioAddDB);
-    if (dd_voice_is_msg(wrap)) {
-        CMessageWrap *w = (CMessageWrap *)wrap;
-        DDVLog(@"addMessageToDB 语音 createTime=%u voiceTime=%u localID=%u (%@)",
-               w.m_uiCreateTime, w.m_uiVoiceTime, w.m_uiMesLocalID,
-               dd_voice_is_mine(w) ? @"本人" : @"他人");
-    }
-    return %orig;
-}
 - (BOOL)updateMessageToDB:(id)wrap {
     DDVHit(kEvAudioUpdDB);
     if (dd_voice_is_msg(wrap))
-        DDVLog(@"updateMessageToDB 语音 voiceTime=%u localID=%u",
-               ((CMessageWrap *)wrap).m_uiVoiceTime, ((CMessageWrap *)wrap).m_uiMesLocalID);
+        DDVLog(@"回填本地库 localID=%u voiceTime=%u",
+               ((CMessageWrap *)wrap).m_uiMesLocalID, ((CMessageWrap *)wrap).m_uiVoiceTime);
     return %orig;
-}
-- (id)uploaderForMsgWrap:(id)wrap {
-    DDVHit(kEvAudioUploader);
-    id u = %orig;
-    DDVLog(@"uploaderForMsgWrap 语音=%@ voiceTime=%u → 上传器=%@",
-           dd_voice_is_msg(wrap) ? @"是" : @"否",
-           dd_voice_is_msg(wrap) ? ((CMessageWrap *)wrap).m_uiVoiceTime : 0u,
-           u ? NSStringFromClass([u class]) : @"nil");
-    return u;
-}
-- (void)ResendVoiceMsg:(id)usr MsgWrap:(id)wrap {
-    DDVHit(kEvAudioResend);
-    DDVLog(@"ResendVoiceMsg →%@ 语音=%@ voiceTime=%u", usr,
-           dd_voice_is_msg(wrap) ? @"是" : @"否",
-           dd_voice_is_msg(wrap) ? ((CMessageWrap *)wrap).m_uiVoiceTime : 0u);
-    %orig;
-}
-%end
-
-// ② 本地存储 / 气泡显示：CExtendInfoOfVoiceMsg 才是真正存储者。
-//    CMessageWrap.m_uiVoiceTime 是 @dynamic（wechat76_dump/CMessageWrap.h:1069），
-//    运行时才挂载 IMP，直接 %hook 有 %orig 为空的风险，故 hook 真实存储类；
-//    被 @dynamic 转发后同样会走到这里，一处覆盖即可同时改「落库值」和「气泡显示」。
-//    ★ 必须过 dd_voice_gate，否则会把所有历史语音一起改写（不可逆）。
-%hook CExtendInfoOfVoiceMsg
-- (void)setM_uiVoiceTime:(unsigned int)v {
-    DDVHit(kEvExtSet);
-    BOOL mine = dd_voice_gate(self);
-    unsigned int out = mine ? dd_voiceTimeMs(v) : v;
-    if (mine && out != v) {
-        CMessageWrap *w = [self m_refMessageWrap];
-        DDVLog(@"落库写入 %u → %u ms（本地也显示自定义；createTime=%u 分界线=%u）",
-               v, out, w ? w.m_uiCreateTime : 0u, [DDVoiceConfig sharedConfig].voiceSecondsSince);
-    }
-    %orig(out);
-}
-- (unsigned int)m_uiVoiceTime {
-    DDVHit(kEvExtGet);
-    unsigned int v = %orig;
-    BOOL mine = dd_voice_gate(self);
-    unsigned int out = mine ? dd_voiceTimeMs(v) : v;
-    if (out != v) DDVLog(@"读取覆盖 %u → %u ms（气泡显示自定义）", v, out);
-    return out;
 }
 %end
 
@@ -1012,7 +855,6 @@ static BOOL dd_voice_gate(id ext) {
 @property (nonatomic, strong) UITextField *secondsField;
 - (void)onExportLog:(id)sender;
 - (void)onClearLog:(id)sender;
-- (void)onResetBoundary:(id)sender;
 - (void)dd_alert:(NSString *)title msg:(NSString *)msg;
 @end
 
@@ -1075,18 +917,6 @@ static BOOL dd_voice_gate(id ext) {
     [sec addCell:[cellMgr switchCellForSel:@selector(onFavSwitch:) target:self title:@"收藏语音转发" on:cfg.favEnabled]];
     [sec addCell:[cellMgr switchCellForSel:@selector(onMsgSwitch:) target:self title:@"语音消息转发" on:cfg.msgEnabled]];
 
-    // 分界线：这一刻之后发的语音才改写，更早的一律保留真实秒数
-    NSString *bTitle;
-    if (cfg.voiceSecondsSince > 0) {
-        NSDateFormatter *fm = [[NSDateFormatter alloc] init];
-        [fm setDateFormat:@"MM-dd HH:mm:ss"];
-        bTitle = [NSString stringWithFormat:@"分界线 %@（点此重置为现在）",
-                  [fm stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)cfg.voiceSecondsSince]]];
-    } else {
-        bTitle = @"分界线 未设置（打开一次开关才会生效）";
-    }
-    [sec addCell:[cellMgr normalCellForSel:@selector(onResetBoundary:) target:self title:bTitle rightView:nil]];
-
     // 日志（证书注入看不到系统日志，用导出文件代替）
     NSInteger n = [[DDVoiceLog shared] lineCount];
     [sec addCell:[cellMgr normalCellForSel:@selector(onExportLog:) target:self
@@ -1130,19 +960,6 @@ static BOOL dd_voice_gate(id ext) {
     av.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
                                                              CGRectGetMidY(self.view.bounds), 1, 1);
     [self presentViewController:av animated:YES completion:nil];
-}
-// 手动重置分界线
-// 用途：想把「已经发过、但现在还是真实秒数」的老消息继续保护住，同时开始新一轮测试时点一下；
-//      也可以反驳「为什么这条没改」——只要它的创建时间早于这里显示的分界线，就属于被保护的历史消息。
-- (void)onResetBoundary:(id)sender {
-    DDVoiceConfig *c = [DDVoiceConfig sharedConfig];
-    unsigned int now = (unsigned int)time(NULL);
-    c.voiceSecondsSince = now;
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    [d setObject:@(now) forKey:kDDVoiceSecondsSince];
-    [d synchronize];
-    DDVLog(@"分界线手动重置为 %u", now);
-    [self buildTable];
 }
 // 清空日志
 - (void)onClearLog:(id)sender {
