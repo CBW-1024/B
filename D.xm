@@ -183,7 +183,7 @@ static const unsigned int kDDVoiceEndFlag = 1;
 // 0x75a018 setM_uiStatus: mov w2,#1
 static const unsigned int kDDMsgStatusSending = 1;
 // 0x7901b4 起下载；0x7901d0 每次 sleepForTimeInterval: 0.25
-// 不设轮询上限：needDownLoad 变 false（下载真正完成）才返回，发送流程随之继续
+// 不设轮询上限：needDownLoad 变 false（下载真正完成）才返回，HUD 随之停止
 static const NSTimeInterval kDDDownloadWaitStep = 0.25;
 // 0x7906a4 ~ 0x7906bc : localID = X + 0x2710(10000)，X 由外部函数生成于 [0, 0x15f90) 区间
 static const unsigned int kDDVoiceLocalIDBase = 10000;
