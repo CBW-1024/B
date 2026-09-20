@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <time.h>
 #import <substrate.h>
 
 // ===== 微信私有类前向声明 =====
@@ -21,7 +22,7 @@
 
 @interface WCTableViewSectionManager : NSObject
 + (id)defaultSection;
-+ (id)sectionWithHeader:(id)arg1;
++ (id)sectionWithHeader:(id)arg1;   // 带分组标题的 section（微信头文件存在）
 - (void)addCell:(id)arg1;
 @end
 
