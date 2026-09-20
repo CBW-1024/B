@@ -42,12 +42,12 @@
 - (void)stopLoading;
 @end
 
-// MMStringToastView.h（微信屏幕/滚动文字提示：addScrollingString 入队，showScreenTips 显示，hideToast 收起）
-@interface MMStringToastView : NSObject
-- (id)initWithFrame:(CGRect)arg1 isUsingMPUI:(CGSize)arg2;
-- (void)addScrollingString:(id)arg1 withDisplayTime:(double)arg2;
-- (void)showScreenTips;
-- (void)hideToast;
+// MMLoadingView.h（微信专用加载视图：startLoading 显示转圈+文字，stopLoading 收起；完成时可用 stopLoadingAndShowOK:）
+@interface MMLoadingView : NSObject
+- (id)initWithFrame:(CGRect)arg1;
+- (void)setText:(id)arg1;
+- (void)startLoading;
+- (void)stopLoading;
 @end
 
 // FavoritesItemDataField.h:192 duration / :245 GetDataPath
@@ -393,19 +393,19 @@ static void dd_downloadFavItemThen(id item, void (^done)(void)) {
     });
 }
 
-// 微信原生屏幕文字提示：addScrollingString 入队“下载中…”（displayTime 兜底不过期），showScreenTips 显示，
-// 下载完成才 hideToast；不参与成功/失败判定。
+// 微信原生加载视图：startLoading 显示（带转圈+“下载中…”），下载完成才 stopLoading；不参与成功/失败判定。
+// 挂在 keyWindow，不受选人器关闭影响。
 static id g_ddLoadingToast = nil;
 static void dd_showLoading(NSString *text) {
-    id toast = [[objc_getClass("MMStringToastView") alloc] initWithFrame:CGRectZero isUsingMPUI:CGSizeZero];
-    [toast addScrollingString:text withDisplayTime:3600.0];
-    [toast showScreenTips];
+    id toast = [[objc_getClass("MMLoadingView") alloc] initWithFrame:CGRectZero];
+    [toast setText:text];
+    [toast startLoading];
     g_ddLoadingToast = toast;
 }
 
 static void dd_hideLoading(void) {
     if (g_ddLoadingToast) {
-        [g_ddLoadingToast hideToast];
+        [g_ddLoadingToast stopLoading];
         g_ddLoadingToast = nil;
     }
 }
