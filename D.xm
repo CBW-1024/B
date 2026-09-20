@@ -82,19 +82,10 @@
 - (_Bool)deleteMessageFromDB:(id)arg1;
 - (_Bool)addMessageToDB:(id)arg1;
 - (id)getAudioFileName:(id)arg1 LocalID:(unsigned int)arg2;
-- (BOOL)prepareSend:(id)arg1;
-- (BOOL)OnRecorderPrepareSend:(id)arg1;
-- (BOOL)SendOriVoiceMsgWithUserData:(id)arg1;
 @end
 
 @interface MMNewSessionMgr : NSObject
 - (unsigned int)GenSendMsgTime;
-@end
-
-// 所有本地消息（含自己录制的语音）入库必经，post-%orig 覆盖自定义秒数最通用、最可靠
-@interface CMessageMgr : NSObject
-- (void)AddLocalMsg:(id)arg1 MsgWrap:(id)arg2;
-- (void)AddMsg:(id)arg1 MsgWrap:(id)arg2;
 @end
 
 @interface CBaseContact : NSObject
@@ -298,11 +289,9 @@ static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int durati
     dd_configureVoiceMeta(wrap, duration);
     return dd_injectVoiceData(wrap, voiceData);
 }
-// 自定义语音秒数：开关开 + 有效数字（1~60）→ 覆盖真实时长；
-// 空串/0 视为不覆盖（等价于关闭）。
-// B 一致性兜底：自定义值 > 真实音频时长时回退真实时长，
-// 避免接收方声明白长、实际音频短导致空播/进度条错位（即"报长"被禁止）。
-// 输入层已保证 1~60；自定义值 ≤ 真实时长时按输入值显示（含把长录音报短）。
+// 自定义语音秒数：开关开 + 有效数字 → 用自定义值覆盖真实时长；
+// 空字符串或 0 视为不覆盖（等价于关闭）；
+// B 兜底：自定义值 > 真实音频时长时回退真实时长，避免接收方空播/进度错位
 static unsigned int dd_effectiveVoiceDuration(unsigned int realDuration) {
     DDVoiceConfig *c = [DDVoiceConfig sharedConfig];
     if (!c.voiceSecondsEnabled) return realDuration;
@@ -311,25 +300,7 @@ static unsigned int dd_effectiveVoiceDuration(unsigned int realDuration) {
     unsigned int v = (unsigned int)[s integerValue];
     if (v == 0) return realDuration;        // 0（含旧配置残留）视为不覆盖
     if (realDuration > 0 && v > realDuration) return realDuration;  // B：声明时长不超过真实音频
-    return v;                               // 输入层已保证 1~60，直接覆盖真实时长
-}
-
-// 把当前语音消息的 m_uiVoiceTime 替换为自定义秒数。
-// 在所有发送/入库路径统一调用，取"最后写入"的那次生效，确保自定义值不被微信真实时长覆盖。
-// ownOnly：YES=调用方已确定是本地自己发送（AudioSender 发送点，此时 m_nsFromUsr 可能未设，
-//            跳过发送者判定）；NO=通用入库点（CMessageMgr），保留 isSenderFromMsgWrap 区分收发。
-static void dd_apply_custom_voice_seconds(id wrap, BOOL ownOnly) {
-    if (![DDVoiceConfig sharedConfig].voiceSecondsEnabled) return;
-    if (!dd_voice_is_msg(wrap)) return;                                   // 仅语音消息(m_uiMessageType==34)
-    if (!ownOnly) {
-        Class wrapCls = objc_getClass("CMessageWrap");
-        if (![wrapCls isSenderFromMsgWrap:wrap]) return;                  // 仅自己发送的语音
-    }
-    id ext = dd_voiceExtendInfo(wrap, NO);
-    if (!ext) return;                                                     // 无语音扩展信息则不处理
-    unsigned int real = [ext m_uiVoiceTime];
-    unsigned int eff = dd_effectiveVoiceDuration(real);
-    if (eff != real) [ext setM_uiVoiceTime:eff];
+    return v;                               // 输入层已保证 1~60，直接采用
 }
 
 #pragma mark - 音频路径
@@ -589,46 +560,6 @@ static void dd_append_voice_msg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 自己录制发送的语音也支持自定义秒数
-// 自录音发送：微信录音完成后经 AudioSender 发送（prepareSend / OnRecorderPrepareSend / SendOriVoiceMsgWithUserData），
-// 最终所有本地消息都会进 CMessageMgr 入库（AddLocalMsg / AddMsg）。这些点都在微信把真实 m_uiVoiceTime 写入之后，
-// post-%orig 再覆盖为自定义值即可生效。
-// 发送点(ownOnly=YES)跳过发送者判定：录音发送必是自己，且此时 m_nsFromUsr 可能尚未设置；
-// 入库点(ownOnly=NO)保留 isSenderFromMsgWrap 区分自己发/接收，避免误伤拉取下来的消息。
-%hook AudioSender
-- (BOOL)prepareSend:(id)wrap {
-    BOOL r = %orig;
-    if (r && wrap) dd_apply_custom_voice_seconds(wrap, YES);
-    return r;
-}
-- (BOOL)OnRecorderPrepareSend:(id)wrap {
-    BOOL r = %orig;
-    if (r && wrap) dd_apply_custom_voice_seconds(wrap, YES);
-    return r;
-}
-- (BOOL)SendOriVoiceMsgWithUserData:(id)wrap {
-    BOOL r = %orig;
-    if (r && wrap) dd_apply_custom_voice_seconds(wrap, YES);
-    return r;
-}
-- (BOOL)addMessageToDB:(id)wrap {
-    BOOL r = %orig;
-    if (r && wrap) dd_apply_custom_voice_seconds(wrap, YES);
-    return r;
-}
-%end
-
-%hook CMessageMgr
-- (void)AddLocalMsg:(id)arg1 MsgWrap:(id)wrap {
-    %orig;
-    if (wrap) dd_apply_custom_voice_seconds(wrap, NO);
-}
-- (void)AddMsg:(id)arg1 MsgWrap:(id)wrap {
-    %orig;
-    if (wrap) dd_apply_custom_voice_seconds(wrap, NO);
-}
-%end
-
 #pragma mark - 设置界面
 
 @interface DDVoiceSettingsViewController : UIViewController <UITableViewDelegate, UITextFieldDelegate>
@@ -676,7 +607,7 @@ static void dd_append_voice_msg(id favItem, id controller) {
     WCTableViewSectionManager *sec = [secMgr defaultSection];
     DDVoiceConfig *cfg = [DDVoiceConfig sharedConfig];
 
-    // 设置语音秒数：开关置于「收藏语音转发」之上；开启后展开「自定义秒数」输入框
+    // 设置语音秒数：开启后展开「自定义秒数」输入框
     [sec addCell:[cellMgr switchCellForSel:@selector(onSecondsSwitch:) target:self title:@"设置语音秒数" on:cfg.voiceSecondsEnabled]];
     if (cfg.voiceSecondsEnabled) {
         self.secondsField = [[UITextField alloc] init];
