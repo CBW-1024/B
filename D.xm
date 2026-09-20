@@ -146,11 +146,15 @@
 - (void)dismissLogicController;
 @end
 
-// SessionSelectView.h:33(m_bShowSelectFromContactList) / :193(setM_bShowSelectFromContactList:)
-// 会话列表视图（含标题行「创建聊天 / 转到其他应用」）。m_bShowSelectFromContactList==YES 时，
-// 标题行直接显示原生「从通讯录选择」入口（图标+文字均为微信原生绘制），无需先点右上角「多选」。
+// SessionSelectView.h:141(handleSelectFromContact) / :150(layoutSubviews)
+// 「选择聊天」页视图（层次树实测：SessionSelectController.view → SessionSelectView → MMTableView），
+// 其标题行本就带原生「从通讯录选择」入口，处理方法是 -handleSelectFromContact。
+// 语音转发时直接调用这个原生入口方法，让微信自己弹出带字母索引的通讯录选人页
+// （ContactSelectorViewController，见 ContactSelectorViewController.h:16 initWithContacts:selectedContacts:），
+// 不再自绘选择器、也不自己拼好友数据。layoutSubviews 作为「页面已上屏」的触发点，一次性触发。
 @interface SessionSelectView : NSObject
-- (BOOL)m_bShowSelectFromContactList;
+- (void)handleSelectFromContact;
+- (void)layoutSubviews;
 @end
 
 // BaseMessageCellView.h + 8.0.76 反汇编双重确认：原生转发按钮相关方法。
@@ -198,11 +202,12 @@ static const unsigned int kDDVoiceLocalIDBase = 10000;
 static const unsigned int kDDVoiceLocalIDRange = 0x15f90;
 // 收藏语音来源：把 FavoritesItem 绑到构造出的语音 wrap 上，供「发送时下载」反查并下载
 static const void *kDDFavSourceKey = &kDDFavSourceKey;
-// 收藏语音转发进行中标记：进入转发流程（addMsgFromItem: 加入语音）后置 YES，
-// 用于让选择器常驻显示原生「从通讯录选择」入口（见 SessionSelectView -m_bShowSelectFromContactList）；
-// 发送/取消后清零，不污染普通转发的入口布局。
-// 用全局标记而非实例绑定：addMsgFromItem: 必然置位，不依赖能否取到子控制器实例，最可靠。
-static BOOL g_ddFavVoicePicking = NO;
+// 语音转发进行中标记：普通语音（BaseMessageCellView -onForward:）与收藏语音（FavForwardLogicController -addMsgFromItem:）
+// 进入转发流程时都会置 YES，供 SessionSelectView 在页面出现后自动调用原生「从通讯录选择」入口（-handleSelectFromContact）；
+// 发送/取消后清零（ForwardMessageLogicController -dismissLogicController / -ForwardMsg*），不污染普通消息转发。
+static BOOL g_ddVoiceForwardPicking = NO;
+// 一次性标记：本次语音转发是否已自动打开过通讯录选人页，避免 layoutSubviews 多次触发重复弹出。
+static BOOL g_ddContactPickerOpened = NO;
 
 @interface DDFavVoiceConfig : NSObject
 + (instancetype)sharedConfig;
@@ -696,15 +701,16 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 // 真正的下载 + 注入数据推迟到发送接管处（dd_takeOverVoiceMsg），从而一次点击即可弹出选人器。
 %hook FavForwardLogicController
 - (void)addMsgFromItem:(id)arg1 {
-    // 进入任意收藏项前先清零标记，避免上一次未发送/未取消导致的残留污染普通转发
-    g_ddFavVoicePicking = NO;
+    // 进入任意收藏项前先清零标记，避免上一次未发送/未取消导致的残留污染
+    g_ddVoiceForwardPicking = NO;
+    g_ddContactPickerOpened = NO;
     if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1)) {
         FavoritesItem *item = (FavoritesItem *)arg1;
         DDLog(@"进入转发流程，收藏语音 type=%d", item.type);
         dd_appendVoiceMsg(item, self);
-        // 标记收藏语音转发进行中：让同步弹出的选择器把原生「从通讯录选择」入口常驻显示（见 SessionSelectView -m_bShowSelectFromContactList）。
-        // 必须在 %orig 之前置位——原实现在同步返回时即弹出选人器并查询该开关。
-        g_ddFavVoicePicking = YES;
+        // 标记语音转发进行中：必须在 %orig 之前置位——原实现在同步返回时即弹出选人器，
+        // SessionSelectView 随后的 layoutSubviews 会据此自动打开原生「从通讯录选择」页。
+        g_ddVoiceForwardPicking = YES;
     }
     // 0x78f5cc：原实现无条件调用（同步，确保选人器正常弹出）
     %orig;
@@ -713,13 +719,13 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 
 #pragma mark - 四 接管语音消息的发送（0x78f6c8 / 0x78f77c / 0x78f8b0 / 0x78f9f8，受 enableVoiceForward 0x78f700 门控，收藏/语音任一开关开启即接管）
 %hook ForwardMessageLogicController
-// 选择器收起/取消/转发出完成时清零标记（g_ddFavVoicePicking），避免污染后续普通转发的「从通讯录选择」入口
+// 选择器收起/取消/转发出完成时清零标记（g_ddVoiceForwardPicking），避免污染后续普通转发的「从通讯录选择」入口
 - (void)dismissLogicController {
-    g_ddFavVoicePicking = NO;
+    g_ddVoiceForwardPicking = NO;
     %orig;
 }
 - (void)ForwardMsg:(id)arg1 ToContact:(id)arg2 {
-    g_ddFavVoicePicking = NO;
+    g_ddVoiceForwardPicking = NO;
     if (dd_isVoiceMsg(arg1)) {
         if (!ddForwardSendEnabled()) { DDLog(@"语音转发两个开关均未开，走原生转发"); %orig; return; }
         // 0x78f718 ~ 0x78f724：命中即接管，无论成败都不再走原实现
@@ -731,7 +737,7 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     %orig;
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 {
-    g_ddFavVoicePicking = NO;
+    g_ddVoiceForwardPicking = NO;
     if (!ddForwardSendEnabled()) { %orig; return; }
     DDLog(@"批量转发 %lu 条，开始逐条接管", (unsigned long)[(NSArray *)arg1 count]);
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
@@ -739,14 +745,14 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
     %orig(rest, arg2);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 WithRevokeBatchId:(id)arg3 {
-    g_ddFavVoicePicking = NO;
+    g_ddVoiceForwardPicking = NO;
     if (!ddForwardSendEnabled()) { %orig; return; }
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
     %orig(rest, arg2, arg3);
 }
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3 {
-    g_ddFavVoicePicking = NO;
+    g_ddVoiceForwardPicking = NO;
     if (!ddForwardSendEnabled()) { %orig; return; }
     NSArray *rest = dd_takeOverVoiceList((NSArray *)arg1, arg2);
     if ([rest count] == 0) return;
@@ -754,14 +760,23 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 四-b 常驻原生「从通讯录选择」入口
-// SessionSelectView 承载标题行「创建聊天 / 转到其他应用」功能入口区；m_bShowSelectFromContactList==YES 时，
-// 标题行直接显示原生「从通讯录选择」入口（图标+文字均为微信原生绘制），无需先点右上角「多选」。
-// 仅在进行中的收藏语音转发（g_ddFavVoicePicking）置 YES，普通转发原样返回 %orig。
+#pragma mark - 四-b 语音转发：自动打开原生「从通讯录选择」页（普通 + 收藏通用）
+// 「选择聊天」页 SessionSelectView 标题行本就带原生「从通讯录选择」入口，其处理方法是 -handleSelectFromContact。
+// 语音转发时不再改微信内部布局/多选态（那套「强开 m_bMultiSelect」实测无效），而是直接在页面出现后
+// 调用这个原生入口方法，由微信自己弹出带字母索引的通讯录选人页——零自绘、零好友数据拼装，
+// 普通语音与收藏语音统一走这一条。仅在进行中的语音转发（g_ddVoiceForwardPicking）触发，
+// 且每次转发只触发一次（g_ddContactPickerOpened）。
 %hook SessionSelectView
-- (BOOL)m_bShowSelectFromContactList {
-    if (g_ddFavVoicePicking) return YES;
-    return %orig;
+- (void)layoutSubviews {
+    %orig;
+    if (g_ddVoiceForwardPicking && !g_ddContactPickerOpened) {
+        g_ddContactPickerOpened = YES;
+        DDLog(@"语音转发：自动调用原生「从通讯录选择」入口");
+        __weak __typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf handleSelectFromContact];
+        });
+    }
 }
 %end
 
@@ -794,6 +809,9 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 - (void)onForward:(id)arg1 {
     if (ddVoiceMsgEnabled() && [self isKindOfClass:objc_getClass("VoiceMessageCellView")]) {
         DDLog(@"语音消息原生 onForward: 被拦截，改走 doForward 触发选人器");
+        // 标记语音转发进行中：普通语音与收藏语音统一走四-b的「自动打开原生通讯录选人页」
+        g_ddVoiceForwardPicking = YES;
+        g_ddContactPickerOpened = NO;
         [self doForward];
         return;
     }
