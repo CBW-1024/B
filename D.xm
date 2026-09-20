@@ -4,7 +4,8 @@
 #import <time.h>
 #import <substrate.h>
 
-// 微信类前向声明
+// ===== 微信私有类前向声明 =====
+
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -19,14 +20,9 @@
 @property (nonatomic, weak) id delegate;
 @end
 
-// 微信头文件证据（四份 dump 一致）：
-//   /tmp/wechat_dump/WCTableViewSectionManager.h          +(id) sectionWithHeader:(id);
-//   /tmp/wechat76_dump/微信/WCTableViewSectionManager.h     + (id)sectionWithHeader:(id)arg1;
-//   /tmp/wcd76_new/WeChat/WCTableViewSectionManager.h      + (id)sectionWithHeader:(id)a0;
-//   /tmp/wechat_new/WeChat/WCTableViewSectionManager.h     + (id)sectionWithHeader:(id)a0;
 @interface WCTableViewSectionManager : NSObject
 + (id)defaultSection;
-+ (id)sectionWithHeader:(id)arg1;   // 带分组标题的 section
++ (id)sectionWithHeader:(id)arg1;
 - (void)addCell:(id)arg1;
 @end
 
@@ -42,19 +38,16 @@
 
 @interface CMessageWrap : NSObject
 + (id)getPathOfMsgImg:(id)arg1;
-+ (_Bool)isSenderFromMsgWrap:(id)arg1;
++ (BOOL)isSenderFromMsgWrap:(id)arg1;
 - (id)initWithMsgType:(long long)arg1;
-// 4 份 dump 均存在：wechat_dump/CMessageWrap.h:156、wechat76:550、wcd76_new:864、wechat_new:853
-- (BOOL)IsVoiceMsg;
+- (BOOL)IsVoiceMsg;                 // 微信判定语音消息的方法
 @property(nonatomic) unsigned int m_uiMessageType;
 @property(nonatomic) unsigned int m_uiCreateTime;
 @property(nonatomic) unsigned int m_uiStatus;
 @property(nonatomic) unsigned int m_uiMesLocalID;
-// CMessageWrap.m_uiVoiceTime 是 @dynamic（wechat76_dump/CMessageWrap.h:1069、wcd76_new:350、
-// wechat_new:347），运行时转发到 m_extendInfoWithMsgType；需要时长的地方走 dd_voiceDuration()。
 @property(retain, nonatomic) NSString *m_nsToUsr;
 @property(retain, nonatomic) NSString *m_nsFromUsr;
-@property(retain, nonatomic) id m_extendInfoWithMsgType;
+@property(retain, nonatomic) id m_extendInfoWithMsgType;   // m_uiVoiceTime 为 @dynamic，时长走 dd_voiceDuration()
 @end
 
 @interface CExtendInfoOfVoiceMsg : NSObject
@@ -65,12 +58,8 @@
 @property(nonatomic, weak) CMessageWrap *m_refMessageWrap;
 @end
 
-// 语音上传结构（protobuf 生成类）。头文件证据：UploadVoiceWrap.h
-// 自己录音发送链路：AudioSender OnRecorderPart:...Duration:
-//                → MMNewUploadVoiceMgr AddNewPart:...VoiceTime:
-//                → UploadVoiceWrap setM_uiVoiceTime:  ← 发出去前的最后一次写入
 @interface UploadVoiceWrap : NSObject
-@property(nonatomic) unsigned int m_uiVoiceTime;   // 唯一被我们改写的字段
+@property(nonatomic) unsigned int m_uiVoiceTime;   // 上行 PB 时长，唯一被改写的字段
 @end
 
 @interface CUtility : NSObject
@@ -129,7 +118,7 @@
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3;
 @end
 
-// 语音 cell 转发生态（BaseMessageCellView 须先于 VoiceMessageCellView 声明）
+// 语音 cell：BaseMessageCellView 须先于其子类 VoiceMessageCellView 声明
 @interface BaseMessageCellView : NSObject
 - (BOOL)canShowForwardMenuItem;
 - (id)forwardMenuItem;
@@ -142,35 +131,30 @@
 - (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;
 @end
 
-#pragma mark - 配置
+// ===== 配置 =====
 
 #define kDDVoiceEnableFav @"kDDVoiceEnableFav"
 #define kDDVoiceEnableMsg @"kDDVoiceEnableMsg"
 #define kDDVoiceSecondsEnabled @"kDDVoiceSecondsEnabled"
 #define kDDVoiceSeconds @"kDDVoiceSeconds"
 
-// 微信语音最大时长（秒）：录制系统硬上限。
-// 头文件证据：MMTapRecordButton.maxSeconds、TingAudioRecordConfiguration.maxTimeInSecond、
-// TingAudioRecorder initWithRecordMinTime:recordMaxTime: —— 微信默认即 60 秒。
-#define kDDVoiceMaxSeconds 60
-
-static const int kDDVoiceFavItemType = 3;        // 收藏语音 type == 3
-static const long long kDDVoiceMsgType = 34;      // 语音消息 m_uiMessageType == 0x22
-static const unsigned int kDDVoiceFormat = 4;
-static const unsigned int kDDVoiceEndFlag = 1;
-static const unsigned int kDDMsgStatusSending = 1;
-static const NSTimeInterval kDDDownloadWaitStep = 0.25;
-static const unsigned int kDDVoiceLocalIDBase = 10000;
-static const unsigned int kDDVoiceLocalIDRange = 0x15f90;
-// 把收藏项绑到构造出的语音 wrap 上，供「发送时下载」反查并下载
-static const void *kDDVoiceFavSourceKey = &kDDVoiceFavSourceKey;
+#define kDDVoiceMaxSeconds 60          // 微信语音上限 60 秒
+#define kDDVoiceFavItemType 3         // 收藏语音 type
+#define kDDVoiceMsgType 34            // 语音消息 m_uiMessageType（0x22）
+#define kDDVoiceFormat 4
+#define kDDVoiceEndFlag 1
+#define kDDMsgStatusSending 1
+#define kDDDownloadWaitStep 0.25
+#define kDDVoiceLocalIDBase 10000
+#define kDDVoiceLocalIDRange 0x15f90
+static const void *kDDVoiceFavSourceKey = &kDDVoiceFavSourceKey;  // 把收藏项绑到构造出的语音 wrap
 
 @interface DDVoiceConfig : NSObject
 + (instancetype)sharedConfig;
-@property (assign, nonatomic) BOOL favEnabled;  // 收藏语音转发
-@property (assign, nonatomic) BOOL msgEnabled;  // 语音消息转发
-@property (assign, nonatomic) BOOL voiceSecondsEnabled;  // 设置语音秒数
-@property (copy, nonatomic) NSString *voiceSeconds;      // 自定义秒数（数字文本，空=不覆盖）
+@property (assign, nonatomic) BOOL favEnabled;       // 收藏语音转发
+@property (assign, nonatomic) BOOL msgEnabled;       // 语音消息转发
+@property (assign, nonatomic) BOOL voiceSecondsEnabled;  // 自定义语音秒数
+@property (copy, nonatomic) NSString *voiceSeconds;  // 自定义秒数（数字文本，空=不覆盖）
 @end
 
 @implementation DDVoiceConfig
@@ -191,70 +175,50 @@ static const void *kDDVoiceFavSourceKey = &kDDVoiceFavSourceKey;
 }
 - (instancetype)init {
     if (self = [super init]) {
-    _favEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceEnableFav];
-    _msgEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceEnableMsg];
-    _voiceSecondsEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceSecondsEnabled];
-    _voiceSeconds = [[NSUserDefaults.standardUserDefaults stringForKey:kDDVoiceSeconds] copy] ?: @"";
+        _favEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceEnableFav];
+        _msgEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceEnableMsg];
+        _voiceSecondsEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceSecondsEnabled];
+        _voiceSeconds = [[NSUserDefaults.standardUserDefaults stringForKey:kDDVoiceSeconds] copy] ?: @"";
     }
     return self;
 }
-- (void)setFavEnabled:(BOOL)v {
-    _favEnabled = v;
-    [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVoiceEnableFav];
-}
-- (void)setMsgEnabled:(BOOL)v {
-    _msgEnabled = v;
-    [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVoiceEnableMsg];
-}
-- (void)setVoiceSecondsEnabled:(BOOL)v {
-    _voiceSecondsEnabled = v;
-    [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVoiceSecondsEnabled];
-}
-- (void)setVoiceSeconds:(NSString *)v {
-    _voiceSeconds = [v copy];
-    [NSUserDefaults.standardUserDefaults setObject:_voiceSeconds forKey:kDDVoiceSeconds];
-}
+- (void)setFavEnabled:(BOOL)v { _favEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVoiceEnableFav]; }
+- (void)setMsgEnabled:(BOOL)v { _msgEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVoiceEnableMsg]; }
+- (void)setVoiceSecondsEnabled:(BOOL)v { _voiceSecondsEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVoiceSecondsEnabled]; }
+- (void)setVoiceSeconds:(NSString *)v { _voiceSeconds = [v copy]; [NSUserDefaults.standardUserDefaults setObject:_voiceSeconds forKey:kDDVoiceSeconds]; }
 @end
 
 static BOOL dd_voice_fav_enabled(void) { return [DDVoiceConfig sharedConfig].favEnabled; }
 static BOOL dd_voice_msg_enabled(void) { return [DDVoiceConfig sharedConfig].msgEnabled; }
-// 发送汇点：收藏/语音任一开关开启即接管（收藏语音最终也构造成 type=34 走此路径发出）
+// 任一转发开关开启即接管（收藏语音最终也构造成 type=34 走此路径）
 static BOOL dd_voice_forward_enabled(void) {
     DDVoiceConfig *c = [DDVoiceConfig sharedConfig];
     return c.favEnabled || c.msgEnabled;
 }
 
-#pragma mark - 工具
+// ===== 工具 =====
 
-// 优先用微信自己的判定（跨版本稳），取不到再回退硬编码 34
+// 优先用微信自带 IsVoiceMsg 判定，取不到回退硬编码 34
 static BOOL dd_voice_is_msg(id msg) {
     if ([msg respondsToSelector:@selector(IsVoiceMsg)]) return [(CMessageWrap *)msg IsVoiceMsg];
     return ((CMessageWrap *)msg).m_uiMessageType == (unsigned int)kDDVoiceMsgType;
 }
-static BOOL dd_voice_is_fav_item(id obj) {
-    return ((FavoritesItem *)obj).type == kDDVoiceFavItemType;
-}
+static BOOL dd_voice_is_fav_item(id obj) { return ((FavoritesItem *)obj).type == kDDVoiceFavItemType; }
 static BOOL dd_file_exists(NSString *path) {
     if ([path length] == 0) return NO;
     return [[NSFileManager defaultManager] fileExistsAtPath:path];
 }
-static NSString *dd_current_usr_name(void) {
-    return [objc_getClass("SettingUtil") getCurUsrName];
-}
+static NSString *dd_current_usr_name(void) { return [objc_getClass("SettingUtil") getCurUsrName]; }
 static id dd_mm_service(NSString *serviceName) {
-    Class ctxCls = objc_getClass("MMContext");
-    id ctx = [ctxCls currentContext];
-    Class svc = objc_getClass([serviceName UTF8String]);
-    return [ctx getService:svc];
+    id ctx = [objc_getClass("MMContext") currentContext];
+    return [ctx getService:objc_getClass([serviceName UTF8String])];
 }
 static void dd_start_download_fav_item(id item) {
-    Class ctxCls = objc_getClass("MMContext");
-    Class mgrCls = objc_getClass("FavoritesMgr");
-    id ctx = [ctxCls currentContext];
-    id mgr = [ctx getService:mgrCls];
+    id mgr = [objc_getClass("MMContext") currentContext];
+    mgr = [mgr getService:objc_getClass("FavoritesMgr")];
     [mgr startDownloadFavoritesItem:item IsPriority:YES];
 }
-// 轮询 needDownLoad 直至下载完成；不设上限
+// 轮询 needDownLoad 直至下载完成
 static void dd_wait_download_finish(id item) {
     while (((FavoritesItem *)item).needDownLoad) {
         [NSThread sleepForTimeInterval:kDDDownloadWaitStep];
@@ -269,24 +233,19 @@ static void dd_download_fav_item_then(id item, void (^done)(void)) {
     });
 }
 
-#pragma mark - 语音扩展信息
+// ===== 语音扩展信息 =====
 
 static id dd_voiceExtendInfo(id wrap, BOOL create) {
-    Class vcls = objc_getClass("CExtendInfoOfVoiceMsg");
     id ext = [wrap m_extendInfoWithMsgType];
     if (ext) return ext;
     if (!create) return nil;
-    id nv = [[vcls alloc] init];
+    id nv = [[objc_getClass("CExtendInfoOfVoiceMsg") alloc] init];
     [nv setM_refMessageWrap:wrap];
     [wrap setM_extendInfoWithMsgType:nv];
     return nv;
 }
-static NSData *dd_voiceData(id wrap) {
-    return [dd_voiceExtendInfo(wrap, NO) m_dtVoice];
-}
-static unsigned int dd_voiceDuration(id wrap) {
-    return [dd_voiceExtendInfo(wrap, NO) m_uiVoiceTime];
-}
+static NSData *dd_voiceData(id wrap) { return [dd_voiceExtendInfo(wrap, NO) m_dtVoice]; }
+static unsigned int dd_voiceDuration(id wrap) { return [dd_voiceExtendInfo(wrap, NO) m_uiVoiceTime]; }
 static BOOL dd_configureVoiceMeta(id wrap, unsigned int duration) {
     id ext = dd_voiceExtendInfo(wrap, YES);
     [ext setM_refMessageWrap:wrap];
@@ -296,45 +255,37 @@ static BOOL dd_configureVoiceMeta(id wrap, unsigned int duration) {
     return YES;
 }
 static BOOL dd_injectVoiceData(id wrap, NSData *voiceData) {
-    id ext = dd_voiceExtendInfo(wrap, YES);
-    [ext setM_dtVoice:voiceData];
+    [dd_voiceExtendInfo(wrap, YES) setM_dtVoice:voiceData];
     return YES;
 }
 static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int duration) {
     dd_configureVoiceMeta(wrap, duration);
     return dd_injectVoiceData(wrap, voiceData);
 }
-// 自定义语音秒数：毫秒进、毫秒出。
-// ★ 单位依据（WCRefine 逆向 + 微信头文件互证）：m_uiVoiceTime 单位是【毫秒】
-//   - WCRefine 0x8f4084 对自定义秒数 mul #1000，未启用时钳到 60000
-//   - 录音层 MMTapRecordButton.maxSeconds 是 double 秒（上限 60），
-//     TingAudioRecordConfiguration.maxTimeInSecond 亦为秒；
-//     而 m_uiVoiceTime 是 unsigned int，60000 = 60 秒 × 1000 精确对应
-// 开关关闭 / 输入为空 / 输入为 0 → 原样返回（等价于不覆盖）
+
+// 自定义语音秒数：秒 → 毫秒（m_uiVoiceTime 单位为毫秒）。
+// 关闭 / 空 / 0 → 原样返回；超出 1~60 钳到边界；声明时长超过真实音频时长则回退真实值。
 static unsigned int dd_voiceTimeMs(unsigned int realMs) {
     DDVoiceConfig *c = [DDVoiceConfig sharedConfig];
-    if (!c.voiceSecondsEnabled) { return realMs; }
+    if (!c.voiceSecondsEnabled) return realMs;
     NSString *s = c.voiceSeconds;
-    if ([s length] == 0) { return realMs; }
+    if ([s length] == 0) return realMs;
     NSInteger sec = [s integerValue];
-    if (sec <= 0) { return realMs; }   // 0（含旧配置残留）视为不覆盖
-    if (sec < 1)  sec = 1;
+    if (sec <= 0) return realMs;
+    if (sec < 1) sec = 1;
     if (sec > kDDVoiceMaxSeconds) sec = kDDVoiceMaxSeconds;
-    unsigned int target = (unsigned int)sec * 1000; // ★ 秒 → 毫秒
-    // B 兜底：声明时长不超过真实音频时长，避免接收方空播/进度条错位
-    if (realMs > 0 && target > realMs) { return realMs; }
-
+    unsigned int target = (unsigned int)sec * 1000;
+    if (realMs > 0 && target > realMs) return realMs;   // 不超过真实音频时长
     return target;
 }
 
-#pragma mark - 音频路径
+// ===== 音频路径 =====
 
-// 决定语音文件归属哪个用户名（群聊/发送方/接收方）
+// 语音文件归属：群聊/发送方返回 toUsr，否则返回 fromUsr
 static NSString *dd_owner_user_for_voice(id msg) {
     NSString *to = (NSString *)((CMessageWrap *)msg).m_nsToUsr;
     if ([to containsString:@"@chatroom"]) return to;
-    Class wrapCls = objc_getClass("CMessageWrap");
-    if ([wrapCls isSenderFromMsgWrap:msg]) return to;
+    if ([objc_getClass("CMessageWrap") isSenderFromMsgWrap:msg]) return to;
     return (NSString *)((CMessageWrap *)msg).m_nsFromUsr;
 }
 // 优先 CUtility 路径，其次 AudioSender 路径，兜底导出 m_dtVoice 到临时文件
@@ -344,53 +295,46 @@ static NSString *dd_audio_path_for_msg(id msg) {
     Class cu = objc_getClass("CUtility");
     NSString *cuPath = (NSString *)[cu GetPathOfMesAudio:usr LocalID:localID DocPath:[cu GetDocPath]];
     if (dd_file_exists(cuPath)) return cuPath;
-    id sender = dd_mm_service(@"AudioSender");
-    NSString *p = (NSString *)[sender getAudioFileName:usr LocalID:localID];
+    NSString *p = (NSString *)[dd_mm_service(@"AudioSender") getAudioFileName:usr LocalID:localID];
     if (dd_file_exists(p)) return p;
     NSData *data = dd_voiceData(msg);
     if ([data length] == 0) return nil;
-    NSString *name = [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"];
-    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
+    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                     [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"]];
     [data writeToFile:tmp atomically:YES];
     return tmp;
 }
 // 把音频落到微信 Audio 目录（本地显示用，不阻断发送）
 static NSString *dd_install_audio_file(id wrap, NSString *src) {
-    Class wrapCls = objc_getClass("CMessageWrap");
-    NSString *p = [[(NSString *)[wrapCls getPathOfMsgImg:wrap] stringByReplacingOccurrencesOfString:@"Img" withString:@"Audio"]
-                                       stringByReplacingOccurrencesOfString:@".pic" withString:@".aud"];
-    NSString *dir = [p stringByDeletingLastPathComponent];
+    NSString *p = [[(NSString *)[objc_getClass("CMessageWrap") getPathOfMsgImg:wrap]
+                    stringByReplacingOccurrencesOfString:@"Img" withString:@"Audio"]
+                   stringByReplacingOccurrencesOfString:@".pic" withString:@".aud"];
     NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:dir]) {
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    }
+    [fm createDirectoryAtPath:[p stringByDeletingLastPathComponent]
+    withIntermediateDirectories:YES attributes:nil error:nil];
     if ([fm fileExistsAtPath:p]) [fm removeItemAtPath:p error:nil];
     [fm copyItemAtPath:src toPath:p error:nil];
     return p;
 }
 
-#pragma mark - 语音发送
+// ===== 语音发送 =====
 
-// 给构造出来的消息一个非零 localID，否则拿不到音频路径
+// 给构造出的消息分配非零 localID，否则拿不到音频路径
 static unsigned int dd_new_voice_local_id(void) {
     return kDDVoiceLocalIDBase + (unsigned int)arc4random_uniform(kDDVoiceLocalIDRange);
 }
 static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     id sender = dd_mm_service(@"AudioSender");
-    Class wrapCls = objc_getClass("CMessageWrap");
-    id raw = [wrapCls alloc];
-    CMessageWrap *wrap = [raw initWithMsgType:kDDVoiceMsgType];
+    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVoiceMsgType];
     [wrap setM_uiMessageType:(unsigned int)kDDVoiceMsgType];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
     [wrap setM_nsToUsr:usr];
     unsigned int createTime = (unsigned int)time(NULL);
-    id sessionMgr = dd_mm_service(@"MMNewSessionMgr");
-    unsigned int t = [sessionMgr GenSendMsgTime];
+    unsigned int t = [dd_mm_service(@"MMNewSessionMgr") GenSendMsgTime];
     if (t != 0) createTime = t;
     [wrap setM_uiCreateTime:createTime];
     [wrap setM_uiStatus:kDDMsgStatusSending];
-    NSData *d = [NSData dataWithContentsOfFile:audPath];
-    dd_configureVoiceMsg(wrap, d, duration);
+    dd_configureVoiceMsg(wrap, [NSData dataWithContentsOfFile:audPath], duration);
     [sender addMessageToDB:wrap];
     dd_install_audio_file(wrap, audPath);
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
@@ -399,15 +343,11 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
 // 收藏外壳：数据未就绪则下载后注入 m_dtVoice 再发送
 static void dd_ensure_fav_voice_data(id msg) {
     if ([dd_voiceData(msg) length] > 0) return;
-    id favItem = objc_getAssociatedObject(msg, kDDVoiceFavSourceKey);
-    NSArray *list = [favItem dataList];
-    id field = [list firstObject];
+    id field = [[(FavoritesItem *)objc_getAssociatedObject(msg, kDDVoiceFavSourceKey) dataList] firstObject];
     NSData *d = [NSData dataWithContentsOfFile:(NSString *)[field GetDataPath]
-                                        options:NSDataReadingMappedIfSafe
-                                          error:nil];
+                                       options:NSDataReadingMappedIfSafe error:nil];
     dd_injectVoiceData(msg, d);
 }
-
 static BOOL dd_take_over_voice_msg(id msg, id contact) {
     if (!dd_voice_is_msg(msg)) return NO;
     NSString *usr = (NSString *)[(CBaseContact *)contact m_nsUsrName];
@@ -418,8 +358,7 @@ static BOOL dd_take_over_voice_msg(id msg, id contact) {
         if (favItem) {
             dd_download_fav_item_then(favItem, ^{
                 dd_ensure_fav_voice_data(msg);
-                NSString *p = dd_audio_path_for_msg(msg);
-                dd_send_voice(usr, p, duration);
+                dd_send_voice(usr, dd_audio_path_for_msg(msg), duration);
             });
             return YES;
         }
@@ -431,40 +370,29 @@ static BOOL dd_take_over_voice_msg(id msg, id contact) {
 static NSArray *dd_take_over_voice_list(NSArray *src, id contact) {
     NSMutableArray *rest = [NSMutableArray array];
     for (id m in src) {
-        if (dd_voice_is_msg(m)) {
-            dd_take_over_voice_msg(m, contact);
-            continue;
-        }
-        [rest addObject:m];
+        if (dd_voice_is_msg(m)) dd_take_over_voice_msg(m, contact);
+        else [rest addObject:m];
     }
     return rest;
 }
 
-#pragma mark - 收藏语音消息构造
+// ===== 收藏语音消息构造 =====
 
-// 把收藏语音数据构造成待转发语音消息：文件未就绪则构造成"外壳"（含时长/localID），数据留待发送时下载
+// 把收藏语音数据构造成待转发语音消息；数据未就绪则构造成外壳（含时长/localID），发送时再下载
 static id dd_msg_wrap_from_fav_data(id favData, id favItem) {
     FavoritesItemDataField *field = (FavoritesItemDataField *)favData;
-    Class wrapCls = objc_getClass("CMessageWrap");
-    id raw = [wrapCls alloc];
-    CMessageWrap *wrap = [raw initWithMsgType:kDDVoiceMsgType];
+    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVoiceMsgType];
     NSString *me = dd_current_usr_name();
     if ([me length] > 0) [wrap setM_nsFromUsr:me];
-    [wrap setM_uiMessageType:(unsigned int)kDDVoiceMsgType];   // 与 dd_send_voice 保持一致，避免 IsVoiceMsg 判否
+    [wrap setM_uiMessageType:(unsigned int)kDDVoiceMsgType];   // 与 dd_send_voice 一致，避免 IsVoiceMsg 判否
     [wrap setM_uiCreateTime:(unsigned int)time(NULL)];
     [wrap setM_uiMesLocalID:dd_new_voice_local_id()];
-    unsigned int duration = dd_voiceTimeMs(field.duration);
-    dd_configureVoiceMeta(wrap, duration);
+    dd_configureVoiceMeta(wrap, dd_voiceTimeMs(field.duration));
     if (favItem) objc_setAssociatedObject(wrap, kDDVoiceFavSourceKey, favItem, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    id pathObj = [field GetDataPath];
-    if (dd_file_exists((NSString *)pathObj)) {
-        NSData *data = [NSData dataWithContentsOfFile:(NSString *)pathObj
-                                              options:NSDataReadingMappedIfSafe
-                                                error:nil];
-        if ([data length] > 0) {
-            dd_injectVoiceData(wrap, data);
-            return wrap;
-        }
+    if (dd_file_exists((NSString *)[field GetDataPath])) {
+        NSData *data = [NSData dataWithContentsOfFile:(NSString *)[field GetDataPath]
+                                              options:NSDataReadingMappedIfSafe error:nil];
+        if ([data length] > 0) dd_injectVoiceData(wrap, data);
     }
     return wrap;
 }
@@ -481,32 +409,16 @@ static void dd_append_voice_msg(id favItem, id controller) {
     [(NSMutableArray *)store addObject:wrap];
 }
 
-#pragma mark - 自定义语音秒数（单位：毫秒）
+// ===== 自定义语音秒数（唯一落点）=====
 
-// ★ 唯一落点：改这里一份 PB，对面和本地都会变成自定义秒数。
-//    链路：AudioSender -OnRecorderPart:Offset:Len:EndFlag:ForceDelete:Duration:
-//       → UploadVoiceCDNMgr / MMNewUploadVoiceMgr -AddNewPart:... VoiceTime:...
-//       → UploadVoiceWrap -setM_uiVoiceTime:   ← 上行前的最后一次写入
-//    头文件证据：UploadVoiceWrap.h（4 份 dump 均有 m_uiVoiceTime / setM_uiVoiceTime:）
-//              UploadVoiceCDNMgr.h:15、MMNewUploadVoiceMgr.h、BaseUploadVoiceMgr.h
-//              三者 AddNewPart 签名完全一致 → 时长不可能从别的口子进来
-//    两轮导出日志实锤：录 4.6s / 4.9s 时该 setter 分别被调用 40 / 43 次，最后一次把
-//    4600 → 1000、4900 → 1000；随后 AudioSender -updateMessageToDB: 用同一个 localID
-//    把本地库里的真实值覆写成 1000 —— 服务端按上行 PB 合成后回填，本地也就跟着是自定义的。
-//    ⇒ 因此不再 hook 任何本地存储类，历史语音也就不可能被误改。
+// 改写上行 PB 时长，服务端按此合成后回填，本地气泡自动同步，无需 hook 任何本地存储类
 %hook UploadVoiceWrap
 - (void)setM_uiVoiceTime:(unsigned int)v {
-    unsigned int out = dd_voiceTimeMs(v);
-    %orig(out);
+    %orig(dd_voiceTimeMs(v));
 }
 %end
 
-// ④ 诊断 hook 已完成使命并删除：
-//    两轮日志都在「完全没有本地 hook」的前提下观测到同一个 localID 先写真实值、
-//    上传成功后被覆写成自定义值（4600→1000 / 4900→1000）→ 服务端回填链路确认。
-//    本地气泡因此自动同步，AudioSender 的诊断 hook 与埋点一并移除。
-
-#pragma mark - 收藏语音转发闸门
+// ===== 收藏语音转发闸门 =====
 
 %hook FavoritesItem
 - (_Bool)canBeForward {
@@ -523,8 +435,7 @@ static void dd_append_voice_msg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 阻止语音被降级为文本
-
+// 阻止语音被降级为文本
 %hook ForwardMsgUtil
 + (id)ConvertMsgToTextIfCannotSend:(id)arg1 {
     if (dd_voice_forward_enabled() && dd_voice_is_msg(arg1)) return nil;
@@ -532,19 +443,15 @@ static void dd_append_voice_msg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 把收藏语音做成待转发消息
-
+// 把收藏语音做成待转发消息
 %hook FavForwardLogicController
 - (void)addMsgFromItem:(id)arg1 {
-    if (dd_voice_fav_enabled() && dd_voice_is_fav_item(arg1)) {
-        dd_append_voice_msg(arg1, self);
-    }
+    if (dd_voice_fav_enabled() && dd_voice_is_fav_item(arg1)) dd_append_voice_msg(arg1, self);
     %orig;
 }
 %end
 
-#pragma mark - 接管语音消息发送
-
+// 接管语音消息发送
 %hook ForwardMessageLogicController
 - (void)ForwardMsg:(id)arg1 ToContact:(id)arg2 {
     if (dd_voice_is_msg(arg1)) {
@@ -574,13 +481,10 @@ static void dd_append_voice_msg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 普通语音消息长按菜单加「转发」
-
+// 普通语音消息长按菜单加「转发」
 %hook BaseMessageCellView
 - (BOOL)canShowForwardMenuItem {
-    if (dd_voice_msg_enabled() && [self isKindOfClass:objc_getClass("VoiceMessageCellView")]) {
-        return YES;
-    }
+    if (dd_voice_msg_enabled() && [self isKindOfClass:objc_getClass("VoiceMessageCellView")]) return YES;
     return %orig;
 }
 - (void)onForward:(id)arg1 {
@@ -596,21 +500,18 @@ static void dd_append_voice_msg(id favItem, id controller) {
 - (NSArray *)operationMenuItems {
     NSArray *original = %orig;
     if (!dd_voice_msg_enabled()) return original;
-    id item = [self forwardMenuItem];
     NSMutableArray *items = [NSMutableArray arrayWithCapacity:[original count] + 1];
     [items addObjectsFromArray:original];
-    [items insertObject:item atIndex:0];
+    [items insertObject:[self forwardMenuItem] atIndex:0];
     return items;
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(onForward:) && dd_voice_msg_enabled()) {
-        return YES;
-    }
+    if (action == @selector(onForward:) && dd_voice_msg_enabled()) return YES;
     return %orig;
 }
 %end
 
-#pragma mark - 设置界面
+// ===== 设置界面 =====
 
 @interface DDVoiceSettingsViewController : UIViewController <UITableViewDelegate, UITextFieldDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
@@ -622,12 +523,12 @@ static void dd_append_voice_msg(id favItem, id controller) {
 }
 - (void)ensureTableViewMgr {
     if (_tableViewManager) return;
-    id mgrCls = objc_getClass("WCTableViewManager");
-    _tableViewManager = [[mgrCls alloc] initWithFrame:[UIScreen mainScreen].bounds
-                                               style:UITableViewStyleInsetGrouped];
+    _tableViewManager = [[objc_getClass("WCTableViewManager") alloc]
+                          initWithFrame:[UIScreen mainScreen].bounds
+                                  style:UITableViewStyleInsetGrouped];
 }
 - (instancetype)init {
-    if (self = [super init]) { [self ensureTableViewMgr]; }
+    if (self = [super init]) [self ensureTableViewMgr];
     return self;
 }
 - (void)viewDidLoad {
@@ -654,31 +555,26 @@ static void dd_append_voice_msg(id favItem, id controller) {
     [_tableViewManager clearAllSection];
     Class cellMgr = objc_getClass("WCTableViewCellManager");
     Class secMgr  = objc_getClass("WCTableViewSectionManager");
-    // 分组标题「语音设置」：优先走 +sectionWithHeader:，老版本没有时回退到 +defaultSection
-    WCTableViewSectionManager *sec = nil;
-    if ([secMgr respondsToSelector:@selector(sectionWithHeader:)])
-        sec = [secMgr sectionWithHeader:@"语音设置"];
-    else
-        sec = [secMgr defaultSection];
+    // 分组标题「语音设置」：优先 +sectionWithHeader:，老版本没有则回退 +defaultSection
+    WCTableViewSectionManager *sec = [secMgr respondsToSelector:@selector(sectionWithHeader:)]
+        ? [secMgr sectionWithHeader:@"语音设置"] : [secMgr defaultSection];
     if (!sec) return;
     DDVoiceConfig *cfg = [DDVoiceConfig sharedConfig];
 
-    // 设置语音秒数：开启后展开「自定义秒数」输入框
     [sec addCell:[cellMgr switchCellForSel:@selector(onSecondsSwitch:) target:self title:@"设置语音秒数" on:cfg.voiceSecondsEnabled]];
     if (cfg.voiceSecondsEnabled) {
         self.secondsField = [[UITextField alloc] init];
         self.secondsField.placeholder = @"自定义秒数(1-60)";
         self.secondsField.text = cfg.voiceSeconds;
         self.secondsField.textAlignment = NSTextAlignmentRight;
-        self.secondsField.keyboardType = UIKeyboardTypeNumberPad;   // 键盘限制数字
-        self.secondsField.delegate = self;                          // 限制：仅数字且 ≤60 秒
+        self.secondsField.keyboardType = UIKeyboardTypeNumberPad;
+        self.secondsField.delegate = self;
         [self.secondsField addTarget:self action:@selector(onSecondsChanged:) forControlEvents:UIControlEventEditingChanged];
         [sec addCell:[cellMgr normalCellForSel:nil
                                         target:nil
                                          title:@"   ↳自定义秒数"
                                      rightView:[self inputRowWithField:self.secondsField action:@selector(onSecondsConfirmed:)]]];
     }
-
     [sec addCell:[cellMgr switchCellForSel:@selector(onFavSwitch:) target:self title:@"收藏语音转发" on:cfg.favEnabled]];
     [sec addCell:[cellMgr switchCellForSel:@selector(onMsgSwitch:) target:self title:@"语音消息转发" on:cfg.msgEnabled]];
 
@@ -698,43 +594,33 @@ static void dd_append_voice_msg(id favItem, id controller) {
         return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
     return UITableViewAutomaticDimension;
 }
-- (void)onFavSwitch:(UISwitch *)s {
-    [DDVoiceConfig sharedConfig].favEnabled = s.on;
-}
-- (void)onMsgSwitch:(UISwitch *)s {
-    [DDVoiceConfig sharedConfig].msgEnabled = s.on;
-}
-// 设置语音秒数：开关切换即重建表格（开启则展开输入框）
+- (void)onFavSwitch:(UISwitch *)s { [DDVoiceConfig sharedConfig].favEnabled = s.on; }
+- (void)onMsgSwitch:(UISwitch *)s { [DDVoiceConfig sharedConfig].msgEnabled = s.on; }
+// 开关切换即重建表格（开启则展开输入框）
 - (void)onSecondsSwitch:(UISwitch *)s {
     [DDVoiceConfig sharedConfig].voiceSecondsEnabled = s.isOn;
     [self buildTable];
 }
-// 输入即自动生效（空字符串视为不覆盖，等价于关闭）
-- (void)onSecondsChanged:(UITextField *)field {
-    [DDVoiceConfig sharedConfig].voiceSeconds = field.text;
-}
-// 确认：收起键盘并确认当前输入
+// 输入即自动生效（空串视为不覆盖）
+- (void)onSecondsChanged:(UITextField *)field { [DDVoiceConfig sharedConfig].voiceSeconds = field.text; }
+// 确认：收起键盘并记录当前输入
 - (void)onSecondsConfirmed:(id)sender {
     [DDVoiceConfig sharedConfig].voiceSeconds = self.secondsField.text;
     [self.secondsField resignFirstResponder];
 }
-// 限制：仅允许数字、且不超过微信语音上限（60 秒）；空串保留（表示不覆盖/关闭）
+// 限制：仅数字、1~60 秒；空串保留表示不覆盖
 - (BOOL)textField:(UITextField *)textField shouldChangeCharactersInRange:(NSRange)range replacementString:(NSString *)string {
     if (textField != self.secondsField) return YES;
     NSString *next = [textField.text stringByReplacingCharactersInRange:range withString:string];
-    if ([next length] == 0) return YES;                                       // 空 = 不覆盖（关闭）
-    if ([[next stringByTrimmingCharactersInSet:[NSCharacterSet decimalDigitCharacterSet]] length] > 0)
-        return NO;                                                            // 非数字字符拒绝
+    if ([next length] == 0) return YES;
+    if ([[next stringByTrimmingCharactersInSet:[NSCharacterSet decimalDigitCharacterSet]] length] > 0) return NO;
     int v = [next intValue];
-    if (v < 1 || v > kDDVoiceMaxSeconds) return NO;                           // 限制：1~60 秒
+    if (v < 1 || v > kDDVoiceMaxSeconds) return NO;
     return YES;
 }
-// 右侧容器：输入框 + 确认按钮（尺寸/样式与 DD收款助手一致：灰底、圆角、系统默认文字颜色）
+// 右侧容器：输入框 + 确认按钮（灰底、圆角、系统默认文字颜色）
 - (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action {
     UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 220, 34)];
-    container.backgroundColor = [UIColor clearColor];
-
-    // 输入框（灰色背景、圆角、无边框、左右留白）
     field.frame = CGRectMake(0, 0, 160, 34);
     field.borderStyle = UITextBorderStyleNone;
     field.backgroundColor = [UIColor systemGray5Color];
@@ -746,7 +632,6 @@ static void dd_append_voice_msg(id favItem, id controller) {
     field.rightViewMode = UITextFieldViewModeAlways;
     [container addSubview:field];
 
-    // 确认按钮（灰色背景、系统默认文字颜色、常规字体、圆角）
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     btn.frame = CGRectMake(168, 0, 52, 34);
     [btn setTitle:@"确认" forState:UIControlStateNormal];
@@ -756,12 +641,11 @@ static void dd_append_voice_msg(id favItem, id controller) {
     btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
     [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     [container addSubview:btn];
-
     return container;
 }
 @end
 
-#pragma mark - 注册
+// ===== 注册 =====
 
 %ctor {
     @autoreleasepool {
