@@ -42,14 +42,6 @@
 - (void)stopLoading;
 @end
 
-// MMLoadingView.h（微信专用加载视图：startLoading 显示转圈+文字，stopLoading 收起；完成时可用 stopLoadingAndShowOK:）
-@interface MMLoadingView : NSObject
-- (id)initWithFrame:(CGRect)arg1;
-- (void)setText:(id)arg1;
-- (void)startLoading;
-- (void)stopLoading;
-@end
-
 // FavoritesItemDataField.h:192 duration / :245 GetDataPath
 @interface FavoritesItemDataField : NSObject
 @property(nonatomic) unsigned int duration;
@@ -393,23 +385,6 @@ static void dd_downloadFavItemThen(id item, void (^done)(void)) {
     });
 }
 
-// 微信原生加载视图：startLoading 显示（带转圈+“下载中…”），下载完成才 stopLoading；不参与成功/失败判定。
-// 挂在 keyWindow，不受选人器关闭影响。
-static id g_ddLoadingToast = nil;
-static void dd_showLoading(NSString *text) {
-    id toast = [[objc_getClass("MMLoadingView") alloc] initWithFrame:CGRectZero];
-    [toast setText:text];
-    [toast startLoading];
-    g_ddLoadingToast = toast;
-}
-
-static void dd_hideLoading(void) {
-    if (g_ddLoadingToast) {
-        [g_ddLoadingToast stopLoading];
-        g_ddLoadingToast = nil;
-    }
-}
-
 #pragma mark - 语音扩展信息
 
 // 对齐锤子 0x75909c voiceExtendInfoForMessageWrap:createIfNeeded:
@@ -588,11 +563,8 @@ static BOOL dd_takeOverVoiceMsg(id msg, id contact) {
         if (favItem) {
             // 收藏语音外壳：音频未就绪，下载后注入 m_dtVoice 再发送（下载必定成功，不做失败分支）
             DDLog(@"发送时语音数据缺失，现下载收藏语音再发送");
-            // 长语音下载可能耗时，挂微信原生加载 HUD 提示，避免静默间隙被误判为卡死
-            dd_showLoading(@"下载中…");
             // 一次性 block（跑完即释放，不形成循环引用），强持有 msg 以保证 shell wrap 在下载期间不被释放
             dd_downloadFavItemThen(favItem, ^{
-                dd_hideLoading();
                 dd_ensureFavVoiceData(msg);
                 NSString *p = dd_audioPathForMsg(msg);
                 dd_sendVoice(usr, p, duration);
