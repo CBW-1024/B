@@ -146,15 +146,14 @@
 - (void)dismissLogicController;
 @end
 
-// SessionSelectView.h:141(handleSelectFromContact) / :150(layoutSubviews)
-// 「选择聊天」页视图（层次树实测：SessionSelectController.view → SessionSelectView → MMTableView），
-// 其标题行本就带原生「从通讯录选择」入口，处理方法是 -handleSelectFromContact。
-// 语音转发时直接调用这个原生入口方法，让微信自己弹出带字母索引的通讯录选人页
-// （ContactSelectorViewController，见 ContactSelectorViewController.h:16 initWithContacts:selectedContacts:），
-// 不再自绘选择器、也不自己拼好友数据。layoutSubviews 作为「页面已上屏」的触发点，一次性触发。
-@interface SessionSelectView : NSObject
-- (void)handleSelectFromContact;
-- (void)layoutSubviews;
+// SessionSelectController 是 UIViewController 子类（承载「选择聊天」页）；声明为 UIViewController
+// 以便直接访问 navigationController / setViewControllers: 等原生导航 API（其余微信类仍声明为 NSObject）。
+// 它内部持有并配置好目标联系人页：-multiSelectContactsVC(:97，返回 MultiSelectContactsViewController)，
+// 原生入口 -openContactPickerView(:197) 负责配置（场景值 + delegate 链连到 ForwardMessageLogicController）并 push 它。
+// 我们复用这个微信已配好的实例，只把它在导航栈里替换「选择聊天」层，避免先出聊天页再出联系人页的「弹两次」。
+@interface SessionSelectController : UIViewController
+- (void)openContactPickerView;
+- (id)multiSelectContactsVC;
 @end
 
 // BaseMessageCellView.h + 8.0.76 反汇编双重确认：原生转发按钮相关方法。
@@ -203,10 +202,11 @@ static const unsigned int kDDVoiceLocalIDRange = 0x15f90;
 // 收藏语音来源：把 FavoritesItem 绑到构造出的语音 wrap 上，供「发送时下载」反查并下载
 static const void *kDDFavSourceKey = &kDDFavSourceKey;
 // 语音转发进行中标记：普通语音（BaseMessageCellView -onForward:）与收藏语音（FavForwardLogicController -addMsgFromItem:）
-// 进入转发流程时都会置 YES，供 SessionSelectView 在页面出现后自动调用原生「从通讯录选择」入口（-handleSelectFromContact）；
-// 发送/取消后清零（ForwardMessageLogicController -dismissLogicController / -ForwardMsg*），不污染普通消息转发。
+// 进入转发流程时都会置 YES，供 SessionSelectController 在页面出现时复用并配置好原生联系人页（openContactPickerView），
+// 随后把「选择聊天」层从导航栈替换掉，屏幕上只呈现联系人页；发送/取消后清零
+// （ForwardMessageLogicController -dismissLogicController / -ForwardMsg*），不污染普通消息转发。
 static BOOL g_ddVoiceForwardPicking = NO;
-// 一次性标记：本次语音转发是否已自动打开过通讯录选人页，避免 layoutSubviews 多次触发重复弹出。
+// 一次性标记：本次语音转发是否已自动打开过联系人选人页，避免控制器多次出现时重复弹出。
 static BOOL g_ddContactPickerOpened = NO;
 
 @interface DDFavVoiceConfig : NSObject
@@ -708,8 +708,8 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
         FavoritesItem *item = (FavoritesItem *)arg1;
         DDLog(@"进入转发流程，收藏语音 type=%d", item.type);
         dd_appendVoiceMsg(item, self);
-        // 标记语音转发进行中：必须在 %orig 之前置位——原实现在同步返回时即弹出选人器，
-        // SessionSelectView 随后的 layoutSubviews 会据此自动打开原生「从通讯录选择」页。
+        // 标记语音转发进行中：必须在 %orig 之前置位——原实现在同步返回时即弹出「选择聊天」页，
+        // 其控制器 SessionSelectController 的 viewWillAppear: 会据此直接打开原生「选择联系人」页。
         g_ddVoiceForwardPicking = YES;
     }
     // 0x78f5cc：原实现无条件调用（同步，确保选人器正常弹出）
@@ -760,22 +760,28 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 }
 %end
 
-#pragma mark - 四-b 语音转发：自动打开原生「从通讯录选择」页（普通 + 收藏通用）
-// 「选择聊天」页 SessionSelectView 标题行本就带原生「从通讯录选择」入口，其处理方法是 -handleSelectFromContact。
-// 语音转发时不再改微信内部布局/多选态（那套「强开 m_bMultiSelect」实测无效），而是直接在页面出现后
-// 调用这个原生入口方法，由微信自己弹出带字母索引的通讯录选人页——零自绘、零好友数据拼装，
-// 普通语音与收藏语音统一走这一条。仅在进行中的语音转发（g_ddVoiceForwardPicking）触发，
-// 且每次转发只触发一次（g_ddContactPickerOpened）。
-%hook SessionSelectView
-- (void)layoutSubviews {
+#pragma mark - 四-b 语音转发：直接打开原生「选择联系人」页（普通 + 收藏通用）
+// 目标页（用户截图实测）为 MultiSelectContactsViewController：搜索框 + 「选择群聊」入口 + A-Z 分组 + 多选圆点。
+// 它在微信原生结构里是「选择聊天」页的子层：由 SessionSelectController 自己持有(:97 multiSelectContactsVC)、
+// 原生入口 -openContactPickerView(:197) 打开——所以只要走原生路径就必然先出会话页（实测「弹两次」）。
+// 这里在「选择聊天」页即将出现时直接打开联系人页，并把本层 view 隐藏，屏幕上只留联系人页那一层。
+// 普通语音与收藏语音统一走这一条；仅在进行中的语音转发触发，每次转发只触发一次（g_ddContactPickerOpened）。
+%hook SessionSelectController
+- (void)viewWillAppear:(BOOL)animated {
     %orig;
     if (g_ddVoiceForwardPicking && !g_ddContactPickerOpened) {
         g_ddContactPickerOpened = YES;
-        DDLog(@"语音转发：自动调用原生「从通讯录选择」入口");
-        __weak __typeof(self) weakSelf = self;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf handleSelectFromContact];
-        });
+        DDLog(@"语音转发：直接呈现原生联系人页（替换选择聊天层，避免弹两次）");
+        // 复用微信已配好的联系人页：openContactPickerView 会配置（场景值 + delegate 链）并把它 push 进导航栈。
+        // 随后把「选择聊天」层（self）从导航栈移除，屏幕上只剩联系人页，消除「先弹聊天页再弹联系人页」。
+        // self 不在导航栈后不影响转发收尾——联系人页的 delegate 是 ContactsSelectorController（与 self 无关）。
+        [self openContactPickerView];
+        id mc = [self multiSelectContactsVC];
+        NSMutableArray *vcs = [NSMutableArray arrayWithArray:[self.navigationController viewControllers]];
+        if (mc && [vcs containsObject:mc]) {
+            [vcs removeObject:self];
+            [self.navigationController setViewControllers:vcs animated:NO];
+        }
     }
 }
 %end
