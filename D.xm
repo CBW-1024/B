@@ -83,10 +83,18 @@
 - (_Bool)addMessageToDB:(id)arg1;
 - (id)getAudioFileName:(id)arg1 LocalID:(unsigned int)arg2;
 - (BOOL)prepareSend:(id)arg1;
+- (BOOL)OnRecorderPrepareSend:(id)arg1;
+- (BOOL)SendOriVoiceMsgWithUserData:(id)arg1;
 @end
 
 @interface MMNewSessionMgr : NSObject
 - (unsigned int)GenSendMsgTime;
+@end
+
+// 所有本地消息（含自己录制的语音）入库必经，post-%orig 覆盖自定义秒数最通用、最可靠
+@interface CMessageMgr : NSObject
+- (void)AddLocalMsg:(id)arg1 MsgWrap:(id)arg2;
+- (void)AddMsg:(id)arg1 MsgWrap:(id)arg2;
 @end
 
 @interface CBaseContact : NSObject
@@ -307,14 +315,16 @@ static unsigned int dd_effectiveVoiceDuration(unsigned int realDuration) {
 }
 
 // 把当前语音消息的 m_uiVoiceTime 替换为自定义秒数。
-// 在所有发送路径（prepareSend / SendOriVoiceMsgWithUserData / addMessageToDB）统一调用，
-// 取"最后写入"的那次生效，确保自定义值不被微信按真实音频时长重新覆盖。
-// 守卫：开关开 + 语音消息(m_uiMessageType==34) + 自己发送的语音，避免误伤接收消息。
-static void dd_apply_custom_voice_seconds(id wrap) {
+// 在所有发送/入库路径统一调用，取"最后写入"的那次生效，确保自定义值不被微信真实时长覆盖。
+// ownOnly：YES=调用方已确定是本地自己发送（AudioSender 发送点，此时 m_nsFromUsr 可能未设，
+//            跳过发送者判定）；NO=通用入库点（CMessageMgr），保留 isSenderFromMsgWrap 区分收发。
+static void dd_apply_custom_voice_seconds(id wrap, BOOL ownOnly) {
     if (![DDVoiceConfig sharedConfig].voiceSecondsEnabled) return;
-    if (!dd_voice_is_msg(wrap)) return;                                   // 仅语音消息
-    Class wrapCls = objc_getClass("CMessageWrap");
-    if (![wrapCls isSenderFromMsgWrap:wrap]) return;                      // 仅自己发送的语音
+    if (!dd_voice_is_msg(wrap)) return;                                   // 仅语音消息(m_uiMessageType==34)
+    if (!ownOnly) {
+        Class wrapCls = objc_getClass("CMessageWrap");
+        if (![wrapCls isSenderFromMsgWrap:wrap]) return;                  // 仅自己发送的语音
+    }
     id ext = dd_voiceExtendInfo(wrap, NO);
     if (!ext) return;                                                     // 无语音扩展信息则不处理
     unsigned int real = [ext m_uiVoiceTime];
@@ -580,31 +590,42 @@ static void dd_append_voice_msg(id favItem, id controller) {
 %end
 
 #pragma mark - 自己录制发送的语音也支持自定义秒数
-// 自录音发送路径：prepareSend: / SendOriVoiceMsgWithUserData: / addMessageToDB: 都挂上同一覆盖逻辑，
-// 取"最后写入"那次生效——修正 prepareSend: 单点不命中或被微信真实时长覆盖导致仍显示真实秒数的问题。
+// 自录音发送：微信录音完成后经 AudioSender 发送（prepareSend / OnRecorderPrepareSend / SendOriVoiceMsgWithUserData），
+// 最终所有本地消息都会进 CMessageMgr 入库（AddLocalMsg / AddMsg）。这些点都在微信把真实 m_uiVoiceTime 写入之后，
+// post-%orig 再覆盖为自定义值即可生效。
+// 发送点(ownOnly=YES)跳过发送者判定：录音发送必是自己，且此时 m_nsFromUsr 可能尚未设置；
+// 入库点(ownOnly=NO)保留 isSenderFromMsgWrap 区分自己发/接收，避免误伤拉取下来的消息。
 %hook AudioSender
 - (BOOL)prepareSend:(id)wrap {
     BOOL r = %orig;
-    if (r && wrap) dd_apply_custom_voice_seconds(wrap);
+    if (r && wrap) dd_apply_custom_voice_seconds(wrap, YES);
     return r;
 }
-%end
-
-%hook AudioSender
-// 录制完成后的"首发"入口（Ori = 原始录音），post-%orig 覆盖，确保是最终写入
+- (BOOL)OnRecorderPrepareSend:(id)wrap {
+    BOOL r = %orig;
+    if (r && wrap) dd_apply_custom_voice_seconds(wrap, YES);
+    return r;
+}
 - (BOOL)SendOriVoiceMsgWithUserData:(id)wrap {
     BOOL r = %orig;
-    if (r && wrap) dd_apply_custom_voice_seconds(wrap);
+    if (r && wrap) dd_apply_custom_voice_seconds(wrap, YES);
+    return r;
+}
+- (BOOL)addMessageToDB:(id)wrap {
+    BOOL r = %orig;
+    if (r && wrap) dd_apply_custom_voice_seconds(wrap, YES);
     return r;
 }
 %end
 
-%hook AudioSender
-// 语音入库点：微信在此前后把真实音频时长写进 m_uiVoiceTime，post-%orig 再覆盖为自定义值
-- (BOOL)addMessageToDB:(id)wrap {
-    BOOL r = %orig;
-    if (r && wrap) dd_apply_custom_voice_seconds(wrap);
-    return r;
+%hook CMessageMgr
+- (void)AddLocalMsg:(id)arg1 MsgWrap:(id)wrap {
+    %orig;
+    if (wrap) dd_apply_custom_voice_seconds(wrap, NO);
+}
+- (void)AddMsg:(id)arg1 MsgWrap:(id)wrap {
+    %orig;
+    if (wrap) dd_apply_custom_voice_seconds(wrap, NO);
 }
 %end
 
