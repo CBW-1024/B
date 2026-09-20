@@ -19,8 +19,14 @@
 @property (nonatomic, weak) id delegate;
 @end
 
+// 微信头文件证据（四份 dump 一致）：
+//   /tmp/wechat_dump/WCTableViewSectionManager.h          +(id) sectionWithHeader:(id);
+//   /tmp/wechat76_dump/微信/WCTableViewSectionManager.h     + (id)sectionWithHeader:(id)arg1;
+//   /tmp/wcd76_new/WeChat/WCTableViewSectionManager.h      + (id)sectionWithHeader:(id)a0;
+//   /tmp/wechat_new/WeChat/WCTableViewSectionManager.h     + (id)sectionWithHeader:(id)a0;
 @interface WCTableViewSectionManager : NSObject
 + (id)defaultSection;
++ (id)sectionWithHeader:(id)arg1;   // 带分组标题的 section
 - (void)addCell:(id)arg1;
 @end
 
@@ -648,7 +654,13 @@ static void dd_append_voice_msg(id favItem, id controller) {
     [_tableViewManager clearAllSection];
     Class cellMgr = objc_getClass("WCTableViewCellManager");
     Class secMgr  = objc_getClass("WCTableViewSectionManager");
-    WCTableViewSectionManager *sec = [secMgr defaultSection];
+    // 分组标题「语音设置」：优先走 +sectionWithHeader:，老版本没有时回退到 +defaultSection
+    WCTableViewSectionManager *sec = nil;
+    if ([secMgr respondsToSelector:@selector(sectionWithHeader:)])
+        sec = [secMgr sectionWithHeader:@"语音设置"];
+    else
+        sec = [secMgr defaultSection];
+    if (!sec) return;
     DDVoiceConfig *cfg = [DDVoiceConfig sharedConfig];
 
     // 设置语音秒数：开启后展开「自定义秒数」输入框
@@ -755,7 +767,7 @@ static void dd_append_voice_msg(id favItem, id controller) {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
         [[mgr sharedInstance] registerControllerWithTitle:@"DD语音助手"
-                                                  version:@"1.2.0"
+                                                  version:@"1.3.0"
                                                controller:@"DDVoiceSettingsViewController"];
     }
 }
