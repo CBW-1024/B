@@ -3,7 +3,7 @@
 #import <objc/message.h>
 #import <substrate.h>
 
-// 微信类前向声明（运行时以 objc_getClass 取类，不强链）
+// 微信类前向声明
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -336,7 +336,7 @@ static BOOL dd_sendVoice(NSString *usr, NSString *audPath, unsigned int duration
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
     return YES;
 }
-// 收藏外壳：数据未就绪则下载后注入 m_dtVoice 再发送（下载必成功，无失败分支）
+// 收藏外壳：数据未就绪则下载后注入 m_dtVoice 再发送
 static void dd_ensureFavVoiceData(id msg) {
     if ([dd_voiceData(msg) length] > 0) return;
     id favItem = objc_getAssociatedObject(msg, kDDFavSourceKey);
