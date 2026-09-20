@@ -666,17 +666,34 @@ static void dd_append_voice_msg(id favItem, id controller) {
     if (v < 1 || v > kDDVoiceMaxSeconds) return NO;                           // 限制：1~60 秒
     return YES;
 }
-// 右侧容器：输入框 + 确认按钮（尺寸与 DD收款助手一致）
+// 右侧容器：输入框 + 确认按钮（尺寸/样式与 DD收款助手一致：灰底、圆角、系统默认文字颜色）
 - (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action {
-    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 200, 30)];
-    field.frame = CGRectMake(0, 0, 150, 30);
-    field.borderStyle = UITextBorderStyleRoundedRect;
+    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 220, 34)];
+    container.backgroundColor = [UIColor clearColor];
+
+    // 输入框（灰色背景、圆角、无边框、左右留白）
+    field.frame = CGRectMake(0, 0, 160, 34);
+    field.borderStyle = UITextBorderStyleNone;
+    field.backgroundColor = [UIColor systemGray5Color];
+    field.layer.cornerRadius = 6.0;
+    field.layer.masksToBounds = YES;
+    field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
+    field.leftViewMode = UITextFieldViewModeAlways;
+    field.rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
+    field.rightViewMode = UITextFieldViewModeAlways;
     [container addSubview:field];
+
+    // 确认按钮（灰色背景、系统默认文字颜色、常规字体、圆角）
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(158, 0, 42, 30);
+    btn.frame = CGRectMake(168, 0, 52, 34);
     [btn setTitle:@"确认" forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor systemGray5Color];
+    btn.layer.cornerRadius = 6.0;
+    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
     [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     [container addSubview:btn];
+
     return container;
 }
 @end
