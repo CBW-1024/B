@@ -42,6 +42,8 @@
 + (id)getPathOfMsgImg:(id)arg1;
 + (_Bool)isSenderFromMsgWrap:(id)arg1;
 - (id)initWithMsgType:(long long)arg1;
+// 4 份 dump 均存在：wechat_dump/CMessageWrap.h:156、wechat76:550、wcd76_new:864、wechat_new:853
+- (BOOL)IsVoiceMsg;
 @property(nonatomic) unsigned int m_uiMessageType;
 @property(nonatomic) unsigned int m_uiCreateTime;
 @property(nonatomic) unsigned int m_uiStatus;
@@ -57,6 +59,26 @@
 @property(nonatomic) unsigned int m_uiVoiceEndFlag;
 @property(retain, nonatomic) NSData *m_dtVoice;
 @property(nonatomic, weak) CMessageWrap *m_refMessageWrap;
+@end
+
+// 语音上传结构（protobuf 生成类）。头文件证据：UploadVoiceWrap.h
+// 自己录音发送链路：AudioSender OnRecorderPart:...Duration:
+//                → MMNewUploadVoiceMgr AddNewPart:...VoiceTime:
+//                → UploadVoiceWrap setM_uiVoiceTime:  ← 发出去前的最后一次写入
+@interface UploadVoiceWrap : NSObject
+@property(nonatomic) unsigned int m_uiVoiceTime;
+@property(nonatomic) unsigned int m_uiVoiceLen;
+@property(nonatomic) unsigned int m_uiVoiceFormat;
+@property(nonatomic) unsigned int m_uiVoiceEndFlag;
+@property(nonatomic) unsigned int m_uiVoiceCancelFlag;
+@property(nonatomic) unsigned int m_uiVoiceForwardFlag;
+@property(nonatomic) unsigned int m_uiOffset;
+@property(nonatomic) unsigned int m_uiLen;
+@property(nonatomic) unsigned int m_uiLocalID;
+@property(nonatomic) unsigned int m_uiCreateTime;
+@property(retain, nonatomic) NSData *m_dtVoice;
+@property(retain, nonatomic) NSString *m_nsToUsrName;
+@property(retain, nonatomic) NSString *m_nsFromUsrName;
 @end
 
 @interface CUtility : NSObject
@@ -213,7 +235,9 @@ static BOOL dd_voice_forward_enabled(void) {
 
 #pragma mark - 工具
 
+// 优先用微信自己的判定（跨版本稳），取不到再回退硬编码 34
 static BOOL dd_voice_is_msg(id msg) {
+    if ([msg respondsToSelector:@selector(IsVoiceMsg)]) return [(CMessageWrap *)msg IsVoiceMsg];
     return ((CMessageWrap *)msg).m_uiMessageType == (unsigned int)kDDVoiceMsgType;
 }
 static BOOL dd_voice_is_fav_item(id obj) {
@@ -289,18 +313,26 @@ static BOOL dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int durati
     dd_configureVoiceMeta(wrap, duration);
     return dd_injectVoiceData(wrap, voiceData);
 }
-// 自定义语音秒数：开关开 + 有效数字 → 用自定义值覆盖真实时长；
-// 空字符串或 0 视为不覆盖（等价于关闭）；
-// B 兜底：自定义值 > 真实音频时长时回退真实时长，避免接收方空播/进度错位
-static unsigned int dd_effectiveVoiceDuration(unsigned int realDuration) {
+// 自定义语音秒数：毫秒进、毫秒出。
+// ★ 单位依据（WCRefine 逆向 + 微信头文件互证）：m_uiVoiceTime 单位是【毫秒】
+//   - WCRefine 0x8f4084 对自定义秒数 mul #1000，未启用时钳到 60000
+//   - 录音层 MMTapRecordButton.maxSeconds 是 double 秒（上限 60），
+//     TingAudioRecordConfiguration.maxTimeInSecond 亦为秒；
+//     而 m_uiVoiceTime 是 unsigned int，60000 = 60 秒 × 1000 精确对应
+// 开关关闭 / 输入为空 / 输入为 0 → 原样返回（等价于不覆盖）
+static unsigned int dd_voiceTimeMs(unsigned int realMs) {
     DDVoiceConfig *c = [DDVoiceConfig sharedConfig];
-    if (!c.voiceSecondsEnabled) return realDuration;
+    if (!c.voiceSecondsEnabled) return realMs;
     NSString *s = c.voiceSeconds;
-    if ([s length] == 0) return realDuration;
-    unsigned int v = (unsigned int)[s integerValue];
-    if (v == 0) return realDuration;        // 0（含旧配置残留）视为不覆盖
-    if (realDuration > 0 && v > realDuration) return realDuration;  // B：声明时长不超过真实音频
-    return v;                               // 输入层已保证 1~60，直接采用
+    if ([s length] == 0) return realMs;
+    NSInteger sec = [s integerValue];
+    if (sec <= 0) return realMs;                    // 0（含旧配置残留）视为不覆盖
+    if (sec < 1)  sec = 1;
+    if (sec > kDDVoiceMaxSeconds) sec = kDDVoiceMaxSeconds;
+    unsigned int target = (unsigned int)sec * 1000; // ★ 秒 → 毫秒
+    // B 兜底：声明时长不超过真实音频时长，避免接收方空播/进度条错位
+    if (realMs > 0 && target > realMs) return realMs;
+    return target;
 }
 
 #pragma mark - 音频路径
@@ -387,7 +419,7 @@ static void dd_ensure_fav_voice_data(id msg) {
 static BOOL dd_take_over_voice_msg(id msg, id contact) {
     if (!dd_voice_is_msg(msg)) return NO;
     NSString *usr = (NSString *)[(CBaseContact *)contact m_nsUsrName];
-    unsigned int duration = dd_effectiveVoiceDuration(dd_voiceDuration(msg));
+    unsigned int duration = dd_voiceTimeMs(dd_voiceDuration(msg));
     NSString *audPath = dd_audio_path_for_msg(msg);
     if ([audPath length] == 0) {
         id favItem = objc_getAssociatedObject(msg, kDDVoiceFavSourceKey);
@@ -428,7 +460,7 @@ static id dd_msg_wrap_from_fav_data(id favData, id favItem) {
     if ([me length] > 0) [wrap setM_nsFromUsr:me];
     [wrap setM_uiCreateTime:(unsigned int)time(NULL)];
     [wrap setM_uiMesLocalID:dd_new_voice_local_id()];
-    unsigned int duration = dd_effectiveVoiceDuration(field.duration);
+    unsigned int duration = dd_voiceTimeMs(field.duration);
     dd_configureVoiceMeta(wrap, duration);
     if (favItem) objc_setAssociatedObject(wrap, kDDVoiceFavSourceKey, favItem, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     id pathObj = [field GetDataPath];
@@ -455,6 +487,62 @@ static void dd_append_voice_msg(id favItem, id controller) {
     if (![store isKindOfClass:[NSMutableArray class]]) return;
     [(NSMutableArray *)store addObject:wrap];
 }
+
+#pragma mark - 自定义语音秒数（单位：毫秒）
+
+// 归属闸门：只改「自己发出」的语音，收到的语音保持原时长。
+// 头文件证据（4 份 dump 均一致）：
+//   CExtendInfoOfVoiceMsg.h —— @property(nonatomic, weak) CMessageWrap *m_refMessageWrap; // @synthesize
+//   CMessageWrap.h          —— m_uiMessageType / m_nsFromUsr
+// 逆向证据：WCRefine 0x8f8484 / 0x8f82f8 —— m_uiMessageType == 0x22(34) 且 m_nsFromUsr == 当前登录用户
+//           （注意它用的是 m_nsFromUsr，不是 +isSenderFromMsgWrap:）
+static BOOL dd_voice_is_mine(id wrap) {
+    if (!wrap) return NO;                                                   // 无归属：保守不动
+    if (!dd_voice_is_msg(wrap)) return NO;
+    NSString *me = dd_current_usr_name();
+    if ([me length] == 0) return NO;
+    return [((CMessageWrap *)wrap).m_nsFromUsr isEqualToString:me];
+}
+// m_refMessageWrap 尚未绑定时是否仍覆盖：
+//   0 = 保守（默认）。只改已归属且来自自己的语音。
+//   1 = 激进。若自己录音时先写时长、后绑 wrap，导致本地气泡仍显示真实秒数，把这里改成 1。
+#define kDDVoiceApplyWhenNoRef 0
+// 从语音扩展信息反查归属消息
+static BOOL dd_voice_ext_is_mine(id ext) {
+    id wrap = [(CExtendInfoOfVoiceMsg *)ext m_refMessageWrap];
+#if kDDVoiceApplyWhenNoRef
+    if (!wrap) return YES;
+#endif
+    return dd_voice_is_mine(wrap);
+}
+
+// ① 上传链路：自己录音发送的必经点。
+//    链路：AudioSender -OnRecorderPart:Offset:Len:EndFlag:ForceDelete:Duration:
+//       → MMNewUploadVoiceMgr -AddNewPart:... VoiceTime:...
+//       → UploadVoiceWrap -setM_uiVoiceTime:   ← 发出去前的最后一次写入
+//    头文件证据：UploadVoiceWrap.h（4 份 dump 均有 m_uiVoiceTime/setM_uiVoiceTime:）
+//              、MMNewUploadVoiceMgr.h、BaseUploadVoiceMgr.h
+//    该结构只在上传自己语音时创建，无需归属闸门。
+%hook UploadVoiceWrap
+- (void)setM_uiVoiceTime:(unsigned int)v {
+    %orig(dd_voiceTimeMs(v));
+}
+%end
+
+// ② 存储 / 本地显示：CExtendInfoOfVoiceMsg 才是真正存储者。
+//    CMessageWrap.m_uiVoiceTime 是 @dynamic（wechat76_dump/CMessageWrap.h:1069），
+//    运行时才挂载 IMP，直接 %hook 有 %orig 为空的风险，故 hook 真实存储类。
+//    被 @dynamic 转发后同样会走到这里，一处覆盖即可同时改「落库值」和「气泡显示」。
+//    头文件证据：CExtendInfoOfVoiceMsg.h（m_uiVoiceTime 为 @synthesize，有真实 ivar）
+%hook CExtendInfoOfVoiceMsg
+- (void)setM_uiVoiceTime:(unsigned int)v {
+    %orig(dd_voice_ext_is_mine(self) ? dd_voiceTimeMs(v) : v);
+}
+- (unsigned int)m_uiVoiceTime {
+    unsigned int v = %orig;
+    return dd_voice_ext_is_mine(self) ? dd_voiceTimeMs(v) : v;
+}
+%end
 
 #pragma mark - 收藏语音转发闸门
 
