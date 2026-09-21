@@ -309,16 +309,14 @@
 //   改它的 updateNumber: 才会连带重算容器尺寸；直接改内层 ScrollNumber 会右溢顶格。
 @interface TimeoutNumber : UIView
 - (void)updateNumber:(unsigned long long)a0;
-- (void)updateNumberInternal:(unsigned long long)a0;
 - (void)defaultNumber:(unsigned long long)a0;
 @end
 
 // ScrollNumber：钱包页金额数字容器，运行时为 UIView（dump 声明为 NSObject，故按 UIView 声明以访问 frame）。
-//   容器宽度按金额推算，而金额有 currentNumber / getNumber 两条读来源，
-//   故写入口与两条读路径须一并拦住，使容器宽度与改写值匹配，否则数字右溢顶格。
+//   容器宽度按金额推算，故写入口与 currentNumber 读路径须一并拦住，
+//   使容器宽度与改写值匹配，否则数字右溢顶格。
 @interface ScrollNumber : UIView
 - (unsigned long long)currentNumber;
-- (unsigned long long)getNumber;
 - (void)defaultNumber:(unsigned long long)a0;
 - (void)updateNumber:(unsigned long long)a0;
 @end
@@ -1783,8 +1781,8 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
 
 #pragma mark - 余额 / 零钱通改写
 // 金额由 TimeoutNumber（容器）内的 ScrollNumber（滚轮）渲染，两条链都要接管：
-//   · 改值 —— 三个写入口（updateNumber: / defaultNumber: / updateNumberInternal:）全部换成目标值，
-//     外加两条读路径 currentNumber / getNumber（原生按它们推算宽度，只改写入口会导致宽度与新值不匹配）。
+//   · 改值 —— 两个写入口（updateNumber: / defaultNumber:）全部换成目标值，
+//     外加 currentNumber 读路径（原生按它推算宽度，只改写入口会导致宽度与新值不匹配）。
 //     钱包页入口头部由 WCPayWalletEntryHeaderView 自身刷新方法接管（见下方 %hook），
 //     %orig 后主动灌改写值，下游 ScrollNumber 自动收到改写值，无滚动动画。
 //     本层是兜底：金额存在多条并行写入路径，Kinda 源头只堵住其中一条，
@@ -1816,23 +1814,9 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
     } @catch (NSException *e) {}
     %orig(v);
 }
-// 第二条写值入口：与 updateNumber: 并列，超时重绘 / 指示器刷新走这条，触发时机更晚。
-//   两处换的是同一个固定值，重复改写无副作用。
-- (void)updateNumberInternal:(unsigned long long)original {
-    unsigned long long v = original;
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
-        }
-    } @catch (NSException *e) {}
-    %orig(v);
-}
 %end
 
-// 读路径必须一起改：scrollNumberSize / widthOfNumber: 推算宽度时读的是金额，
-//   该值有 currentNumber / getNumber 两条来源，只改一条会让宽度仍按旧值算，
+// 读路径必须一起改：宽度推算时读的是金额，只改写入口会让宽度仍按旧值算，
 //   容器与内容对不上 → 数字右溢盖箭头（顶格）。
 %hook ScrollNumber
 - (unsigned long long)currentNumber {
@@ -1845,7 +1829,6 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
             if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
-    DDLog(@"SN.currentNumber %llu → %llu", orig, v);
     return v;
 }
 - (void)defaultNumber:(unsigned long long)original {
@@ -1869,20 +1852,6 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
         }
     } @catch (NSException *e) {}
     %orig(v);
-}
-// 第二条读值入口：与 currentNumber 并列。宽度推算（scrollNumberSize / widthOfNumber:）
-//   若走这条，只改 currentNumber 会让宽度仍按真实值算。
-- (unsigned long long)getNumber {
-    unsigned long long orig = %orig;
-    unsigned long long v = orig;
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
-        }
-    } @catch (NSException *e) {}
-    return v;
 }
 %end
 
