@@ -63,7 +63,6 @@
 @interface WeToast : MMWindowViewController
 + (id)toast;
 - (void)showDoneToastWithText:(id)a0;
-- (void)showErrorToastWithText:(id)a0;
 @end
 
 @interface WCPluginsMgr : NSObject
@@ -107,7 +106,6 @@
 @interface CBaseContact : NSObject
 @property (retain, nonatomic) NSString *m_nsUsrName;
 @property (retain, nonatomic) NSString *m_nsAliasName;
-- (BOOL)isSelf;
 @end
 
 @interface CSetting : NSObject
@@ -202,7 +200,6 @@
 @interface BaseMessageCellView : BaseChatCellView
 - (void)layoutContentView;
 - (void)layoutInternal;
-- (void)prepareForReuse;
 - (id)operationMenuItems;
 @end
 
@@ -212,9 +209,6 @@
 @end
 
 @interface BaseMsgContentViewController : MMUIViewController
-- (void)clearNodeLayoutCache;
-- (void)reloadNodeWithMessageWrap:(CMessageWrap *)msgWrap;
-- (void)reloadVisibleNodeWithCellView:(UIView *)cellView;
 - (UITableView *)getMsgTableView;
 @end
 
@@ -227,7 +221,6 @@
 //   但方法确在调用（编译期需要声明，删了会 "no known instance method"）。
 //   签名锚定 WeChat/RichTextView.h:131/132/146/223。
 @interface RichTextView : MMCPLabel
-- (id)getContent;
 - (void)setContent:(id)content;
 - (void)calculateAndUpdateFrame;
 - (void)forceDisplayInSync;
@@ -245,8 +238,8 @@
 - (CMessageWrap *)messageWrap;
 @end
 
+// WCPayBaseMessageCellView 无自身方法，只作为 WCPayTransferMessageCellView 的父类占位。
 @interface WCPayBaseMessageCellView : CommonMessageCellView
-- (void)onTouchUpInside;
 @end
 
 @interface WCPayTransferMessageCellView : WCPayBaseMessageCellView
