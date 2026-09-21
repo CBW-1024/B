@@ -588,9 +588,8 @@ static void DDJokerCacheClear(NSString *name) {
     dispatch_sync(DDJokerCacheQueue(), ^{ [DDJokerMemCaches() removeObjectForKey:name]; });
     [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
 }
-// 替换图目录：路径进程内固定，只在首次与「清空记录」后各建一次。
-//   原实现每次调用都 createDirectoryAtPath，而 DDImageReplacementPath 是从 layoutContentView
-//   走进来的 —— 那是一条布局热路径，不该每帧都去碰一次文件系统。
+// 替换图目录路径进程内固定，只建一次；layoutContentView 是布局热路径，每帧取替换图，
+//   不该每帧都去碰一次文件系统。
 static NSString *DDJokerImagesDir(void) {
     static NSString *dir = nil;
     static dispatch_once_t once;
@@ -626,7 +625,7 @@ static NSString *DDJokerCachedText(CMessageWrap *msg) {
     return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
 }
 
-// 前向声明：原文写入函数定义在本文件稍后，改写时需要先补记原文。
+// 原文写入函数定义在下方，此处先声明以便改写前先补记原文。
 static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text);
 
 // 原文只在真正改写时记录一次：此刻 m_nsContent 还没被改写过，存下来的才是真原文。
@@ -1660,7 +1659,6 @@ static DDBalancePageKind DDBalanceKindFor(id v) {
     return kind;
 }
 
-// 前向声明：DDClampFen 定义在本文件稍后（取目标值时要先钳位）
 static unsigned long long DDClampFen(unsigned long long fen);
 
 // 取该 view 应改成的目标值（分）；不需要改写返回 NO。
@@ -1785,7 +1783,7 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
 %end
 
 // 入口头部余额：直接在类层级接管刷新方法（用头文件声明的 timeoutNumber / balanceMoneyLabel 属性），
-//   不再依赖 superview 链判定。%orig 后主动把真实值换成改写值，下游 ScrollNumber 自动收到改写值。
+//   %orig 后主动灌改写值，下游 ScrollNumber 自动收到改写值；判定职责落在类自身，无需视图树遍历。
 static void DDBalancePatchEntryHeader(id header, unsigned long long fen) {
     id tn = [header timeoutNumber];
     if ([tn respondsToSelector:@selector(updateNumber:)]) [tn updateNumber:fen];
