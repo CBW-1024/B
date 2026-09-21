@@ -309,21 +309,18 @@
 //   改它的 updateNumber: 才会连带重算容器尺寸；直接改内层 ScrollNumber 会右溢顶格。
 @interface TimeoutNumber : UIView
 - (void)updateNumber:(unsigned long long)a0;
+- (void)updateNumberInternal:(unsigned long long)a0;
 - (void)defaultNumber:(unsigned long long)a0;
-- (void)updateScrollNumber;
-- (id)scrollNumber;
-- (CGSize)scrollNumberSize;
 @end
 
 // ScrollNumber：钱包页金额数字容器，运行时为 UIView（dump 声明为 NSObject，故按 UIView 声明以访问 frame）。
-//   scrollNumberSize / widthOfNumber: 均以 currentNumber 推算文字宽度；改写余额须同时拦住
-//   两个写入口（updateNumber: / defaultNumber:）与 currentNumber getter，
-//   使容器宽度与改写值匹配，否则数字右溢顶格。
+//   容器宽度按金额推算，而金额有 currentNumber / getNumber 两条读来源，
+//   故写入口与两条读路径须一并拦住，使容器宽度与改写值匹配，否则数字右溢顶格。
 @interface ScrollNumber : UIView
 - (unsigned long long)currentNumber;
+- (unsigned long long)getNumber;
 - (void)defaultNumber:(unsigned long long)a0;
 - (void)updateNumber:(unsigned long long)a0;
-- (id)container;      // dump 中存在：外层容器（TimeoutNumber）
 @end
 
 // 钱包"服务"页顶部入口头部：余额同时由 timeoutNumber 滚轮与 balanceMoneyLabel 文案呈现。
@@ -409,6 +406,57 @@ static BOOL DDStringHas(const char *haystack, const char *needle) {
     NSString *h = [[NSString stringWithUTF8String:haystack] lowercaseString];
     NSString *n = [[NSString stringWithUTF8String:needle] lowercaseString];
     return (h && n) ? ([h rangeOfString:n].location != NSNotFound) : NO;
+}
+
+#pragma mark - 调试日志
+// 改写过程的流水账，追加写入 Documents/ddjoker.log，设置页可导出 / 清空。
+//   写盘丢到独立串行队列，调用方只拼一次字符串，不占主线程。
+
+static NSString *DDLogPath(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject;
+    if (doc.length == 0) doc = @"/var/mobile/Documents";
+    return [doc stringByAppendingPathComponent:@"ddjoker.log"];
+}
+
+static dispatch_queue_t DDLogQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("dd.joker.log", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+
+static void DDLog(NSString *fmt, ...) {
+    if (!fmt) return;
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"[%.3f] %@\n",
+                      [[NSDate date] timeIntervalSince1970], msg];
+    dispatch_async(DDLogQueue(), ^{
+        NSString *path = DDLogPath();
+        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+        // 超过 512KB 就从头重写，避免日志在 Documents 里无限增长
+        if ([[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil] fileSize] > 512 * 1024) {
+            [data writeToFile:path atomically:YES];
+            return;
+        }
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [data writeToFile:path atomically:YES];
+            return;
+        }
+        [fh seekToEndOfFile];
+        [fh writeData:data];
+        [fh closeFile];
+    });
+}
+
+static void DDLogClear(void) {
+    dispatch_async(DDLogQueue(), ^{
+        [[NSFileManager defaultManager] removeItemAtPath:DDLogPath() error:nil];
+    });
 }
 
 #pragma mark - 聊天消息改写（工具与唯一键）
@@ -1629,13 +1677,8 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 //     重写为 "<KindaViewController: 0x…>balanceEntryUIPage / …lqtDetailUIPage"
 //     （KindaViewController.h:18 重写了 description），故按 description 匹配页面名。
 //   WCPayMainViewControllerV2：服务页原生壳，按类名兜底。
-//
-// includeVC —— 宽窄两种判定的唯一区别：
-//   YES（改值）：认 cell 标识符，也认详情页 / 服务页 —— 这些页面的金额都要改，覆盖面要广。
-//   NO （修帧）：只认钱包页两个单元格 —— 改值可以广，动 frame 必须窄，否则会把
-//     详情页居中的大数字（宿主接近全屏宽，金额居中）也右对齐推歪。
 //   上限 24 只是防御，实际深度由响应链长度决定（cell 与详情页都是 6～9 层）。
-static DDBalancePageKind DDBalancePageKindOf(id sn, BOOL includeVC) {
+static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
         if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
         UIResponder *r = (UIResponder *)sn;
@@ -1647,7 +1690,7 @@ static DDBalancePageKind DDBalancePageKindOf(id sn, BOOL includeVC) {
                 if ([ai isEqualToString:@"balance_cell"])
                     return DDBalancePageBalance;
             }
-            if (includeVC && [r isKindOfClass:[UIViewController class]]) {
+            if ([r isKindOfClass:[UIViewController class]]) {
                 NSString *cls = NSStringFromClass([r class]) ?: @"";
                 NSString *all = [NSString stringWithFormat:@"%@ %@", cls, [r description] ?: @""];
                 if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
@@ -1663,24 +1706,18 @@ static DDBalancePageKind DDBalancePageKindOf(id sn, BOOL includeVC) {
 }
 
 // 判定结果缓存：同一实例在页面生命周期内身份恒定，没必要每次布局 / 每次读数都重跑整条响应链。
-//   TimeoutNumber 的 scrollNumberSize / widthOfNumber: 每次布局都读 currentNumber（Yoga 布局），
+//   TimeoutNumber 的宽度推算每次布局都读金额（Yoga 布局），
 //   不缓存的话一次页面渲染就是几十次全链遍历。
-//   宽（改值）/ 窄（修帧）判定结果可能不同，用两个 key 分开存，避免串味。
-//   缓存前要求视图已挂载：未入树的实例响应链还不完整，此刻的 None 只是暂时状态，
-//   缓存它会让节点挂载后一直读到 None；未挂载一律不缓存，下次重新判定。
-//   已挂载的 None 照常缓存 —— 服务页那些与余额无关的节点不必每次都白跑一遍链。
 //   实例销毁时关联对象自动释放，新页面新实例重新判定，无失效风险。
-static char kDDKindWideKey;
-static char kDDKindNarrowKey;
+static char kDDKindKey;
 
-static DDBalancePageKind DDBalanceKindFor(id v, BOOL includeVC) {
+static DDBalancePageKind DDBalanceKindFor(id v) {
     if (![v isKindOfClass:[UIView class]]) return DDBalancePageNone;
-    const void *key = includeVC ? &kDDKindWideKey : &kDDKindNarrowKey;
-    NSNumber *cached = objc_getAssociatedObject(v, key);
+    NSNumber *cached = objc_getAssociatedObject(v, &kDDKindKey);
     if (cached) return (DDBalancePageKind)cached.integerValue;
-    DDBalancePageKind kind = DDBalancePageKindOf(v, includeVC);
+    DDBalancePageKind kind = DDBalancePageKindOf(v);
     if (kind != DDBalancePageNone || ((UIView *)v).window) {
-        objc_setAssociatedObject(v, key, @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(v, &kDDKindKey, @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return kind;
 }
@@ -1694,15 +1731,6 @@ static BOOL DDBalanceWantFenFor(id v, DDBalancePageKind kind, unsigned long long
     if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { *out = DDClampFen(DDLingtongFenValue()); return YES; }
     if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { *out = DDClampFen(DDBalanceFenValue()); return YES; }
     return NO;
-}
-
-// 钱包页金额行右侧箭头 + 间距占用的宽度，沿用 28pt 右缘边距常量（不压箭头）。
-static const CGFloat kDDWalletArrowGap = 28.0;
-
-// frame 是否已足够接近（避免重复赋值触发反复重排 → 闪烁）
-static BOOL DDBalanceFrameNear(CGRect a, CGRect b) {
-    return (fabs(a.origin.x - b.origin.x) < 0.5 && fabs(a.origin.y - b.origin.y) < 0.5 &&
-            fabs(a.size.width - b.size.width) < 0.5 && fabs(a.size.height - b.size.height) < 0.5);
 }
 
 static unsigned long long DDClampFen(unsigned long long fen) {
@@ -1761,38 +1789,33 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
 //     %orig 后主动灌改写值，下游 ScrollNumber 自动收到改写值，无滚动动画。
 //     本层是兜底：金额存在多条并行写入路径，Kinda 源头只堵住其中一条，
 //     仍有原生路径绕过源头直接灌真实值，需要这一层一并吃掉，否则真实值会漏出去触发一次滚动。
-//   · 修帧 —— 钱包页两个金额单元格右侧有箭头，数字变长后原生 frame 仍是旧宽度会右溢盖住，
-//     故在 layoutSubviews 里按 scrollNumberSize 重设滚轮与自身 frame，把右缘钉在箭头左侧。
-
-// 修帧开关：置 NO 整体关掉下方顶格三步，只留改值，用于验证修帧是否仍必要。
-static BOOL const kDDBalanceFixFrame = NO;
+//   读路径一并改写后，Kinda 侧重算布局时取到的就是新值宽度，容器与内容天然匹配，
+//     故无需再手动修 frame。
 
 %hook TimeoutNumber
 - (void)updateNumber:(unsigned long long)original {
+    unsigned long long v = original;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalanceKindFor(self, YES);
-            unsigned long long want = 0; BOOL rewrite = NO;
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
-            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue()); rewrite = YES; }
-            if (rewrite) { %orig(want); return; }
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
-    %orig(original);
+    DDLog(@"TN.updateNumber %llu → %llu", original, v);
+    %orig(v);
 }
 - (void)defaultNumber:(unsigned long long)original {
+    unsigned long long v = original;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalanceKindFor(self, YES);
-            unsigned long long want = 0; BOOL rewrite = NO;
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
-            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue()); rewrite = YES; }
-            if (rewrite) { %orig(want); return; }
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
-    %orig(original);
+    DDLog(@"TN.defaultNumber %llu → %llu", original, v);
+    %orig(v);
 }
 // 第二条写值入口：与 updateNumber: 并列，超时重绘 / 指示器刷新走这条，触发时机更晚。
 //   两处换的是同一个固定值，重复改写无副作用。
@@ -1801,59 +1824,12 @@ static BOOL const kDDBalanceFixFrame = NO;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalanceKindFor(self, YES);
             unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
+            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
+    DDLog(@"TN.updateNumberInternal %llu → %llu", original, v);
     %orig(v);
-}
-// 顶格三步，缺一不可：
-//   1) [sn setFrame:] 原点不变、尺寸换成 scrollNumberSize —— 滚轮按新值的正确尺寸重设
-//   2) [self updateScrollNumber] —— 容器按新滚轮尺寸重排内部
-//   3) [self setFrame:] x = superview 宽度 - 28 - 宽度 —— 右缘钉在箭头左侧，数字往左长
-// 前提：scrollNumberSize 按改后的值算，故 currentNumber / getNumber 两条读路径须一并改写，
-//   否则宽度仍按旧值算，仅改 frame 无法对齐。
-- (void)layoutSubviews {
-    %orig;
-    if (!kDDBalanceFixFrame) return;
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (!cfg.balanceEnabled) return;
-        // 只命中钱包页两个金额单元格才修帧，其余页面一律不碰。
-        DDBalancePageKind fixKind = DDBalanceKindFor(self, NO);
-        if (fixKind != DDBalancePageBalance && fixKind != DDBalancePageLQT) return;
-        unsigned long long want = 0;
-        if (!DDBalanceWantFenFor(self, fixKind, &want)) return;
-        if (![self respondsToSelector:@selector(scrollNumber)] ||
-            ![self respondsToSelector:@selector(scrollNumberSize)]) return;
-        UIView *sn = [self scrollNumber];
-        if (![sn isKindOfClass:[UIView class]]) return;
-        // 父容器接近全宽的一律跳过：Kinda 用 Yoga 布局（ScrollNumber.h:14 isYogaRightAlignment），
-        //   形态由宿主宽度决定 —— 钱包页两单元格的金额区宿主很窄，需要顶格；
-        //   详情页宿主接近全宽、金额居中，一旦右对齐会被推到屏幕边上。
-        //   该判定须在任何 frame 改动之前完成。
-        UIView *sp = self.superview;
-        if (!sp) return;
-        CGFloat spW = sp.bounds.size.width;
-        CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
-        if (screenW > 0 && spW > screenW * 0.7) return;
-        CGSize sz = [self scrollNumberSize];
-        if (sz.width <= 0 || sz.height <= 0) return;
-        // ① 滚轮尺寸按新值重设（原点保持不变）
-        CGRect snF = sn.frame;
-        CGRect snNew = CGRectMake(snF.origin.x, snF.origin.y, sz.width, sz.height);
-        if (!DDBalanceFrameNear(snF, snNew)) sn.frame = snNew;
-        // ② 容器按新的滚轮尺寸重排内部
-        if ([self respondsToSelector:@selector(updateScrollNumber)]) [self updateScrollNumber];
-        // ③ 自身右对齐：右缘钉在 superview 宽度 - 箭头区(28)，数字往左长 → 永远压不到箭头
-        CGRect selfF = self.frame;
-        CGFloat newX = spW - kDDWalletArrowGap - sz.width;
-        // 越界处理：算出的位置越过左边界（或 superview 宽度异常）时退化为"右缘原地不动"
-        if (spW <= 0 || newX < 0) newX = (selfF.origin.x + selfF.size.width) - sz.width;
-        CGRect selfNew = CGRectMake(newX, selfF.origin.y, sz.width, selfF.size.height);
-        if (!DDBalanceFrameNear(selfF, selfNew)) self.frame = selfNew;
-    } @catch (NSException *e) {}
 }
 %end
 
@@ -1863,26 +1839,27 @@ static BOOL const kDDBalanceFixFrame = NO;
 %hook ScrollNumber
 - (unsigned long long)currentNumber {
     unsigned long long orig = %orig;
+    unsigned long long v = orig;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (!cfg.balanceEnabled) return orig;
-        DDBalancePageKind kind = DDBalanceKindFor(self, YES);
-        unsigned long long want = 0;
-        if (!DDBalanceWantFenFor(self, kind, &want)) return orig;
-        return want;
+        if (cfg.balanceEnabled) {
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
+        }
     } @catch (NSException *e) {}
-    return orig;
+    DDLog(@"SN.currentNumber %llu → %llu", orig, v);
+    return v;
 }
 - (void)defaultNumber:(unsigned long long)original {
     unsigned long long v = original;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalanceKindFor(self, YES);
             unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
+            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
+    DDLog(@"SN.defaultNumber %llu → %llu", original, v);
     %orig(v);
 }
 - (void)updateNumber:(unsigned long long)original {
@@ -1890,25 +1867,27 @@ static BOOL const kDDBalanceFixFrame = NO;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalanceKindFor(self, YES);
             unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
+            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
+    DDLog(@"SN.updateNumber %llu → %llu", original, v);
     %orig(v);
 }
 // 第二条读值入口：与 currentNumber 并列。宽度推算（scrollNumberSize / widthOfNumber:）
 //   若走这条，只改 currentNumber 会让宽度仍按真实值算。
 - (unsigned long long)getNumber {
     unsigned long long orig = %orig;
+    unsigned long long v = orig;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (!cfg.balanceEnabled) return orig;
-        DDBalancePageKind kind = DDBalanceKindFor(self, YES);
-        unsigned long long want = 0;
-        if (DDBalanceWantFenFor(self, kind, &want)) return want;
+        if (cfg.balanceEnabled) {
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
+        }
     } @catch (NSException *e) {}
-    return orig;
+    DDLog(@"SN.getNumber %llu → %llu", orig, v);
+    return v;
 }
 %end
 
@@ -1965,14 +1944,16 @@ static void DDBalancePatchEntryHeader(id header, unsigned long long fen) {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             id tn = [self timeoutNumber];
-            DDBalancePageKind kind = DDBalanceKindFor(tn, YES);
+            DDBalancePageKind kind = DDBalanceKindFor(tn);
             unsigned long long want = 0;
             if (DDBalanceWantFenFor(tn, kind, &want)) {
                 %orig((long long)want, NO);   // animated:NO —— 关掉滚轮动画
+                DDLog(@"KindaMoney setMoney %lld → %lld", money, (long long)want);
                 return;
             }
         }
     } @catch (NSException *e) {}
+    DDLog(@"KindaMoney setMoney %lld → 未改写", money);
     %orig(money, animated);
 }
 %end
@@ -2878,6 +2859,18 @@ static BOOL DDHideChatName(void) {
 
     [_tableViewManager addSection:profileSection];
 
+    WCTableViewSectionManager *logSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"调试"];
+    logSection.footerTitle = @"日志记录金额等改写的判定过程，导出为 ddjoker.log";
+    UIButton *logExportBtn = [self dd_actionButton:@"导出" action:@selector(exportLogTapped:) x:0];
+    UIView *logExportRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+    [logExportRight addSubview:logExportBtn];
+    [logSection addCell:[cellCls normalCellForSel:nil target:nil title:@"导出日志" rightView:logExportRight]];
+    UIButton *logClearBtn = [self dd_actionButton:@"清空" action:@selector(clearLogTapped:) x:0];
+    UIView *logClearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+    [logClearRight addSubview:logClearBtn];
+    [logSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空日志" rightView:logClearRight]];
+    [_tableViewManager addSection:logSection];
+
     [_tableViewManager reloadTableView];
 }
 
@@ -2992,6 +2985,27 @@ static BOOL DDHideChatName(void) {
 - (void)clearAllAvatarTapped:(id)sender {
     (void)DDAvatarRemoveAll();
     [self dd_showDoneToast:@"头像已清理"];
+}
+
+- (void)exportLogTapped:(id)sender {
+    NSString *path = DDLogPath();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [self dd_showDoneToast:@"暂无日志"];
+        return;
+    }
+    UIActivityViewController *av = [[UIActivityViewController alloc]
+            initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
+    if (av.popoverPresentationController) {          // iPad 需要一个锚点，否则崩溃
+        av.popoverPresentationController.sourceView = self.view;
+        av.popoverPresentationController.sourceRect = CGRectMake(
+                self.view.bounds.size.width / 2, self.view.bounds.size.height / 2, 0, 0);
+    }
+    [self presentViewController:av animated:YES completion:nil];
+}
+
+- (void)clearLogTapped:(id)sender {
+    DDLogClear();
+    [self dd_showDoneToast:@"日志已清空"];
 }
 
 - (void)stepsConfirm:(id)sender {
