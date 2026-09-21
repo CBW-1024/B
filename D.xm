@@ -2324,8 +2324,7 @@ static __weak AddContactToChatRoomViewController *s_profileVC = nil;
 static AddContactToChatRoomViewController *DDProfileVCForTable(id tableViewInfo) {
     AddContactToChatRoomViewController *vc = s_profileVC;
     if (!vc || !tableViewInfo) return nil;
-    id tv = nil;
-    @try { tv = [vc valueForKey:@"m_tableViewInfo"]; } @catch (NSException *e) { tv = nil; }
+    id tv = [vc valueForKey:@"m_tableViewInfo"];
     if (tv != tableViewInfo) return nil;
     return vc;
 }
