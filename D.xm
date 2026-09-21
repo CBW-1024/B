@@ -1755,14 +1755,17 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
 
 #pragma mark - 余额 / 零钱通改写
 // 金额由 TimeoutNumber（容器）内的 ScrollNumber（滚轮）渲染，两条链都要接管：
-//   · 改值 —— 两个写入口（updateNumber: / defaultNumber:）全部换成目标值，
-//     外加 currentNumber 读路径（原生按它推算宽度，只改写入口会导致宽度与新值不匹配）。
+//   · 改值 —— 三个写入口（updateNumber: / defaultNumber: / updateNumberInternal:）全部换成目标值，
+//     外加两条读路径 currentNumber / getNumber（原生按它们推算宽度，只改写入口会导致宽度与新值不匹配）。
 //     钱包页入口头部由 WCPayWalletEntryHeaderView 自身刷新方法接管（见下方 %hook），
 //     %orig 后主动灌改写值，下游 ScrollNumber 自动收到改写值，无滚动动画。
 //     本层是兜底：金额存在多条并行写入路径，Kinda 源头只堵住其中一条，
 //     仍有原生路径绕过源头直接灌真实值，需要这一层一并吃掉，否则真实值会漏出去触发一次滚动。
 //   · 修帧 —— 钱包页两个金额单元格右侧有箭头，数字变长后原生 frame 仍是旧宽度会右溢盖住，
 //     故在 layoutSubviews 里按 scrollNumberSize 重设滚轮与自身 frame，把右缘钉在箭头左侧。
+
+// 修帧开关：置 NO 整体关掉下方顶格三步，只留改值，用于验证修帧是否仍必要。
+static BOOL const kDDBalanceFixFrame = NO;
 
 %hook TimeoutNumber
 - (void)updateNumber:(unsigned long long)original {
@@ -1791,14 +1794,29 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
     } @catch (NSException *e) {}
     %orig(original);
 }
+// 第二条写值入口：与 updateNumber: 并列，超时重绘 / 指示器刷新走这条，触发时机更晚。
+//   两处换的是同一个固定值，重复改写无副作用。
+- (void)updateNumberInternal:(unsigned long long)original {
+    unsigned long long v = original;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalanceKindFor(self, YES);
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
+        }
+    } @catch (NSException *e) {}
+    %orig(v);
+}
 // 顶格三步，缺一不可：
 //   1) [sn setFrame:] 原点不变、尺寸换成 scrollNumberSize —— 滚轮按新值的正确尺寸重设
 //   2) [self updateScrollNumber] —— 容器按新滚轮尺寸重排内部
 //   3) [self setFrame:] x = superview 宽度 - 28 - 宽度 —— 右缘钉在箭头左侧，数字往左长
-// 前提：scrollNumberSize 按改后的值算，故 currentNumber 读路径须一并改写，
+// 前提：scrollNumberSize 按改后的值算，故 currentNumber / getNumber 两条读路径须一并改写，
 //   否则宽度仍按旧值算，仅改 frame 无法对齐。
 - (void)layoutSubviews {
     %orig;
+    if (!kDDBalanceFixFrame) return;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (!cfg.balanceEnabled) return;
@@ -1839,8 +1857,9 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
 }
 %end
 
-// 读路径必须一起改：scrollNumberSize / widthOfNumber: 都读 currentNumber 推算宽度，
-//   否则内部宽度仍按旧值算，容器与内容对不上 → 数字右溢盖箭头（顶格）。
+// 读路径必须一起改：scrollNumberSize / widthOfNumber: 推算宽度时读的是金额，
+//   该值有 currentNumber / getNumber 两条来源，只改一条会让宽度仍按旧值算，
+//   容器与内容对不上 → 数字右溢盖箭头（顶格）。
 %hook ScrollNumber
 - (unsigned long long)currentNumber {
     unsigned long long orig = %orig;
@@ -1877,6 +1896,19 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
         }
     } @catch (NSException *e) {}
     %orig(v);
+}
+// 第二条读值入口：与 currentNumber 并列。宽度推算（scrollNumberSize / widthOfNumber:）
+//   若走这条，只改 currentNumber 会让宽度仍按真实值算。
+- (unsigned long long)getNumber {
+    unsigned long long orig = %orig;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return orig;
+        DDBalancePageKind kind = DDBalanceKindFor(self, YES);
+        unsigned long long want = 0;
+        if (DDBalanceWantFenFor(self, kind, &want)) return want;
+    } @catch (NSException *e) {}
+    return orig;
 }
 %end
 
