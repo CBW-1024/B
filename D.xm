@@ -1814,7 +1814,6 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
             if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
-    DDLog(@"TN.defaultNumber %llu → %llu", original, v);
     %orig(v);
 }
 // 第二条写值入口：与 updateNumber: 并列，超时重绘 / 指示器刷新走这条，触发时机更晚。
@@ -1828,7 +1827,6 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
             if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
-    DDLog(@"TN.updateNumberInternal %llu → %llu", original, v);
     %orig(v);
 }
 %end
@@ -1859,7 +1857,6 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
             if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
-    DDLog(@"SN.defaultNumber %llu → %llu", original, v);
     %orig(v);
 }
 - (void)updateNumber:(unsigned long long)original {
@@ -1871,7 +1868,6 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
             if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
-    DDLog(@"SN.updateNumber %llu → %llu", original, v);
     %orig(v);
 }
 // 第二条读值入口：与 currentNumber 并列。宽度推算（scrollNumberSize / widthOfNumber:）
@@ -1886,7 +1882,6 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
             if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
         }
     } @catch (NSException *e) {}
-    DDLog(@"SN.getNumber %llu → %llu", orig, v);
     return v;
 }
 %end
