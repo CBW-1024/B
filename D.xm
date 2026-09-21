@@ -399,57 +399,6 @@ static BOOL DDStringHas(const char *haystack, const char *needle) {
     return (h && n) ? ([h rangeOfString:n].location != NSNotFound) : NO;
 }
 
-#pragma mark - 调试日志
-// 改写过程的流水账，追加写入 Documents/ddjoker.log，设置页可导出 / 清空。
-//   写盘丢到独立串行队列，调用方只拼一次字符串，不占主线程。
-
-static NSString *DDLogPath(void) {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *doc = paths.firstObject;
-    if (doc.length == 0) doc = @"/var/mobile/Documents";
-    return [doc stringByAppendingPathComponent:@"ddjoker.log"];
-}
-
-static dispatch_queue_t DDLogQueue(void) {
-    static dispatch_queue_t q;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("dd.joker.log", DISPATCH_QUEUE_SERIAL); });
-    return q;
-}
-
-static void DDLog(NSString *fmt, ...) {
-    if (!fmt) return;
-    va_list args;
-    va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    NSString *line = [NSString stringWithFormat:@"[%.3f] %@\n",
-                      [[NSDate date] timeIntervalSince1970], msg];
-    dispatch_async(DDLogQueue(), ^{
-        NSString *path = DDLogPath();
-        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-        // 超过 512KB 就从头重写，避免日志在 Documents 里无限增长
-        if ([[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil] fileSize] > 512 * 1024) {
-            [data writeToFile:path atomically:YES];
-            return;
-        }
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) {
-            [data writeToFile:path atomically:YES];
-            return;
-        }
-        [fh seekToEndOfFile];
-        [fh writeData:data];
-        [fh closeFile];
-    });
-}
-
-static void DDLogClear(void) {
-    dispatch_async(DDLogQueue(), ^{
-        [[NSFileManager defaultManager] removeItemAtPath:DDLogPath() error:nil];
-    });
-}
-
 #pragma mark - 聊天消息改写（工具与唯一键）
 // 长按消息弹出"小丑"菜单：文字改内容与引用标题、图片替换为相册所选图、转账改金额。
 // 改写值按消息会话唯一键缓存到 plist，刷新走 cell/viewModel 重绘。
@@ -1668,31 +1617,29 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 //     重写为 "<KindaViewController: 0x…>balanceEntryUIPage / …lqtDetailUIPage"
 //     （KindaViewController.h:18 重写了 description），故按 description 匹配页面名。
 //   WCPayMainViewControllerV2：服务页原生壳，按类名兜底。
-//   上限 24 只是防御，实际深度由响应链长度决定（cell 与详情页都是 6～9 层）。
+//   上限 24 只是兜底，实际深度由响应链长度决定（cell 与详情页都是 6～9 层）。
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
-    @try {
-        if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
-        UIResponder *r = (UIResponder *)sn;
-        for (int depth = 0; depth < 24 && r; depth++) {
-            if ([r isKindOfClass:[UIView class]]) {
-                NSString *ai = ((UIView *)r).accessibilityIdentifier;
-                if ([ai isEqualToString:@"lqt_cell"])
-                    return DDBalancePageLQT;
-                if ([ai isEqualToString:@"balance_cell"])
-                    return DDBalancePageBalance;
-            }
-            if ([r isKindOfClass:[UIViewController class]]) {
-                NSString *cls = NSStringFromClass([r class]) ?: @"";
-                NSString *all = [NSString stringWithFormat:@"%@ %@", cls, [r description] ?: @""];
-                if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
-                    return DDBalancePageLQT;
-                if ([all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound ||
-                    [cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound)
-                    return DDBalancePageBalance;
-            }
-            r = r.nextResponder;
+    if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
+    UIResponder *r = (UIResponder *)sn;
+    for (int depth = 0; depth < 24 && r; depth++) {
+        if ([r isKindOfClass:[UIView class]]) {
+            NSString *ai = ((UIView *)r).accessibilityIdentifier;
+            if ([ai isEqualToString:@"lqt_cell"])
+                return DDBalancePageLQT;
+            if ([ai isEqualToString:@"balance_cell"])
+                return DDBalancePageBalance;
         }
-    } @catch (NSException *e) {}
+        if ([r isKindOfClass:[UIViewController class]]) {
+            NSString *cls = NSStringFromClass([r class]) ?: @"";
+            NSString *all = [NSString stringWithFormat:@"%@ %@", cls, [r description] ?: @""];
+            if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
+                return DDBalancePageLQT;
+            if ([all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound ||
+                [cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound)
+                return DDBalancePageBalance;
+        }
+        r = r.nextResponder;
+    }
     return DDBalancePageNone;
 }
 
@@ -1786,25 +1733,20 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
 %hook TimeoutNumber
 - (void)updateNumber:(unsigned long long)original {
     unsigned long long v = original;
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
-        }
-    } @catch (NSException *e) {}
-    DDLog(@"TN.updateNumber %llu → %llu", original, v);
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled) {
+        unsigned long long want = 0;
+        if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
+    }
     %orig(v);
 }
 - (void)defaultNumber:(unsigned long long)original {
     unsigned long long v = original;
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
-        }
-    } @catch (NSException *e) {}
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled) {
+        unsigned long long want = 0;
+        if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
+    }
     %orig(v);
 }
 %end
@@ -1815,35 +1757,29 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
 - (unsigned long long)currentNumber {
     unsigned long long orig = %orig;
     unsigned long long v = orig;
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
-        }
-    } @catch (NSException *e) {}
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled) {
+        unsigned long long want = 0;
+        if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
+    }
     return v;
 }
 - (void)defaultNumber:(unsigned long long)original {
     unsigned long long v = original;
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
-        }
-    } @catch (NSException *e) {}
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled) {
+        unsigned long long want = 0;
+        if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
+    }
     %orig(v);
 }
 - (void)updateNumber:(unsigned long long)original {
     unsigned long long v = original;
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
-        }
-    } @catch (NSException *e) {}
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled) {
+        unsigned long long want = 0;
+        if (DDBalanceWantFenFor(self, DDBalanceKindFor(self), &want)) v = want;
+    }
     %orig(v);
 }
 %end
@@ -1851,18 +1787,16 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
 // 入口头部余额：直接在类层级接管刷新方法（用头文件声明的 timeoutNumber / balanceMoneyLabel 属性），
 //   不再依赖 superview 链判定。%orig 后主动把真实值换成改写值，下游 ScrollNumber 自动收到改写值。
 static void DDBalancePatchEntryHeader(id header, unsigned long long fen) {
-    @try {
-        id tn = [header timeoutNumber];
-        if ([tn respondsToSelector:@selector(updateNumber:)]) [tn updateNumber:fen];
-        id lb = [header balanceMoneyLabel];
-        if ([lb isKindOfClass:[UILabel class]]) {
-            NSString *t = ((UILabel *)lb).text;
-            if (t.length) {
-                NSString *nt = DDBalanceRewriteMoneyText(t, fen);
-                if (nt && ![nt isEqualToString:t]) ((UILabel *)lb).text = nt;
-            }
+    id tn = [header timeoutNumber];
+    if ([tn respondsToSelector:@selector(updateNumber:)]) [tn updateNumber:fen];
+    id lb = [header balanceMoneyLabel];
+    if ([lb isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)lb).text;
+        if (t.length) {
+            NSString *nt = DDBalanceRewriteMoneyText(t, fen);
+            if (nt && ![nt isEqualToString:t]) ((UILabel *)lb).text = nt;
         }
-    } @catch (NSException *e) {}
+    }
 }
 %hook WCPayWalletEntryHeaderView
 - (void)setupTimeoutNumber {
@@ -1897,20 +1831,16 @@ static void DDBalancePatchEntryHeader(id header, unsigned long long fen) {
 //   %orig 前就把值换成改写值 —— 下游 TimeoutNumber / ScrollNumber 从未收到真实值，滚动动画无从触发。
 %hook KindaMoneyLoadingView
 - (void)setMoney:(long long)money animated:(BOOL)animated {
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            id tn = [self timeoutNumber];
-            DDBalancePageKind kind = DDBalanceKindFor(tn);
-            unsigned long long want = 0;
-            if (DDBalanceWantFenFor(tn, kind, &want)) {
-                %orig((long long)want, NO);   // animated:NO —— 关掉滚轮动画
-                DDLog(@"KindaMoney setMoney %lld → %lld", money, (long long)want);
-                return;
-            }
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled) {
+        id tn = [self timeoutNumber];
+        DDBalancePageKind kind = DDBalanceKindFor(tn);
+        unsigned long long want = 0;
+        if (DDBalanceWantFenFor(tn, kind, &want)) {
+            %orig((long long)want, NO);   // animated:NO —— 关掉滚轮动画
+            return;
         }
-    } @catch (NSException *e) {}
-    DDLog(@"KindaMoney setMoney %lld → 未改写", money);
+    }
     %orig(money, animated);
 }
 %end
@@ -2381,13 +2311,11 @@ static NSString * const kDDProfileChangedNotification = @"DDProfileContentChange
 static const void *kDDInjectedCellMarker = &kDDInjectedCellMarker;
 
 static BOOL DDSectionHasInjectedCell(id section) {
-    @try {
-        unsigned long long n = [section getCellCount];
-        for (unsigned long long i = 0; i < n; i++) {
-            id c = [section getCellAt:i];
-            if (objc_getAssociatedObject(c, kDDInjectedCellMarker) != nil) return YES;
-        }
-    } @catch (NSException *e) {}
+    unsigned long long n = [section getCellCount];
+    for (unsigned long long i = 0; i < n; i++) {
+        id c = [section getCellAt:i];
+        if (objc_getAssociatedObject(c, kDDInjectedCellMarker) != nil) return YES;
+    }
     return NO;
 }
 
@@ -2816,18 +2744,6 @@ static BOOL DDHideChatName(void) {
 
     [_tableViewManager addSection:profileSection];
 
-    WCTableViewSectionManager *logSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"调试"];
-    logSection.footerTitle = @"日志记录金额等改写的判定过程，导出为 ddjoker.log";
-    UIButton *logExportBtn = [self dd_actionButton:@"导出" action:@selector(exportLogTapped:) x:0];
-    UIView *logExportRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
-    [logExportRight addSubview:logExportBtn];
-    [logSection addCell:[cellCls normalCellForSel:nil target:nil title:@"导出日志" rightView:logExportRight]];
-    UIButton *logClearBtn = [self dd_actionButton:@"清空" action:@selector(clearLogTapped:) x:0];
-    UIView *logClearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
-    [logClearRight addSubview:logClearBtn];
-    [logSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空日志" rightView:logClearRight]];
-    [_tableViewManager addSection:logSection];
-
     [_tableViewManager reloadTableView];
 }
 
@@ -2942,27 +2858,6 @@ static BOOL DDHideChatName(void) {
 - (void)clearAllAvatarTapped:(id)sender {
     (void)DDAvatarRemoveAll();
     [self dd_showDoneToast:@"头像已清理"];
-}
-
-- (void)exportLogTapped:(id)sender {
-    NSString *path = DDLogPath();
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        [self dd_showDoneToast:@"暂无日志"];
-        return;
-    }
-    UIActivityViewController *av = [[UIActivityViewController alloc]
-            initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
-    if (av.popoverPresentationController) {          // iPad 需要一个锚点，否则崩溃
-        av.popoverPresentationController.sourceView = self.view;
-        av.popoverPresentationController.sourceRect = CGRectMake(
-                self.view.bounds.size.width / 2, self.view.bounds.size.height / 2, 0, 0);
-    }
-    [self presentViewController:av animated:YES completion:nil];
-}
-
-- (void)clearLogTapped:(id)sender {
-    DDLogClear();
-    [self dd_showDoneToast:@"日志已清空"];
 }
 
 - (void)stepsConfirm:(id)sender {
