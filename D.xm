@@ -1,4 +1,4 @@
-//  DD语音助手 v1.0.2  —— 媒体互转  (WeChat Tweak, Theos/Logos 单文件)
+//  DD语音助手 v1.0.6  —— 媒体互转  (WeChat Tweak, Theos/Logos 单文件)
 //  长按消息 → 按消息类型在原生长按悬浮菜单追加转换按钮 → 点击转换并发送到当前聊天：
 //    视频消息 / 文件消息 → 「转语音」→ 转换成语音消息，发到当前聊天
 //    语音消息          → 「转文件」→ 转换成 m4a 文件消息，发到当前聊天
@@ -32,6 +32,70 @@
 //       并且候选必须先过 dd_silk_frames_valid（WCR sub_0x8f15f4 同款帧链遍历）再喂解码器。
 //    ④ 顺带补上 AVLinearPCMIsNonInterleaved（WCR 的 PCM 输出字典是 7 个键：0x8f2134 mov x4,#7）
 //
+//  v1.0.3 逐条对「微信 8.0.79 头文件 dump（46581 个 .h）」校验后打的一批**实锤错**：
+//  之前所有「按头文件第 X 行」的注释都是对着旧版本 dump 写的，人到 8.0.79 就已经失真了。
+//    ① 【高危】MMMenuItem 的父类搞错了 —— 我写的是 UIMenuItem，实际是 NSObject（MMMenuItem.h:1）。
+//       微信拿到 operationMenuItems 后会按 MMMenuItem 自己的字段（iconImage/menuType/
+//       itemViewCreateHandler/userInfo…）取值，按 UIMenuItem 语义理解它结果不可预期。
+//       顺带发现：8.0.79 的 MMMenuItem **没有 title getter、没有 action getter**
+//       （51 行头文件里只有 target）→ 原先靠 `it.action == action` 去重根本不成立。
+//       改：去重改用自己的 userInfo 标记（MMMenuItem.h:29 读 / :49 写）。
+//    ② 菜单图标：v1.0.5 起直接吃微信内置 svg 资源名 icon_filled_record_voice.svg（用户确认存在），
+//       无兜底（initWithTitle:svgName:target:action:，MMMenuItem.h:18）。
+//    ③ m_oAppDataItem 在 8.0.79 全库（46581 个 .h）里**一个都没有** —— 不是「偶尔为 nil」，
+//       是彻底废弃。取数据项改走 CMessageWrap.h:382 的 m_extendInfoWithMsgType。
+//       这直接影响文件扩展名识别 → 「文件识别失败」那类消息的菜单表现。
+//    ④ 【语音转文件没反应的最后一环】dd_send_file_to_chat 里
+//       原来用 [wrap setValue:app forKey:@"m_oAppDataItem"] 挂数据项 → 8.0.79 抛
+//       NSUndefinedKeyException 被 @catch 吞掉 → extendInfo 永远挂不上 → AddAppMsg 内部
+//       拿不到数据项 → 静默失败。改：[wrap setM_extendInfoWithMsgType:]（CMessageWrap.h:637）。
+//       兜底 addMessageToDB: 也错了 —— 它只在 AudioSender 上（AudioSender.h:13），
+//       CMessageMgr 没有 → respondsToSelector 恒 NO。改 AddLocalMsg:（CMessageMgr.h:191）。
+//    ⑤ BaseMessageCellView 上其实没有 viewModel（真实锚在 BaseChatCellView.h:17）；
+//       canPerformAction:withSender: 在 BaseMessageCellView.h:11；
+//       四个 cell 的 operationMenuItems 行号：Video:12 / AppVideo:7 / AppFile:17 / Voice:34。
+//    ⑥ 文件路径新增一条「不依赖 msgWrap 内部字段」的五参通道
+//       +GetPathOfAppDataByUserName:andMessageWrap:andAttachId:andAttachFileExt:retStrPath:
+//       （CMessageWrap.h:107）—— 专治字段残缺的「识别失败」文件。
+//
+//  v1.0.4（用户确认内置图标后调整）
+//    菜单按钮图标改用微信**内置 svg 资源名 voice_record_filled.svg**（用户明确确认该资源在 8.0.79
+//    存在）。主路径回到 initWithTitle:svgName:target:action: 直接吃 svg 名（MMMenuItem.h:18），
+//    每个候选确认真解出 iconImage 才采用；仅当 svg 全都解不出图时，才退回到 v1.0.3 的
+//    initWithTitle:icon: 借原生图标方案，最后才是纯文字。这样「转语音」「转文件」两个按钮
+//    统一用语音录音图标，不再出现一个有图一个没图。
+//
+//  v1.0.5（用户确认图标名后再次调整）
+//    图标资源名改为用户最终确认的 **icon_filled_record_voice.svg**（8.0.79 内置，用户确认存在），
+//    并去掉所有兜底：不再借原生图标、不做纯文字构造。直接 initWithTitle:svgName:target:action:
+//    吃这个 svg 名（MMMenuItem.h:18）。「转语音」「转文件」按钮统一用这一个内置图标。
+//
+//  v1.0.6（参考「视频转语音.txt」重写视频路径解析，仍以 8.0.79 头文件为准）
+//    那份参考文件是另一个插件的视频转语音逻辑还原，用户要求「只作参考、以最新头文件为准」。
+//    其中两点对真机可靠性有用、且能在头文件里坐实，故采纳：
+//    ① 解析出的视频路径**可能是目录**，要在目录里找第一个 .mp4/.mov/.m4v（参考
+//       WCLiteFirstVideoFileUnderPath）—— 我方原先只判 dd_file_exists(videoPath)，若 videoPath
+//       是目录就会把目录当文件喂给 AVAssetReader 而抽不到音轨。新增 dd_first_video_file_under_path 修复。
+//    ② 视频路径多源：除 VideoMessageViewModel.videoPath（VideoMessageViewModel.h:24）外，补上
+//       WCLanDeviceServiceUtil +filePathFromMsgWrap:（WCLanDeviceServiceUtil.h:7）与
+//       CUtility +GetDocPath（CUtility.h:49）两条头文件里确凿存在的权威源做兜底
+//       （参考 WCLiteResolveVideoMessageLocalPath，覆盖 videoPath 在视频号/未下载场景取不到的情况）。
+//       参考里的 WCLiteVoicePackSender 是它私有发送类（不在头文件里），不采纳，仍走我方
+//       AddLocalMsg + ResendVoiceMsg 发送链路。类型判定沿用 43/62（kDDMVideoMsgType / kDDMShortVideoMsgType）。
+//
+//  v1.0.7（根治「转出来是静音消息」—— 用户真机日志定位）
+//    用户 2026-09-22 导出的 DDMediaConvert 调试日志显示：视频→语音一路抽 PCM、编码出 16600 字节 SILK、
+//    落盘 4.aud、ResendVoiceMsg 也调了，但**播放静音**；同一日志里「语音→文件」读同一个 .aud 时，
+//    MJSilkCodec 的 decodeToAudioDataFromSilkData: / decodeToPCMFromSilkData: 都返回 0 字节
+//    → 编码器产物连微信自己的解码器都解不回来。微信语音播放器用的就是 MJSilkCodec 这个解码器，
+//    解不回 = 播放静音。旧逻辑（v1.0.2~v1.0.6）即便回环解码失败仍把类方法产物硬发出去，于是静音照发。
+//    修复：dd_encode_pcm_to_silk 改为收集类方法 + 实例 API 两路原始产物，对每个产物生成
+//    「\x02#!SILK_V3(magic10)」与「#!SILK_V3(magic9)」两个容器变体，逐一交给
+//    MJSilkCodec decodeToPCMFromSilkData: 回环验证，**只发能解回来的容器**；全部解不开则
+//    return nil 放弃发送（绝不发静音消息）。用微信自己的解码器当裁判，彻底消除 magic9/magic10 猜测。
+//    另：non-SILK 路径的语音时长改用「真实抽出的 PCM 长度」算（旧逻辑用 asset.duration=视频时长，
+//    日志里出现过视频 16.167s、音轨仅 8s 导致气泡时长错、播放错位）。
+//
 //  锚定证据（微信头文件 dump / WCRefine 加载态 dump）：
 //   · 文件数据路径 —— CMessageWrap +GetPathOfAppData:msgWrap            (CMessageWrap.h:26)
 //                     +GetPathOfAppData:LocalID:FileExt:retStrPath:      (CMessageWrap.h:106)
@@ -39,10 +103,13 @@
 //   · 语音文件落地 —— CMessageWrap -getVoicePath                        (CMessageWrap.h:362)
 //                     +getPathOfAudio:msgWrap                           (CMessageWrap.h:66)
 //                     CUtility +GetPathOfMesAudio:LocalID:DocPath:      (CUtility.h:82)
-//   · 菜单图标   —— MMMenuItem -initWithTitle:svgName:target:action:   (MMMenuItem.h:18)
-//   · 视频路径   —— 普通视频 VideoMessageViewModel.videoPath (VideoMessageViewModel.h:5)；
-//                  应用视频/视频号 AppVideoMessageViewModel 无路径属性（继承 BizAppBaseMessageViewModel），
-//                  路径在 msgWrap.m_oAppDataItem，与文件同取路径通道 (AppVideoMessageViewModel.h:3)
+//   · 菜单图标   —— MMMenuItem -initWithTitle:svgName:target:action: 直接吃内置 svg 名
+//                  icon_filled_record_voice.svg（MMMenuItem.h:18，用户确认存在，无兜底）
+//                  去重靠 userInfo                                      (MMMenuItem.h:29 / :49)
+//   · 视频路径   —— 普通视频 VideoMessageViewModel.videoPath (VideoMessageViewModel.h:24)；
+//                  应用视频/视频号 AppVideoMessageViewModel 无路径属性（AppVideoMessageViewModel.h
+//                  只有 coverImgUrl/isWSVideo/titleText），路径走 m_extendInfoWithMsgType 通道，
+//                  与文件消息同（v1.0.3：原先写的 msgWrap.m_oAppDataItem 在 8.0.79 已不存在）
 //   · SILK 编解码 —— MJSilkCodec +encodeToSilkFromPCMData: /
 //                    +decodeToPCMFromSilkData: / +decodeToAudioDataFromSilkData:
 //                                                            (MJSilkCodec.h:5 / :4 / :3)
@@ -107,28 +174,41 @@
 + (id)centerCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3;
 @end
 
-// 菜单项：继承 UIMenuItem，原生支持直接吃 svg 资源名（微信内部渲染，无需自行转 UIImage）。
-//   MMMenuItem.h:18 —— -initWithTitle:svgName:target:action:
-// v1.0.1 补齐：图标检测/回退要用到的三个选择器，之前只声明了 svgName 构造器，
-// CI 报 "no visible @interface for 'MMMenuItem' declares the selector 'iconImage'"
-@interface MMMenuItem : UIMenuItem
-- (id)initWithTitle:(id)a0 svgName:(id)a1 target:(id)a2 action:(SEL)a3;  // MMMenuItem.h:18
-- (id)initWithTitle:(id)a0 target:(id)a1 action:(SEL)a2;                 // MMMenuItem.h:19  无 svg 的降级构造器
-- (id)iconImage;                                                          // MMMenuItem.h:12  读图标（判 svg 名是否真解析出图）
+// 菜单项：注意它不是 UIMenuItem —— 8.0.79 头文件里 @interface MMMenuItem : NSObject
+//   （MMMenuItem.h:1）。v1.0.2 及更早版本把它声明成 UIMenuItem 子类，是个实打实的错：
+//   微信拿 operationMenuItems 数组时会按 MMMenuItem 自己的字段
+//   （iconImage / menuType / itemViewCreateHandler / userInfo …）去取，
+//   按 UIMenuItem 的语义理解它，行为不可预期。这里按真实声明改回 NSObject。
+// 另注意两个容易踩空的点：
+//   · MMMenuItem **没有** `title` getter、**没有** `action` getter（头文件 51 行里只有 target）
+//     → 依赖 `it.action` 做去重在 8.0.79 上是永远不成立的，改用 userInfo 打标记。
+//   · 有 `initWithTitle:icon:target:action:`（:15）可以直接吃 UIImage，
+//     比猜 svg 资源名可靠得多 → 图标问题从根上解决。
+@interface MMMenuItem : NSObject
+- (id)initWithTitle:(id)a0 svgName:(id)a1 target:(id)a2 action:(SEL)a3;   // MMMenuItem.h:18
+- (id)initWithTitle:(id)a0 icon:(id)a1 target:(id)a2 action:(SEL)a3;      // MMMenuItem.h:15  直接吃 UIImage
+- (id)initWithTitle:(id)a0 target:(id)a1 action:(SEL)a2;                  // MMMenuItem.h:19  无图标降级构造器
+- (id)iconImage;                                                          // MMMenuItem.h:12  读图标
 - (void)setIconImage:(id)a0;                                              // MMMenuItem.h:38  兜底塞图标
+- (id)userInfo;                                                           // MMMenuItem.h:29  去重标记位
+- (void)setUserInfo:(id)a0;                                               // MMMenuItem.h:49
 @end
 
+// CMessageWrap.h（8.0.79）实测行号：m_uiMesLocalID:519 / m_uiMessageType:520 / m_uiCreateTime:512
+//   / m_uiStatus:525 / m_nsFromUsr:404 / m_nsToUsr:421 / initWithMsgType::367 / isSenderFromMsgWrap::19
+// ⚠ 以下两个字段 8.0.79 **不存在**（全库 46581 个头文件里都没有），已在 v1.0.3 删除：
+//   · m_oAppDataItem     —— 老版本字段，8.0.79 已移除；文件/应用消息的数据项改走
+//                           m_extendInfoWithMsgType（CMessageWrap.h:382）
+//   · m_uiAppMsgInnerType —— 它在 CExtendInfoOfAPP 上（CExtendInfoOfAPP.h:201），不在 CMessageWrap 上
 @interface CMessageWrap : NSObject
 @property(nonatomic) unsigned int m_uiMessageType;
 @property(nonatomic) unsigned int m_uiMesLocalID;
 @property(nonatomic) unsigned int m_uiCreateTime;
 @property(nonatomic) unsigned int m_uiStatus;
-@property(nonatomic) unsigned int m_uiAppMsgInnerType;
 @property(retain, nonatomic) NSString *m_nsToUsr;
 @property(retain, nonatomic) NSString *m_nsFromUsr;
 - (id)initWithMsgType:(long long)arg1;
 + (BOOL)isSenderFromMsgWrap:(id)arg1;
-- (id)m_oAppDataItem;
 // 以下按头文件补齐（Xcode 26 SDK + ARC 下 id 接收者必须有可见声明，否则报 no known method）
 + (id)getPathOfMsgImg:(id)arg1;                     // CMessageWrap.h:72（小写 g，无大写 G 版本）
 - (BOOL)IsVideoMsg;                                 // CMessageWrap.h:155
@@ -136,13 +216,24 @@
 - (BOOL)IsVoiceMsg;                                 // CMessageWrap.h:156
 - (id)m_extendInfoWithMsgType;                      // CMessageWrap.h:382
 - (void)setM_extendInfoWithMsgType:(id)arg1;        // CMessageWrap.h:637
-// 路径接口（v1.0.1 修正：原实现只靠 KVC 猜 m_oAppDataItem 的键名，
-// 文件消息（含“识别失败”文件）本地路径取不到 → 追加以下权威类方法，按头件行号锚定）
+- (void)setM_uiMessageType:(unsigned int)arg1;      // CMessageWrap.h:720
+- (void)setM_uiCreateTime:(unsigned int)arg1;       // CMessageWrap.h:710
+- (void)setM_uiStatus:(unsigned int)arg1;           // CMessageWrap.h:726
+- (void)setM_nsToUsr:(id)arg1;                      // CMessageWrap.h:695
+- (void)setM_nsFromUsr:(id)arg1;                    // CMessageWrap.h:678
+// 路径接口（v1.0.3 全面按 8.0.79 头文件重校行号；m_oAppDataItem 已废弃见上方说明）
 - (id)getVoicePath;                                 // CMessageWrap.h:362  语音文件本地路径（实例方法，无需拼 usr/localID）
 + (id)getPathOfAudio:(id)arg1;                      // CMessageWrap.h:66   语音路径（单参 msgWrap）
 + (id)GetPathOfAppData:(id)arg1;                    // CMessageWrap.h:26   文件/附件数据路径（单参 msgWrap）
 + (void)GetPathOfAppData:(id)a0 LocalID:(unsigned int)lid FileExt:(id)ext retStrPath:(void *)pp;  // :106
 + (void)GetPathOfAppDataByUserName:(id)usr andMessageWrap:(id)wrap retStrPath:(void *)pp;         // :108
++ (void)GetPathOfAppDataByUserName:(id)usr andMessageWrap:(id)wrap andAttachId:(id)aid
+                                         andAttachFileExt:(id)aext retStrPath:(void *)pp;         // :107
+@end
+
+// 视频/小视频（43/62）本地路径的额外权威源（参考「视频转语音.txt」多源解析，类名以 8.0.79 头文件为准）
+@interface WCLanDeviceServiceUtil : NSObject
++ (id)filePathFromMsgWrap:(id)arg1;                    // WCLanDeviceServiceUtil.h:7  —— 视频/文件落点路径
 @end
 
 @interface CExtendInfoOfAPP : NSObject   // 文件/app 消息的数据项（CExtendInfoOfAPP.h）
@@ -185,17 +276,21 @@
 @end
 
 @interface AudioSender : NSObject
-- (void)ResendVoiceMsg:(id)arg1 MsgWrap:(id)arg2;
-- (_Bool)addMessageToDB:(id)arg1;
-- (id)getAudioFileName:(id)arg1 LocalID:(unsigned int)arg2;
+- (void)ResendVoiceMsg:(id)arg1 MsgWrap:(id)arg2;   // AudioSender.h:62
+- (_Bool)addMessageToDB:(id)arg1;                   // AudioSender.h:13（只有 AudioSender 有）
+- (id)getAudioFileName:(id)arg1 LocalID:(unsigned int)arg2;   // AudioSender.h:35
 @end
 
 @interface CMessageMgr : NSObject
-- (void)StartDownloadVideo:(id)a0 MsgWrap:(id)a1 Priority:(BOOL)a2 Silent:(BOOL)a3;   // CMessageMgr.h:213
-- (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2;                  // CMessageMgr.h:252
-- (BOOL)IsVideoMsgdDownloadIng:(id)a0;                                                // CMessageMgr.h:90
-- (void)AddAppMsg:(id)a0 MsgWrap:(id)a1 DataPath:(id)a2 Scene:(unsigned int)a3;       // CMessageMgr.h:248
-- (_Bool)addMessageToDB:(id)a0;
+- (void)StartDownloadVideo:(id)a0 MsgWrap:(id)a1 Priority:(BOOL)a2 Silent:(BOOL)a3;   // CMessageMgr.h:269
+- (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2;                  // CMessageMgr.h:32
+- (BOOL)IsVideoMsgdDownloadIng:(id)a0;                                                // CMessageMgr.h:24
+- (void)AddAppMsg:(id)a0 MsgWrap:(id)a1 DataPath:(id)a2 Scene:(unsigned int)a3;       // CMessageMgr.h:187
+- (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;                                            // CMessageMgr.h:191
+- (void)AddMsg:(id)a0 MsgWrap:(id)a1;                                                 // CMessageMgr.h:194
+// ⚠ addMessageToDB: 只有 AudioSender 有（AudioSender.h:13），CMessageMgr 没有 ——
+//   v1.0.2 把它误写在 CMessageMgr 上，调用点 respondsToSelector 永远为 NO → 兜底发送静默失败。
+//   v1.0.3 改为上面真实存在的 AddLocalMsg: / AddMsg:。
 @end
 
 @interface MMNewSessionMgr : NSObject
@@ -241,29 +336,46 @@
 - (BOOL)isWSVideo;                                  // AppVideoMessageViewModel.h:5
 @end
 
-// cell 层级：BaseMessageCellView 须先于子类声明
-@interface BaseMessageCellView : NSObject
-@property (readonly, nonatomic) id viewModel;
+// ⚠ 8.0.79 里 `viewModel` **不在 BaseMessageCellView 上**（该头文件 1000+ 行里一个 viewModel 都没有），
+//   真实位置是 BaseChatCellView.h:17。运行时 cell 是从 BaseChatCellView 继承来的，
+//   所以 [cell viewModel] 能跑通 —— 这里把它挂到 BaseMessageCellView 上只是为了 hook 内
+//   能静态调用（self.viewModel），不是在宣称头文件里有这条。
+@interface BaseChatCellView : NSObject
+@property (readonly, nonatomic) id viewModel;       // BaseChatCellView.h:17（真实锚点）
 @end
 
+@interface BaseMessageCellView : BaseChatCellView
+- (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;   // BaseMessageCellView.h:11（在基类上）
+@end
+
+// cell 层级：BaseMessageCellView 须先于子类声明
 @interface VideoMessageCellView : BaseMessageCellView
-- (id)operationMenuItems;
+- (id)operationMenuItems;                          // VideoMessageCellView.h:12
 - (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;
 @end
 
 @interface AppVideoMessageCellView : BaseMessageCellView
-- (id)operationMenuItems;
+- (id)operationMenuItems;                          // AppVideoMessageCellView.h:7
 - (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;
 @end
 
 @interface AppFileMessageCellView : BaseMessageCellView
-- (id)operationMenuItems;
+- (id)operationMenuItems;                          // AppFileMessageCellView.h:17
 - (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;
 @end
 
 @interface VoiceMessageCellView : BaseMessageCellView
-- (id)operationMenuItems;
-- (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;
+- (id)operationMenuItems;                          // VoiceMessageCellView.h:34
+- (BOOL)canPerformAction:(SEL)arg1 withSender:(id)arg2;   // VoiceMessageCellView.h:6
+@end
+
+// 8.0.79 另外发现 VoiceMessageViewModel.voiceTimeLength（VoiceMessageViewModel.h:36）能直接拿到
+//   微信自己认为的语音秒数；本版没用（dd_voice_to_file 手上只有 msg 拿不到 cell.viewModel），
+//   留作下一次若要交叉校验「m4a 时长 vs 语音秒数」时的现成入口。
+// AppFileMessageViewModel 上的 isFileExist 已用起来（见 dd_file_ready_of_cell）。
+@interface AppFileMessageViewModel : NSObject
+- (BOOL)isFileExist;                               // AppFileMessageViewModel.h:9  文件是否已落地
+- (BOOL)contentExists;                             // AppFileMessageViewModel.h:6
 @end
 
 #pragma mark - 配置（三个开关 + 发送模式）
@@ -339,7 +451,7 @@
 #define kDDLogDirName    @"DDVoiceAssistantLogs"
 #define kDDLogFileName   @"ddvoice_debug.log"
 #define kDDPluginName    @"DD语音助手"
-#define kDDPluginVersion @"1.0.2"
+#define kDDPluginVersion @"1.0.6"
 
 @interface DDLogStore : NSObject
 + (instancetype)shared;
@@ -493,9 +605,42 @@ static CMessageWrap *dd_msg_of_cell(id cell) {
 }
 
 // 普通视频本地路径（VideoMessageCellView，承载 m_uiMessageType=43 视频 与 62 小视频，二者共用此类）
-// 证据：VideoMessageViewModel.videoPath（VideoMessageViewModel.h:5）；
-//       CMessageWrap IsVideoMsg/IsPureVideoMsg（CMessageWrap.h:854-855）；
-//       CMessageMgr AddVideoMsg:43 / AddShortVideoMsg:62（CMessageMgr.h:203-204）
+// 证据：VideoMessageViewModel.videoPath（VideoMessageViewModel.h:24）；
+// 类型守卫 dd_is_msg_wrap 定义在文件靠后（约第 745 行），这里提前调用，故先前向声明
+static BOOL dd_is_msg_wrap(id obj);
+//       CMessageWrap IsVideoMsg/IsPureVideoMsg（CMessageWrap.h:155/144）；
+//       CMessageMgr AddVideoMsg:43 / AddShortVideoMsg:62（CMessageMgr.h:63-64）
+// v1.0.6：参考「视频转语音.txt」的多源解析思路（该文件仅供参考，类名以 8.0.79 头文件为准）重写为
+//         目录感知 + 多源。关键启发：解析出的路径**可能是目录**，要在里面找第一个
+//         .mp4/.mov/.m4v（参考 WCLiteFirstVideoFileUnderPath）；同时补上参考里的另外两条权威源
+//         WCLanDeviceServiceUtil.filePathFromMsgWrap:（WCLanDeviceServiceUtil.h:7）与
+//         CUtility.GetDocPath（CUtility.h:49）兜底，覆盖 videoPath 在某些视频号/未下载场景取不到的情况。
+
+// 视频扩展名白名单（参考 WCLiteVideoToVoiceAllowedExtensions：mp4/mov/m4v）
+static NSSet *dd_video_ext_set(void) {
+    static NSSet *s; static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [NSSet setWithObjects:@"mp4", @"mov", @"m4v", nil]; });
+    return s;
+}
+// 目录感知：path 是带白名单后缀的文件 → 原样返回；是目录 → 扫首个白名单文件（非递归，对齐参考文件）
+static NSString *dd_first_video_file_under_path(NSString *path) {
+    if (![path isKindOfClass:[NSString class]] || path.length == 0) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:path isDirectory:&isDir]) return nil;
+    if (!isDir) {
+        return [dd_video_ext_set() containsObject:path.pathExtension.lowercaseString] ? path : nil;
+    }
+    NSArray *ents = [fm contentsOfDirectoryAtPath:path error:nil];
+    for (NSString *name in ents) {
+        if (![dd_video_ext_set() containsObject:name.pathExtension.lowercaseString]) continue;
+        NSString *sub = [path stringByAppendingPathComponent:name];
+        BOOL subDir = NO;
+        if ([fm fileExistsAtPath:sub isDirectory:&subDir] && !subDir) return sub;
+    }
+    return nil;
+}
+
 static NSString *dd_video_path_of_cell(id cell) {
     id msg = dd_msg_of_cell(cell);
     // 视频消息含 43（视频）与 62（小视频），IsVideoMsg 对两者均返回 YES，做一道显式类型识别
@@ -503,15 +648,73 @@ static NSString *dd_video_path_of_cell(id cell) {
         dd_log(@"[path.video] type=%u 非视频消息，跳过", msg ? ((CMessageWrap *)msg).m_uiMessageType : 0);
         return nil;
     }
-    id vm = [cell viewModel];
+    NSMutableArray<NSString *> *cands = [NSMutableArray array];
+    // ① VideoMessageViewModel.videoPath（VideoMessageViewModel.h:24）—— 已下载视频最直接
+    id vm = [cell respondsToSelector:@selector(viewModel)] ? [(id)cell viewModel] : nil;
     if ([vm respondsToSelector:@selector(videoPath)]) {
         NSString *p = [vm videoPath];
-        dd_log(@"[path.video] videoPath=%@ 存在=%d", p ?: @"(nil)", dd_file_exists(p));
-        if (dd_file_exists(p)) return p;
+        if ([p isKindOfClass:[NSString class]] && p.length) [cands addObject:p];
     } else {
         dd_log(@"[path.video] vm=%@ 无 videoPath", NSStringFromClass([vm class]));
     }
+    // ②~④ 仅当拿到真正的 CMessageWrap 时才打这些权威接口（避免越界，沿用 dd_is_msg_wrap 守卫）
+    if (dd_is_msg_wrap(msg)) {
+        // ② WCLanDeviceServiceUtil.filePathFromMsgWrap:（WCLanDeviceServiceUtil.h:7）
+        Class lan = objc_getClass("WCLanDeviceServiceUtil");
+        if (lan && [lan respondsToSelector:@selector(filePathFromMsgWrap:)]) {
+            @try { id p = [lan filePathFromMsgWrap:msg];
+                   if ([p isKindOfClass:[NSString class]] && ((NSString *)p).length) [cands addObject:p]; }
+            @catch (NSException *e) { dd_log(@"[path.video] WCLanDeviceServiceUtil 异常 %@", e.reason); }
+        }
+        // ③ CMessageWrap +GetPathOfAppData:（CMessageWrap.h:26）
+        Class wc = objc_getClass("CMessageWrap");
+        if (wc && [wc respondsToSelector:@selector(GetPathOfAppData:)]) {
+            @try { id p = [wc GetPathOfAppData:msg];
+                   if ([p isKindOfClass:[NSString class]] && ((NSString *)p).length) [cands addObject:p]; }
+            @catch (NSException *e) { dd_log(@"[path.video] GetPathOfAppData: 异常 %@", e.reason); }
+        }
+        // ④ CUtility +GetDocPath（CUtility.h:49）兜底扫文档目录
+        Class cu = objc_getClass("CUtility");
+        if (cu && [cu respondsToSelector:@selector(GetDocPath)]) {
+            @try { id p = [cu GetDocPath];
+                   if ([p isKindOfClass:[NSString class]] && ((NSString *)p).length) [cands addObject:p]; }
+            @catch (NSException *e) { dd_log(@"[path.video] GetDocPath 异常 %@", e.reason); }
+        }
+    }
+    // 目录感知查找：命中即返回
+    NSUInteger idx = 0;
+    for (NSString *p in cands) {
+        NSString *f = dd_first_video_file_under_path(p);
+        if (f.length) {
+            dd_log(@"[path.video] 源#%lu 命中视频文件 → %@ (ext=%@)", (unsigned long)idx, f, f.pathExtension);
+            return f;
+        }
+        idx++;
+    }
+    if (cands.count) {
+        dd_log(@"[path.video] 无视频文件命中，返回候选#0 供下载轮询: %@", cands.firstObject);
+        return cands.firstObject;   // 可能只是目录；dd_media_to_voice 触发下载后会再解析出文件
+    }
+    dd_log(@"[path.video] 完全取不到视频路径");
     return nil;
+}
+
+// 8.0.79 新见：AppFileMessageViewModel.isFileExist（AppFileMessageViewModel.h:9）
+//   —— 直接问 viewModel「这文件到底落地了没」，比拿一条摸索出来的路径去 stat 更早知道答案。
+//   NO = 确实没下载，后面那套下载触发 + 轮询才有意义；不确定时按「有」处理，让路径探测自己说话。
+// 返回值只用于日志与提前判空，不改变既有行为。
+static BOOL dd_file_ready_of_cell(id cell) {
+    id vm = nil;
+    @try { vm = [cell respondsToSelector:@selector(viewModel)] ? [(id)cell viewModel] : nil; } @catch (...) {}
+    if (!vm) return YES;
+    @try {
+        if ([vm respondsToSelector:@selector(isFileExist)]) {
+            BOOL ex = [(id)vm isFileExist];
+            dd_log(@"[file.ready] vm=%@ isFileExist=%d", NSStringFromClass([vm class]), ex);
+            return ex;
+        }
+    } @catch (NSException *e) { dd_log(@"[file.ready] isFileExist 异常 %@", e.reason); }
+    return YES;
 }
 
 // 应用视频 / 视频号视频本地路径（AppVideoMessageCellView，m_uiMessageType=49 的 app 视频）
@@ -558,6 +761,12 @@ static BOOL dd_is_msg_wrap(id obj) {
            [obj respondsToSelector:@selector(m_uiMessageType)];
 }
 
+// v1.0.3 重写：8.0.79 全库 46581 个头文件里**已经没有 m_oAppDataItem**（老版本字段，已移除），
+// 所以它不是一个「偶尔为 nil」的通道，而是彻底不通 —— 这正是「文件识别失败」的消息
+// 取不到扩展名、进而在菜单里连按钮都出不来的根因之一。
+// 8.0.79 上文件/app 消息的数据项走 CMessageWrap.h:382 的 m_extendInfoWithMsgType，
+// 返回的就是 CExtendInfoOfAPP（CExtendInfoOfAPP.h:201 起有 m_uiAppMsgInnerType /
+// m_nsAppFileExt / m_uiAppDataSize / m_nsAppMediaUrl / m_nsAppAttachID）。
 static id dd_app_item_of_msg(CMessageWrap *msg) {
     if (!msg) return nil;
     if (!dd_is_msg_wrap(msg)) {
@@ -565,10 +774,18 @@ static id dd_app_item_of_msg(CMessageWrap *msg) {
         return nil;
     }
     id appItem = nil;
+    // 1) 权威：m_extendInfoWithMsgType（CMessageWrap.h:382）
     @try {
-        if ([msg respondsToSelector:@selector(m_oAppDataItem)]) appItem = [msg m_oAppDataItem];
-    } @catch (...) { appItem = nil; }
-    if (!appItem) @try { appItem = [msg valueForKey:@"m_oAppDataItem"]; } @catch (...) { appItem = nil; }
+        if ([msg respondsToSelector:@selector(m_extendInfoWithMsgType)])
+            appItem = [msg m_extendInfoWithMsgType];
+    } @catch (NSException *e) { dd_log(@"[ext.file] m_extendInfoWithMsgType 异常 %@", e.reason); appItem = nil; }
+    if (appItem) {
+        dd_log(@"[ext.file] 命中 m_extendInfoWithMsgType → %@", NSStringFromClass([appItem class]));
+        return appItem;
+    }
+    // 2) 旧版本字段的 KVC 兜底（为兼容更老的微信；8.0.79 上这条路会抛 undefinedKey，被吞）
+    @try { appItem = [msg valueForKey:@"m_oAppDataItem"]; } @catch (...) { appItem = nil; }
+    if (!appItem) dd_log(@"[ext.file] 取不到数据项（m_extendInfoWithMsgType 与 KVC 兜底都失败）");
     return appItem;
 }
 // 扩展名字段全空的兜底路径（只走权威接口，避免与 dd_file_path_of_msg 互相递归打日志）
@@ -621,9 +838,9 @@ static BOOL dd_file_is_audio(CMessageWrap *msg) {
     return ok;
 }
 
-// 文件消息本地路径（v1.0.1 重写：v1.0.0 只靠 KVC 猜 m_oAppDataItem 的键名，
-// “识别失败”的文件 m_oAppDataItem 为 nil → 路径永远拿不到 → 转语音必然失败。
-// 改用微信权威接口 CMessageWrap.GetPathOfAppData: 系列打头）
+// 文件消息本地路径（v1.0.3 按 8.0.79 头文件重排候选：
+//   m_oAppDataItem 这个字段在 8.0.79 已彻底不存在，数据项改由 m_extendInfoWithMsgType 提供；
+//   「识别失败」的文件过去取不到路径 → 转语音必然失败，现在多了一条不依赖内部字段的五参通道）
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!msg) return nil;
     // v1.0.2：先过类型守卫。dd_msg_of_cell 对某些 cell 交回来的不是 CMessageWrap，
@@ -649,14 +866,40 @@ static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
         if ([p isKindOfClass:[NSString class]] && p.length) [cands addObject:p];
     } @catch (NSException *e) { dd_log(@"[path.file] GetPathOfAppDataByUserName: 异常 %@", e.reason); }
 
-    // 3) m_oAppDataItem KVC 多键名兜底（覆盖不同版本的字段命名）
+    // 3) m_extendInfoWithMsgType 出来的数据项里的路径键（v1.0.3：数据源从 m_oAppDataItem 换成它）
     id appItem = dd_app_item_of_msg(msg);
-    for (NSString *k in @[@"m_nsFilePath", @"filePath", @"dataPath", @"m_nsDataPath", @"localPath", @"m_nsAppMediaUrl"]) {
+    NSArray<NSString *> *extKeys = @[@"m_nsAppMediaUrl", @"m_nsFilePath", @"m_nsDataPath",
+                                     @"filePath", @"dataPath", @"localPath"];
+    for (NSString *k in extKeys) {
         @try {
             id v = [appItem valueForKey:k];
             if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length) [cands addObject:v];
         } @catch (...) {}
     }
+
+    // 4) v1.0.3 新增：五参版 GetPathOfAppDataByUserName:andMessageWrap:andAttachId:andAttachFileExt:retStrPath:
+    //    （CMessageWrap.h:107）。它不依赖 msgWrap 内部的扩展名字段，由调用方显式传入 attachId + fileExt，
+    //    对那些「文件识别失败」（内部字段残缺）的消息反而更稳。ext 从 m_nsAppFileExt 取，取不到就传 @""
+    //    —— 经验值：这条路在字段残缺时是唯一还能出路径的通道。
+    @try {
+        NSString *ext = nil;
+        for (NSString *k in @[@"m_nsAppFileExt", @"m_nsFileExt", @"fileExt"]) {
+            id v = [appItem valueForKey:k];
+            if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length) { ext = v; break; }
+        }
+        id attachId = nil;
+        @try { attachId = [appItem valueForKey:@"m_nsAppAttachID"]; } @catch (...) {}
+        NSString *p = nil;
+        [wrapCls GetPathOfAppDataByUserName:dd_current_usr_name()
+                            andMessageWrap:msg
+                              andAttachId:[attachId isKindOfClass:[NSString class]] ? attachId : @""
+                         andAttachFileExt:ext ?: @""
+                              retStrPath:&p];
+        if ([p isKindOfClass:[NSString class]] && p.length) {
+            dd_log(@"[path.file] 五参 GetPathOfAppData 命中 → %@", p);
+            [cands addObject:p];
+        }
+    } @catch (NSException *e) { dd_log(@"[path.file] 五参 GetPathOfAppData 异常 %@", e.reason); }
     dd_log(@"[path.file] appItem=%@ 候选路径=%lu 条",
           appItem ? NSStringFromClass([appItem class]) : @"(nil)", (unsigned long)cands.count);
     NSUInteger idx = 0;
@@ -994,21 +1237,65 @@ static BOOL dd_silk_frames_valid(NSData *d) {
     dd_log(@"[silk.frame] 尾部不足 2 字节帧长头(pos=%lu len=%lu)，容器损坏", (unsigned long)pos, (unsigned long)len);
     return NO;
 }
-// 回环自校验：拿微信自己的解码器反解候选，解不动的不要（只用来自查，不参与最终挑选逻辑）
-static long long dd_silk_roundtrip_score(NSData *cand, NSUInteger pcmLen) {
-    Class codec = objc_getClass("MJSilkCodec");
-    if (![codec respondsToSelector:@selector(decodeToPCMFromSilkData:)]) return -2;
-    NSData *back = nil;
-    @try { back = [codec decodeToPCMFromSilkData:cand]; } @catch (NSException *e) { return -2; }
-    if (back.length == 0) return -1;
-    long long diff = (long long)labs((long)back.length - (long)pcmLen);
-    return LLONG_MAX - diff;   // 越大越好（先保证解得动，再挑长度最接近的）
-}
 
 // PCM → SILK：严格按 WCR sub_0x8f2804（0x8f2804~0x8f2d18）的顺序与参数
 //   主路径 类方法 +encodeToSilkFromPCMData:（MJSilkCodec.h:5）
 //   兜底   实例 -initEncoderWithSampleRate:16000 + -encodeFromPCMData:（MJSilkCodec.h:7/:10）
-//   两条路的产物都过 dd_silk_normalize（WCR sub_0x8f18d8）补齐 \x02 容器头
+//
+// v1.0.7 关键修复（针对「转出来是静音消息」）：
+//   用户 2026-09-22 真机日志显示：编码器产出 16600 字节 SILK 并已落盘、ResendVoiceMsg 也调了，
+//   但播放静音；同时「语音→文件」读同一个 .aud 时 MJSilkCodec 的 decodeToAudioDataFromSilkData /
+//   decodeToPCMFromSilkData 都返回 0 字节 —— 即编码器产物连微信自己的解码器都解不回来。
+//   微信语音播放器用的正是 MJSilkCodec 这个解码器，解不回 = 播放静音。
+//   旧逻辑（v1.0.2~v1.0.6）即便回环解码失败，仍把类方法产物硬发出去（「退回类方法产物尝试发送」），
+//   于是静音消息照发不误。
+//   新逻辑：把每个编码器产物的「标准头 \x02#!SILK_V3(magic10)」与「裸 #!SILK_V3(magic9)」两个容器变体
+//   都交给 MJSilkCodec 的 decodeToPCMFromSilkData: 做回环验证，**只发能解回来的那个**；
+//   全部解不开 → 放弃发送（绝不发静音消息）。用微信自己的解码器当裁判，彻底消除 magic9/magic10 猜测。
+
+// 把编码器原始产物整理成候选容器数组（去重、按优先级：已经是 magic10 优先，其次 magic9，再补 0x02 变体）
+static NSArray<NSData *> *dd_silk_candidates_from(NSData *raw) {
+    NSMutableArray *arr = [NSMutableArray arrayWithCapacity:2];
+    if (!raw.length) return arr;
+    if (dd_silk_has_magic10(raw)) {                 // 已经是标准 10 字节头
+        [arr addObject:raw];
+    } else if (dd_silk_has_magic9(raw)) {           // 裸 9 字节魔数
+        [arr addObject:raw];                        // 先试原样
+        NSMutableData *m = [NSMutableData dataWithCapacity:raw.length + 1];
+        const unsigned char lead = 0x02;
+        [m appendBytes:&lead length:1];
+        [m appendData:raw];
+        [arr addObject:m];                          // 再试补 0x02 变体
+    }
+    // 连裸魔数都不是 → 不是 SILK，不入候选（回环验证也救不回来）
+    return arr;
+}
+
+// 回环验证：用微信自己的解码器 decodeToPCMFromSilkData: 逐个试候选，返回第一个能解出 PCM 的容器。
+// 解不回来的容器微信播放器必然也解不出 → 静音，绝不该发出去。
+static NSData *dd_pick_decodable_silk(NSArray<NSData *> *raws) {
+    Class codec = objc_getClass("MJSilkCodec");
+    if (![codec respondsToSelector:@selector(decodeToPCMFromSilkData:)]) {
+        dd_log(@"[silk.enc] MJSilkCodec 无 decodeToPCMFromSilkData:，无法回环验证（保守放弃）");
+        return nil;
+    }
+    for (NSData *raw in raws) {
+        NSArray<NSData *> *cands = dd_silk_candidates_from(raw);
+        for (NSData *c in cands) {
+            NSData *pcm = nil;
+            @try { pcm = [codec decodeToPCMFromSilkData:c]; }
+            @catch (NSException *e) { pcm = nil; dd_log(@"[silk.enc] 回环解码异常: %@", e.reason); }
+            if (pcm.length > 0) {
+                dd_log(@"[silk.enc] ✅ 选中可解码容器 magic%d（%lu 字节 → 解出 PCM %lu 字节），微信播放器必能播",
+                      dd_silk_has_magic10(c) ? 10 : 9, (unsigned long)c.length, (unsigned long)pcm.length);
+                return c;
+            }
+            dd_log(@"[silk.enc] 候选 magic%d 解出 0 字节，跳过", dd_silk_has_magic10(c) ? 10 : 9);
+        }
+    }
+    return nil;
+}
+
 static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (pcm.length == 0) { dd_log(@"[silk.enc] PCM 为空"); return nil; }
     Class codec = objc_getClass("MJSilkCodec");
@@ -1016,32 +1303,20 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     dd_log(@"[silk.enc] 输入 PCM=%lu 字节（%.2fs @16000Hz/单声道/16bit）",
           (unsigned long)pcm.length, pcm.length / (double)(kDDMCVoiceSampleRate * 2));
 
+    // 先收集两个编码器的原始产物（都不急着归一化，留给回环验证决定用哪个容器变体）
+    NSMutableArray *raws = [NSMutableArray arrayWithCapacity:2];
+
     // ── 主路径：类方法（WCR 0x8f2890 取的就是这个 SEL，tbz 只在 respondsToSelector: 失败时才跳兜底）
-    NSData *primary = nil;
     if ([codec respondsToSelector:@selector(encodeToSilkFromPCMData:)]) {
         @try {
             NSData *raw = [codec encodeToSilkFromPCMData:pcm];
             dd_log(@"[silk.enc] 类方法 → %lu 字节 头16=%@", (unsigned long)raw.length, dd_hex_head(raw, 16));
-            primary = dd_silk_normalize(raw);
-            if (!primary.length) dd_log(@"[silk.enc] 类方法产物不是 SILK 容器");
+            if (raw.length) [raws addObject:raw];
         } @catch (NSException *e) {
             dd_log(@"[silk.enc] 类方法异常: %@", e.reason);
         }
     } else {
         dd_log(@"[silk.enc] MJSilkCodec 无类方法 encodeToSilkFromPCMData:");
-    }
-    if (primary.length) {
-        dd_silk_frames_valid(primary);   // 只记日志：帧不自洽也照样发（微信自己会兜），但日志要留证据
-        long long sc = dd_silk_roundtrip_score(primary, pcm.length);
-        dd_log(@"[silk.enc] 类方法产物回环打分=%lld %@", sc,
-              sc == -2 ? @"（回环解码失败）" : (sc == -1 ? @"（回环解出0字节）" : @"（回环OK）"));
-        if (sc >= 0) {
-            dd_log(@"[silk.enc] 选定=类方法 输出=%lu 字节 标准头=%d",
-                  (unsigned long)primary.length, dd_silk_has_magic10(primary));
-            return primary;
-        }
-        // 解得动才算数；解不动就往下试试实例兜底，两条路都不行也还有 primary 兜着
-        dd_log(@"[silk.enc] 类方法产物自己解不回来，再试实例兜底对比");
     }
 
     // ── 兜底：实例 API，采样率写死 16000（WCR 0x8f2b00 mov x2,#0x3e80）
@@ -1049,37 +1324,32 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
         [codec instancesRespondToSelector:@selector(encodeFromPCMData:)]) {
         @try {
             id inst = [[codec alloc] init];
-            BOOL okUnit = NO;
-            NSData *raw = nil;
             if ([inst initEncoderWithSampleRate:(long long)kDDMCVoiceSampleRate]) {
-                okUnit = YES;
-                raw = [inst encodeFromPCMData:pcm];
+                NSData *raw = [inst encodeFromPCMData:pcm];
                 dd_log(@"[silk.enc] 实例 API @%dHz → %lu 字节 头16=%@",
                       (int)kDDMCVoiceSampleRate, (unsigned long)raw.length, dd_hex_head(raw, 16));
+                if (raw.length) [raws addObject:raw];
             } else {
                 dd_log(@"[silk.enc] initEncoderWithSampleRate:%d 返回 NO", (int)kDDMCVoiceSampleRate);
             }
             if ([inst respondsToSelector:@selector(uninitEncoder)]) [inst uninitEncoder];
-            NSData *silk = dd_silk_normalize(raw);
-            if (silk.length) {
-                dd_silk_frames_valid(silk);
-                dd_log(@"[silk.enc] 选定=实例API 输出=%lu 字节 标准头=%d",
-                      (unsigned long)silk.length, dd_silk_has_magic10(silk));
-                return silk;
-            }
-            if (okUnit) dd_log(@"[silk.enc] 实例 API 产物不是 SILK 容器");
         } @catch (NSException *e) {
             dd_log(@"[silk.enc] 实例 API 异常: %@", e.reason);
         }
     }
-    // 走到这里说明实例兜底也拿不到可解产物；宁可把类方法产物交出去（微信端也许能播），
-    // 也不返回 nil 让用户看到「点了没反应」——日志里已经留下完整证据可供下一轮定位。
-    if (primary.length) {
-        dd_log(@"[silk.enc] 兜底无果，退回类方法产物(%lu 字节)尝试发送", (unsigned long)primary.length);
-        return primary;
+
+    if (!raws.count) { dd_log(@"[silk.enc] 类方法与实例 API 均无产物，放弃编码"); return nil; }
+
+    // ── 回环验证：只发微信自己的解码器能解回来的容器（这是静音问题的根治点）
+    NSData *ok = dd_pick_decodable_silk(raws);
+    if (!ok) {
+        dd_log(@"[silk.enc] ⚠ 全部编码器产物经 MJSilkCodec 回环解码均为 0 字节 → 微信播放器也解不出 → "
+               "放弃发送（避免静音消息）。头16 分别：%@ / %@",
+              raws.count > 0 ? dd_hex_head(raws[0], 16) : @"(空)",
+              raws.count > 1 ? dd_hex_head(raws[1], 16) : @"(单路)");
+        return nil;
     }
-    dd_log(@"[silk.enc] 类方法与实例 API 全部失败，放弃编码");
-    return nil;
+    return ok;
 }
 // SILK（.aud 全文）→ PCM
 // WCR 的做法（0x8de7d4 起）：后缀是 aud/silk/slk 且 sub_0x8f15f4 判合格时，
@@ -1181,8 +1451,11 @@ static void dd_media_to_voice(CMessageWrap *msg, NSString *(^pathBlock)(void), v
             } else {
                 NSData *pcm = dd_extract_pcm(path, &duration);
                 if (pcm.length == 0) { dd_log(@"[media→voice] PCM 为空（无音轨或格式不支持），放弃"); return; }
+                // 时长必须以「真实抽出的 PCM 长度」为准，不能用 asset.duration（那是视频时长，
+                // 可能与音轨实际长度不符，日志里就出现过视频 16.167s、音轨仅 8s 的情况 → 气泡时长错、播放错位）
+                duration = (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2);
                 aud = dd_encode_pcm_to_silk(pcm);
-                if (aud.length == 0) { dd_log(@"[media→voice] SILK 编码失败，放弃"); return; }
+                if (aud.length == 0) { dd_log(@"[media→voice] SILK 编码失败（回环验证未通过，已放弃发送以免静音），放弃"); return; }
             }
 
             NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
@@ -1361,7 +1634,17 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     [app setM_nsAppFileName:fileName];
     [app setM_nsAppFileExt:@"m4a"];
     [app setM_uiAppDataSize:fsize];
-    @try { [wrap setValue:app forKey:@"m_oAppDataItem"]; } @catch (...) {}
+    // v1.0.3：这里原来是 [wrap setValue:app forKey:@"m_oAppDataItem"]，而 8.0.79 全库已无该字段
+    // （KVC 抛 NSUndefinedKeyException 被 @catch 吞掉）→ extendInfo 永远挂不上 →
+    // AddAppMsg 内部拿不到文件数据项 → 「语音转文件」走到最后一步静默失败（用户看到的就是「没反应」）。
+    // 换成真实存在的权威 setter：CMessageWrap.h:637 setM_extendInfoWithMsgType:
+    @try {
+        [wrap setM_extendInfoWithMsgType:app];
+        dd_log(@"[file.send] extendInfo 已挂载 setM_extendInfoWithMsgType: (CMessageWrap.h:637)");
+    } @catch (NSException *e) {
+        dd_log(@"[file.send] setM_extendInfoWithMsgType: 异常 %@", e.reason);
+        @try { [wrap setValue:app forKey:@"m_oAppDataItem"]; } @catch (...) {}   // 老版本兼容
+    }
 
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     if ([mgr respondsToSelector:@selector(AddAppMsg:MsgWrap:DataPath:Scene:)]) {
@@ -1369,9 +1652,17 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
         dd_log(@"[file.send] 已调用 AddAppMsg:MsgWrap:DataPath:Scene:");
         return YES;
     }
-    dd_log(@"[file.send] CMessageMgr 无 AddAppMsg，回退 addMessageToDB");
-    if ([mgr respondsToSelector:@selector(addMessageToDB:)]) {
-        [mgr addMessageToDB:wrap];
+    // v1.0.3：原来的兜底是 [mgr addMessageToDB:]，但 8.0.79 里这个方法只存在于 AudioSender
+    // （AudioSender.h:13），CMessageMgr 没有 → respondsToSelector 恒为 NO → 兜底形同虚设。
+    // 换成 CMessageMgr 真实存在的本地落地接口（CMessageMgr.h:191 / :194）。
+    if ([mgr respondsToSelector:@selector(AddLocalMsg:MsgWrap:)]) {
+        [mgr AddLocalMsg:usr MsgWrap:wrap];
+        dd_log(@"[file.send] AddAppMsg 不可用，已回退 AddLocalMsg:MsgWrap: (CMessageMgr.h:191)");
+        return YES;
+    }
+    if ([mgr respondsToSelector:@selector(AddMsg:MsgWrap:)]) {
+        [mgr AddMsg:usr MsgWrap:wrap];
+        dd_log(@"[file.send] 已回退 AddMsg:MsgWrap: (CMessageMgr.h:194)");
         return YES;
     }
     dd_log(@"[file.send] 无任何可用发送接口");
@@ -1442,6 +1733,7 @@ static void dd_voice_to_file(CMessageWrap *msg) {
             if (silk.length == 0) { dd_log(@"[voice→file] 取不到语音数据，放弃"); return; }
             NSString *m4a = dd_decode_silk_to_audio(silk);
             if (!m4a.length) { dd_log(@"[voice→file] 解码/封装失败，放弃"); return; }
+            if (!m4a.length) { dd_log(@"[voice→file] 解码/封装失败，放弃"); return; }
             dispatch_async(dispatch_get_main_queue(), ^{
                 BOOL sent = dd_send_file_to_chat(usr, m4a, fn);
                 dd_log(@"[voice→file] ==== 结束 ==== 发送结果=%d", sent);
@@ -1453,55 +1745,35 @@ static void dd_voice_to_file(CMessageWrap *msg) {
     });
 }
 
-#pragma mark - 菜单图标（MMMenuItem 直接吃 svg 资源名：MMMenuItem.h:18）
+#pragma mark - 菜单图标（用户确认 icon_filled_record_voice.svg 在 8.0.79 内置资源中存在，不做兜底）
 
-// 微信各版本的 svg 命名不统一，写死一个名字在部分机型/版本上会退化成「只有文字、没有图标」
-// （用户实测现象：视频「转语音」有图标、语音「转文件」没图标 → 同一个名字在两处表现不一致）。
-// 解法：候选名逐个试，取第一个真能解出 iconImage 的；全都不行就借原生菜单项自带的图标。
-static NSArray<NSString *> *dd_icon_candidates(void) {
-    return @[@"voice_record_filled",             // 旧版锚定的语音图标（DDMediaConvert_语音转文件_头文件锚定.md:27）
-             @"icon_filled_record_voice",        // v1.0.0 用的名字
-             @"icons_filled_voice_record",
-             @"icons_filled_record_voice",
-             @"voice_record",
-             @"record_voice"];
+// 用户确认 icon_filled_record_voice.svg 在 8.0.79 内置资源中存在，直接吃这个 svg 资源名，
+// 不走任何兜底（不借原生图标、不做纯文字）。initWithTitle:svgName:target:action:（MMMenuItem.h:18）。
+// 8.0.79 的 MMMenuItem **既没有 title getter 也没有 action getter**（51 行的头文件里只有 target），
+// 所以原先用 `it.action == action` 去重的做法在这版本上恒不成立（同一 action 会被重复注入）。
+// 改法：自己往 userInfo 里塞标记（MMMenuItem.h:29 读 / :49 写）。
+static NSString *dd_menu_token(SEL action) {
+    return [@"ddmc:" stringByAppendingString:NSStringFromSelector(action)];
 }
+
 static MMMenuItem *dd_convertMenuItem(NSString *title, id target, SEL action, NSArray *original) {
-    MMMenuItem *fallbackItem = nil;
-    for (NSString *svg in dd_icon_candidates()) {
-        @try {
-            MMMenuItem *it = [[%c(MMMenuItem) alloc] initWithTitle:title
-                                                           svgName:svg
-                                                            target:target
-                                                            action:action];
-            if (!it) continue;
-            if (!fallbackItem) fallbackItem = it;
-            UIImage *img = nil;
-            if ([it respondsToSelector:@selector(iconImage)]) img = (UIImage *)[it iconImage];
-            dd_log(@"[menu.icon] svg=%@ → iconImage=%@", svg, img ? @"有" : @"无");
-            if (img) return it;   // 确认能出图，直接用它
-        } @catch (NSException *e) {
-            dd_log(@"[menu.icon] svg=%@ 异常: %@", svg, e.reason);
-        }
-    }
-    if (!fallbackItem) {   // svg 构造器整体不可用 → 退回纯文字版
-        @try { fallbackItem = [[%c(MMMenuItem) alloc] initWithTitle:title target:target action:action]; }
-        @catch (NSException *e) { dd_log(@"[menu.icon] 落 pure-title 构造异常: %@", e.reason); return nil; }
-    }
-    // 兜底：从原生菜单项借一张图标，保证菜单里一定看得见图（不再出现“没图标”的按钮）
+    Class cls = objc_getClass("MMMenuItem");
+    if (!cls) return nil;
+    MMMenuItem *item = nil;
+    // 用户确认存在的内置 svg 图标，无兜底。
     @try {
-        if (![fallbackItem respondsToSelector:@selector(iconImage)] || ![fallbackItem iconImage]) {
-            for (MMMenuItem *src in original) {
-                UIImage *borrowed = [src respondsToSelector:@selector(iconImage)] ? (UIImage *)[src iconImage] : nil;
-                if (borrowed) {
-                    [fallbackItem setIconImage:borrowed];
-                    dd_log(@"[menu.icon] svg 全落空，借用原生菜单图标：%@", NSStringFromClass([src class]));
-                    break;
-                }
-            }
-        }
-    } @catch (...) {}
-    return fallbackItem;
+        item = [[cls alloc] initWithTitle:title
+                                  svgName:@"icon_filled_record_voice.svg"
+                                   target:target
+                                   action:action];
+    } @catch (NSException *e) {
+        dd_log(@"[menu.icon] initWithTitle:svgName: 异常: %@", e.reason);
+        return nil;
+    }
+    if (!item) { dd_log(@"[menu.icon] MMMenuItem 构造返回 nil（svg=icon_filled_record_voice.svg）"); return nil; }
+    @try { [item setUserInfo:dd_menu_token(action)]; } @catch (...) {}
+    dd_log(@"[menu.icon] 用内置 svg icon_filled_record_voice.svg");
+    return item;
 }
 
 // 统一注入：取原生菜单数组，按开关追加对应按钮
@@ -1509,16 +1781,21 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     dd_log(@"[menu] cell=%@ 注入「%@」enabled=%d 原生菜单数=%lu",
           NSStringFromClass([cell class]), title, enabled, (unsigned long)original.count);
     if (!enabled) { dd_log(@"[menu] 开关关闭/类型不匹配，不注入「%@」", title); return original; }
-    // 按 action 去重（UIMenuItem.action 公开可读）
+    // 按我们自己塞进 userInfo 的标记去重（8.0.79 的 MMMenuItem 读不出 title/action，见上方说明）。
     // 依据 WCR：它在基类 BaseMessageCellView 统一 hook operationMenuItems（BaseMessageCellView.h:65），
     // 四个子类各自也 hook（VideoMessageCellView.h:12 / AppVideoMessageCellView.h:7 /
-    // AppFileMessageCellView.h:17 / VoiceMessageCellView.h:33）。两层 hook 叠加时同一个 action
+    // AppFileMessageCellView.h:17 / VoiceMessageCellView.h:34）。两层 hook 叠加时同一个 action
     // 会被注入两次，菜单里就会出现两个同名按钮 —— 追加前先查一轮，命中就跳过。
-    for (MMMenuItem *it in original) {
-        if ([it respondsToSelector:@selector(action)] && it.action == action) {
-            dd_log(@"[menu] 「%@」已存在（基类或其他 hook 已注入），跳过重复追加", title);
-            return original;
-        }
+    NSString *token = dd_menu_token(action);
+    for (id it in original) {
+        @try {
+            if (![it respondsToSelector:@selector(userInfo)]) continue;
+            id ui = [(id)it userInfo];
+            if ([ui isKindOfClass:[NSString class]] && [(NSString *)ui isEqualToString:token]) {
+                dd_log(@"[menu] 「%@」已存在（基类或其他 hook 已注入），跳过重复追加", title);
+                return original;
+            }
+        } @catch (...) {}
     }
     MMMenuItem *item = dd_convertMenuItem(title, cell, action, original);
     if (!item) { dd_log(@"[menu] MMMenuItem 构造失败"); return original; }
@@ -1620,8 +1897,9 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     // dd_extract_pcm 会用 AVFoundation 自己判断素材能不能抽音轨。
     NSString *ext = dd_file_ext_of_msg(msg);
     BOOL audio = dd_file_is_audio(msg);
-    dd_log(@"[action] 文件消息 ext=%@ 疑似音频=%d —— 无论如何都尝试抽音轨",
-          ext ?: @"(nil)", audio);
+    BOOL landed = dd_file_ready_of_cell(self);   // 8.0.79 AppFileMessageViewModel.h:9
+    dd_log(@"[action] 文件消息 ext=%@ 疑似音频=%d 已落地=%d —— 无论如何都尝试抽音轨",
+          ext ?: @"(nil)", audio, landed);
     dd_media_to_voice(msg, ^NSString *{ return dd_file_path_of_msg(msg); },
                           ^{ dd_trigger_file_download(msg); });
 }
