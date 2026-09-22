@@ -118,6 +118,17 @@
 //    日志都已落盘，且 init 仅在不存时建空文件、不清空已有日志文件，故重启微信后闪退日志可查。
 //    下一步：请用户重装 v1.0.9 后复现文件转语音闪退，进设置页导出日志即可定位闪退根因。
 //
+//  v1.0.10（修「语音转文件发出的 m4a 重启后/清理后打不开」，确定性 bug）
+//    用户确认「文件打不开」，与上一轮推断的诱因二一致：dd_send_file_to_chat 把
+//    NSTemporaryDirectory() 下的 m4a 路径**直接**交给 AddAppMsg:MsgWrap:DataPath:Scene:，
+//    而微信 AddAppMsg 后续读取/上传的就是这个 DataPath；NSTemporaryDirectory() 在进程重启或
+//    系统周期性清理时会被清空，文件消息指向死路径 → 本地/重启后打不开。
+//    修复：新增 dd_persist_copy 在发送前把 m4a 拷进微信持久沙盒（CUtility.GetDocPath 优先、
+//    退回 NSDocumentDirectory），用持久副本路径构造 extendInfo 与发送；原临时文件保留不动。
+//    锚定：CUtility +GetDocPath（CUtility.h:49）；NSSearchPathForDirectoriesInDomains(NSDocumentDirectory)。
+//    注：诱因一（取源路径随微信运行态漂移、重启后可能掉 m_dtVoice 兜底致时长/内容变）仍待日志坐实，
+//    本轮未动解码逻辑，避免把已能用的视频转语音又带出静音。
+//
 //  锚定证据（微信头文件 dump / WCRefine 加载态 dump）：
 //   · 文件数据路径 —— CMessageWrap +GetPathOfAppData:msgWrap            (CMessageWrap.h:26)
 //                     +GetPathOfAppData:LocalID:FileExt:retStrPath:      (CMessageWrap.h:106)
@@ -473,7 +484,7 @@
 #define kDDLogDirName    @"DDVoiceAssistantLogs"
 #define kDDLogFileName   @"ddvoice_debug.log"
 #define kDDPluginName    @"DD语音助手"
-#define kDDPluginVersion @"1.0.9"
+#define kDDPluginVersion @"1.0.10"
 
 @interface DDLogStore : NSObject
 + (instancetype)shared;
@@ -1635,9 +1646,46 @@ static NSString *dd_write_m4a(NSData *pcm) {
     return path;
 }
 
+// v1.0.10：把临时目录产物拷进微信持久沙盒再发送，避免「NSTemporaryDirectory 被系统清理 →
+// 文件消息指向死路径 → 重启后/清理后打不开」。微信 AddAppMsg:DataPath: 后续会直接读这个路径，
+// 而临时目录在进程重启或系统周期性清理时会被清空，因此必须在发送前落到持久目录。
+static NSString *dd_persist_copy(NSString *src) {
+    if (!dd_file_exists(src)) return nil;
+    NSString *dir = nil;
+    Class util = objc_getClass("CUtility");
+    if ([util respondsToSelector:@selector(GetDocPath)]) {   // CUtility.h:49
+        @try {
+            NSString *d = (NSString *)[util GetDocPath];
+            if ([d isKindOfClass:[NSString class]] && d.length) dir = d;
+        } @catch (NSException *e) { dd_log(@"[persist] GetDocPath 异常 %@", e.reason); }
+    }
+    if (!dir.length) {
+        NSArray<NSString *> *ds = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        if (ds.count) dir = ds.firstObject;
+    }
+    if (!dir.length) dir = NSHomeDirectory();
+    NSString *dst = [dir stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"ddmc_voice_%@.m4a", [[NSUUID UUID] UUIDString]]];
+    NSError *e = nil;
+    if (![[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:&e] || !dd_file_exists(dst)) {
+        dd_log(@"[persist] 拷贝失败 %@ → %@", src.lastPathComponent, e.localizedDescription ?: @"未知");
+        return nil;
+    }
+    return dst;
+}
+
 // 把 m4a 作为文件消息发到当前聊天（CExtendInfoOfAPP innerType=6 + CMessageMgr.AddAppMsg）
 //  ⚠ 真机校验点：文件消息构造 + 本地文件上传发送在不同微信版本差异较大，需对照真机微调。
 static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName) {
+    // v1.0.10：先持久化，再用持久路径发送（见 dd_persist_copy 注释）。原临时文件保留不动，
+    // 仅把 m4aPath 重定向到持久副本，后续 extendInfo / AddAppMsg 全部基于持久路径。
+    NSString *persistPath = dd_persist_copy(m4aPath);
+    if (persistPath.length) {
+        dd_log(@"[file.send] 产物已拷入持久沙盒 %@ → %@", m4aPath.lastPathComponent, persistPath);
+        m4aPath = persistPath;
+    } else {
+        dd_log(@"[file.send] 持久化拷贝失败，仍用临时路径（风险：重启后可能打不开）");
+    }
     if (!dd_file_exists(m4aPath) || !usr.length) {
         dd_log(@"[file.send] 参数不合法: path=%@ usr=%@", m4aPath ?: @"(nil)", usr ?: @"(nil)");
         return NO;
