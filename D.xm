@@ -96,6 +96,17 @@
 //    另：non-SILK 路径的语音时长改用「真实抽出的 PCM 长度」算（旧逻辑用 asset.duration=视频时长，
 //    日志里出现过视频 16.167s、音轨仅 8s 导致气泡时长错、播放错位）。
 //
+//  v1.0.8（修 CI 真机构建编译错误，非功能改动）
+//    Xcode 26 SDK + 全局 -Werror 下，Tweak.xm 第 203~232 行手动 forward-declare 的
+//    @interface CMessageWrap 里，@property(retain,nonatomic) NSString *m_nsToUsr / m_nsFromUsr
+//    与手写的 -setM_nsToUsr: / -setM_nsFromUsr: 参数类型 (id) 不一致，编译器报
+//    「type of property does not match type of accessor [-Werror]」致 make package 失败。
+//    修复：把这两个 setter 参数类型对齐为 (NSString *)，与 property 类型一致
+//    （CMessageWrap.h:695 / :678 真实签名即 NSString*，头文件锚定无误）。
+//    同步把 .devtools/clang_syntax_check/check.py 的校验从 -fsyntax-only 升级为全局 -Werror
+//    （仅对 GNUstep 桩固有噪音 incompatible-library-redeclaration 降权），使沙箱静态检查
+//    能复现 CI 的 property/accessor 类型不匹配错误，不再漏检。
+//
 //  锚定证据（微信头文件 dump / WCRefine 加载态 dump）：
 //   · 文件数据路径 —— CMessageWrap +GetPathOfAppData:msgWrap            (CMessageWrap.h:26)
 //                     +GetPathOfAppData:LocalID:FileExt:retStrPath:      (CMessageWrap.h:106)
@@ -219,8 +230,8 @@
 - (void)setM_uiMessageType:(unsigned int)arg1;      // CMessageWrap.h:720
 - (void)setM_uiCreateTime:(unsigned int)arg1;       // CMessageWrap.h:710
 - (void)setM_uiStatus:(unsigned int)arg1;           // CMessageWrap.h:726
-- (void)setM_nsToUsr:(id)arg1;                      // CMessageWrap.h:695
-- (void)setM_nsFromUsr:(id)arg1;                    // CMessageWrap.h:678
+- (void)setM_nsToUsr:(NSString *)arg1;              // CMessageWrap.h:695
+- (void)setM_nsFromUsr:(NSString *)arg1;            // CMessageWrap.h:678
 // 路径接口（v1.0.3 全面按 8.0.79 头文件重校行号；m_oAppDataItem 已废弃见上方说明）
 - (id)getVoicePath;                                 // CMessageWrap.h:362  语音文件本地路径（实例方法，无需拼 usr/localID）
 + (id)getPathOfAudio:(id)arg1;                      // CMessageWrap.h:66   语音路径（单参 msgWrap）
