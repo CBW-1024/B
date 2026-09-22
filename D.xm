@@ -1293,6 +1293,17 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     dd_log(@"[menu] cell=%@ 注入「%@」enabled=%d 原生菜单数=%lu",
           NSStringFromClass([cell class]), title, enabled, (unsigned long)original.count);
     if (!enabled) { dd_log(@"[menu] 开关关闭/类型不匹配，不注入「%@」", title); return original; }
+    // 按 action 去重（UIMenuItem.action 公开可读）
+    // 依据 WCR：它在基类 BaseMessageCellView 统一 hook operationMenuItems（BaseMessageCellView.h:65），
+    // 四个子类各自也 hook（VideoMessageCellView.h:12 / AppVideoMessageCellView.h:7 /
+    // AppFileMessageCellView.h:17 / VoiceMessageCellView.h:33）。两层 hook 叠加时同一个 action
+    // 会被注入两次，菜单里就会出现两个同名按钮 —— 追加前先查一轮，命中就跳过。
+    for (MMMenuItem *it in original) {
+        if ([it respondsToSelector:@selector(action)] && it.action == action) {
+            dd_log(@"[menu] 「%@」已存在（基类或其他 hook 已注入），跳过重复追加", title);
+            return original;
+        }
+    }
     MMMenuItem *item = dd_convertMenuItem(title, cell, action, original);
     if (!item) { dd_log(@"[menu] MMMenuItem 构造失败"); return original; }
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
@@ -1609,4 +1620,3 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
         dd_log(@"[ctor] 注册入口完成：%@ v%@", kDDPluginName, kDDPluginVersion);
     }
 }
-ccc
