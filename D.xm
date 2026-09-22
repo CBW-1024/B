@@ -23,7 +23,7 @@
 //   · 语音文件落地 —— CMessageWrap -getVoicePath                        (CMessageWrap.h:362)
 //                     +getPathOfAudio:msgWrap                           (CMessageWrap.h:66)
 //                     CUtility +GetPathOfMesAudio:LocalID:DocPath:      (CUtility.h:82)
-//   · 菜单图标   —— MMMenuItem -initWithTitle:svgName:target:action:   (MMMenuItem.h:31)
+//   · 菜单图标   —— MMMenuItem -initWithTitle:svgName:target:action:   (MMMenuItem.h:18)
 //   · 视频路径   —— 普通视频 VideoMessageViewModel.videoPath (VideoMessageViewModel.h:5)；
 //                  应用视频/视频号 AppVideoMessageViewModel 无路径属性（继承 BizAppBaseMessageViewModel），
 //                  路径在 msgWrap.m_oAppDataItem，与文件同取路径通道 (AppVideoMessageViewModel.h:3)
@@ -92,9 +92,14 @@
 @end
 
 // 菜单项：继承 UIMenuItem，原生支持直接吃 svg 资源名（微信内部渲染，无需自行转 UIImage）。
-//   MMMenuItem.h:29 —— -initWithTitle:svgName:target:action:
+//   MMMenuItem.h:18 —— -initWithTitle:svgName:target:action:
+// v1.0.1 补齐：图标检测/回退要用到的三个选择器，之前只声明了 svgName 构造器，
+// CI 报 "no visible @interface for 'MMMenuItem' declares the selector 'iconImage'"
 @interface MMMenuItem : UIMenuItem
-- (id)initWithTitle:(id)a0 svgName:(id)a1 target:(id)a2 action:(SEL)a3;
+- (id)initWithTitle:(id)a0 svgName:(id)a1 target:(id)a2 action:(SEL)a3;  // MMMenuItem.h:18
+- (id)initWithTitle:(id)a0 target:(id)a1 action:(SEL)a2;                 // MMMenuItem.h:19  无 svg 的降级构造器
+- (id)iconImage;                                                          // MMMenuItem.h:12  读图标（判 svg 名是否真解析出图）
+- (void)setIconImage:(id)a0;                                              // MMMenuItem.h:38  兜底塞图标
 @end
 
 @interface CMessageWrap : NSObject
@@ -1096,12 +1101,14 @@ static NSString *dd_write_m4a(NSData *pcm) {
     if (!ex) { dd_log(@"[m4a] 创建 AVAssetExportSession 失败"); return nil; }
     ex.outputFileType = AVFileTypeAppleM4A;
     ex.outputURL = [NSURL fileURLWithPath:path];
+    // done 区分「回调正常返回」和「20s 超时没等到回调」——超时时 status 可能还没落终态，不能算成功
     __block BOOL done = NO;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     [ex exportAsynchronouslyWithCompletionHandler:^{ done = YES; dispatch_semaphore_signal(sem); }];
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
-    BOOL ok = dd_file_exists(path) && ex.status == AVAssetExportSessionStatusCompleted;
-    dd_log(@"[m4a] 导出结果=%d 状态=%ld 错误=%@", ok, (long)ex.status, ex.error.localizedDescription ?: @"无");
+    BOOL ok = done && dd_file_exists(path) && ex.status == AVAssetExportSessionStatusCompleted;
+    dd_log(@"[m4a] 导出结果=%d 状态=%ld 回调已返回=%d 错误=%@",
+          ok, (long)ex.status, done, ex.error.localizedDescription ?: @"无");
     [[NSFileManager defaultManager] removeItemAtPath:wavPath error:nil];
     if (!ok) return nil;
     unsigned long long sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize] unsignedLongLongValue];
@@ -1230,7 +1237,7 @@ static void dd_voice_to_file(CMessageWrap *msg) {
     });
 }
 
-#pragma mark - 菜单图标（MMMenuItem 直接吃 svg 资源名：MMMenuItem.h:31）
+#pragma mark - 菜单图标（MMMenuItem 直接吃 svg 资源名：MMMenuItem.h:18）
 
 // 微信各版本的 svg 命名不统一，写死一个名字在部分机型/版本上会退化成「只有文字、没有图标」
 // （用户实测现象：视频「转语音」有图标、语音「转文件」没图标 → 同一个名字在两处表现不一致）。
@@ -1268,11 +1275,11 @@ static MMMenuItem *dd_convertMenuItem(NSString *title, id target, SEL action, NS
     // 兜底：从原生菜单项借一张图标，保证菜单里一定看得见图（不再出现“没图标”的按钮）
     @try {
         if (![fallbackItem respondsToSelector:@selector(iconImage)] || ![fallbackItem iconImage]) {
-            for (MMMenuItem *it in original) {
-                UIImage *img = [it respondsToSelector:@selector(iconImage)] ? (UIImage *)[it iconImage] : nil;
-                if (img) {
-                    [fallbackItem setIconImage:img];
-                    dd_log(@"[menu.icon] svg 全落空，借用原生菜单图标：%@", NSStringFromClass([it class]));
+            for (MMMenuItem *src in original) {
+                UIImage *borrowed = [src respondsToSelector:@selector(iconImage)] ? (UIImage *)[src iconImage] : nil;
+                if (borrowed) {
+                    [fallbackItem setIconImage:borrowed];
+                    dd_log(@"[menu.icon] svg 全落空，借用原生菜单图标：%@", NSStringFromClass([src class]));
                     break;
                 }
             }
@@ -1602,3 +1609,4 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
         dd_log(@"[ctor] 注册入口完成：%@ v%@", kDDPluginName, kDDPluginVersion);
     }
 }
+ccc
