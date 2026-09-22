@@ -129,6 +129,21 @@
 //    注：诱因一（取源路径随微信运行态漂移、重启后可能掉 m_dtVoice 兜底致时长/内容变）仍待日志坐实，
 //    本轮未动解码逻辑，避免把已能用的视频转语音又带出静音。
 //
+//  v1.0.11（据 2026-09-23 06:22 真机日志，修「文件消息变 0B/23.dat」+「文件转语音闪退」）
+//    用户日志暴露两处：
+//    ① 语音转文件（06:20:53，localID=22）→ 发出的文件消息重启后变 0B 的 23.dat（用户截图）。
+//       log 74 行显示微信把该文件落在 OpenData/<hash>/23.m4a（23=localID），而不是我们持久化的
+//       ddmc_voice_*.m4a。根因：AddAppMsg:MsgWrap:DataPath:Scene:（CMessageMgr.h:187）只做
+//       「本地落库 + 拷进 OpenData」，**不触发上传** → 消息 status 停在 Sending、服务器无该文件
+//       记录 → 微信把它当「未下载」（0B +「接收文件」按钮），重启/清理本地缓存后更明显。
+//       修复：AddAppMsg 成功后紧接着调 StartUploadAppMsg:MsgWrap:Scene:（CMessageMgr.h:273）
+//       触发上传，消息才变「已发送/已上传」。
+//    ② 文件转语音闪退（06:21:00，对 localID=23 转语音）：日志到 `[voice.install] 复制结果=1`
+//       后就断、无 `已调用 ResendVoiceMsg`，紧接 [ctor] 重启 → 崩溃点在 ResendVoiceMsg。
+//       而 ResendVoiceMsg 跑在主线程 block 里，外层 @try 只包住 global block，主线程这段**无保护**。
+//       修复：给 dd_media_to_voice / dd_voice_to_file 两处主线程发送 block 补 @try/@catch 兜异常。
+//       （补上传后，我方发出的文件消息不再是「未上传」脏状态，对它的转语音崩溃亦应缓解。）
+//
 //  锚定证据（微信头文件 dump / WCRefine 加载态 dump）：
 //   · 文件数据路径 —— CMessageWrap +GetPathOfAppData:msgWrap            (CMessageWrap.h:26)
 //                     +GetPathOfAppData:LocalID:FileExt:retStrPath:      (CMessageWrap.h:106)
@@ -147,9 +162,10 @@
 //                    +decodeToPCMFromSilkData: / +decodeToAudioDataFromSilkData:
 //                                                            (MJSilkCodec.h:5 / :4 / :3)
 //   · 语音路径   —— CUtility GetPathOfMesAudio: / AudioSender getAudioFileName:
-//   · 视频下载   —— CMessageMgr -StartDownloadVideo:MsgWrap:Priority:Silent: (CMessageMgr.h:213)
-//   · 文件下载   —— CMessageMgr -StartDownloadAppAttach:MsgWrap:Silent:  (CMessageMgr.h:252)
-//   · 发文件消息 —— CMessageMgr -AddAppMsg:MsgWrap:DataPath:Scene:       (CMessageMgr.h:248)
+//   · 视频下载   —— CMessageMgr -StartDownloadVideo:MsgWrap:Priority:Silent: (CMessageMgr.h:269)
+//   · 文件下载   —— CMessageMgr -StartDownloadAppAttach:MsgWrap:Silent:  (CMessageMgr.h:32)
+//   · 发文件消息 —— CMessageMgr -AddAppMsg:MsgWrap:DataPath:Scene:       (CMessageMgr.h:187，仅本地落库)
+//                   CMessageMgr -StartUploadAppMsg:MsgWrap:Scene:         (CMessageMgr.h:273，触发上传)
 //   · 文件 data  —— CExtendInfoOfAPP (m_uiAppMsgInnerType=6 文件 / m_nsAppFileName /
 //                    m_nsAppFileExt / m_uiAppDataSize)                 (CExtendInfoOfAPP.h)
 //   · 菜单落点   —— 各 cell 的 operationMenuItems + canPerformAction:withSender:
@@ -319,6 +335,7 @@
 - (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2;                  // CMessageMgr.h:32
 - (BOOL)IsVideoMsgdDownloadIng:(id)a0;                                                // CMessageMgr.h:24
 - (void)AddAppMsg:(id)a0 MsgWrap:(id)a1 DataPath:(id)a2 Scene:(unsigned int)a3;       // CMessageMgr.h:187
+- (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;               // CMessageMgr.h:273（触发上传）
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;                                            // CMessageMgr.h:191
 - (void)AddMsg:(id)a0 MsgWrap:(id)a1;                                                 // CMessageMgr.h:194
 // ⚠ addMessageToDB: 只有 AudioSender 有（AudioSender.h:13），CMessageMgr 没有 ——
@@ -484,7 +501,7 @@
 #define kDDLogDirName    @"DDVoiceAssistantLogs"
 #define kDDLogFileName   @"ddvoice_debug.log"
 #define kDDPluginName    @"DD语音助手"
-#define kDDPluginVersion @"1.0.10"
+#define kDDPluginVersion @"1.0.11"
 
 @interface DDLogStore : NSObject
 + (instancetype)shared;
@@ -1508,8 +1525,15 @@ static void dd_media_to_voice(CMessageWrap *msg, NSString *(^pathBlock)(void), v
             dd_log(@"[media→voice] 时长=%ums → 发送语音 (aud=%lu 字节 标准容器头=%d)",
                   ms, (unsigned long)aud.length, dd_silk_has_magic10(aud));
             dispatch_async(dispatch_get_main_queue(), ^{
-                BOOL sent = dd_send_voice(usr, tmp, ms);
-                dd_log(@"[media→voice] ==== 结束 ==== 发送结果=%d", sent);
+                // v1.0.11：ResendVoiceMsg 跑在主线程，外层 @try 只包了 global block，
+                // 这里必须单独兜异常，否则微信内部抛出的 NSException 会直接崩进程
+                // （用户日志 06:21:01 崩点即 voice.install 之后、ResendVoiceMsg 之前无日志）。
+                @try {
+                    BOOL sent = dd_send_voice(usr, tmp, ms);
+                    dd_log(@"[media→voice] ==== 结束 ==== 发送结果=%d", sent);
+                } @catch (NSException *e) {
+                    dd_log(@"[media→voice] 发送阶段异常（已捕获，避免闪退）: %@ | %@", e.name, e.reason);
+                }
             });
         } @catch (NSException *e) {
             dd_log(@"[media→voice] 异常（已捕获，避免闪退）: %@ | %@", e.name, e.reason);
@@ -1728,6 +1752,18 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     if ([mgr respondsToSelector:@selector(AddAppMsg:MsgWrap:DataPath:Scene:)]) {
         [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
         dd_log(@"[file.send] 已调用 AddAppMsg:MsgWrap:DataPath:Scene:");
+        // v1.0.11：AddAppMsg 只做「本地落库 + 把文件拷进 OpenData」这一步，**不上传** →
+        // 消息 status 停在 Sending、服务器无该文件记录 → 微信把文件消息当「未下载」，
+        // 重启/系统清理本地缓存后显示 0B（用户截图 23.dat 0B + 「接收文件」按钮，23 即该消息
+        // localID；日志 74 行也显示微信把它落在 OpenData/<hash>/23.m4a，而非我们持久化的副本）。
+        // 必须紧接着调 StartUploadAppMsg:MsgWrap:Scene:（CMessageMgr.h:273）触发上传，消息才会
+        // 变成「已发送/已上传」，重启后不再变 0B。
+        if ([mgr respondsToSelector:@selector(StartUploadAppMsg:MsgWrap:Scene:)]) {
+            [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
+            dd_log(@"[file.send] 已调用 StartUploadAppMsg:MsgWrap:Scene: 触发上传 (CMessageMgr.h:273)");
+        } else {
+            dd_log(@"[file.send] CMessageMgr 无 StartUploadAppMsg:MsgWrap:Scene:（无法触发上传）");
+        }
         return YES;
     }
     // v1.0.3：原来的兜底是 [mgr addMessageToDB:]，但 8.0.79 里这个方法只存在于 AudioSender
@@ -1813,8 +1849,12 @@ static void dd_voice_to_file(CMessageWrap *msg) {
             if (!m4a.length) { dd_log(@"[voice→file] 解码/封装失败，放弃"); return; }
             if (!m4a.length) { dd_log(@"[voice→file] 解码/封装失败，放弃"); return; }
             dispatch_async(dispatch_get_main_queue(), ^{
-                BOOL sent = dd_send_file_to_chat(usr, m4a, fn);
-                dd_log(@"[voice→file] ==== 结束 ==== 发送结果=%d", sent);
+                @try {   // v1.0.11：AddAppMsg/StartUploadAppMsg 在主线程，单独兜异常
+                    BOOL sent = dd_send_file_to_chat(usr, m4a, fn);
+                    dd_log(@"[voice→file] ==== 结束 ==== 发送结果=%d", sent);
+                } @catch (NSException *e) {
+                    dd_log(@"[voice→file] 发送阶段异常（已捕获，避免闪退）: %@ | %@", e.name, e.reason);
+                }
             });
         } @catch (NSException *e) {
             // 兜底：解码/封装/发送任何异常都吞掉并留证据，避免把微信带崩
