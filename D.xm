@@ -1,7 +1,7 @@
 //  DD语音助手 v1.0.6  —— 媒体互转  (WeChat Tweak, Theos/Logos 单文件)
 //  长按消息 → 按消息类型在原生长按悬浮菜单追加转换按钮 → 点击转换并发送到当前聊天：
 //    视频消息 / 文件消息 → 「转语音」→ 转换成语音消息，发到当前聊天
-//    语音消息          → 「转文件」→ 转换成 m4r 铃声文件消息（AAC-in-MP4 容器，与 m4a 同构，仅扩展名不同），发到当前聊天
+//    语音消息          → 「转文件」→ 转换成 m4a 文件消息，发到当前聊天
 //  未下载的视频 / 文件：先自动下载，下载完成后再转换（WCR 同款思路）。
 //
 //  调试日志（自签证书/未越狱看不到 syslog，故日志留在 App 内部）：
@@ -143,14 +143,22 @@
 //       而 ResendVoiceMsg 跑在主线程 block 里，外层 @try 只包住 global block，主线程这段**无保护**。
 //       修复：给 dd_media_to_voice / dd_voice_to_file 两处主线程发送 block 补 @try/@catch 兜异常。
 //       （补上传后，我方发出的文件消息不再是「未上传」脏状态，对它的转语音崩溃亦应缓解。）
-//   v1.0.12（语音转文件输出格式 m4a → m4r）：用户确认要 mp3，但全库 8.0.79 头文件检索确认
+//   v1.0.12（评估语音转文件输出格式）：用户一度要 mp3，但全库 8.0.79 头文件检索确认
 //       微信**无内置 mp3 转换方法**（Mp3/mp3 仅命中 YTLogger/MMLiveCommonUtil/Calib3d 三个无关文件，
 //       无任何 toMp3/ConvertToMp3/Mp3Encode 等接口；微信音频编解码器只有 SILK 与 AAC 两类）；
-//       且 iOS 系统 AVAssetExportSession/AVAssetWriter 也不支持 mp3 编码输出（只有解码）。
-//       用户改选 m4r：m4r 与 m4a 字节级同构（同为 AAC-in-MP4 容器，仅扩展名不同，靠 .m4r 让系统当铃声），
-//       因此**无需任何第三方编码器**、不破坏单文件——直接复用现有 AVAssetExportSession(AVAssetExportPresetAppleM4A)，
-//       仅把产物扩展名、持久副本扩展名、setM_nsAppFileExt、文件名由 m4a 改为 m4r（Tweak.xm:1650/1692/1737/1841），
-//       直出通道 isFtyp 落盘扩展名同步改 m4r（:1816）。为 mp3 试建的 shine 空目录已清理。
+//       且 iOS 系统 AVAssetExportSession/AVAssetWriter 也不支持 mp3 编码输出（只有解码），mp3 须引第三方库。
+//       也曾试 m4r（与 m4a 同为 AAC-in-MP4 容器、仅扩展名不同）；但用户最终决定**保持 m4a**，
+//       因此语音转文件维持 AVAssetExportSession(AVAssetExportPresetAppleM4A) 输出 .m4a（与 v1.0.11 一致，
+//       产物扩展名/持久副本/setM_nsAppFileExt/文件名均为 m4a，未引入任何第三方编码器）。
+//   v1.0.14（修「菜单按钮无图标」）：曾尝试绕开 MMMenuItem 的 svgName 内部解析、改用 WCSVGImage 自加载
+//       UIImage 再塞 icon/setIconImage: —— 属多余绕行，v1.0.15 已删除。
+//   v1.0.15（据用户提供 DD小丑助手 源码定案菜单图标写法）：
+//       DD小丑助手的 DDJokerMenuItem 就是单一路径 `[[MMMenuItem alloc] initWithTitle:title
+//       svgName:@"icons_filled_sticker" target:target action:action]`（其源码 993~1000 行），
+//       图标由微信内部渲染，无需自行转 UIImage。故本版回归原生单一路径：
+//       `-initWithTitle:svgName:target:action:`（MMMenuItem.h:18）+ svg 名 icon_filled_record_voice.svg
+//       （用户确认存在）。删除 v1.0.14 的 WCSVGImage 自加载 / setIconImage: / 双保险兜底，
+//       与其他插件在同一条被验证可行的路径上。
 //
 //  锚定证据（微信头文件 dump / WCRefine 加载态 dump）：
 //   · 文件数据路径 —— CMessageWrap +GetPathOfAppData:msgWrap            (CMessageWrap.h:26)
@@ -159,8 +167,9 @@
 //   · 语音文件落地 —— CMessageWrap -getVoicePath                        (CMessageWrap.h:362)
 //                     +getPathOfAudio:msgWrap                           (CMessageWrap.h:66)
 //                     CUtility +GetPathOfMesAudio:LocalID:DocPath:      (CUtility.h:82)
-//   · 菜单图标   —— MMMenuItem -initWithTitle:svgName:target:action: 直接吃内置 svg 名
-//                  icon_filled_record_voice.svg（MMMenuItem.h:18，用户确认存在，无兜底）
+//   · 菜单图标   —— 微信内置 svg icon_filled_record_voice.svg（用户确认存在，据 DD小丑助手写法定案）；
+//                  直接走原生 MMMenuItem -initWithTitle:svgName:target:action:（MMMenuItem.h:18），
+//                  svg 资源名交微信内部渲染（DD小丑助手同路径，其 svg 名 icons_filled_sticker）
 //                  去重靠 userInfo                                      (MMMenuItem.h:29 / :49)
 //   · 视频路径   —— 普通视频 VideoMessageViewModel.videoPath (VideoMessageViewModel.h:24)；
 //                  应用视频/视频号 AppVideoMessageViewModel 无路径属性（AppVideoMessageViewModel.h
@@ -509,7 +518,7 @@
 #define kDDLogDirName    @"DDVoiceAssistantLogs"
 #define kDDLogFileName   @"ddvoice_debug.log"
 #define kDDPluginName    @"DD语音助手"
-#define kDDPluginVersion @"1.0.12"
+#define kDDPluginVersion @"1.0.15"
 
 @interface DDLogStore : NSObject
 + (instancetype)shared;
@@ -897,7 +906,7 @@ static BOOL dd_file_is_audio(CMessageWrap *msg) {
     static NSSet *audioExts = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        audioExts = [NSSet setWithObjects:@"mp3", @"m4r", @"wav", @"aac", @"amr", @"flac", @"caf", @"aiff", nil];
+        audioExts = [NSSet setWithObjects:@"mp3", @"m4a", @"wav", @"aac", @"amr", @"flac", @"caf", @"aiff", nil];
     });
     BOOL ok = ext.length && [audioExts containsObject:ext];
     dd_log(@"[ext.file] 是否音频文件=%d (ext=%@)", ok, ext ?: @"(nil)");
@@ -1420,7 +1429,7 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
 // SILK（.aud 全文）→ PCM
 // WCR 的做法（0x8de7d4 起）：后缀是 aud/silk/slk 且 sub_0x8f15f4 判合格时，
 // 直接把文件原文当语音数据用 ——— 因为它本来就是语音数据，压根不必解码。
-// 我们这一步要把 .aud 解成 PCM（为了导出成 m4r 铃声文件消息），所以必须解码；
+// 我们这一步要把 .aud 解成 PCM（为了导出成 m4a 文件消息），所以必须解码；
 // 候选顺序就照 WCR 那套容器认知排，优先级最高的是 \x02#!SILK_V3 原文。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     Class codec = objc_getClass("MJSilkCodec");
@@ -1549,7 +1558,7 @@ static void dd_media_to_voice(CMessageWrap *msg, NSString *(^pathBlock)(void), v
     });
 }
 
-#pragma mark - 转换：语音 → 文件（SILK → 音频/m4r 铃声 → 作为文件消息发到当前聊天）
+#pragma mark - 转换：语音 → 文件（SILK → 音频/m4a → 作为文件消息发到当前聊天）
 
 // 语音消息本地路径（v1.0.1：优先实例方法 -getVoicePath（CMessageWrap.h:362）。
 // 它直接给出语音落点，不需要拼 usr/localID，也就绕开了
@@ -1639,28 +1648,28 @@ static NSData *dd_wav_of_pcm(NSData *pcm) {
     [wav appendData:pcm];
     return wav;
 }
-// PCM → m4r 铃声（v1.0.1 重写：PCM→WAV→AVAssetExportSession(AVAssetExportPresetAppleM4A)；m4r 与 m4a 同为 AAC-in-MP4 容器，仅扩展名不同）
+// PCM → m4a 文件（v1.0.1 重写：PCM→WAV→AVAssetExportSession(AVAssetExportPresetAppleM4A)）
 // v1.0.0 用 AVAssetWriter + CMBlockBufferCreateWithMemoryBlock 直接借用 NSData.bytes，
 // 且 memoryBlock 生命周期不受控；SILK 解码出来的 PCM 一旦不规整就会被 CMSampleBuffer 判定越界 → 闪退。
 // 改为 WCRefine 验证过的路线：PCM → WAV 文件 → AVAssetExportSession(AVAssetExportPresetAppleM4A)
 // （WCR_三转换功能_逆向分析.md:110 中关于 AVAssetExportSession / AVAssetExportPresetAppleM4A 的实证）
 static NSString *dd_write_m4a(NSData *pcm) {
-    if (pcm.length == 0) { dd_log(@"[audio] PCM 为空"); return nil; }
+    if (pcm.length == 0) { dd_log(@"[m4a] PCM 为空"); return nil; }
     NSString *wavPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
                          [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"wav"]];
     NSData *wav = dd_wav_of_pcm(pcm);
-    if (![wav writeToFile:wavPath atomically:YES]) { dd_log(@"[audio] WAV 写盘失败"); return nil; }
-    dd_log(@"[audio] WAV=%@ (%lu 字节, PCM=%lu, 约%.2fs)",
+    if (![wav writeToFile:wavPath atomically:YES]) { dd_log(@"[m4a] WAV 写盘失败"); return nil; }
+    dd_log(@"[m4a] WAV=%@ (%lu 字节, PCM=%lu, 约%.2fs)",
           wavPath.lastPathComponent, (unsigned long)wav.length, (unsigned long)pcm.length,
           pcm.length / (double)(kDDMCVoiceSampleRate * 2));
 
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                      [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"m4r"]];
+                      [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"m4a"]];
     [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:wavPath] options:nil];
     AVAssetExportSession *ex = [AVAssetExportSession exportSessionWithAsset:asset
                                                                 presetName:AVAssetExportPresetAppleM4A];
-    if (!ex) { dd_log(@"[audio] 创建 AVAssetExportSession 失败"); return nil; }
+    if (!ex) { dd_log(@"[m4a] 创建 AVAssetExportSession 失败"); return nil; }
     ex.outputFileType = AVFileTypeAppleM4A;
     ex.outputURL = [NSURL fileURLWithPath:path];
     // done 区分「回调正常返回」和「20s 超时没等到回调」——超时时 status 可能还没落终态，不能算成功
@@ -1669,12 +1678,12 @@ static NSString *dd_write_m4a(NSData *pcm) {
     [ex exportAsynchronouslyWithCompletionHandler:^{ done = YES; dispatch_semaphore_signal(sem); }];
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
     BOOL ok = done && dd_file_exists(path) && ex.status == AVAssetExportSessionStatusCompleted;
-    dd_log(@"[audio] 导出结果=%d 状态=%ld 回调已返回=%d 错误=%@",
+    dd_log(@"[m4a] 导出结果=%d 状态=%ld 回调已返回=%d 错误=%@",
           ok, (long)ex.status, done, ex.error.localizedDescription ?: @"无");
     [[NSFileManager defaultManager] removeItemAtPath:wavPath error:nil];
     if (!ok) return nil;
     unsigned long long sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize] unsignedLongLongValue];
-    dd_log(@"[audio] 产物=%@ (%llu 字节)", path.lastPathComponent, sz);
+    dd_log(@"[m4a] 产物=%@ (%llu 字节)", path.lastPathComponent, sz);
     return path;
 }
 
@@ -1697,7 +1706,7 @@ static NSString *dd_persist_copy(NSString *src) {
     }
     if (!dir.length) dir = NSHomeDirectory();
     NSString *dst = [dir stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"ddmc_voice_%@.m4r", [[NSUUID UUID] UUIDString]]];
+        [NSString stringWithFormat:@"ddmc_voice_%@.m4a", [[NSUUID UUID] UUIDString]]];
     NSError *e = nil;
     if (![[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:&e] || !dd_file_exists(dst)) {
         dd_log(@"[persist] 拷贝失败 %@ → %@", src.lastPathComponent, e.localizedDescription ?: @"未知");
@@ -1742,7 +1751,7 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     CExtendInfoOfAPP *app = [[objc_getClass("CExtendInfoOfAPP") alloc] init];
     [app setM_uiAppMsgInnerType:kDDMCAppInnerFile];
     [app setM_nsAppFileName:fileName];
-    [app setM_nsAppFileExt:@"m4r"];
+    [app setM_nsAppFileExt:@"m4a"];
     [app setM_uiAppDataSize:fsize];
     // v1.0.3：这里原来是 [wrap setValue:app forKey:@"m_oAppDataItem"]，而 8.0.79 全库已无该字段
     // （KVC 抛 NSUndefinedKeyException 被 @catch 吞掉）→ extendInfo 永远挂不上 →
@@ -1791,7 +1800,7 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     return NO;
 }
 
-// SILK → m4r 铃声文件：优先走直出音频接口 decodeToAudioDataFromSilkData:（MJSilkCodec.h:3），
+// SILK → m4a 文件：优先走直出音频接口 decodeToAudioDataFromSilkData:（MJSilkCodec.h:3），
 // 若其返回 m4a/mp4 容器（'ftyp' box）则直接落盘，省去 PCM→AAC 重编码；否则回退 PCM→AAC。
 static NSString *dd_decode_silk_to_audio(NSData *fileData) {
     Class codec = objc_getClass("MJSilkCodec");
@@ -1800,7 +1809,7 @@ static NSString *dd_decode_silk_to_audio(NSData *fileData) {
     if (pcm.length) {
         NSString *m4a = dd_write_m4a(pcm);
         if (m4a.length) return m4a;
-        dd_log(@"[decode] PCM→m4r 失败，继续尝试直出通道");
+        dd_log(@"[decode] PCM→m4a 失败，继续尝试直出通道");
     }
     // 备选：decodeToAudioDataFromSilkData:（MJSilkCodec.h:3）直出音频。
     // 实测 v1.0.0 它对我们送进去的数据返回 0 字节（容器不对），故排在 PCM 之后。
@@ -1821,7 +1830,7 @@ static NSString *dd_decode_silk_to_audio(NSData *fileData) {
         BOOL isID3  = (b[0]=='I' && b[1]=='D' && b[2]=='3');
         BOOL isFmt  = (b[0]=='R' && b[1]=='I' && b[2]=='F' && b[3]=='F');
         if (isFtyp || isID3) {   // m4a/mp4 容器或 mp3(ID3) → 可直接落盘，无需重编码
-            NSString *ext = isFtyp ? @"m4r" : @"mp3";
+            NSString *ext = isFtyp ? @"m4a" : @"mp3";
             NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:
                 [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:ext]];
             if ([audio writeToFile:p atomically:YES] && dd_file_exists(p)) {
@@ -1832,21 +1841,21 @@ static NSString *dd_decode_silk_to_audio(NSData *fileData) {
         if (isFmt && audio.length > 44) {   // WAV 容器 → 剥 44 字节头拿 PCM 再走统一封装
             NSData *raw = [audio subdataWithRange:NSMakeRange(44, audio.length - 44)];
             NSString *m4a = dd_write_m4a(raw);
-            if (m4a.length) { dd_log(@"[decode] 直出 WAV → 转封装 m4r"); return m4a; }
+            if (m4a.length) { dd_log(@"[decode] 直出 WAV → 转封装 m4a"); return m4a; }
         }
     }
     dd_log(@"[decode] 直出通道也没出结果");
     return nil;
 }
 
-// 语音消息 → 文件消息（"语音转文件"开关）：取 SILK → m4r 铃声 → 作为文件消息发到当前聊天。
+// 语音消息 → 文件消息（"语音转文件"开关）：取 SILK → m4a → 作为文件消息发到当前聊天。
 // v1.0.1：整条链路挪到全局队列跑。v1.0.0 在主线程上做 SILK 解码 + 音频编码，
 // 长语音会把主线程堵住（微信被 watchdog 判无响应直接杀进程，表现为“闪退”）；
 // 微信的消息发送 API 仍回主线程调用。
 static void dd_voice_to_file(CMessageWrap *msg) {
     if (!msg) { dd_log(@"[voice→file] msg 为空，放弃"); return; }
     NSString *usr = dd_chat_usr_of_msg(msg);
-    NSString *fn  = [NSString stringWithFormat:@"语音_%u.m4r", (unsigned int)time(NULL)];
+    NSString *fn  = [NSString stringWithFormat:@"语音_%u.m4a", (unsigned int)time(NULL)];
     unsigned int localID = msg.m_uiMesLocalID;
     dd_log(@"[voice→file] ==== 开始 ==== localID=%u chat=%@", localID, usr ?: @"(nil)");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -1882,23 +1891,28 @@ static NSString *dd_menu_token(SEL action) {
     return [@"ddmc:" stringByAppendingString:NSStringFromSelector(action)];
 }
 
+// 菜单项构造：直接走微信原生 MMMenuItem -initWithTitle:svgName:target:action:（MMMenuItem.h:18），
+// svg 资源名由微信内部渲染成图标，无需自行转 UIImage。
+// 参照 DD小丑助手（其 DDJokerMenuItem 即 initWithTitle:svgName:target:action: 单路径，
+// svg 名 icons_filled_sticker 直接显示图标）——v1.0.14 那套「WCSVGImage 自加载 + setIconImage:」
+// 是多余的绕行，v1.0.15 删除，回归原生单一路径。
 static MMMenuItem *dd_convertMenuItem(NSString *title, id target, SEL action, NSArray *original) {
     Class cls = objc_getClass("MMMenuItem");
-    if (!cls) return nil;
+    if (!cls) { dd_log(@"[menu.icon] 找不到 MMMenuItem 类"); return nil; }
     MMMenuItem *item = nil;
-    // 用户确认存在的内置 svg 图标，无兜底。
+    // 用户确认的内置 svg 资源名 icon_filled_record_voice.svg，直接交给原生构造器（不做兜底）。
     @try {
         item = [[cls alloc] initWithTitle:title
                                   svgName:@"icon_filled_record_voice.svg"
                                    target:target
                                    action:action];
     } @catch (NSException *e) {
-        dd_log(@"[menu.icon] initWithTitle:svgName: 异常: %@", e.reason);
+        dd_log(@"[menu.icon] initWithTitle:svgName:target:action: 异常: %@", e.reason);
         return nil;
     }
     if (!item) { dd_log(@"[menu.icon] MMMenuItem 构造返回 nil（svg=icon_filled_record_voice.svg）"); return nil; }
-    @try { [item setUserInfo:dd_menu_token(action)]; } @catch (...) {}
-    dd_log(@"[menu.icon] 用内置 svg icon_filled_record_voice.svg");
+    @try { [item setUserInfo:dd_menu_token(action)]; } @catch (...) {}   // 去重标记（MMMenuItem.h:49）
+    dd_log(@"[menu.icon] 原生构造完成 title=%@ svg=icon_filled_record_voice.svg", title);
     return item;
 }
 
