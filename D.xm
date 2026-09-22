@@ -107,6 +107,17 @@
 //    （仅对 GNUstep 桩固有噪音 incompatible-library-redeclaration 降权），使沙箱静态检查
 //    能复现 CI 的 property/accessor 类型不匹配错误，不再漏检。
 //
+//  v1.0.9（修「闪退后日志被清空」，非功能改动）
+//    用户实测 v1.0.8：视频转语音已出声；但文件转语音偶发闪退，且**闪退后设置页日志为空**，
+//    无法据此定位闪退。根因在 DDLogStore.append:（Tweak.xm 约第 507 行）：原实现走
+//    dispatch_async(_q) 异步写、且 writeData: 后从不 synchronizeFile（fsync），只有「导出」时
+//    flushSync 才 fsync。进程在转换流程中崩溃的瞬间，队列里尚未执行的 block 与未刷盘的页缓存
+//    一并丢失 → 闪退前的关键日志不在文件里（DDLogStore.h 注释原称「内存环形缓冲 + 落盘」，
+//    实际落盘被延迟到导出才发生）。修复：append: 改为 dispatch_sync(_q) 同步写，每条写前
+//    seekToEndOfFile、写后 synchronizeFile（fsync）落盘；_handle 失效时就地重建。崩溃前的每条
+//    日志都已落盘，且 init 仅在不存时建空文件、不清空已有日志文件，故重启微信后闪退日志可查。
+//    下一步：请用户重装 v1.0.9 后复现文件转语音闪退，进设置页导出日志即可定位闪退根因。
+//
 //  锚定证据（微信头文件 dump / WCRefine 加载态 dump）：
 //   · 文件数据路径 —— CMessageWrap +GetPathOfAppData:msgWrap            (CMessageWrap.h:26)
 //                     +GetPathOfAppData:LocalID:FileExt:retStrPath:      (CMessageWrap.h:106)
@@ -462,7 +473,7 @@
 #define kDDLogDirName    @"DDVoiceAssistantLogs"
 #define kDDLogFileName   @"ddvoice_debug.log"
 #define kDDPluginName    @"DD语音助手"
-#define kDDPluginVersion @"1.0.6"
+#define kDDPluginVersion @"1.0.9"
 
 @interface DDLogStore : NSObject
 + (instancetype)shared;
@@ -506,12 +517,20 @@
 }
 - (void)append:(NSString *)line {
     if (!line.length) return;
-    dispatch_async(_q, ^{
+    // 同步落盘：原实现 dispatch_async 异步写、且 writeData 后从不 synchronizeFile（fsync），
+    // 进程在转换流程中崩溃时队列里未执行的 block 与未刷盘的页缓存一起丢失 → 「闪退后日志被清空」。
+    // 改为同步写 + 每条 fsync，确保崩溃前的每条日志都已落盘可查（init 不会清空已有日志文件）。
+    dispatch_sync(_q, ^{
         if (self->_lines.count >= kDDLogMaxLines)
             [self->_lines removeObjectsInRange:NSMakeRange(0, kDDLogMaxLines / 4)];
         [self->_lines addObject:line];
         NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-        @try { [self->_handle writeData:d]; } @catch (...) {}
+        @try {
+            if (!self->_handle) self->_handle = [NSFileHandle fileHandleForWritingAtPath:self->_logPath];
+            [self->_handle seekToEndOfFile];
+            [self->_handle writeData:d];
+            [self->_handle synchronizeFile];   // fsync：崩溃也不丢
+        } @catch (...) {}
         NSLog(@"[%@] %@", kDDPluginName, line);
     });
 }
