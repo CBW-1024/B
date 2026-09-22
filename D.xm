@@ -228,8 +228,6 @@
 #define kDDMCVoiceFormat 4            // SILK
 #define kDDMCVoiceEndFlag 1
 #define kDDMCStatusSending 1
-#define kDDMCVoiceLocalIDBase 10000
-#define kDDMCVoiceLocalIDRange 0x15f90
 #define kDDMCVoiceSampleRate 8000     // 微信语音 8kHz 单声道 16bit
 #define kDDMCDownloadTimeout 90.0    // 自动下载等待上限（秒）
 
@@ -620,9 +618,7 @@ static NSString *dd_install_audio_file(CMessageWrap *wrap, NSString *src) {
     dd_log(@"[voice.install] 目标=%@ 复制结果=%d 错误=%@", p, dd_file_exists(p), cpErr.localizedDescription ?: @"无");
     return p;
 }
-static unsigned int dd_new_voice_local_id(void) {
-    return kDDMCVoiceLocalIDBase + (unsigned int)arc4random_uniform(kDDMCVoiceLocalIDRange);
-}
+
 // 发送语音消息到指定会话（复用 DD语音助手 的发送链路：addMessageToDB + ResendVoiceMsg）
 static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     NSData *data = [NSData dataWithContentsOfFile:audPath];
