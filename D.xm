@@ -39,7 +39,6 @@
 @end
 
 @interface WCTableViewSectionManager : NSObject
-+ (id)defaultSection;
 + (id)sectionWithHeader:(id)arg1;
 - (void)addCell:(id)arg1;
 @end
@@ -82,8 +81,7 @@
 - (id)getVoicePath;                                 // CMessageWrap.h:362
     - (void)setM_nsVoicePath:(NSString *)arg1;          // WCR 0x8dfec0（dump 未导出，运行时存在；语音规范路径，ResendVoiceMsg 据此定位 SILK）
 + (id)getPathOfAudio:(id)arg1;                      // CMessageWrap.h:66
-+ (id)GetPathOfAppData:(id)arg1;                    // CMessageWrap.h:26
-+ (void)GetPathOfAppDataByUserName:(id)usr andMessageWrap:(id)wrap retStrPath:(void *)pp;  // CMessageWrap.h:108
++ (void)GetPathOfAppData:(id)usr LocalID:(unsigned int)lid FileExt:(id)ext retStrPath:(void *)pp;  // CMessageWrap.h:106
 @end
 
 @interface WCLanDeviceServiceUtil : NSObject
@@ -97,6 +95,7 @@
 @property(nonatomic) unsigned long long m_uiAppDataSize;
 @property(retain, nonatomic) NSString *m_nsAppMediaUrl;
 @property(retain, nonatomic) NSString *m_nsAppAttachID;
+- (id)getFileExt;                                   // CExtendInfoOfAPP.h:44
 - (id)m_nsTitle;
 - (void)setM_nsTitle:(id)arg1;
 - (BOOL)m_bAppAttachExistInSvr;
@@ -106,10 +105,6 @@
 
 @interface CExtendInfoOfVoiceMsg : NSObject
 - (id)m_dtVoice;                                    // :12
-- (id)m_refMessageWrap;                             // :13
-- (unsigned int)m_uiVoiceEndFlag;                   // :17
-- (unsigned int)m_uiVoiceFormat;                    // :18
-- (unsigned int)m_uiVoiceTime;                      // :20
 - (void)setM_dtVoice:(id)arg1;                      // :27
 - (void)setM_refMessageWrap:(id)arg1;               // :28
 - (void)setM_uiVoiceEndFlag:(unsigned int)arg1;     // :30
@@ -150,11 +145,8 @@
 @end
 
 @interface MJSilkCodec : NSObject
-+ (id)decodeToAudioDataFromSilkData:(id)a0;         // MJSilkCodec.h:3
 + (id)decodeToPCMFromSilkData:(id)a0;               // MJSilkCodec.h:4
 + (id)encodeToSilkFromPCMData:(id)a0;               // MJSilkCodec.h:5
-- (BOOL)initEncoderWithSampleRate:(long long)rate;  // MJSilkCodec.h:7
-- (id)encodeFromPCMData:(id)a0;                     // MJSilkCodec.h:10
 @end
 
 @interface BaseMessageViewModel : NSObject
@@ -165,9 +157,6 @@
 @end
 @interface AppVideoMessageViewModel : NSObject
 - (BOOL)isWSVideo;                                  // AppVideoMessageViewModel.h:5
-@end
-@interface AppFileMessageViewModel : NSObject
-- (BOOL)isFileExist;                                // AppFileMessageViewModel.h:9
 @end
 @interface BaseChatCellView : NSObject
 @property (readonly, nonatomic) id viewModel;       // BaseChatCellView.h:17
@@ -480,19 +469,36 @@ static NSString *dd_video_path_of_cell(id cell) {
     return nil;
 }
 
-// 文件消息本地路径。原生方法两路：
-// ① GetPathOfAppDataByUserName:retStrPath:（CMessageWrap.h:108）—— 对未下载/残缺字段返回空而非崩（安全主路径）
-// ② GetPathOfAppData:（:26）—— 最权威，但「未下载/字段残缺时内部崩」，仅 m_uiDownloadStatus==9（已下载）才调
-// 早期版本把 GetPathOfAppData: 当首选，未下载文件消息点击即崩（后台队列 autorelease pool pop + PAC 失败）。
+// 文件消息本地路径。
+// 【崩因实证】旧实现 GetPathOfAppDataByUserName:andMessageWrap:retStrPath:（:108）内部要从 msg 的
+// app extendInfo 挖 attachId/fileExt；文件消息（m_uiMessageType=49、m_uiDownloadStatus=0）上该
+// introspection 会破坏堆状态 —— 日志实证：它返回并打出「命中」后，紧接着下一次 autorelease pool
+// drain 必崩，后台块连第一行日志都来不及写（2.mp3 / 3.m4r 两个不同文件、两次点击均同一位置复现）。
+// 【改用】GetPathOfAppData:LocalID:FileExt:retStrPath:（:106）：只吃 usrName + localID + fileExt，
+// 完全不 introspect 消息对象。fileExt 取自 CExtendInfoOfAPP（getFileExt:44 / m_nsAppFileExt:79）。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
+    id ext = [msg m_extendInfoWithMsgType];
+    NSString *fileExt = nil;
+    if ([ext respondsToSelector:@selector(getFileExt)]) {                   // CExtendInfoOfAPP.h:44
+        id e = [ext getFileExt];
+        if ([e isKindOfClass:[NSString class]] && ((NSString *)e).length) fileExt = e;
+    }
+    if (!fileExt.length && [ext respondsToSelector:@selector(m_nsAppFileExt)]) {   // :79
+        id e = [ext m_nsAppFileExt];
+        if ([e isKindOfClass:[NSString class]] && ((NSString *)e).length) fileExt = e;
+    }
+    if (!fileExt.length) { dd_log(@"[path.file] 取不到 fileExt，放弃"); return nil; }
     NSString *p = nil;
-    [objc_getClass("CMessageWrap") GetPathOfAppDataByUserName:dd_current_usr_name()
-                                          andMessageWrap:msg retStrPath:&p];
+    [objc_getClass("CMessageWrap") GetPathOfAppData:dd_current_usr_name()
+                                            LocalID:msg.m_uiMesLocalID
+                                            FileExt:fileExt
+                                         retStrPath:&p];
     if ([p isKindOfClass:[NSString class]] && p.length) {
-        if (dd_file_exists(p)) { dd_log(@"[path.file] 命中 → %@", p); return p; }
+        if (dd_file_exists(p)) { dd_log(@"[path.file] 命中 → %@ (ext=%@)", p, fileExt); return p; }
         return p;   // 未下载完也返回路径供下载轮询
     }
+    dd_log(@"[path.file] GetPathOfAppData 未返回路径 (ext=%@ localID=%u)", fileExt, msg.m_uiMesLocalID);
     return nil;
 }
 // 语音消息本地路径：getVoicePath（CMessageWrap.h:362）→ getPathOfAudio:（:66）→ m_dtVoice 兜底
