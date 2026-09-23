@@ -396,11 +396,14 @@ static void dd_retain_wrap(id wrap) {
 
 #pragma mark - 路径解析
 
-// 「含音轨容器」白名单 —— 视频消息路径解析与文件消息菜单准入共用同一份。
-// 判据只有一条：能不能用 AVAssetReader 抽出音轨。图片（png/jpg/gif/webp/heic/bmp）与文档
-// （txt/pdf/doc/xls/zip…）没有音轨，抽出来是空 PCM，点了必然失败，故一律排除。
-// WCR 的白名单（@0x152e00）含图片，是因为它的「媒体→语音」还兼做图片转文字等语义；
-// 本插件只做音轨抽取，所以按「含音轨」划分，不照抄。
+// 媒体文件白名单 —— 视频消息路径解析与文件消息菜单准入共用同一份。
+// 准入分两类：
+//   ① 音频/视频容器：能用 AVAssetReader 抽出音轨再编 SILK。图片（png/jpg/gif/webp/heic/bmp）与
+//      文档（txt/pdf/doc/xls/zip…）没有音轨，抽出来是空 PCM，点了必然失败，故一律排除。
+//      WCR 的白名单（@0x152e00）含图片，是因为它的「媒体→语音」还兼做图片转文字等语义；
+//      本插件只做音轨抽取，所以按「含音轨」划分，不照抄。
+//   ② SILK 终态容器 aud/silk：微信语音本体（\x02#!SILK_V3），本身就是终态，原样复用即可，
+//      不需要也不应该走 PCM 抽取（AVAssetReader 读不了 SILK，且 SILK→PCM→SILK 是有损二次编码）。
 static NSSet *dd_media_ext_set(void) {
     static NSSet *s; static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -409,7 +412,9 @@ static NSSet *dd_media_ext_set(void) {
              @"mp3", @"wav", @"m4a", @"aac", @"flac", @"ogg", @"oga", @"opus",
              @"caf", @"aiff", @"aif", @"m4r", @"amr", @"wma", @"ape", @"au",
              // 视频容器（含音轨，可抽取）
-             @"mp4", @"mov", @"m4v", @"avi", @"mkv", @"flv", @"webm", @"3gp", @"wmv", @"mpg", @"mpeg", nil];
+             @"mp4", @"mov", @"m4v", @"avi", @"mkv", @"flv", @"webm", @"3gp", @"wmv", @"mpg", @"mpeg",
+             // SILK 终态容器（原样复用，不二次编码）
+             @"aud", @"silk", nil];
     });
     return s;
 }
@@ -419,7 +424,11 @@ static NSSet *dd_media_ext_set(void) {
 // 逐个 dd_first_media_file_under_path 试（含目录展开），8 份真机日志里**永远只有 `源#0 命中`**，
 // `源#1` 零次 —— filePathFromMsgWrap: 从未被执行到，纯冗余，删。
 // 目录展开同样零命中：videoPath 恒指向微信规范附件 `Video/<usr>/<localID>.mp4`（单文件），
-// 从未是目录，故只留「白名单扩展名 + 文件存在」两步判定。
+// 从未是目录，故只留「白名单扩展名」一步判定。
+//
+// 【日志节流 · 日志 060141 实证】本函数会被 dd_wait_local_path 每 0.5s 回调一次做下载轮询，
+// 若无条件打日志，一次未下载视频（轮询 57s）会刷出 ~130 条 `命中`（占满整个日志文件）。
+// 只在文件真正存在时才打 —— 轮询期间（文件还没落盘）保持静默，下载完成那一次才记录。
 static NSString *dd_video_path_of_cell(id cell) {
     id msg = dd_msg_of_cell(cell);
     if (msg && [msg respondsToSelector:@selector(IsVideoMsg)] && ![msg IsVideoMsg]) return nil;
@@ -428,6 +437,7 @@ static NSString *dd_video_path_of_cell(id cell) {
     NSString *p = [vm videoPath];
     if (![p isKindOfClass:[NSString class]] || p.length == 0) return nil;
     if (![dd_media_ext_set() containsObject:p.pathExtension.lowercaseString]) return nil;
+    if (!dd_file_exists(p)) return p;          // 未下载完也返回路径，供 dd_wait_local_path 轮询
     dd_log(@"[path.video] 命中 → %@", p);
     return p;
 }
@@ -761,21 +771,28 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
             dd_log(@"[%@→语音] 下载后解析路径=%@ 存在=%d", tag, path ?: @"(空)", dd_file_exists(path));
         }
         if (!dd_file_exists(path)) { dd_log(@"[%@→语音] 下载失败/超时，放弃", tag); return; }
-        NSData *fileData = [NSData dataWithContentsOfFile:path];
-        dd_log(@"[%@→语音] 源文件读取 len=%lu ext=%@", tag, (unsigned long)fileData.length, path.pathExtension.lowercaseString);
-        NSString *ext = [[path pathExtension] lowercaseString];
-        NSData *aud = nil;
         double duration = 0;
-        // 源本身就是合法 SILK（.aud/.silk/.slk）→ 按 WCR 原样复用，不二次编码
-        BOOL alreadySilk = fileData.length > 0 &&
-            ([ext isEqualToString:@"aud"] || [ext isEqualToString:@"silk"] || [ext isEqualToString:@"slk"]) &&
-            dd_silk_frames_valid(fileData);
-        if (alreadySilk) {
-            dd_log(@"[%@→语音] 源已是合法 SILK，原样复用（不二次编码）magic%d",
-                   tag, dd_silk_has_magic10(fileData) ? 10 : 9);
-            aud = fileData;
-            NSData *pcm = dd_decode_silk_to_pcm(fileData);
-            duration = pcm.length ? (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2) : 0;
+        // 只取文件大小，不 read 全文：日志 060141 的视频素材 20.7MB，原写法为打一条日志把整个文件
+        // 读进内存（dataWithContentsOfFile）；抽音轨走的是 AVAssetReader，根本不需要这份 NSData。
+        unsigned long long fsize = [[[NSFileManager defaultManager] attributesOfItemAtPath:path
+                                                                                    error:nil][NSFileSize] unsignedLongLongValue];
+        dd_log(@"[%@→语音] 源文件 size=%llu ext=%@", tag, fsize, path.pathExtension.lowercaseString);
+        NSData *aud = nil;
+        NSString *ext = path.pathExtension.lowercaseString;
+        // 源本身就是微信 SILK 终态容器（.aud/.silk）→ 原样复用，不二次编码。
+        // AVAssetReader 读不了 SILK；即便能解，SILK→PCM→SILK 也是有损二次编码（音质劣化 + 白跑
+        // 两趟编解码）。只有这里才 read 全文 —— SILK 文件通常几十 KB，不像视频那种 20MB。
+        // 帧链不自洽的（损坏或伪装扩展名）当场放弃：dd_send_voice 虽然也校验，但那时已经写好了
+        // 临时文件，不如早退；送不合法 SILK 给 ResendVoiceMsg 会在其内部 C 层 SIGSEGV，@try 拦不住。
+        if ([ext isEqualToString:@"aud"] || [ext isEqualToString:@"silk"]) {
+            NSData *raw = [NSData dataWithContentsOfFile:path];
+            if (!dd_silk_frames_valid(raw)) { dd_log(@"[%@→语音] 源是 .%@ 但帧链不自洽，放弃", tag, ext); return; }
+            aud = raw;
+            // 时长只能靠解回 PCM 反推：SILK 容器头不写时长
+            NSData *pcm = dd_decode_silk_to_pcm(raw);
+            duration = (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2);
+            dd_log(@"[%@→语音] 源已是合法 SILK，原样复用 magic%d（%lu 字节）",
+                   tag, dd_silk_has_magic10(raw) ? 10 : 9, (unsigned long)raw.length);
         } else {
             NSData *pcm = dd_extract_pcm(path, &duration);
             if (pcm.length == 0) { dd_log(@"[%@→语音] PCM 为空，放弃", tag); return; }
