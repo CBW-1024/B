@@ -459,16 +459,10 @@ static NSString *dd_video_path_of_cell(id cell) {
         if ([p isKindOfClass:[NSString class]] && p.length) [cands addObject:p];
     }
     // ② WCLanDeviceServiceUtil.filePathFromMsgWrap:（WCLanDeviceServiceUtil.h:7）
-    // ③ CUtility.GetDocPath（CUtility.h:49）
     if (dd_is_msg_wrap(msg)) {
         Class lan = objc_getClass("WCLanDeviceServiceUtil");
         if ([lan respondsToSelector:@selector(filePathFromMsgWrap:)]) {
             id p = [lan filePathFromMsgWrap:msg];
-            if ([p isKindOfClass:[NSString class]] && ((NSString *)p).length) [cands addObject:p];
-        }
-        Class cu = objc_getClass("CUtility");
-        if ([cu respondsToSelector:@selector(GetDocPath)]) {
-            id p = [cu GetDocPath];
             if ([p isKindOfClass:[NSString class]] && ((NSString *)p).length) [cands addObject:p];
         }
     }
@@ -734,6 +728,7 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
 }
 // 抽音轨为 16bit / 单声道 / 16000Hz PCM（输出字典 7 键，对齐 WCRefine sub_0x8f1bc8）
 static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
+    dd_log(@"[pcm] 入参 mediaPath=%@ 存在=%d", mediaPath, dd_file_exists(mediaPath));
     if (!dd_file_exists(mediaPath)) return nil;
     NSDictionary *opts = @{(id)AVURLAssetPreferPreciseDurationAndTimingKey: @YES};
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:mediaPath] options:opts];
@@ -771,53 +766,69 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
 }
 
 // 媒体 → 语音：确保已下载 → 抽音轨 → SILK → 发送到当前聊天
+//
+static void dd_convert_to_voice(NSString *tag, NSString *usr, NSString *path);   // 前向声明（定义见下方）
+
+// 关键线程约束：路径解析（GetPathOfAppData / filePathFromMsgWrap / StartDownload* 等）触碰微信内部
+// 状态，必须在主线程；但解析结果只取「纯路径字符串」交给后台，后台块绝不再捕获任何微信对象
+// （CMessageWrap 等）—— 否则后台块作用域结束时会在后台线程释放微信对象，撞上非线程安全 dealloc
+// 致 autorelease pool pop SIGSEGV（文件消息 dlStatus=0 无 UI 续命，必崩；视频被屏幕 UI 强引用掩盖）。
 static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^pathBlock)(void), void(^downloadBlock)(void)) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
     dd_log(@"[%@→语音] ==== 开始 ==== type=%u localID=%u dlStatus=%u chat=%@",
            tag, msg.m_uiMessageType, msg.m_uiMesLocalID, msg.m_uiDownloadStatus, usr ?: @"(nil)");
+    // 主线程先解析一次：已缓存（文件/视频绝大多数场景）直接命中，零后台微信对象引用
+    NSString *path = dd_on_main_string(pathBlock);
+    if (dd_file_exists(path)) {
+        dispatch_async(dd_convert_queue, ^{ dd_convert_to_voice(tag, usr, path); });
+        return;
+    }
+    // 未就绪：下载+轮询放后台（避免阻塞主线程），WeChat 调用仍经 dd_on_main 回主线程
     dispatch_async(dd_convert_queue, ^{
-        // 路径解析 / 下载触发都触碰微信内部状态，必须在主线程（见 dd_on_main）
-        NSString *path = dd_on_main_string(pathBlock);
-        if (!dd_file_exists(path)) {
-            if (downloadBlock) dd_on_main(downloadBlock);
-            path = dd_wait_local_path(^{ return dd_on_main_string(pathBlock); }, kDDMCDownloadTimeout);
-            dd_log(@"[%@→语音] 下载后解析路径=%@ 存在=%d", tag, path ?: @"(空)", dd_file_exists(path));
-        }
-        if (!dd_file_exists(path)) { dd_log(@"[%@→语音] 下载失败/超时，放弃", tag); return; }
-        NSData *fileData = [NSData dataWithContentsOfFile:path];
-        NSString *ext = [[path pathExtension] lowercaseString];
-        NSData *aud = nil;
-        double duration = 0;
-        // 源本身就是合法 SILK（.aud/.silk/.slk）→ 按 WCR 原样复用，不二次编码
-        BOOL alreadySilk = fileData.length > 0 &&
-            ([ext isEqualToString:@"aud"] || [ext isEqualToString:@"silk"] || [ext isEqualToString:@"slk"]) &&
-            dd_silk_frames_valid(fileData);
-        if (alreadySilk) {
-            dd_log(@"[%@→语音] 源已是合法 SILK，原样复用（不二次编码）magic%d",
-                   tag, dd_silk_has_magic10(fileData) ? 10 : 9);
-            aud = fileData;
-            NSData *pcm = dd_decode_silk_to_pcm(fileData);
-            duration = pcm.length ? (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2) : 0;
-        } else {
-            NSData *pcm = dd_extract_pcm(path, &duration);
-            if (pcm.length == 0) { dd_log(@"[%@→语音] PCM 为空，放弃", tag); return; }
-            // 时长必须按真实 PCM 长度算（asset.duration 是视频时长，可能与音轨不符）
-            duration = (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2);
-            aud = dd_encode_pcm_to_silk(pcm);
-            if (aud.length == 0) { dd_log(@"[%@→语音] SILK 编码失败，放弃", tag); return; }
-        }
-        NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                         [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"]];
-        [aud writeToFile:tmp atomically:YES];
-        unsigned int ms = (unsigned int)(duration * 1000);
-        if (ms == 0) ms = 1000;
-        if (ms > 60000) ms = 60000;   // 微信语音上限 60s
-        dd_log(@"[%@→语音] 时长=%ums → 发送语音 (aud=%lu 字节)", tag, ms, (unsigned long)aud.length);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            BOOL sent = dd_send_voice(usr, tmp, ms);
-            dd_log(@"[%@→语音] ==== 结束 ==== 发送结果=%d", tag, sent);
-        });
+        if (downloadBlock) dd_on_main(downloadBlock);
+        NSString *p = dd_wait_local_path(^{ return dd_on_main_string(pathBlock); }, kDDMCDownloadTimeout);
+        dd_log(@"[%@→语音] 下载后解析路径=%@ 存在=%d", tag, p ?: @"(空)", dd_file_exists(p));
+        if (!dd_file_exists(p)) { dd_log(@"[%@→语音] 下载失败/超时，放弃", tag); return; }
+        dd_convert_to_voice(tag, usr, p);
+    });
+}
+
+// 纯媒体处理：文件读取 + 抽音轨 + SILK 编码 + 发送。仅接收「纯路径字符串」，不触碰任何微信对象。
+static void dd_convert_to_voice(NSString *tag, NSString *usr, NSString *path) {
+    NSData *fileData = [NSData dataWithContentsOfFile:path];
+    dd_log(@"[%@→语音] 源文件读取 len=%lu ext=%@", tag, (unsigned long)fileData.length, path.pathExtension.lowercaseString);
+    NSString *ext = [[path pathExtension] lowercaseString];
+    NSData *aud = nil;
+    double duration = 0;
+    // 源本身就是合法 SILK（.aud/.silk/.slk）→ 按 WCR 原样复用，不二次编码
+    BOOL alreadySilk = fileData.length > 0 &&
+        ([ext isEqualToString:@"aud"] || [ext isEqualToString:@"silk"] || [ext isEqualToString:@"slk"]) &&
+        dd_silk_frames_valid(fileData);
+    if (alreadySilk) {
+        dd_log(@"[%@→语音] 源已是合法 SILK，原样复用（不二次编码）magic%d",
+               tag, dd_silk_has_magic10(fileData) ? 10 : 9);
+        aud = fileData;
+        NSData *pcm = dd_decode_silk_to_pcm(fileData);
+        duration = pcm.length ? (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2) : 0;
+    } else {
+        NSData *pcm = dd_extract_pcm(path, &duration);
+        if (pcm.length == 0) { dd_log(@"[%@→语音] PCM 为空，放弃", tag); return; }
+        // 时长必须按真实 PCM 长度算（asset.duration 是视频时长，可能与音轨不符）
+        duration = (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2);
+        aud = dd_encode_pcm_to_silk(pcm);
+        if (aud.length == 0) { dd_log(@"[%@→语音] SILK 编码失败，放弃", tag); return; }
+    }
+    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                     [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"]];
+    [aud writeToFile:tmp atomically:YES];
+    unsigned int ms = (unsigned int)(duration * 1000);
+    if (ms == 0) ms = 1000;
+    if (ms > 60000) ms = 60000;   // 微信语音上限 60s
+    dd_log(@"[%@→语音] 时长=%ums → 发送语音 (aud=%lu 字节)", tag, ms, (unsigned long)aud.length);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BOOL sent = dd_send_voice(usr, tmp, ms);
+        dd_log(@"[%@→语音] ==== 结束 ==== 发送结果=%d", tag, sent);
     });
 }
 
