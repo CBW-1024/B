@@ -411,6 +411,20 @@ static void dd_retain_wrap(id wrap) {
     @synchronized (pool) { [pool addObject:wrap]; }
 }
 
+// 微信实例/类方法非线程安全：后台队列调用会与主线程 UI 重排竞态 → 堆损坏 → 后续 SIGSEGV。
+// 转换链路里凡触碰微信内部状态（取路径、触发下载）的调用统一走主线程。
+static void dd_on_main(void (^block)(void)) {
+    if (!block) return;
+    if ([NSThread isMainThread]) block();
+    else dispatch_sync(dispatch_get_main_queue(), block);
+}
+static NSString *dd_on_main_string(NSString *(^block)(void)) {
+    if (!block) return nil;
+    __block NSString *r = nil;
+    dd_on_main(^{ r = block(); });
+    return r;
+}
+
 #pragma mark - 路径解析
 
 // 普通视频本地路径（VideoMessageCellView，覆盖 m_uiMessageType=43 视频 / 62 小视频）
@@ -521,7 +535,7 @@ static void dd_trigger_video_download(CMessageWrap *msg) {
     }
 }
 // 文件消息下载：基础触发 StartDownloadAppAttach:MsgWrap:Silent:（CMessageMgr.h:32）。
-// 实测文件消息 m_uiDownloadStatus 恒为 0，无「状态=9 误判」场景，删除基于此的按 attachId 强制重拉分支（死代码）。
+// 实测 m_uiDownloadStatus 恒为 0，无「状态=9 误判」场景，故不叠加 attachId 强制重拉。
 static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return NO;
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
@@ -763,10 +777,11 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
     dd_log(@"[%@→语音] ==== 开始 ==== type=%u localID=%u dlStatus=%u chat=%@",
            tag, msg.m_uiMessageType, msg.m_uiMesLocalID, msg.m_uiDownloadStatus, usr ?: @"(nil)");
     dispatch_async(dd_convert_queue, ^{
-        NSString *path = pathBlock();
+        // 路径解析 / 下载触发都触碰微信内部状态，必须在主线程（见 dd_on_main）
+        NSString *path = dd_on_main_string(pathBlock);
         if (!dd_file_exists(path)) {
-            if (downloadBlock) downloadBlock();
-            path = dd_wait_local_path(pathBlock, kDDMCDownloadTimeout);
+            if (downloadBlock) dd_on_main(downloadBlock);
+            path = dd_wait_local_path(^{ return dd_on_main_string(pathBlock); }, kDDMCDownloadTimeout);
             dd_log(@"[%@→语音] 下载后解析路径=%@ 存在=%d", tag, path ?: @"(空)", dd_file_exists(path));
         }
         if (!dd_file_exists(path)) { dd_log(@"[%@→语音] 下载失败/超时，放弃", tag); return; }
