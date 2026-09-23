@@ -530,7 +530,15 @@
 #define kDDLogDirName    @"DDVoiceAssistantLogs"
 #define kDDLogFileName   @"ddvoice_debug.log"
 #define kDDPluginName    @"DD语音助手"
-#define kDDPluginVersion @"1.0.16"
+#define kDDPluginVersion @"1.0.18"
+
+// v1.0.17：SILK 编解码（MJSilkCodec 类方法 +encodeToSilkFromPCMData: / +decodeToPCMFromSilkData:）
+// 内部带全局/静态编码器上下文，**非线程安全**。原实现把转换重活丢到全局并发队列，用户快速连点
+// 多次「转语音/转文件」时多个 block 并发打 MJSilkCodec 类方法 → 竞争写共享编码缓冲 → 堆损坏
+// （崩溃栈表现为后台 GCD 队列 autorelease pool pop 时 objc_msgSend release 触发 PAC 失败的 SIGSEGV，
+//  见 2026-09-23 13:47:38 真机崩溃日志，崩在 com.apple.root.user-initiated-qos，非主线程）。
+// 收敛到下面的串行队列，保证任意时刻只有一个转换在跑 SILK 编解码，从根上消除数据竞争。
+static dispatch_queue_t dd_convert_queue;   // v1.0.18：在 %ctor 里创建，不能在此用 dispatch_queue_create 初始化（非编译期常量）
 
 @interface DDLogStore : NSObject
 + (instancetype)shared;
@@ -1546,9 +1554,11 @@ static void dd_media_to_voice(CMessageWrap *msg, NSString *(^pathBlock)(void), v
     dd_log(@"[media→voice] ==== 开始 ==== type=%u localID=%u chat=%@",
           msg.m_uiMessageType, msg.m_uiMesLocalID, dd_chat_usr_of_msg(msg) ?: @"(nil)");
     NSString *usr = dd_chat_usr_of_msg(msg);
-    // v1.0.1：抽音轨 + SILK 编码 + 回环自校验都不轻，挪到全局队列，避免长按菜单点击后
-    //         主线程卡顿被 watchdog 杀；只有最后的发送回到主线程。
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    // v1.0.18：抽音轨 + SILK 编码 + 回环自校验都不轻，挪到**串行**队列 dd_convert_queue，
+    // 避免主线程卡顿被 watchdog 杀；只有最后的发送回到主线程。
+    // 之所以必须是串行而非全局并发队列：MJSilkCodec 的 SILK 编解码类方法内部带全局编码器上下文，
+    // 并发调用会竞争写同一缓冲 → 堆损坏 → 偶发 SIGSEGV（见 v1.0.18 崩溃修复说明）。
+    dispatch_async(dd_convert_queue, ^{
         @try {
             NSString *path = pathBlock();
             if (!dd_file_exists(path)) {
@@ -1916,7 +1926,7 @@ static void dd_voice_to_file(CMessageWrap *msg) {
     NSString *fn  = [NSString stringWithFormat:@"语音_%u.m4a", (unsigned int)time(NULL)];
     unsigned int localID = msg.m_uiMesLocalID;
     dd_log(@"[voice→file] ==== 开始 ==== localID=%u chat=%@", localID, usr ?: @"(nil)");
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    dispatch_async(dd_convert_queue, ^{
         @try {
             NSData *silk = dd_silk_data_of_msg(msg);
             if (silk.length == 0) { dd_log(@"[voice→file] 取不到语音数据，放弃"); return; }
@@ -2315,6 +2325,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 #pragma mark - 注册入口（参考 DD语音助手）
 
 %ctor {
+    dd_convert_queue = dispatch_queue_create("com.ddmedia.convert", DISPATCH_QUEUE_SERIAL);
     @autoreleasepool {
         // 日志开关在启动时同步一次（用户上次可能关闭过）
         [DDLogStore shared].enabled = [DDMediaConvertConfig shared].logEnabled;
