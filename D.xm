@@ -80,7 +80,6 @@
 - (BOOL)m_bForward;                                 // CMessageWrap.h:269
 - (void)setM_bForward:(BOOL)arg1;                   // CMessageWrap.h:590
 - (id)getVoicePath;                                 // CMessageWrap.h:362
-- (void)setM_nsVoicePath:(NSString *)arg1;          // WCR 0x8dfec0（dump 未导出，运行时存在，发送侧必设）
 + (id)getPathOfAudio:(id)arg1;                      // CMessageWrap.h:66
 + (id)GetPathOfAppData:(id)arg1;                    // CMessageWrap.h:26
 + (void)GetPathOfAppDataByUserName:(id)usr andMessageWrap:(id)wrap retStrPath:(void *)pp;  // CMessageWrap.h:108
@@ -729,10 +728,8 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     [mgr AddLocalMsg:usr MsgWrap:wrap];
     dd_log(@"[voice.send] AddLocalMsg → localID=%u", wrap.m_uiMesLocalID);
     NSString *voicePath = dd_install_audio_file(wrap, audPath);   // 写 SILK 到规范路径（GetPathOfMesAudio）
-    if (voicePath.length && [wrap respondsToSelector:@selector(setM_nsVoicePath:)])
-        [wrap setM_nsVoicePath:voicePath];   // WCR 0x8dfec0：缺则 ResendVoiceMsg/重启重建按 localID 读错文件 → 转圈
     if ([mgr respondsToSelector:@selector(SaveMesVoice:MsgWrap:)])
-        [mgr SaveMesVoice:data MsgWrap:wrap];  // WCR 0x8dff24：首参传 SILK 数据（落语音库记录），传 nil 等于不落库
+        [mgr SaveMesVoice:nil MsgWrap:wrap];   // 首参 nil：与视频转语音一致（1.0.25 误传 data 导致视频闪退，已回退）
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
     dd_log(@"[voice.send] 已发送 voicePath=%@ 会话=%@", voicePath ?: @"(空)", usr ?: @"(nil)");
     return YES;
@@ -1193,7 +1190,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
         dd_convert_queue = dispatch_queue_create("com.ddmedia.convert", DISPATCH_QUEUE_SERIAL);
         [DDLogStore shared].enabled = [DDMediaConvertConfig shared].logEnabled;
         [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD语音助手"
-                                                              version:@"1.0.25"
+                                                              version:@"1.0.26"
                                                            controller:@"DDMediaConvertSettingsViewController"];
     }
 }
