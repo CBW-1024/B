@@ -403,21 +403,32 @@ static void dd_retain_wrap(id wrap) {
 
 #pragma mark - 路径解析
 
-// 普通视频本地路径（VideoMessageCellView，覆盖 m_uiMessageType=43 视频 / 62 小视频）
-static NSSet *dd_video_ext_set(void) {
+// 「含音轨容器」白名单 —— 视频消息路径解析与文件消息菜单准入共用同一份。
+// 判据只有一条：能不能用 AVAssetReader 抽出音轨。图片（png/jpg/gif/webp/heic/bmp）与文档
+// （txt/pdf/doc/xls/zip…）没有音轨，抽出来是空 PCM，点了必然失败，故一律排除。
+// WCR 的白名单（@0x152e00）含图片，是因为它的「媒体→语音」还兼做图片转文字等语义；
+// 本插件只做音轨抽取，所以按「含音轨」划分，不照抄。
+static NSSet *dd_media_ext_set(void) {
     static NSSet *s; static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [NSSet setWithObjects:@"mp4", @"mov", @"m4v", nil]; });
+    dispatch_once(&once, ^{
+        s = [NSSet setWithObjects:
+             // 音频容器
+             @"mp3", @"wav", @"m4a", @"aac", @"flac", @"ogg", @"oga", @"opus",
+             @"caf", @"aiff", @"aif", @"m4r", @"amr", @"wma", @"ape", @"au",
+             // 视频容器（含音轨，可抽取）
+             @"mp4", @"mov", @"m4v", @"avi", @"mkv", @"flv", @"webm", @"3gp", @"wmv", @"mpg", @"mpeg", nil];
+    });
     return s;
 }
-// 路径可能是文件也可能是目录：目录时扫首个白名单视频文件
-static NSString *dd_first_video_file_under_path(NSString *path) {
+// 路径可能是文件也可能是目录：目录时扫首个白名单媒体文件
+static NSString *dd_first_media_file_under_path(NSString *path) {
     if (![path isKindOfClass:[NSString class]] || path.length == 0) return nil;
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
     if (![fm fileExistsAtPath:path isDirectory:&isDir]) return nil;
-    if (!isDir) return [dd_video_ext_set() containsObject:path.pathExtension.lowercaseString] ? path : nil;
+    if (!isDir) return [dd_media_ext_set() containsObject:path.pathExtension.lowercaseString] ? path : nil;
     for (NSString *name in [fm contentsOfDirectoryAtPath:path error:nil]) {
-        if (![dd_video_ext_set() containsObject:name.pathExtension.lowercaseString]) continue;
+        if (![dd_media_ext_set() containsObject:name.pathExtension.lowercaseString]) continue;
         NSString *sub = [path stringByAppendingPathComponent:name];
         BOOL subDir = NO;
         if ([fm fileExistsAtPath:sub isDirectory:&subDir] && !subDir) return sub;
@@ -444,15 +455,18 @@ static NSString *dd_video_path_of_cell(id cell) {
     }
     NSUInteger idx = 0;
     for (NSString *p in cands) {
-        NSString *f = dd_first_video_file_under_path(p);
+        NSString *f = dd_first_media_file_under_path(p);
         if (f.length) {
             dd_log(@"[path.video] 源#%lu 命中 → %@", (unsigned long)idx, f);
             return f;
         }
         idx++;
     }
-    if (cands.count) return cands.firstObject;   // 可能只是目录，下载后再解析
-    dd_log(@"[path.video] 取不到视频路径");
+    // 未命中一律返回 nil，不再把「没过白名单的候选路径」交出去（原写法 return cands.firstObject，
+    // 会把非含音轨容器/纯目录的路径当成文件送到下游，读到垃圾或在 PCM 抽取阶段才失败）。
+    // 未下载完的场景不受影响：dd_media_to_voice 见 path 为空会先触发下载，
+    // 下载完成后再通过 dd_wait_local_path 重新调本函数解析，届时文件已存在即可命中。
+    dd_log(@"[path.video] 未取到含音轨容器（候选=%lu）", (unsigned long)cands.count);
     return nil;
 }
 
@@ -972,23 +986,9 @@ static void dd_voice_to_file(CMessageWrap *msg) {
 
 #pragma mark - 菜单注入
 
-// 文件消息「转语音」的准入白名单：**必须含音轨**的容器才挂按钮。
+// 文件消息「转语音」的准入判定：白名单复用 dd_media_ext_set（含音轨容器，与视频侧同一份）。
 // 图片（png/jpg/gif/webp/heic/bmp）、文档（txt/pdf/doc/xls/zip…）没有音轨，抽出来是空 PCM，
 // 挂了按钮点了必然失败 —— 故一律不挂（用户实证：txt / 图片文件的长按菜单上不该出现「转语音」）。
-// WCR 的白名单（@0x152e00）只认视频/图片容器，是因为它的「媒体→语音」还兼做图片转文字等语义；
-// 本插件只做音轨抽取，故按「含音轨」重新划分：音频容器 + 视频容器。
-static NSSet *dd_audio_ext_set(void) {
-    static NSSet *s; static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        s = [NSSet setWithObjects:
-             // 音频容器
-             @"mp3", @"wav", @"m4a", @"aac", @"flac", @"ogg", @"oga", @"opus",
-             @"caf", @"aiff", @"aif", @"m4r", @"amr", @"wma", @"ape", @"au",
-             // 视频容器（含音轨，可抽取）
-             @"mp4", @"mov", @"m4v", @"avi", @"mkv", @"flv", @"webm", @"3gp", @"wmv", @"mpg", @"mpeg", nil];
-    });
-    return s;
-}
 // 菜单构建阶段判定：只读消息自带字段，绝不解析路径（解析留到点击后，见 WCR 0x8dd96c）。
 // 扩展名取 CExtendInfoOfAPP.m_nsAppFileExt（WCR 同款字段，@三方对比 §1.2），
 // 该字段为空时取 m_nsAppFileName 的 pathExtension —— 两个字段都是消息内存里的现成值，无副作用。
@@ -1004,7 +1004,7 @@ static BOOL dd_file_has_audio(CMessageWrap *msg) {
             ext = ((NSString *)[(CExtendInfoOfAPP *)app m_nsAppFileName]).pathExtension;
     }
     if (![ext isKindOfClass:[NSString class]] || ext.length == 0) return NO;
-    BOOL hit = [dd_audio_ext_set() containsObject:ext.lowercaseString];
+    BOOL hit = [dd_media_ext_set() containsObject:ext.lowercaseString];
     if (!hit) dd_log(@"[menu] 文件非含音轨容器 ext=%@ → 不挂「转语音」", ext.lowercaseString);
     return hit;
 }
