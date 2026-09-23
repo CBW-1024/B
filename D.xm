@@ -156,9 +156,20 @@
 //       DD小丑助手的 DDJokerMenuItem 就是单一路径 `[[MMMenuItem alloc] initWithTitle:title
 //       svgName:@"icons_filled_sticker" target:target action:action]`（其源码 993~1000 行），
 //       图标由微信内部渲染，无需自行转 UIImage。故本版回归原生单一路径：
-//       `-initWithTitle:svgName:target:action:`（MMMenuItem.h:18）+ svg 名 icon_filled_record_voice.svg
-//       （用户确认存在）。删除 v1.0.14 的 WCSVGImage 自加载 / setIconImage: / 双保险兜底，
-//       与其他插件在同一条被验证可行的路径上。
+//       `-initWithTitle:svgName:target:action:`（MMMenuItem.h:18）+ svg 名 icon_filled_record_voice。
+//       （实测带 .svg 后缀微信资源表查不到 → 无图标；DD小丑助手 用裸名 icons_filled_sticker 即出图标，
+//        证实微信 svg 注册名不带后缀。用户确认的 icon_filled_record_voice.svg 是物理文件名，注册 key 去后缀。）
+//       删除 v1.0.14 的 WCSVGImage 自加载 / setIconImage: / 双保险兜底，与其他插件同路径。
+//   v1.0.16（据 2026-09-23 12:47 真机日志再修两个功能性问题）：
+//       ① 文件转语音闪退（仍崩，@try 兜不住 SIGSEGV）：根因是「抽到半下载文件 → 损坏 SILK → ResendVoiceMsg C 层崩」。
+//          - dd_wait_local_path 原只查文件存在，现改为连续两轮大小一致才算下载完成（避免抽到微信下载中的半文件）；
+//            超时仍不稳定则放弃转换（return nil → 上层走「下载失败/超时」分支，绝不把半文件交给编码/ResendVoiceMsg）。
+//          - dd_send_voice 在 addMessageToDB 之前先校验 aud 是合法 SILK 容器（dd_silk_frames_valid），
+//            损坏则放弃、绝不落库，从源头避免「闪退 → 重启后微信用损坏数据自动重发」死循环。
+//       ② 语音转文件「重启后名字大小变」：日志证实 AddAppMsg+StartUploadAppMsg 均已调用、发送结果=1；
+//          微信收到文件消息后会用消息 localID 重命名（如 26.m4a）并重新封装 m4a（大小变），这是微信文件消息的
+//          正常存储行为；"被清理/打不开"多因 StartUploadAppMsg 触发后用户在上传完成前就重启（本例仅 12s）。
+//          已在 AddAppMsg 后记录微信分配的 localID，便于对照"名字变"即该 localID。
 //
 //  锚定证据（微信头文件 dump / WCRefine 加载态 dump）：
 //   · 文件数据路径 —— CMessageWrap +GetPathOfAppData:msgWrap            (CMessageWrap.h:26)
@@ -355,6 +366,7 @@
 - (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;               // CMessageMgr.h:273（触发上传）
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;                                            // CMessageMgr.h:191
 - (void)AddMsg:(id)a0 MsgWrap:(id)a1;                                                 // CMessageMgr.h:194
+- (BOOL)SaveMesVoice:(id)a0 MsgWrap:(id)a1;                                          // CMessageMgr.h:29（语音元数据落库）
 // ⚠ addMessageToDB: 只有 AudioSender 有（AudioSender.h:13），CMessageMgr 没有 ——
 //   v1.0.2 把它误写在 CMessageMgr 上，调用点 respondsToSelector 永远为 NO → 兜底发送静默失败。
 //   v1.0.3 改为上面真实存在的 AddLocalMsg: / AddMsg:。
@@ -518,7 +530,7 @@
 #define kDDLogDirName    @"DDVoiceAssistantLogs"
 #define kDDLogFileName   @"ddvoice_debug.log"
 #define kDDPluginName    @"DD语音助手"
-#define kDDPluginVersion @"1.0.15"
+#define kDDPluginVersion @"1.0.16"
 
 @interface DDLogStore : NSObject
 + (instancetype)shared;
@@ -796,6 +808,7 @@ static BOOL dd_file_ready_of_cell(id cell) {
 // 前向声明：下面会复用 dd_file_path_of_msg 的权威路径通道（两者定义在文件靠后处）
 static id dd_app_item_of_msg(CMessageWrap *msg);
 static NSString *dd_file_path_of_msg(CMessageWrap *msg);
+static BOOL dd_silk_frames_valid(NSData *d);   // 定义见文件靠后处；dd_send_voice 等前置调用需此声明
 // 证据：AppVideoMessageViewModel 无自己的视频路径属性（AppVideoMessageViewModel.h 仅
 //       coverImgUrl/isWSVideo/titleText 等），视频文件落在消息数据项里，与文件消息同通道。
 static NSString *dd_appvideo_path_of_msg(CMessageWrap *msg) {
@@ -1017,19 +1030,36 @@ static void dd_trigger_file_download(CMessageWrap *msg) {
 }
 
 // 轮询等待本地文件出现（自动下载是异步的，WCR 用 downloadMgr + completion 回调，此处用路径轮询兜底）
+// 轮询等待本地文件「下载/写入完成」：不仅看文件存在，还要连续两轮大小一致才算就绪
+// （微信下载中的文件已经存在、但内容还在写；抽到半下载文件 → 损坏音频 → 损坏 SILK →
+//  ResendVoiceMsg 内部 C 层崩溃（SIGSEGV，@try 兜不住）。所以必须等大小稳定）。
 static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     NSUInteger rounds = 0;
+    long long prevSize = -1;
     while ([deadline timeIntervalSinceNow] > 0) {
         NSString *p = pathBlock();
         if (dd_file_exists(p)) {
-            dd_log(@"[download.wait] 第 %lu 轮轮询命中 → %@", (unsigned long)rounds, p);
-            return p;
+            long long sz = -1;
+            @try {
+                NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+                if (a) sz = [a[NSFileSize] longLongValue];
+            } @catch (...) {}
+            if (sz > 0 && sz == prevSize) {   // 连续两轮大小一致 → 写入已完成
+                dd_log(@"[download.wait] 第 %lu 轮大小稳定(%lld) → 文件就绪 %@", (unsigned long)rounds, sz, p);
+                return p;
+            }
+            dd_log(@"[download.wait] 第 %lu 轮命中但大小未稳定(sz=%lld 上一轮=%lld) → 继续等",
+                  (unsigned long)rounds, sz, prevSize);
+            prevSize = sz;
         }
         rounds++;
         [NSThread sleepForTimeInterval:0.5];
     }
-    dd_log(@"[download.wait] 超时 %.0fs 仍未出现本地文件（共轮询 %lu 轮）", timeout, (unsigned long)rounds);
+    // 超时仍不稳定 → 放弃（return nil → 上层走「下载失败/超时，放弃转换」），
+    // 绝不把半下载文件交给抽取/编码/ResendVoiceMsg，从根上避免「点转语音 → 闪退」。
+    dd_log(@"[download.wait] 超时 %.0fs 文件仍未就绪（共轮询 %lu 轮），放弃转换以免抽到半下载文件",
+          timeout, (unsigned long)rounds);
     return nil;
 }
 
@@ -1092,6 +1122,14 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     dd_log(@"[voice.send] usr=%@ aud=%@ data=%lu 字节 duration=%ums",
           usr ?: @"(nil)", audPath ?: @"(nil)", (unsigned long)data.length, duration);
     if (data.length == 0) { dd_log(@"[voice.send] 语音数据为空，放弃发送"); return NO; }
+    // v1.0.16：发送前校验 SILK 容器自洽。损坏的 aud 交给 ResendVoiceMsg 会触发微信内部 C 层崩溃
+    // （SIGSEGV，@try 兜不住），且因为下方 addMessageToDB 已落库，重启后微信会用同一损坏数据自动重发，
+    // 形成「点转语音 → 闪退 → 重启后仍在发损坏语音」的死循环。故损坏就在此处放弃、绝不落库。
+    if (!dd_silk_frames_valid(data)) {
+        dd_log(@"[voice.send] ⚠ aud 不是合法 SILK 容器(%lu 字节)，放弃发送以免 ResendVoiceMsg 崩溃",
+              (unsigned long)data.length);
+        return NO;
+    }
     AudioSender *sender = (AudioSender *)dd_mm_service(@"AudioSender");
     if (!sender) { dd_log(@"[voice.send] 取不到 AudioSender 服务"); return NO; }
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDMCVoiceMsgType];
@@ -1104,10 +1142,30 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     [wrap setM_uiCreateTime:createTime];
     [wrap setM_uiStatus:kDDMCStatusSending];
     dd_configureVoiceMsg(wrap, data, duration);
-    BOOL added = NO;
-    if ([sender respondsToSelector:@selector(addMessageToDB:)]) added = [sender addMessageToDB:wrap];
-    dd_log(@"[voice.send] addMessageToDB=%d localID=%u", added, wrap.m_uiMesLocalID);
-    dd_install_audio_file(wrap, audPath);
+    // v1.0.17：发送链路对齐 WCRefine（_WCRefineSendVoiceDataToChat @0x8ded1c）。
+    // 关键差异：必须用 CMessageMgr -AddLocalMsg:MsgWrap: 分配 localID 并落库，而不是
+    // AudioSender -addMessageToDB:。8.0.79 里 addMessageToDB: 不分配 m_uiMesLocalID（实测 localID=0），
+    // 导致 dd_install_audio_file 里 GetPathOfMesAudio:LocalID: 走不到，落到 getPathOfMsgImg 字符串
+    // 兜底 → 算错/算不出规范语音路径 → ResendVoiceMsg 按 localID 读不到 SILK → C 层 SIGSEGV（@try 兜不住）。
+    // WCR 链路顺序：AddLocalMsg(分配 localID) → 写 SILK 到规范路径 → SaveMesVoice → ResendVoiceMsg。
+    CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
+    if (mgr && [mgr respondsToSelector:@selector(AddLocalMsg:MsgWrap:)]) {
+        [mgr AddLocalMsg:usr MsgWrap:wrap];   // void 返回，localID 写回 wrap.m_uiMesLocalID
+        dd_log(@"[voice.send] AddLocalMsg → localID=%u", wrap.m_uiMesLocalID);
+    } else {
+        // 极端兜底：退回 AudioSender.addMessageToDB:（仅旧版/缺失 AddLocalMsg 时）
+        if ([sender respondsToSelector:@selector(addMessageToDB:)]) [sender addMessageToDB:wrap];
+        dd_log(@"[voice.send] CMessageMgr 无 AddLocalMsg，已回退 addMessageToDB: localID=%u", wrap.m_uiMesLocalID);
+    }
+    // 写 SILK 到规范语音路径（依赖上面刚分配的 localID）
+    NSString *installed = dd_install_audio_file(wrap, audPath);
+    dd_log(@"[voice.send] 语音落地路径=%@", installed ?: @"(nil)");
+    // WCR 在写文件后调 CMessageMgr -SaveMesVoice:MsgWrap: 把语音元数据落库（CMessageMgr.h:29）。
+    // 8.0.79 第一项参数语义不明，传 nil（ObjC 对 nil 消息安全），@try 内保护，失败仅记日志不阻断。
+    if (mgr && [mgr respondsToSelector:@selector(SaveMesVoice:MsgWrap:)]) {
+        @try { [mgr SaveMesVoice:nil MsgWrap:wrap]; }
+        @catch (NSException *e) { dd_log(@"[voice.send] SaveMesVoice 异常 %@", e.reason); }
+    }
     if ([sender respondsToSelector:@selector(ResendVoiceMsg:MsgWrap:)]) {
         [sender ResendVoiceMsg:usr MsgWrap:wrap];
         dd_log(@"[voice.send] 已调用 ResendVoiceMsg，会话=%@", usr ?: @"(nil)");
@@ -1768,7 +1826,7 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     if ([mgr respondsToSelector:@selector(AddAppMsg:MsgWrap:DataPath:Scene:)]) {
         [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
-        dd_log(@"[file.send] 已调用 AddAppMsg:MsgWrap:DataPath:Scene:");
+        dd_log(@"[file.send] 已调用 AddAppMsg:MsgWrap:DataPath:Scene: → 微信分配 localID=%u", wrap.m_uiMesLocalID);
         // v1.0.11：AddAppMsg 只做「本地落库 + 把文件拷进 OpenData」这一步，**不上传** →
         // 消息 status 停在 Sending、服务器无该文件记录 → 微信把文件消息当「未下载」，
         // 重启/系统清理本地缓存后显示 0B（用户截图 23.dat 0B + 「接收文件」按钮，23 即该消息
@@ -1882,7 +1940,9 @@ static void dd_voice_to_file(CMessageWrap *msg) {
 
 #pragma mark - 菜单图标（用户确认 icon_filled_record_voice.svg 在 8.0.79 内置资源中存在，不做兜底）
 
-// 用户确认 icon_filled_record_voice.svg 在 8.0.79 内置资源中存在，直接吃这个 svg 资源名，
+// 用户确认 icon_filled_record_voice.svg 在 8.0.79 内置资源中存在（物理文件名带 .svg），
+// 但微信 svg 资源表的注册名不带后缀（DD小丑助手 用裸名 icons_filled_sticker 即出图标），
+// 故这里传去后缀的 icon_filled_record_voice。直接吃这个 svg 资源名，
 // 不走任何兜底（不借原生图标、不做纯文字）。initWithTitle:svgName:target:action:（MMMenuItem.h:18）。
 // 8.0.79 的 MMMenuItem **既没有 title getter 也没有 action getter**（51 行的头文件里只有 target），
 // 所以原先用 `it.action == action` 去重的做法在这版本上恒不成立（同一 action 会被重复注入）。
@@ -1903,7 +1963,7 @@ static MMMenuItem *dd_convertMenuItem(NSString *title, id target, SEL action, NS
     // 用户确认的内置 svg 资源名 icon_filled_record_voice.svg，直接交给原生构造器（不做兜底）。
     @try {
         item = [[cls alloc] initWithTitle:title
-                                  svgName:@"icon_filled_record_voice.svg"
+                                  svgName:@"icon_filled_record_voice"
                                    target:target
                                    action:action];
     } @catch (NSException *e) {
