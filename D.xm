@@ -80,6 +80,7 @@
 - (BOOL)m_bForward;                                 // CMessageWrap.h:269
 - (void)setM_bForward:(BOOL)arg1;                   // CMessageWrap.h:590
 - (id)getVoicePath;                                 // CMessageWrap.h:362
+- (void)setM_nsVoicePath:(NSString *)arg1;          // WCR 0x8dfec0（dump 未导出，运行时存在，发送侧必设）
 + (id)getPathOfAudio:(id)arg1;                      // CMessageWrap.h:66
 + (id)GetPathOfAppData:(id)arg1;                    // CMessageWrap.h:26
 + (void)GetPathOfAppDataByUserName:(id)usr andMessageWrap:(id)wrap retStrPath:(void *)pp;  // CMessageWrap.h:108
@@ -133,6 +134,8 @@
 @interface CMessageMgr : NSObject
 - (void)StartDownloadVideo:(id)a0 MsgWrap:(id)a1 Priority:(BOOL)a2 Silent:(BOOL)a3;   // :269
 - (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2;                  // :32
+- (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2 autoDownload:(BOOL)a3;          // :33
+- (void)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 AttachId:(id)a2 AttachDataSize:(unsigned int)a3 AttachFileExt:(id)a4;  // :256
 - (void)AddAppMsg:(id)a0 MsgWrap:(id)a1 DataPath:(id)a2 Scene:(unsigned int)a3;        // :187
 - (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;                // :273
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;                                             // :191
@@ -280,9 +283,11 @@ static dispatch_queue_t dd_convert_queue;
         _q = dispatch_queue_create("com.ddvoice.log", DISPATCH_QUEUE_SERIAL);
         _lines = [NSMutableArray array];
         _enabled = YES;
-        NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *doc = dirs.firstObject.length ? dirs.firstObject : NSTemporaryDirectory();
-        _logDir  = [doc stringByAppendingPathComponent:@"DDVoiceAssistantLogs"];
+        // 日志落 Library/Preferences/DDMediaConvertLogs：Documents/下载缓存会被微信清理，重启即丢。
+        NSArray<NSString *> *libDirs = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+        NSString *lib = libDirs.firstObject.length ? libDirs.firstObject : NSHomeDirectory();
+        NSString *pref = [lib stringByAppendingPathComponent:@"Preferences"];
+        _logDir  = [pref stringByAppendingPathComponent:@"DDMediaConvertLogs"];
         _logPath = [_logDir stringByAppendingPathComponent:@"ddvoice_debug.log"];
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm createDirectoryAtPath:_logDir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -518,19 +523,47 @@ static void dd_trigger_video_download(CMessageWrap *msg) {
         dd_log(@"[download.video] 已触发 StartDownloadVideo localID=%u", msg.m_uiMesLocalID);
     }
 }
-static void dd_trigger_file_download(CMessageWrap *msg) {
-    if (!msg) return;
+// 文件消息下载：基础触发 StartDownloadAppAttach:MsgWrap:Silent:（CMessageMgr.h:32）。
+// 若返回 NO（典型为 m_uiDownloadStatus==9 被误判“已下载”，但微信已清理 down 缓存 → 磁盘缺文件），
+// 改用 CMessageMgr.h:256 的 StartDownloadAppAttach:MsgWrap:AttachId:AttachDataSize:AttachFileExt:
+// 按 attachId 强制定向重拉，绕过状态误判。
+static BOOL dd_trigger_file_download(CMessageWrap *msg) {
+    if (!dd_is_msg_wrap(msg)) return NO;
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-    if ([mgr respondsToSelector:@selector(StartDownloadAppAttach:MsgWrap:Silent:)]) {
-        [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES];
-        dd_log(@"[download.file] 已触发 StartDownloadAppAttach localID=%u", msg.m_uiMesLocalID);
+    if (!mgr) return NO;
+    NSString *path = dd_file_path_of_msg(msg);
+    BOOL missingButMarked = (msg.m_uiDownloadStatus == 9) && !dd_file_exists(path);
+    BOOL forced = NO;
+    if (missingButMarked &&
+        [mgr respondsToSelector:@selector(StartDownloadAppAttach:MsgWrap:AttachId:AttachDataSize:AttachFileExt:)]) {
+        id app = [msg respondsToSelector:@selector(m_extendInfoWithMsgType)] ? [msg m_extendInfoWithMsgType] : nil;
+        NSString *aid = [app respondsToSelector:@selector(m_nsAppAttachID)] ? [app m_nsAppAttachID] : nil;
+        NSString *ext = [app respondsToSelector:@selector(m_nsAppFileExt)] ? [app m_nsAppFileExt] : nil;
+        unsigned long long sz = [app respondsToSelector:@selector(m_uiAppDataSize)] ? [app m_uiAppDataSize] : 0;
+        if (aid.length) {
+            [mgr StartDownloadAppAttach:nil MsgWrap:msg AttachId:aid
+                          AttachDataSize:(unsigned int)sz AttachFileExt:ext];
+            dd_log(@"[download.file] 强制重拉 attachId=%@ size=%llu ext=%@ (磁盘缺文件且状态=9)", aid, sz, ext);
+            forced = YES;
+        }
     }
+    if (!forced && [mgr respondsToSelector:@selector(StartDownloadAppAttach:MsgWrap:Silent:)]) {
+        BOOL ok = [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES];
+        dd_log(@"[download.file] StartDownloadAppAttach → %@ localID=%u", ok ? @"YES" : @"NO", msg.m_uiMesLocalID);
+        if (!ok && [mgr respondsToSelector:@selector(StartDownloadAppAttach:MsgWrap:Silent:autoDownload:)]) {
+            ok = [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES autoDownload:YES];
+            dd_log(@"[download.file] autoDownload 兜底 → %@", ok ? @"YES" : @"NO");
+        }
+        return ok;
+    }
+    return forced;
 }
 // 轮询等待文件下载/写入完成：连续两轮大小一致才算就绪（半下载文件会让 SILK 编码产出损坏数据，
 // 进而使 ResendVoiceMsg 内部 C 层 SIGSEGV —— @try 兜不住）
 static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     long long prevSize = -1;
+    NSTimeInterval lastLog = 0;
     while ([deadline timeIntervalSinceNow] > 0) {
         NSString *p = pathBlock();
         if (dd_file_exists(p)) {
@@ -538,6 +571,12 @@ static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval
             long long sz = a ? [a[NSFileSize] longLongValue] : -1;
             if (sz > 0 && sz == prevSize) { dd_log(@"[download.wait] 大小稳定(%lld) → 就绪 %@", sz, p); return p; }
             prevSize = sz;
+        }
+        NSTimeInterval now = [NSDate.date timeIntervalSince1970];
+        if (now - lastLog >= 3.0) {   // 每 3s 一条，避免刷屏；持久化日志里能看清下载是否推进
+            dd_log(@"[download.wait] 轮询中 路径=%@ 存在=%d 大小=%lld",
+                   p ?: @"(空)", dd_file_exists(p), prevSize);
+            lastLog = now;
         }
         [NSThread sleepForTimeInterval:0.5];
     }
@@ -689,10 +728,13 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddLocalMsg:usr MsgWrap:wrap];
     dd_log(@"[voice.send] AddLocalMsg → localID=%u", wrap.m_uiMesLocalID);
-    dd_install_audio_file(wrap, audPath);
-    if ([mgr respondsToSelector:@selector(SaveMesVoice:MsgWrap:)]) [mgr SaveMesVoice:nil MsgWrap:wrap];
+    NSString *voicePath = dd_install_audio_file(wrap, audPath);   // 写 SILK 到规范路径（GetPathOfMesAudio）
+    if (voicePath.length && [wrap respondsToSelector:@selector(setM_nsVoicePath:)])
+        [wrap setM_nsVoicePath:voicePath];   // WCR 0x8dfec0：缺则 ResendVoiceMsg/重启重建按 localID 读错文件 → 转圈
+    if ([mgr respondsToSelector:@selector(SaveMesVoice:MsgWrap:)])
+        [mgr SaveMesVoice:data MsgWrap:wrap];  // WCR 0x8dff24：首参传 SILK 数据（落语音库记录），传 nil 等于不落库
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
-    dd_log(@"[voice.send] 已发送，会话=%@", usr ?: @"(nil)");
+    dd_log(@"[voice.send] 已发送 voicePath=%@ 会话=%@", voicePath ?: @"(空)", usr ?: @"(nil)");
     return YES;
 }
 // 抽音轨为 16bit / 单声道 / 16000Hz PCM（输出字典 7 键，对齐 WCRefine sub_0x8f1bc8）
@@ -744,6 +786,7 @@ static void dd_media_to_voice(CMessageWrap *msg, NSString *(^pathBlock)(void), v
         if (!dd_file_exists(path)) {
             if (downloadBlock) downloadBlock();
             path = dd_wait_local_path(pathBlock, kDDMCDownloadTimeout);
+            dd_log(@"[media→voice] 下载后解析路径=%@ 存在=%d", path ?: @"(空)", dd_file_exists(path));
         }
         if (!dd_file_exists(path)) { dd_log(@"[media→voice] 下载失败/超时，放弃"); return; }
         NSData *fileData = [NSData dataWithContentsOfFile:path];
@@ -1150,7 +1193,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
         dd_convert_queue = dispatch_queue_create("com.ddmedia.convert", DISPATCH_QUEUE_SERIAL);
         [DDLogStore shared].enabled = [DDMediaConvertConfig shared].logEnabled;
         [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD语音助手"
-                                                              version:@"1.0.23"
+                                                              version:@"1.0.25"
                                                            controller:@"DDMediaConvertSettingsViewController"];
     }
 }
