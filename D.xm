@@ -483,9 +483,6 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         }
         if (!dd_file_exists(path)) return;
         double duration = 0;
-        // 只取文件大小，不读全文（视频可能数十 MB，抽音轨走 AVAssetReader 不需要 NSData）。
-        unsigned long long fsize = [[[NSFileManager defaultManager] attributesOfItemAtPath:path
-                                                                                    error:nil][NSFileSize] unsignedLongLongValue];
         NSData *aud = nil;
         NSString *ext = path.pathExtension.lowercaseString;
         // 源是微信 SILK 容器（aud/silk）→ 原样复用，不二次编码；帧链不自洽直接放弃。
