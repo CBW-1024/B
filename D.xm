@@ -580,24 +580,28 @@ static NSData *dd_silk_normalize(NSData *d) {
     }
     return nil;
 }
-// PCM → SILK：类方法为主路径（WCRefine sub_0x8f2804 @0x8f2890）。产物必须过 MJSilkCodec
-// 回环解码验证——解不回 = 微信播放器也解不出 = 静音，宁可放弃发送（实例 API 兜底实测冗余已删）。
+// PCM → SILK（WCRefine sub_0x8f2804 @0x8f2890）。
+//
+// 【崩溃实证 · 勿恢复回环解码验证】原实现编码后调 decodeToPCMFromSilkData: 把产物解回 PCM 做
+// 「能不能解回来」的验证。真机日志 + 信号栈证明它就是闪退根因：
+//   01:39:23 文件→语音 36s 素材 → 回环一次性解出 PCM 1157120 字节 → 发送结果=1
+//   01:39:2x [CRASH] signal=11 SIGSEGV
+//            _pthread_wqthread → _dispatch_root_queue_drain → objc_autoreleasePoolPop → objc_release
+//   同样链路的 16s 素材（回环 PCM 512640 字节）从不崩溃 —— 一次性解码的堆破坏随 PCM 长度触发，
+//   超过约 1MB 即写坏堆，随后 dd_convert_queue 的 autorelease pool 释放任何对象都会炸。
+// 该检查同时也从未失败过（每份日志恒为「选中可解码容器」），属纯冗余，故删除。
+// 产物校验交由 dd_silk_frames_valid 承担：纯字节扫描帧链，不进解码器、不分配大内存。
 static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (pcm.length == 0) return nil;
     Class codec = objc_getClass("MJSilkCodec");
     if (!codec || ![codec respondsToSelector:@selector(encodeToSilkFromPCMData:)]) return nil;
     NSData *raw = [codec encodeToSilkFromPCMData:pcm];
     if (raw.length == 0) { dd_log(@"[silk.enc] 编码为空，放弃"); return nil; }
-    for (NSData *c in @[raw, dd_silk_normalize(raw) ?: raw]) {
-        NSData *p = [codec decodeToPCMFromSilkData:c];
-        if (p.length > 0) {
-            dd_log(@"[silk.enc] 选中可解码容器 magic%d（%lu → PCM %lu 字节）",
-                  dd_silk_has_magic10(c) ? 10 : 9, (unsigned long)c.length, (unsigned long)p.length);
-            return c;
-        }
-    }
-    dd_log(@"[silk.enc] ⚠ 产物回环解码为 0 字节，放弃发送以免静音");
-    return nil;
+    NSData *silk = dd_silk_normalize(raw) ?: raw;
+    if (!dd_silk_frames_valid(silk)) { dd_log(@"[silk.enc] 帧链校验失败，放弃"); return nil; }
+    dd_log(@"[silk.enc] 产物 magic%d 长度=%lu 字节（源 PCM %lu 字节）",
+           dd_silk_has_magic10(silk) ? 10 : 9, (unsigned long)silk.length, (unsigned long)pcm.length);
+    return silk;
 }
 // SILK → PCM：候选顺序照 WCR 容器认知（\x02#!SILK_V3 原文优先）；帧链不自洽的不喂解码器
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
