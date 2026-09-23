@@ -476,10 +476,27 @@ static NSString *dd_video_path_of_cell(id cell) {
 //     retStrPath: 是全工程唯一的 void* 出参调用点。
 //   · 曾换成 GetPathOfAppData:LocalID:FileExt:retStrPath:（:106）照样崩 —— 同样是 void* 出参。
 //   · 路径解析曾搬到主线程 → 崩得更早：主线程 runloop pool 每次循环都 pop，double release 立刻爆。
-// 反汇编对照：WCRefine.dylib 字符串表与 selref 中**不存在** GetPathOfAppDataByUserName:...:
-// retStrPath:（也没有 filePathFromMsgWrap），WCR 只用返回值版 `+(id) GetPathOfAppData:(id)`
-// （CMessageWrap.h:26，selref 槽 0x269e218）—— WCR 从不让 ARC 去猜 void* 出参的所有权。
-// 修法：用 __unsafe_unretained 接住出参（ARC 不 release 它），再赋给 __strong 让 ARC 正常持有。
+// 反汇编对照（锤子 WeChatTweak.dylib，同样 ARC 编译、同样用这个 API）：它的调用现场在出参返回后
+// **立刻对结果做一次 retain**，与下面的写法生成的代码一致：
+//     0x7a31e0  str xzr,[sp,#0x18]     ; 局部置 nil
+//     0x7a31e4  add x4,sp,#0x18        ; x4 = &local（retStrPath 参数）
+//     0x7a31f4  bl  #0x8cc920          ; GetPathOfAppDataByUserName:andMessageWrap:retStrPath:
+//     0x7a31f8  ldr x21,[sp,#0x18]     ; 取出结果
+//     0x7a3200  bl  #0x8ca0fc          ; ★ objc_retain（stub → __la_symbol_ptr 0xcc9528）
+//   （另两处调用点 0x7ce3e0 / 0x7eb4d8 模式完全相同）
+// 而 WCRefine.dylib 的字符串表/selref 里**不存在**该 selector（也无 filePathFromMsgWrap），
+// WCR 走的是返回值版 `+(id) GetPathOfAppData:(id)`（CMessageWrap.h:26，selref 槽 0x269e218）。
+// 两条路都指向同一结论：不能让 ARC 凭空去猜 void* 出参的所有权。
+//
+// LLVM IR 级验证（clang -fobjc-arc -S -emit-llvm，最小复现）：
+//   before（NSString *p; ...&p;  return p;）
+//       retain(A) → storeStrong(p,nil) 即 release(A) → autoreleaseReturnValue(A)
+//       ⇒ 保留计数净 0，却**多出一条 autorelease 记录**（微信那条仍在池里）
+//       ⇒ pool pop 时 release 两次而计数只够一次 → over-release → SIGSEGV
+//   after（NSString * __unsafe_unretained raw; ...&raw; NSString *p = raw; return p;）
+//       retain(A) → retain(A) → release(A) → autoreleaseReturnValue(A)
+//       ⇒ 池里两条 autorelease 记录各有一份 retain 对应 → 平衡
+// 修法：用 __unsafe_unretained 接住出参，再赋给 __strong —— 让 ARC 补上那次缺失的 retain。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
     NSString * __unsafe_unretained raw = nil;
