@@ -475,15 +475,14 @@ static id dd_app_item_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
     return [msg respondsToSelector:@selector(m_extendInfoWithMsgType)] ? [msg m_extendInfoWithMsgType] : nil;
 }
-// 文件消息本地路径：GetPathOfAppData:（CMessageWrap.h:26）+ GetPathOfAppDataByUserName:（:108）
-// + 数据项路径键。注意本函数会在 GetPathOfAppData: 内部崩（未下载/字段残缺）——只在「点击后」调用，
-// 绝不在建菜单阶段调用（参见 WCR WCRefineAppendVoiceToolsMediaMenuItems 0x8dd96c 的做法）。
+// 文件消息本地路径：GetPathOfAppData:（CMessageWrap.h:26）最权威，但「未下载/字段残缺时内部崩」
+// —— 这正是「文件转语音」点击即崩的根因（后台全局队列 autorelease pool pop + PAC 失败 SIGSEGV）。
+// 故把它降级为「已下载(m_uiDownloadStatus==9)才调用」的兜底，优先用对残缺字段安全的来源：
+// GetPathOfAppDataByUserName:（:108）与 extendInfo 键（CMessageWrap.h:382）。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
     Class wrapCls = objc_getClass("CMessageWrap");
     NSMutableArray<NSString *> *cands = [NSMutableArray array];
-    NSString *p = (NSString *)[wrapCls GetPathOfAppData:msg];
-    if ([p isKindOfClass:[NSString class]] && p.length) [cands addObject:p];
     NSString *p2 = nil;
     [wrapCls GetPathOfAppDataByUserName:dd_current_usr_name() andMessageWrap:msg retStrPath:&p2];
     if ([p2 isKindOfClass:[NSString class]] && p2.length) [cands addObject:p2];
@@ -495,12 +494,18 @@ static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     NSUInteger idx = 0;
     for (NSString *c in cands) {
         if (dd_file_exists(c)) {
-            dd_log(@"[path.file] 命中候选#%lu → %@", (unsigned long)idx, c);
+            dd_log(@"[path.file] 命中安全来源#%lu → %@", (unsigned long)idx, c);
             return c;
         }
         idx++;
     }
-    return cands.count ? cands.firstObject : nil;   // 未下载完也返回路径供下载轮询
+    // 已下载后字段完整，GetPathOfAppData: 才安全；取其权威路径（处理子目录/多分片）
+    if (msg.m_uiDownloadStatus == 9) {
+        NSString *p = (NSString *)[wrapCls GetPathOfAppData:msg];
+        if ([p isKindOfClass:[NSString class]] && p.length) [cands addObject:p];
+        for (NSString *c in cands) if (dd_file_exists(c)) return c;
+    }
+    return cands.lastObject;   // 未下载完也返回路径供下载轮询
 }
 // 应用视频/视频号视频路径：与文件消息同通道
 static NSString *dd_appvideo_path_of_msg(CMessageWrap *msg) {
@@ -606,36 +611,23 @@ static NSData *dd_silk_normalize(NSData *d) {
     }
     return nil;
 }
-// PCM → SILK：类方法为主路径（WCRefine sub_0x8f2804 @0x8f2890），实例 API 兜底（写死 16000Hz）。
-// 产物必须过 MJSilkCodec 回环解码验证——解不回 = 微信播放器也解不出 = 静音，宁可放弃发送。
+// PCM → SILK：类方法为主路径（WCRefine sub_0x8f2804 @0x8f2890）。产物必须过 MJSilkCodec
+// 回环解码验证——解不回 = 微信播放器也解不出 = 静音，宁可放弃发送（实例 API 兜底实测冗余已删）。
 static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (pcm.length == 0) return nil;
     Class codec = objc_getClass("MJSilkCodec");
-    if (!codec) return nil;
-    NSMutableArray<NSData *> *raws = [NSMutableArray arrayWithCapacity:2];
-    if ([codec respondsToSelector:@selector(encodeToSilkFromPCMData:)]) {
-        NSData *raw = [codec encodeToSilkFromPCMData:pcm];
-        if (raw.length) [raws addObject:raw];
-    }
-    if ([codec instancesRespondToSelector:@selector(initEncoderWithSampleRate:)] &&
-        [codec instancesRespondToSelector:@selector(encodeFromPCMData:)]) {
-        id inst = [[codec alloc] init];
-        if ([inst initEncoderWithSampleRate:(long long)kDDMCVoiceSampleRate]) {
-            NSData *raw = [inst encodeFromPCMData:pcm];
-            if (raw.length) [raws addObject:raw];
+    if (!codec || ![codec respondsToSelector:@selector(encodeToSilkFromPCMData:)]) return nil;
+    NSData *raw = [codec encodeToSilkFromPCMData:pcm];
+    if (raw.length == 0) { dd_log(@"[silk.enc] 编码为空，放弃"); return nil; }
+    for (NSData *c in @[raw, dd_silk_normalize(raw) ?: raw]) {
+        NSData *p = [codec decodeToPCMFromSilkData:c];
+        if (p.length > 0) {
+            dd_log(@"[silk.enc] 选中可解码容器 magic%d（%lu → PCM %lu 字节）",
+                  dd_silk_has_magic10(c) ? 10 : 9, (unsigned long)c.length, (unsigned long)p.length);
+            return c;
         }
     }
-    for (NSData *raw in raws) {
-        for (NSData *c in @[raw, dd_silk_normalize(raw) ?: raw]) {
-            NSData *p = [codec decodeToPCMFromSilkData:c];
-            if (p.length > 0) {
-                dd_log(@"[silk.enc] 选中可解码容器 magic%d（%lu → PCM %lu 字节）",
-                      dd_silk_has_magic10(c) ? 10 : 9, (unsigned long)c.length, (unsigned long)p.length);
-                return c;
-            }
-        }
-    }
-    dd_log(@"[silk.enc] ⚠ 全部产物回环解码为 0 字节，放弃发送以免静音");
+    dd_log(@"[silk.enc] ⚠ 产物回环解码为 0 字节，放弃发送以免静音");
     return nil;
 }
 // SILK → PCM：候选顺序照 WCR 容器认知（\x02#!SILK_V3 原文优先）；帧链不自洽的不喂解码器
@@ -1192,7 +1184,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
         dd_convert_queue = dispatch_queue_create("com.ddmedia.convert", DISPATCH_QUEUE_SERIAL);
         [DDLogStore shared].enabled = [DDMediaConvertConfig shared].logEnabled;
         [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD语音助手"
-                                                              version:@"1.0.21"
+                                                              version:@"1.0.22"
                                                            controller:@"DDMediaConvertSettingsViewController"];
     }
 }
