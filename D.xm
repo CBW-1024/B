@@ -1,30 +1,17 @@
-//  DD语音助手 —— 微信媒体互转（Theos/Logos 单文件）
+//  DD语音助手 —— 微信媒体互转（Theos/Logos 单文件插件）
+//
 //  长按消息 → 原生长按菜单追加转换按钮 → 点击转换并发送到当前聊天：
-//    视频 / 文件消息 → 「转语音」→ SILK 语音消息
-//    语音消息        → 「转文件」→ m4a 文件消息
+//    视频 / 文件消息 →「转语音」→ SILK 语音消息
+//    语音消息       →「转文件」→ m4a 文件消息
 //  未下载的媒体先触发微信自动下载，下载完成后再转换。
 //
-//  本文件所有微信类/方法签名锚定微信 8.0.79 头文件 dump + WCRefine.dylib 反汇编。
-//  调试日志：设置页「调试日志」分组导出 / 清空（自签证书看不到 syslog，故落 App 沙盒）。
+//  方法签名锚定微信 8.0.79 头文件 dump。
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
-#import <Photos/Photos.h>
-#import <substrate.h>
 #include <string.h>
-#include <limits.h>
-#include <math.h>
-#include <signal.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <execinfo.h>
-
-// CI（Xcode 26 / iOS 26 SDK）开 -Werror，这两类警告会变 error
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-#pragma clang diagnostic ignored "-Wobjc-multiple-method-names"
 
 #pragma mark - 微信类声明（锚定 8.0.79 头文件 dump）
 
@@ -36,9 +23,7 @@
 @interface WCTableViewManager : NSObject
 - (id)initWithFrame:(struct CGRect)arg1 style:(long long)arg2;
 - (id)getTableView;
-- (void)clearAllSection;
 - (void)addSection:(id)arg1;
-- (void)reloadTableView;
 @property (nonatomic, weak) id delegate;
 @end
 
@@ -49,10 +34,9 @@
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 on:(_Bool)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 rightValue:(id)a4;
++ (id)normalCellForSel:(SEL)arg1 target:(id)a2 title:(id)a3 rightValue:(id)a4;
 @end
 
-// MMMenuItem.h:1 —— 父类是 NSObject（不是 UIMenuItem）；无 title/action getter，去重靠 userInfo
 @interface MMMenuItem : NSObject
 - (id)initWithTitle:(id)a0 svgName:(id)a1 target:(id)a2 action:(SEL)a3;   // MMMenuItem.h:18
 - (id)userInfo;                                                          // MMMenuItem.h:29
@@ -76,13 +60,13 @@
 - (void)setM_uiStatus:(unsigned int)arg1;
 - (void)setM_nsToUsr:(NSString *)arg1;
 - (void)setM_nsFromUsr:(NSString *)arg1;
-- (id)m_nsContent;                                  // CMessageWrap.h:402  消息正文（语音/appmsg XML）
+- (id)m_nsContent;                                  // CMessageWrap.h:402
 - (void)setM_nsContent:(id)arg1;                    // CMessageWrap.h:676
 - (unsigned int)m_uiDownloadStatus;                 // CMessageWrap.h:513
 - (void)setM_uiDownloadStatus:(unsigned int)arg1;   // CMessageWrap.h:711
 - (void)setM_bForward:(BOOL)arg1;                   // CMessageWrap.h:590
 - (id)getVoicePath;                                 // CMessageWrap.h:362
-- (void)setM_nsVoicePath:(NSString *)arg1;          // WCR 0x8dfec0（dump 未导出，运行时存在；语音规范路径，ResendVoiceMsg 据此定位 SILK）
+- (void)setM_nsVoicePath:(NSString *)arg1;          // 语音规范路径，ResendVoiceMsg 据此定位 SILK（运行时存在，dump 未导出）
 + (void)GetPathOfAppDataByUserName:(id)usr andMessageWrap:(id)wrap retStrPath:(void *)pp;  // CMessageWrap.h:108
 @end
 
@@ -91,8 +75,6 @@
 @property(retain, nonatomic) NSString *m_nsAppFileName;
 @property(retain, nonatomic) NSString *m_nsAppFileExt;
 @property(nonatomic) unsigned long long m_uiAppDataSize;
-@property(retain, nonatomic) NSString *m_nsAppMediaUrl;
-@property(retain, nonatomic) NSString *m_nsAppAttachID;
 - (id)init;
 - (void)setM_nsTitle:(id)arg1;
 - (void)setM_bAppAttachExistInSvr:(BOOL)arg1;
@@ -174,16 +156,14 @@ static NSString *const kDDMCPluginName = @"DD语音助手";
 #define kDDMCVideoToVoice @"kDDMCVideoToVoice"
 #define kDDMCFileToVoice  @"kDDMCFileToVoice"
 #define kDDMCVoiceToFile  @"kDDMCVoiceToFile"
-#define kDDMCLogEnabled   @"kDDMCLogEnabled"
 
-#define kDDMCVoiceMsgType 34          // 语音 (0x22)
-#define kDDMCAppMsgType   49          // app/文件 (0x31)
+#define kDDMCVoiceMsgType 34          // 语音
+#define kDDMCAppMsgType   49          // app/文件
 #define kDDMCAppInnerFile 6           // 文件 innerType
 #define kDDMCVoiceFormat  4           // SILK
 #define kDDMCVoiceEndFlag 1
 #define kDDMCStatusSending 1
-// 微信语音 PCM 参数（WCRefine sub_0x8f1bc8 @0x8f1f68 mov w2,#0x3e80 == 16000；单声道；16bit）
-#define kDDMCVoiceSampleRate 16000
+#define kDDMCVoiceSampleRate 16000    // 16kHz 单声道 16bit
 #define kDDMCDownloadTimeout 90.0
 
 @interface DDMediaConvertConfig : NSObject
@@ -191,7 +171,6 @@ static NSString *const kDDMCPluginName = @"DD语音助手";
 @property (assign, nonatomic) BOOL videoToVoiceEnabled;
 @property (assign, nonatomic) BOOL fileToVoiceEnabled;
 @property (assign, nonatomic) BOOL voiceToFileEnabled;
-@property (assign, nonatomic) BOOL logEnabled;
 @end
 
 @implementation DDMediaConvertConfig
@@ -205,7 +184,7 @@ static NSString *const kDDMCPluginName = @"DD语音助手";
     if (self != [DDMediaConvertConfig class]) return;
     [NSUserDefaults.standardUserDefaults registerDefaults:@{
         kDDMCVideoToVoice: @NO, kDDMCFileToVoice: @NO,
-        kDDMCVoiceToFile: @NO, kDDMCLogEnabled: @YES,
+        kDDMCVoiceToFile: @NO,
     }];
 }
 - (instancetype)init {
@@ -213,150 +192,16 @@ static NSString *const kDDMCPluginName = @"DD语音助手";
         _videoToVoiceEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDMCVideoToVoice];
         _fileToVoiceEnabled  = [NSUserDefaults.standardUserDefaults boolForKey:kDDMCFileToVoice];
         _voiceToFileEnabled  = [NSUserDefaults.standardUserDefaults boolForKey:kDDMCVoiceToFile];
-        _logEnabled          = [NSUserDefaults.standardUserDefaults boolForKey:kDDMCLogEnabled];
     }
     return self;
 }
 - (void)setVideoToVoiceEnabled:(BOOL)v { _videoToVoiceEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDMCVideoToVoice]; }
 - (void)setFileToVoiceEnabled:(BOOL)v { _fileToVoiceEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDMCFileToVoice]; }
 - (void)setVoiceToFileEnabled:(BOOL)v { _voiceToFileEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDMCVoiceToFile]; }
-- (void)setLogEnabled:(BOOL)v { _logEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDMCLogEnabled]; }
 @end
 
-#pragma mark - 调试日志
-
-// MJSilkCodec 的编解码类方法内部带全局编码器上下文、非线程安全（并发调用 → 堆损坏 →
-// 后台 GCD 队列 autorelease pool pop 时 SIGSEGV）。所有媒体转换收敛到此串行队列。
+// 编解码非线程安全，所有媒体转换统一走此串行队列。
 static dispatch_queue_t dd_convert_queue;
-
-@interface DDLogStore : NSObject
-+ (instancetype)shared;
-@property (nonatomic, assign) BOOL enabled;
-@property (nonatomic, copy)   NSString *logDir;
-@property (nonatomic, copy)   NSString *logPath;
-- (void)append:(NSString *)line;
-- (void)flushSync;
-- (void)clearAll;
-- (NSUInteger)lineCount;
-- (unsigned long long)fileSize;
-@end
-
-// 崩溃信号处理器只能用 async-signal-safe 的 open/write，不能走 Objective-C，
-// 故在此缓存日志文件的 C 路径（init 时写入一次，之后只读）。
-static char dd_log_c_path[PATH_MAX] = {0};
-
-@implementation DDLogStore {
-    NSFileHandle *_handle;
-    dispatch_queue_t _q;
-}
-+ (instancetype)shared {
-    static DDLogStore *s = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [DDLogStore new]; });
-    return s;
-}
-- (instancetype)init {
-    if (self = [super init]) {
-        _q = dispatch_queue_create("com.ddvoice.log", DISPATCH_QUEUE_SERIAL);
-        _enabled = YES;
-        // 日志落 Library/Preferences/DDMediaConvertLogs：Documents/下载缓存会被微信清理，重启即丢。
-        NSArray<NSString *> *libDirs = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
-        NSString *lib = libDirs.firstObject.length ? libDirs.firstObject : NSHomeDirectory();
-        NSString *pref = [lib stringByAppendingPathComponent:@"Preferences"];
-        _logDir  = [pref stringByAppendingPathComponent:@"DDMediaConvertLogs"];
-        _logPath = [_logDir stringByAppendingPathComponent:@"ddvoice_debug.log"];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:_logDir withIntermediateDirectories:YES attributes:nil error:nil];
-        if (![fm fileExistsAtPath:_logPath]) [fm createFileAtPath:_logPath contents:nil attributes:nil];
-        _handle = [NSFileHandle fileHandleForWritingAtPath:_logPath];
-        [_handle seekToEndOfFile];
-        strlcpy(dd_log_c_path, _logPath.fileSystemRepresentation, sizeof(dd_log_c_path));
-    }
-    return self;
-}
-- (void)append:(NSString *)line {
-    if (!line.length) return;
-    // 同步写 + 每条 fsync：崩溃瞬间的日志也必须落盘（异步写会在闪退时丢日志，无法定位问题）
-    dispatch_sync(_q, ^{
-        NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-        [self->_handle seekToEndOfFile];
-        [self->_handle writeData:d];
-        [self->_handle synchronizeFile];
-        NSLog(@"[%@] %@", kDDMCPluginName, line);
-    });
-}
-- (void)flushSync { dispatch_sync(_q, ^{ [self->_handle synchronizeFile]; }); }
-// 行数按磁盘文件统计：闪退重启后内存计数归零（导出头部出现过「日志条数: 0 文件大小: 4685」），
-// 只有文件行数才与实际导出的正文一致。
-- (NSUInteger)lineCount {
-    __block NSUInteger n = 0;
-    dispatch_sync(_q, ^{
-        NSString *s = [NSString stringWithContentsOfFile:self->_logPath encoding:NSUTF8StringEncoding error:nil];
-        NSUInteger c = s.length ? [s componentsSeparatedByString:@"\n"].count : 0;
-        n = c > 1 ? c - 1 : 0;
-    });
-    return n;
-}
-- (unsigned long long)fileSize {
-    __block unsigned long long sz = 0;
-    dispatch_sync(_q, ^{
-        sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:self->_logPath error:nil][NSFileSize] unsignedLongLongValue];
-    });
-    return sz;
-}
-- (void)clearAll {
-    dispatch_sync(_q, ^{
-        [self->_handle closeFile];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm removeItemAtPath:self->_logPath error:nil];
-        [fm createFileAtPath:self->_logPath contents:nil attributes:nil];
-        self->_handle = [NSFileHandle fileHandleForWritingAtPath:self->_logPath];
-        [self->_handle seekToEndOfFile];
-    });
-}
-@end
-
-static NSString *dd_log_stamp(void) {
-    static NSDateFormatter *df = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ df = [NSDateFormatter new]; df.dateFormat = @"MM-dd HH:mm:ss.SSS"; });
-    return [df stringFromDate:[NSDate date]];
-}
-static void dd_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
-static void dd_log(NSString *fmt, ...) {
-    DDLogStore *s = [DDLogStore shared];
-    if (!s.enabled) return;
-    va_list args; va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    [s append:[NSString stringWithFormat:@"%@ %@", dd_log_stamp(), msg]];
-}
-
-// 导出：flush → 拼头部信息 → 另存带时间戳 txt，返回路径
-static NSString *dd_log_export_path(void) {
-    DDLogStore *s = [DDLogStore shared];
-    [s flushSync];
-    NSData *d = [NSData dataWithContentsOfFile:s.logPath];
-    NSString *body = [[NSString alloc] initWithData:(d ?: [NSData data]) encoding:NSUTF8StringEncoding];
-    if (!body.length) body = @"（暂无日志）\n";
-    NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
-    static NSDateFormatter *fdf = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ fdf = [NSDateFormatter new]; fdf.dateFormat = @"yyyyMMdd_HHmmss"; });
-    NSString *stamp = [fdf stringFromDate:[NSDate date]];
-    NSString *text = [NSString stringWithFormat:
-        @"%@ 调试日志\n设备: %@  系统: %@\n微信: %@ (%@)\n导出时间: %@\n日志条数: %lu  文件大小: %llu 字节\n"
-        @"----------------------------------------\n%@",
-        kDDMCPluginName,
-        [UIDevice currentDevice].model, [UIDevice currentDevice].systemVersion,
-        info[@"CFBundleShortVersionString"] ?: @"-", info[@"CFBundleVersion"] ?: @"-",
-        [NSDate date], (unsigned long)[s lineCount], [s fileSize], body];
-    NSString *dst = [s.logDir stringByAppendingPathComponent:
-                     [NSString stringWithFormat:@"%@_日志_%@.txt", kDDMCPluginName, stamp]];
-    [[text dataUsingEncoding:NSUTF8StringEncoding] writeToFile:dst atomically:YES];
-    dd_log(@"导出日志 → %@", dst);
-    return dst;
-}
 
 #pragma mark - 通用工具
 
@@ -372,20 +217,15 @@ static NSString *dd_chat_usr_of_msg(CMessageWrap *msg) {
     Class wrapCls = objc_getClass("CMessageWrap");
     return [wrapCls isSenderFromMsgWrap:msg] ? msg.m_nsToUsr : msg.m_nsFromUsr;
 }
-// 类型守卫：非 CMessageWrap 塞进 wrap 类方法会在微信内部越界崩。
-// isKindOfClass 已覆盖子类；原先追加的 respondsToSelector(m_uiMesLocalID/m_uiMessageType) 二次
-// 判定从未拦下过任何对象（日志 `[msg] … 无 messageWrap` 零出现），删。
+// 判定对象是否为 CMessageWrap。
 static BOOL dd_is_msg_wrap(id obj) {
     return obj && [obj isKindOfClass:objc_getClass("CMessageWrap")];
 }
+// 取 cell 对应的消息对象。
 static CMessageWrap *dd_msg_of_cell(id cell) {
-    id vm = [cell viewModel];
-    if ([vm respondsToSelector:@selector(messageWrap)]) return [vm messageWrap];
-    dd_log(@"[msg] cell=%@ vm=%@ 无 messageWrap", NSStringFromClass([cell class]), NSStringFromClass([vm class]));
-    return nil;
+    return [[cell viewModel] messageWrap];
 }
-// 把待发送 wrap 放进静态数组保活：微信发送是异步的（上传在后台队列），ARC 在我们 block
-// 返回后释放 wrap 会让后台链路踩空（后台队列 autorelease pool pop 时 SIGSEGV）。
+// 微信发送走异步后台队列，保活 wrap 防止其在回调前被 ARC 释放。
 static void dd_retain_wrap(id wrap) {
     if (!wrap) return;
     static NSMutableArray *pool = nil;
@@ -396,14 +236,9 @@ static void dd_retain_wrap(id wrap) {
 
 #pragma mark - 路径解析
 
-// 媒体文件白名单 —— 视频消息路径解析与文件消息菜单准入共用同一份。
-// 准入分两类：
-//   ① 音频/视频容器：能用 AVAssetReader 抽出音轨再编 SILK。图片（png/jpg/gif/webp/heic/bmp）与
-//      文档（txt/pdf/doc/xls/zip…）没有音轨，抽出来是空 PCM，点了必然失败，故一律排除。
-//      WCR 的白名单（@0x152e00）含图片，是因为它的「媒体→语音」还兼做图片转文字等语义；
-//      本插件只做音轨抽取，所以按「含音轨」划分，不照抄。
-//   ② SILK 终态容器 aud/silk：微信语音本体（\x02#!SILK_V3），本身就是终态，原样复用即可，
-//      不需要也不应该走 PCM 抽取（AVAssetReader 读不了 SILK，且 SILK→PCM→SILK 是有损二次编码）。
+// 含音轨 / 可复用容器白名单。视频路径解析与文件菜单准入共用。
+// 音频视频容器可由 AVAssetReader 抽音轨再编 SILK；图片/文档无音轨，一律排除；
+// aud/silk 是微信语音终态容器，直接复用，不二次编码。
 static NSSet *dd_media_ext_set(void) {
     static NSSet *s; static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -418,152 +253,72 @@ static NSSet *dd_media_ext_set(void) {
     });
     return s;
 }
-// 视频消息本地路径：单一入口 VideoMessageViewModel.videoPath（VideoMessageViewModel.h:24）。
-//
-// 【候选精简 · 日志实证】原实现是「videoPath + WCLanDeviceServiceUtil.filePathFromMsgWrap:」两候选
-// 逐个 dd_first_media_file_under_path 试（含目录展开），8 份真机日志里**永远只有 `源#0 命中`**，
-// `源#1` 零次 —— filePathFromMsgWrap: 从未被执行到，纯冗余，删。
-// 目录展开同样零命中：videoPath 恒指向微信规范附件 `Video/<usr>/<localID>.mp4`（单文件），
-// 从未是目录，故只留「白名单扩展名」一步判定。
-//
-// 【日志节流 · 日志 060141 实证】本函数会被 dd_wait_local_path 每 0.5s 回调一次做下载轮询，
-// 若无条件打日志，一次未下载视频（轮询 57s）会刷出 ~130 条 `命中`（占满整个日志文件）。
-// 只在文件真正存在时才打 —— 轮询期间（文件还没落盘）保持静默，下载完成那一次才记录。
+// 视频消息本地路径：VideoMessageViewModel.videoPath（指向 Video/<usr>/<localID>.mp4）。
+// 扩展名需命中白名单；未下载完也返回路径，供下载轮询。
 static NSString *dd_video_path_of_cell(id cell) {
     id msg = dd_msg_of_cell(cell);
-    if (msg && [msg respondsToSelector:@selector(IsVideoMsg)] && ![msg IsVideoMsg]) return nil;
-    id vm = [cell viewModel];
-    if (![vm respondsToSelector:@selector(videoPath)]) return nil;
-    NSString *p = [vm videoPath];
+    if (msg && ![msg IsVideoMsg]) return nil;
+    NSString *p = [(VideoMessageViewModel *)[cell viewModel] videoPath];
     if (![p isKindOfClass:[NSString class]] || p.length == 0) return nil;
     if (![dd_media_ext_set() containsObject:p.pathExtension.lowercaseString]) return nil;
-    if (!dd_file_exists(p)) return p;          // 未下载完也返回路径，供 dd_wait_local_path 轮询
-    dd_log(@"[path.video] 命中 → %@", p);
     return p;
 }
-
-// 文件消息本地路径（CMessageWrap.h:108）。
-//
-// 【崩溃根因 · 实证：09-24 01:58 / 01:59 两份日志 + SIGSEGV 信号栈】
-// 原写法 `NSString *p = nil; ... retStrPath:&p;`，p 是 __strong 局部变量。而头文件签名是
-//   +(void) GetPathOfAppDataByUserName:(id) andMessageWrap:(id) retStrPath:(void *)
-// 即「返回 void + void* 出参」。微信内部往 *pp 写入的是 **autorelease（+0）**字符串，而 ARC
-// 对 void* 出参完全不感知：不会为写入的对象补 retain，却在 p 出作用域时照常 release 一次
-// → 对象被**多释放一次**。之后任何一个 autorelease pool pop 再 release 这个已销毁的对象就炸。
-// 崩溃栈两份一致（signal=11 SIGSEGV）：
-//     objc_autoreleasePoolPop + 244
-//     ├─ 01:58 那次：CFRunLoopRunSpecific（主线程 runloop 的 pool）
-//     └─ 01:59 那次：_pthread_wqthread（dd_convert_queue 的 pool）
-// 崩点随「pool 何时被 pop」漂移 —— 所以表象是「发送结果=1 之后随机闪退」。
-// 由此解释全部历史现象：
-//   · 只有文件消息崩：视频走 VideoMessageViewModel.videoPath、语音走 getVoicePath /
-//     GetPathOfMesAudio:LocalID:DocPath:，全是**返回值** API，ARC 管理正确；
-//     retStrPath: 是全工程唯一的 void* 出参调用点。
-//   · 曾换成 GetPathOfAppData:LocalID:FileExt:retStrPath:（:106）照样崩 —— 同样是 void* 出参。
-//   · 路径解析曾搬到主线程 → 崩得更早：主线程 runloop pool 每次循环都 pop，double release 立刻爆。
-// 反汇编对照（锤子 WeChatTweak.dylib，同样 ARC 编译、同样用这个 API）：它的调用现场在出参返回后
-// **立刻对结果做一次 retain**，与下面的写法生成的代码一致：
-//     0x7a31e0  str xzr,[sp,#0x18]     ; 局部置 nil
-//     0x7a31e4  add x4,sp,#0x18        ; x4 = &local（retStrPath 参数）
-//     0x7a31f4  bl  #0x8cc920          ; GetPathOfAppDataByUserName:andMessageWrap:retStrPath:
-//     0x7a31f8  ldr x21,[sp,#0x18]     ; 取出结果
-//     0x7a3200  bl  #0x8ca0fc          ; ★ objc_retain（stub → __la_symbol_ptr 0xcc9528）
-//   （另两处调用点 0x7ce3e0 / 0x7eb4d8 模式完全相同）
-// 而 WCRefine.dylib 的字符串表/selref 里**不存在**该 selector（也无 filePathFromMsgWrap），
-// WCR 走的是返回值版 `+(id) GetPathOfAppData:(id)`（CMessageWrap.h:26，selref 槽 0x269e218）。
-// 两条路都指向同一结论：不能让 ARC 凭空去猜 void* 出参的所有权。
-//
-// LLVM IR 级验证（clang -fobjc-arc -S -emit-llvm，最小复现）：
-//   before（NSString *p; ...&p;  return p;）
-//       retain(A) → storeStrong(p,nil) 即 release(A) → autoreleaseReturnValue(A)
-//       ⇒ 保留计数净 0，却**多出一条 autorelease 记录**（微信那条仍在池里）
-//       ⇒ pool pop 时 release 两次而计数只够一次 → over-release → SIGSEGV
-//   after（NSString * __unsafe_unretained raw; ...&raw; NSString *p = raw; return p;）
-//       retain(A) → retain(A) → release(A) → autoreleaseReturnValue(A)
-//       ⇒ 池里两条 autorelease 记录各有一份 retain 对应 → 平衡
-// 修法：用 __unsafe_unretained 接住出参，再赋给 __strong —— 让 ARC 补上那次缺失的 retain。
+// 文件消息本地路径。GetPathOfAppDataByUserName:...retStrPath: 是 void* 出参，
+// 微信向 *pp 写入 autorelease(+0) 字符串，ARC 不感知其所有权；必须用 __unsafe_unretained
+// 接住出参再赋给 __strong，否则出作用域时 ARC 多 release 一次导致 over-release 崩溃。
+// 未下载完也返回路径，供下载轮询。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
     NSString * __unsafe_unretained raw = nil;
     [objc_getClass("CMessageWrap") GetPathOfAppDataByUserName:dd_current_usr_name()
                                           andMessageWrap:msg retStrPath:(void *)&raw];
     NSString *p = raw;   // __strong：ARC 在此 retain，与出作用域时的 release 配平
-    if ([p isKindOfClass:[NSString class]] && p.length) {
-        if (dd_file_exists(p)) { dd_log(@"[path.file] 命中 → %@", p); return p; }
-        return p;   // 未下载完也返回路径供下载轮询
-    }
+    if ([p isKindOfClass:[NSString class]] && p.length) return p;
     return nil;
 }
-// 语音消息本地路径：单一入口 getVoicePath（CMessageWrap.h:362）。
-//
-// 【候选精简 · 日志实证】原实现是「getVoicePath + CMessageWrap.getPathOfAudio: + SaveMesVoice 落盘
-// + m_nsVoicePath 转路径」逐级下沉，5 份真机日志（220950 / 231315 / 002044 / 004922 / 011656 /
-// 013953 / 024435）里 getVoicePath 与 getPathOfAudio **恒返回同一个规范路径**
-// （Audio/<usr>/<localID>.aud）且从不为空 —— 后面的候选从未被执行过，全删。
+// 语音消息本地路径：getVoicePath（Audio/<usr>/<localID>.aud）。
 static NSString *dd_voice_path_of_msg(CMessageWrap *msg) {
     if (!msg) return nil;
     NSString *p = (NSString *)[msg getVoicePath];
-    if (![p isKindOfClass:[NSString class]] || p.length == 0) {
-        dd_log(@"[path.voice] getVoicePath 返回空（语音可能尚未下载）");
-        return nil;
-    }
-    dd_log(@"[path.voice] 命中 → %@", p);
+    if (![p isKindOfClass:[NSString class]] || p.length == 0) return nil;
     return p;
 }
 
 #pragma mark - 自动下载
 
+// 触发视频下载。
 static void dd_trigger_video_download(CMessageWrap *msg) {
     if (!msg) return;
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-    if ([mgr respondsToSelector:@selector(StartDownloadVideo:MsgWrap:Priority:Silent:)]) {
-        [mgr StartDownloadVideo:nil MsgWrap:msg Priority:YES Silent:YES];
-        dd_log(@"[download.video] 已触发 StartDownloadVideo localID=%u", msg.m_uiMesLocalID);
-    }
+    [mgr StartDownloadVideo:nil MsgWrap:msg Priority:YES Silent:YES];
 }
-// 文件消息下载：StartDownloadAppAttach:MsgWrap:Silent:（CMessageMgr.h:32）。
-// 实测 m_uiDownloadStatus 恒为 0 而附件其实已在本地（日志：文件消息 dlStatus=0，但「开始」后 2ms
-// 内路径即命中），故本函数在所有真机日志里从未被触发过；原先挂在后面的 4 参 autoDownload: 版本
-// （CMessageMgr.h:33）是「主 API 失败再试一次」的二级兜底，零执行记录，删。
+// 触发文件附件下载。
 static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return NO;
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     if (!mgr) return NO;
-    BOOL ok = [mgr respondsToSelector:@selector(StartDownloadAppAttach:MsgWrap:Silent:)] &&
-              [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES];
-    dd_log(@"[download.file] StartDownloadAppAttach → %@ localID=%u", ok ? @"YES" : @"NO", msg.m_uiMesLocalID);
-    return ok;
+    return [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES];
 }
-// 轮询等待文件下载/写入完成：连续两轮大小一致才算就绪（半下载文件会让 SILK 编码产出损坏数据，
-// 进而使 ResendVoiceMsg 内部 C 层 SIGSEGV —— @try 兜不住）
+// 轮询等待文件就绪：连续两轮大小一致才返回（半下载文件会让编码产出损坏数据）。
 static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     long long prevSize = -1;
-    NSTimeInterval lastLog = 0;
     while ([deadline timeIntervalSinceNow] > 0) {
         NSString *p = pathBlock();
         if (dd_file_exists(p)) {
             NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
             long long sz = a ? [a[NSFileSize] longLongValue] : -1;
-            if (sz > 0 && sz == prevSize) { dd_log(@"[download.wait] 大小稳定(%lld) → 就绪 %@", sz, p); return p; }
+            if (sz > 0 && sz == prevSize) return p;
             prevSize = sz;
-        }
-        NSTimeInterval now = [NSDate.date timeIntervalSince1970];
-        if (now - lastLog >= 3.0) {   // 每 3s 一条，避免刷屏；持久化日志里能看清下载是否推进
-            dd_log(@"[download.wait] 轮询中 路径=%@ 存在=%d 大小=%lld",
-                   p ?: @"(空)", dd_file_exists(p), prevSize);
-            lastLog = now;
         }
         [NSThread sleepForTimeInterval:0.5];
     }
-    dd_log(@"[download.wait] 超时 %.0fs 仍未就绪，放弃转换", timeout);
     return nil;
 }
 
-#pragma mark - SILK 容器（对齐 WCRefine 反汇编）
+#pragma mark - SILK 容器
 
-// 微信 .aud 正规容器头是 10 字节 \x02#!SILK_V3；MJSilkCodec 常只吐 9 字节 #!SILK_V3，须补 0x02
-//   （WCRefine sub_0x8f18d8：0x8f1ac8 mov w8,#2 → appendBytes(&0x02,1)）
+// 微信 .aud 头部为 \x02#!SILK_V3（10 字节）；MJSilkCodec 仅吐 9 字节 #!SILK_V3，须补前导 0x02。
 static BOOL dd_silk_has_magic9(NSData *d) {
     return d.length >= 9 && memcmp(d.bytes, "#!SILK_V3", 9) == 0;
 }
@@ -571,7 +326,7 @@ static BOOL dd_silk_has_magic10(NSData *d) {
     return d.length >= 10 && ((const unsigned char *)d.bytes)[0] == 0x02
            && memcmp((const unsigned char *)d.bytes + 1, "#!SILK_V3", 9) == 0;
 }
-// 帧链校验（WCRefine sub_0x8f15f4）：容器后是「[2字节小端帧长][帧数据]」重复序列
+// 帧链校验：容器后为「[2字节小端帧长][帧数据]」重复序列。
 static BOOL dd_silk_frames_valid(NSData *d) {
     if (!dd_silk_has_magic10(d) && !dd_silk_has_magic9(d)) return NO;
     const unsigned char *b = (const unsigned char *)d.bytes;
@@ -596,59 +351,37 @@ static NSData *dd_silk_normalize(NSData *d) {
     }
     return nil;
 }
-// PCM → SILK（WCRefine sub_0x8f2804 @0x8f2890）。
-//
-// 【注释纠错】此处曾断言「回环解码验证是闪退根因」，**该结论已被证伪，勿采信**：
-//   v1.0.27 删除回环解码后，09-24 01:58 / 01:59 两份日志仍复现同样的 SIGSEGV，且第二次的素材
-//   只有 16s（PCM 512640 字节，与从不崩溃的视频素材同规模）—— 崩溃与 PCM 长度无关。
-//   真根因是 dd_file_path_of_msg 里 retStrPath: 出参的 ARC over-release，见该函数注释。
-// 回环解码之所以仍不恢复：它把整段音频一次性解成 PCM（36s → 1157120 字节）只为做「能不能解
-// 回来」的验证，而每份日志它恒为通过（从未拦下过任何问题），属纯冗余 + 额外大内存分配。
-// 产物校验交由 dd_silk_frames_valid 承担：纯字节扫描帧链，不进解码器、不分配大内存。
+// PCM → SILK。产物补前导 0x02 并校验帧链。
 static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (pcm.length == 0) return nil;
-    Class codec = objc_getClass("MJSilkCodec");
-    if (!codec || ![codec respondsToSelector:@selector(encodeToSilkFromPCMData:)]) return nil;
-    NSData *raw = [codec encodeToSilkFromPCMData:pcm];
-    if (raw.length == 0) { dd_log(@"[silk.enc] 编码为空，放弃"); return nil; }
+    NSData *raw = [objc_getClass("MJSilkCodec") encodeToSilkFromPCMData:pcm];
+    if (raw.length == 0) return nil;
     NSData *silk = dd_silk_normalize(raw) ?: raw;
-    if (!dd_silk_frames_valid(silk)) { dd_log(@"[silk.enc] 帧链校验失败，放弃"); return nil; }
-    dd_log(@"[silk.enc] 产物 magic%d 长度=%lu 字节（源 PCM %lu 字节）",
-           dd_silk_has_magic10(silk) ? 10 : 9, (unsigned long)silk.length, (unsigned long)pcm.length);
+    if (!dd_silk_frames_valid(silk)) return nil;
     return silk;
 }
-// SILK → PCM：微信 .aud 恒为规范容器 \x02#!SILK_V3（magic10），校验帧链后直接喂解码器。
-//
-// 【候选精简 · 日志实证】原实现按「magic10 原文 / magic9 原文 / magic9 补 0x02」三候选逐个解码、
-// 取最长者（best 循环）。全部真机日志里 .aud 头 16 字节恒为
-//     02 23 21 53 49 4c 4b 5f 56 33   =   \x02 # ! S I L K _ V 3
-// 即一律 magic10；老日志解码段也只有 `候选「原文(\x02#!SILK_V3)」→ PCM 512640 字节` 一条，
-// 而 `候选#N 帧链无效 跳过`、`非 SILK 魔数` 在所有日志里零出现
-// → magic9 两个候选与「取最长」的 best 循环从未生效，删。
-// dd_silk_normalize 保留：编码侧仍需要它（MJSilkCodec 只吐 magic9，须补前导 0x02）。
+// SILK → PCM。校验帧链后喂解码器。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
-    if (fileData.length < 12) { dd_log(@"[silk.pcm] 数据过小(<12) 放弃"); return nil; }
-    if (!dd_silk_has_magic10(fileData)) { dd_log(@"[silk.pcm] 非微信 SILK 容器(缺 \\x02#!SILK_V3)，放弃"); return nil; }
-    if (!dd_silk_frames_valid(fileData)) { dd_log(@"[silk.pcm] 帧链不自洽，放弃"); return nil; }
+    if (fileData.length < 12) return nil;
+    if (!dd_silk_has_magic10(fileData)) return nil;
+    if (!dd_silk_frames_valid(fileData)) return nil;
     NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:fileData];
-    dd_log(@"[silk.pcm] 解码结果=%lu 字节", (unsigned long)pcm.length);
     return pcm.length ? pcm : nil;
 }
 
 #pragma mark - 媒体 → 语音
 
-// wrap 由 [[CMessageWrap alloc] initWithMsgType:34] 新建，m_extendInfoWithMsgType 恒为 nil，
-// 原写的 `if (ext) return ext` 复用分支从未命中过（日志零证据），直接 new 一个装上去。
+// 构造语音扩展信息并挂到 wrap。
 static id dd_voiceExtendInfo(id wrap) {
     id nv = [[objc_getClass("CExtendInfoOfVoiceMsg") alloc] init];
     [nv setM_refMessageWrap:wrap];
     [wrap setM_extendInfoWithMsgType:nv];
     return nv;
 }
-// 语音消息正文：标准 voicemsg XML（对齐 WCR _WCRefineSendVoiceDataToChat @0x8df464）。
-// 不写它，微信重启后会从 DB 的 m_nsContent 重建消息时拿到空正文 → 当「未完成语音」自动重发。
+// 填充语音消息扩展信息与 voicemsg XML 正文。
+// 不写正文则微信重启重建消息时拿到空正文 → 当作未完成语音自动重发。
 static void dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int duration) {
-    id ext = dd_voiceExtendInfo(wrap);   // 内部已 setM_refMessageWrap:，这里不再重复设
+    id ext = dd_voiceExtendInfo(wrap);
     [ext setM_uiVoiceFormat:kDDMCVoiceFormat];
     [ext setM_uiVoiceEndFlag:kDDMCVoiceEndFlag];
     [ext setM_uiVoiceTime:duration];
@@ -657,7 +390,7 @@ static void dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int durati
         @"<msg><voicemsg voicelength=\"%u\" voiceformat=\"4\" forwardflag=\"0\" /></msg>", duration];
     [wrap setM_nsContent:xml];
 }
-// 音频数据落到微信语音规范路径（CUtility.GetPathOfMesAudio:LocalID:DocPath: CUtility.h:82）
+// 把音频数据写入微信语音规范路径（CUtility.GetPathOfMesAudio）。
 static NSString *dd_install_audio_file(CMessageWrap *wrap, NSString *src) {
     NSString *p = nil;
     if (wrap.m_uiMesLocalID != 0) {
@@ -665,55 +398,43 @@ static NSString *dd_install_audio_file(CMessageWrap *wrap, NSString *src) {
                                                             LocalID:wrap.m_uiMesLocalID
                                                             DocPath:[objc_getClass("CUtility") GetDocPath]];
     }
-    if (!p.length) return nil;   // 仅 GetPathOfMesAudio:LocalID:DocPath: 原生路径（对齐 WCR，不靠字符串替换 hack）
+    if (!p.length) return nil;
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:[p stringByDeletingLastPathComponent]
   withIntermediateDirectories:YES attributes:nil error:nil];
     if ([fm fileExistsAtPath:p]) [fm removeItemAtPath:p error:nil];
     [fm copyItemAtPath:src toPath:p error:nil];
-    dd_log(@"[voice.install] 目标=%@ 复制结果=%d", p, dd_file_exists(p));
     return p;
 }
-// 发语音到指定会话。链路对齐 WCR：AddLocalMsg(分配 localID) → 写 SILK 到规范路径 → SaveMesVoice
-// → ResendVoiceMsg。不用 AudioSender.addMessageToDB:（8.0.79 下它不分配 m_uiMesLocalID）。
+// 发送语音到会话：AddLocalMsg 分配 localID → 写 SILK 到规范路径 → SaveMesVoice → ResendVoiceMsg。
+// 必须显式 setM_nsVoicePath，否则 ResendVoiceMsg 回退按 localID 重算路径易读坏文件。
+// SaveMesVoice 首参传 nil（实际两参，传 NSData 会被当路径）。
 static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     NSData *data = [NSData dataWithContentsOfFile:audPath];
-    if (data.length == 0 || !dd_silk_frames_valid(data)) {
-        dd_log(@"[voice.send] 数据为空或非合法 SILK，放弃（避免 ResendVoiceMsg C 层崩）");
-        return NO;
-    }
+    if (data.length == 0 || !dd_silk_frames_valid(data)) return NO;
     AudioSender *sender = (AudioSender *)dd_mm_service(@"AudioSender");
     if (!sender) return NO;
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDMCVoiceMsgType];
     [wrap setM_uiMessageType:kDDMCVoiceMsgType];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
     [wrap setM_nsToUsr:usr];
-    // GenSendMsgTime（MMNewSessionMgr.h）—— 原写 `t ?: time(NULL)` 的本地兜底时间戳从未生效过，删
     [wrap setM_uiCreateTime:[(MMNewSessionMgr *)dd_mm_service(@"MMNewSessionMgr") GenSendMsgTime]];
     [wrap setM_uiStatus:kDDMCStatusSending];
-    [wrap setM_uiDownloadStatus:9];    // 已下载（WCR 同款，缺失会让发送链路状态自相矛盾）
+    [wrap setM_uiDownloadStatus:9];    // 标记已下载
     [wrap setM_bForward:1];
     dd_retain_wrap(wrap);
     dd_configureVoiceMsg(wrap, data, duration);
 
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddLocalMsg:usr MsgWrap:wrap];
-    dd_log(@"[voice.send] AddLocalMsg → localID=%u", wrap.m_uiMesLocalID);
-    NSString *voicePath = dd_install_audio_file(wrap, audPath);   // 写 SILK 到规范路径（GetPathOfMesAudio）
-    // WCR 0x8dfec0：必须显式 setM_nsVoicePath。缺则 ResendVoiceMsg 回退按 localID 重算路径，
-    // 文件来源(dlStatus=0)读坏文件/状态不一致 → SIGSEGV；视频也设，无害。
-    if (voicePath.length && [wrap respondsToSelector:@selector(setM_nsVoicePath:)])
-        [wrap setM_nsVoicePath:voicePath];
-    // SaveMesVoice 首参必须 nil：WCR 反汇编 SaveMesVoice:MsgWrap: 仅两参，传 SILK NSData 会被当路径 → 崩（1.0.25 教训）
-    if ([mgr respondsToSelector:@selector(SaveMesVoice:MsgWrap:)])
-        [mgr SaveMesVoice:nil MsgWrap:wrap];
+    NSString *voicePath = dd_install_audio_file(wrap, audPath);
+    if (voicePath.length) [wrap setM_nsVoicePath:voicePath];
+    [mgr SaveMesVoice:nil MsgWrap:wrap];
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
-    dd_log(@"[voice.send] 已发送 voicePath=%@ 会话=%@", voicePath ?: @"(空)", usr ?: @"(nil)");
     return YES;
 }
-// 抽音轨为 16bit / 单声道 / 16000Hz PCM（输出字典 7 键，对齐 WCRefine sub_0x8f1bc8）
+// 抽取音轨为 16bit / 单声道 / 16000Hz PCM。
 static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
-    dd_log(@"[pcm] 入参 mediaPath=%@ 存在=%d", mediaPath, dd_file_exists(mediaPath));
     if (!dd_file_exists(mediaPath)) return nil;
     NSDictionary *opts = @{(id)AVURLAssetPreferPreciseDurationAndTimingKey: @YES};
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:mediaPath] options:opts];
@@ -721,9 +442,9 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
     if (outDuration && isfinite(dur) && dur > 0) *outDuration = dur;
     NSError *err = nil;
     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
-    if (err) { dd_log(@"[pcm] AVAssetReader 创建失败: %@", err.localizedDescription); return nil; }
+    if (err) return nil;
     AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-    if (!track) { dd_log(@"[pcm] 素材无音轨: %@", mediaPath); return nil; }
+    if (!track) return nil;
     NSDictionary *outSettings = @{
         AVFormatIDKey: @(kAudioFormatLinearPCM),
         AVSampleRateKey: @(kDDMCVoiceSampleRate),
@@ -735,7 +456,7 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
     };
     AVAssetReaderTrackOutput *out = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:outSettings];
     [reader addOutput:out];
-    if (![reader startReading]) { dd_log(@"[pcm] startReading 失败"); return nil; }
+    if (![reader startReading]) return nil;
     NSMutableData *pcm = [NSMutableData data];
     while (reader.status == AVAssetReaderStatusReading) {
         CMSampleBufferRef sb = [out copyNextSampleBuffer];
@@ -746,60 +467,40 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
             [pcm appendBytes:ptr length:len];
         CFRelease(sb);
     }
-    dd_log(@"[pcm] 抽取结果=%d PCM=%lu 字节", reader.status == AVAssetReaderStatusCompleted, (unsigned long)pcm.length);
     return reader.status == AVAssetReaderStatusCompleted ? pcm : nil;
 }
 
-// 媒体 → 语音：确保已下载 → 抽音轨 → SILK → 发送到当前聊天
-//
-// 【线程选择依据：日志实证，勿再改】路径解析（GetPathOfAppDataByUserName / filePathFromMsgWrap /
-// StartDownload* 等）必须留在「后台队列」内直接调用，不要搬到主线程：
-// v1.0.27 原始实现如此，文件消息能完整跑完发送（发送结果=1，重启后语音送达，即最初报的症状）。
-// 之后两版把解析搬到主线程（后台 dispatch_sync(main)，或主线程先解析再入队）反而让文件消息在
-// 「路径解析阶段」就崩，连发送都到不了 —— 日志 231315 / 002044 / 004922 三份一致：命中后零输出。
-// 结论：GetPathOfAppDataByUserName 在主线程调用立即致命，在后台调用至少能完成发送。
+// 媒体 → 语音：确保已下载 → 抽音轨/复用 SILK → 编码 → 发送。
+// 路径解析与下载触发必须在后台队列内直接调用（GetPathOfAppDataByUserName 主线程调用会崩）。
 static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^pathBlock)(void), void(^downloadBlock)(void)) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
-    dd_log(@"[%@→语音] ==== 开始 ==== type=%u localID=%u dlStatus=%u chat=%@",
-           tag, msg.m_uiMessageType, msg.m_uiMesLocalID, msg.m_uiDownloadStatus, usr ?: @"(nil)");
     dispatch_async(dd_convert_queue, ^{
         NSString *path = pathBlock();
         if (!dd_file_exists(path)) {
             if (downloadBlock) downloadBlock();
             path = dd_wait_local_path(pathBlock, kDDMCDownloadTimeout);
-            dd_log(@"[%@→语音] 下载后解析路径=%@ 存在=%d", tag, path ?: @"(空)", dd_file_exists(path));
         }
-        if (!dd_file_exists(path)) { dd_log(@"[%@→语音] 下载失败/超时，放弃", tag); return; }
+        if (!dd_file_exists(path)) return;
         double duration = 0;
-        // 只取文件大小，不 read 全文：日志 060141 的视频素材 20.7MB，原写法为打一条日志把整个文件
-        // 读进内存（dataWithContentsOfFile）；抽音轨走的是 AVAssetReader，根本不需要这份 NSData。
+        // 只取文件大小，不读全文（视频可能数十 MB，抽音轨走 AVAssetReader 不需要 NSData）。
         unsigned long long fsize = [[[NSFileManager defaultManager] attributesOfItemAtPath:path
                                                                                     error:nil][NSFileSize] unsignedLongLongValue];
-        dd_log(@"[%@→语音] 源文件 size=%llu ext=%@", tag, fsize, path.pathExtension.lowercaseString);
         NSData *aud = nil;
         NSString *ext = path.pathExtension.lowercaseString;
-        // 源本身就是微信 SILK 终态容器（.aud/.silk）→ 原样复用，不二次编码。
-        // AVAssetReader 读不了 SILK；即便能解，SILK→PCM→SILK 也是有损二次编码（音质劣化 + 白跑
-        // 两趟编解码）。只有这里才 read 全文 —— SILK 文件通常几十 KB，不像视频那种 20MB。
-        // 帧链不自洽的（损坏或伪装扩展名）当场放弃：dd_send_voice 虽然也校验，但那时已经写好了
-        // 临时文件，不如早退；送不合法 SILK 给 ResendVoiceMsg 会在其内部 C 层 SIGSEGV，@try 拦不住。
+        // 源是微信 SILK 容器（aud/silk）→ 原样复用，不二次编码；帧链不自洽直接放弃。
         if ([ext isEqualToString:@"aud"] || [ext isEqualToString:@"silk"]) {
             NSData *raw = [NSData dataWithContentsOfFile:path];
-            if (!dd_silk_frames_valid(raw)) { dd_log(@"[%@→语音] 源是 .%@ 但帧链不自洽，放弃", tag, ext); return; }
+            if (!dd_silk_frames_valid(raw)) return;
             aud = raw;
-            // 时长只能靠解回 PCM 反推：SILK 容器头不写时长
-            NSData *pcm = dd_decode_silk_to_pcm(raw);
+            NSData *pcm = dd_decode_silk_to_pcm(raw);   // SILK 容器头不写时长，靠解回 PCM 反推
             duration = (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2);
-            dd_log(@"[%@→语音] 源已是合法 SILK，原样复用 magic%d（%lu 字节）",
-                   tag, dd_silk_has_magic10(raw) ? 10 : 9, (unsigned long)raw.length);
         } else {
             NSData *pcm = dd_extract_pcm(path, &duration);
-            if (pcm.length == 0) { dd_log(@"[%@→语音] PCM 为空，放弃", tag); return; }
-            // 时长必须按真实 PCM 长度算（asset.duration 是视频时长，可能与音轨不符）
-            duration = (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2);
+            if (pcm.length == 0) return;
+            duration = (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2);   // 按真实 PCM 长度算
             aud = dd_encode_pcm_to_silk(pcm);
-            if (aud.length == 0) { dd_log(@"[%@→语音] SILK 编码失败，放弃", tag); return; }
+            if (aud.length == 0) return;
         }
         NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
                          [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"]];
@@ -807,17 +508,15 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         unsigned int ms = (unsigned int)(duration * 1000);
         if (ms == 0) ms = 1000;
         if (ms > 60000) ms = 60000;   // 微信语音上限 60s
-        dd_log(@"[%@→语音] 时长=%ums → 发送语音 (aud=%lu 字节)", tag, ms, (unsigned long)aud.length);
         dispatch_async(dispatch_get_main_queue(), ^{
-            BOOL sent = dd_send_voice(usr, tmp, ms);
-            dd_log(@"[%@→语音] ==== 结束 ==== 发送结果=%d", tag, sent);
+            dd_send_voice(usr, tmp, ms);
         });
     });
 }
 
 #pragma mark - 语音 → 文件
 
-// PCM → WAV（44 字节 RIFF 头，16bit / 单声道 / 16000Hz）
+// PCM → WAV（44 字节 RIFF 头，16bit / 单声道 / 16000Hz）。
 static NSData *dd_wav_of_pcm(NSData *pcm) {
     if (pcm.length == 0) return nil;
     const uint32_t sampleRate = (uint32_t)kDDMCVoiceSampleRate;
@@ -839,7 +538,7 @@ static NSData *dd_wav_of_pcm(NSData *pcm) {
     [wav appendData:pcm];
     return wav;
 }
-// PCM → m4a：PCM→WAV→AVAssetExportSession(AVAssetExportPresetAppleM4A)
+// PCM → m4a：先转 WAV，再经 AVAssetExportSession 导出 AppleM4A。
 static NSString *dd_write_m4a(NSData *pcm) {
     if (pcm.length == 0) return nil;
     NSString *wavPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
@@ -859,31 +558,24 @@ static NSString *dd_write_m4a(NSData *pcm) {
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
     [[NSFileManager defaultManager] removeItemAtPath:wavPath error:nil];
     BOOL ok = done && dd_file_exists(path) && ex.status == AVAssetExportSessionStatusCompleted;
-    dd_log(@"[m4a] 导出结果=%d", ok);
     return ok ? path : nil;
 }
-// SILK → m4a 文件
+// SILK → m4a 文件。
 static NSString *dd_decode_silk_to_audio(NSData *fileData) {
-    dd_log(@"[voice→file] SILK→PCM→m4a 开始 (源=%lu 字节)", (unsigned long)fileData.length);
     NSData *pcm = dd_decode_silk_to_pcm(fileData);
-    if (pcm.length == 0) { dd_log(@"[voice→file] 解码 PCM 为空，放弃"); return nil; }
-    NSString *m4a = dd_write_m4a(pcm);
-    dd_log(@"[voice→file] m4a=%@", m4a ?: @"(空)");
-    return m4a;
+    if (pcm.length == 0) return nil;
+    return dd_write_m4a(pcm);
 }
-// 把临时产物拷进微信持久沙盒再发送（临时目录会被系统/重启清空，指向死路径 → 消息打不开）
+// 拷入微信持久沙盒再发送（临时目录会被系统清空，指向死路径 → 消息打不开）。
 static NSString *dd_persist_copy(NSString *src) {
     if (!dd_file_exists(src)) return nil;
-    // CUtility.GetDocPath（CUtility.h:49）—— 与 dd_install_audio_file 同一个 API，真机日志里
-    // 6 次 voice.install 全部成功返回规范路径，原先挂在后面的 NSDocumentDirectory 退回分支
-    // 从未被执行过，删。
     NSString *dir = (NSString *)[objc_getClass("CUtility") GetDocPath];
     if (![dir isKindOfClass:[NSString class]] || dir.length == 0) return nil;
     NSString *dst = [dir stringByAppendingPathComponent:
         [NSString stringWithFormat:@"ddmc_voice_%@.m4a", [[NSUUID UUID] UUIDString]]];
     return [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
 }
-// 发文件消息到当前聊天：AddAppMsg(本地落库) → StartUploadAppMsg(触发上传)
+// 发送 m4a 文件消息：AddAppMsg 本地落库 → StartUploadAppMsg 触发上传。
 static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName) {
     NSString *persistPath = dd_persist_copy(m4aPath);
     if (persistPath.length) m4aPath = persistPath;
@@ -891,7 +583,6 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     NSData *fdata = [NSData dataWithContentsOfFile:m4aPath];
     if (fdata.length == 0) return NO;
     unsigned long long fsize = fdata.length;
-    dd_log(@"[file.send] usr=%@ file=%@ size=%llu", usr, m4aPath.lastPathComponent, fsize);
 
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDMCAppMsgType];
     [wrap setM_uiMessageType:kDDMCAppMsgType];
@@ -907,10 +598,9 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     [app setM_uiAppDataSize:fsize];
     [app setM_nsTitle:fileName];
     [app setM_bAppAttachExistInSvr:YES];
-    [wrap setM_extendInfoWithMsgType:app];   // CMessageWrap.h:637（m_oAppDataItem 在 8.0.79 已不存在）
+    [wrap setM_extendInfoWithMsgType:app];
 
-    // 消息正文 appmsg XML（type=6 文件）。不写它，微信重启后从 DB 重建消息时正文为空
-    // → 判不出文件名/扩展名（退回 .dat）、判不出本地已有附件（0B +「接收文件」）。
+    // 消息正文 appmsg XML（type=6 文件）。不写则微信重启重建消息时正文为空 → 判不出文件名/附件。
     [wrap setM_nsContent:[NSString stringWithFormat:
         @"<msg><appmsg appid=\"\" sdkver=\"0\"><title>%@</title><des></des><type>6</type>"
          "<appattach><totallen>%llu</totallen><attachid></attachid><fileext>%@</fileext>"
@@ -919,82 +609,59 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
 
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
-    dd_log(@"[file.send] AddAppMsg → localID=%u", wrap.m_uiMesLocalID);
-    // 只调 AddAppMsg 不上传 → 消息停在 Sending、服务器无记录 → 微信当「未下载」，重启后显示 0B
-    if ([mgr respondsToSelector:@selector(StartUploadAppMsg:MsgWrap:Scene:)]) {
-        [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
-        dd_log(@"[file.send] 已触发上传");
-    }
+    [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
     return YES;
 }
-// 语音消息 → 文件消息
+// 语音消息 → 文件消息。
 static void dd_voice_to_file(CMessageWrap *msg) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
     NSString *fn  = [NSString stringWithFormat:@"语音_%u.m4a", (unsigned int)time(NULL)];
-    dd_log(@"[voice→file] ==== 开始 ==== localID=%u chat=%@", msg.m_uiMesLocalID, usr ?: @"(nil)");
     dispatch_async(dd_convert_queue, ^{
         NSString *p = dd_voice_path_of_msg(msg);
-        if (!dd_file_exists(p)) { dd_log(@"[voice→file] 取不到语音文件，放弃"); return; }
+        if (!dd_file_exists(p)) return;
         NSData *silk = [NSData dataWithContentsOfFile:p];
-        if (silk.length < 12) { dd_log(@"[voice→file] 语音数据过小，放弃"); return; }
+        if (silk.length < 12) return;
         NSString *m4a = dd_decode_silk_to_audio(silk);
-        if (!m4a.length) { dd_log(@"[voice→file] 解码/封装失败，放弃"); return; }
+        if (!m4a.length) return;
         dispatch_async(dispatch_get_main_queue(), ^{
-            BOOL sent = dd_send_file_to_chat(usr, m4a, fn);
-            dd_log(@"[voice→file] ==== 结束 ==== 发送结果=%d", sent);
+            dd_send_file_to_chat(usr, m4a, fn);
         });
     });
 }
 
 #pragma mark - 菜单注入
 
-// 文件消息「转语音」的准入判定：白名单复用 dd_media_ext_set（含音轨容器，与视频侧同一份）。
-// 图片（png/jpg/gif/webp/heic/bmp）、文档（txt/pdf/doc/xls/zip…）没有音轨，抽出来是空 PCM，
-// 挂了按钮点了必然失败 —— 故一律不挂（用户实证：txt / 图片文件的长按菜单上不该出现「转语音」）。
-// 菜单构建阶段判定：只读消息自带字段，绝不解析路径（解析留到点击后，见 WCR 0x8dd96c）。
-// 扩展名取 CExtendInfoOfAPP.m_nsAppFileExt（WCR 同款字段，@三方对比 §1.2），
-// 该字段为空时取 m_nsAppFileName 的 pathExtension —— 两个字段都是消息内存里的现成值，无副作用。
+// 文件消息「转语音」准入：扩展名需命中白名单。菜单构建阶段只判消息自带字段，不解析路径。
 static BOOL dd_file_has_audio(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return NO;
     id app = [msg m_extendInfoWithMsgType];
     if (!app) return NO;
-    NSString *ext = nil;
-    if ([app respondsToSelector:@selector(m_nsAppFileExt)])
-        ext = [(CExtendInfoOfAPP *)app m_nsAppFileExt];
-    if (![ext isKindOfClass:[NSString class]] || ext.length == 0) {
-        if ([app respondsToSelector:@selector(m_nsAppFileName)])
-            ext = ((NSString *)[(CExtendInfoOfAPP *)app m_nsAppFileName]).pathExtension;
-    }
+    NSString *ext = [(CExtendInfoOfAPP *)app m_nsAppFileExt];
+    if (![ext isKindOfClass:[NSString class]] || ext.length == 0)
+        ext = ((NSString *)[(CExtendInfoOfAPP *)app m_nsAppFileName]).pathExtension;
     if (![ext isKindOfClass:[NSString class]] || ext.length == 0) return NO;
-    BOOL hit = [dd_media_ext_set() containsObject:ext.lowercaseString];
-    if (!hit) dd_log(@"[menu] 文件非含音轨容器 ext=%@ → 不挂「转语音」", ext.lowercaseString);
-    return hit;
+    return [dd_media_ext_set() containsObject:ext.lowercaseString];
 }
-
-// 按 userInfo 标记去重（MMMenuItem 无 title/action getter，无法按 action 比对）。
-// 基类与四个子类各 hook 一次 operationMenuItems，两层叠加时同一 action 会注入两次。
+// 用 userInfo 标记去重（MMMenuItem 无 title/action getter）。
 static NSString *dd_menu_token(SEL action) {
     return [@"ddmc:" stringByAppendingString:NSStringFromSelector(action)];
 }
+// 注入菜单项（svg 图标 + 标题，一级平铺项）。已注入则跳过。
 static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSString *title, SEL action) {
     if (!enabled) return original;
     NSString *token = dd_menu_token(action);
-    for (id it in original) {
-        if (![it respondsToSelector:@selector(userInfo)]) continue;
-        id ui = [(id)it userInfo];
+    for (MMMenuItem *it in original) {
+        id ui = [it userInfo];
         if ([ui isKindOfClass:[NSString class]] && [(NSString *)ui isEqualToString:token]) return original;
     }
     Class cls = objc_getClass("MMMenuItem");
-    // 内置 svg 资源名 icon_filled_record_voice（微信 svg 注册名不带后缀），由微信内部渲染成图标
     MMMenuItem *item = [[cls alloc] initWithTitle:title
                                           svgName:@"icon_filled_record_voice"
                                            target:cell
                                            action:action];
-    if (!item) { dd_log(@"[menu] MMMenuItem 构造失败"); return original; }
+    if (!item) return original;
     [item setUserInfo:token];
-    dd_log(@"[menu] 已追加「%@」cell=%@ → 菜单数=%lu",
-          title, NSStringFromClass([cell class]), (unsigned long)original.count + 1);
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
     [items addObject:item];
     return items;
@@ -1013,7 +680,6 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 }
 %new
 - (void)dd_mediaToVoice:(id)sender {
-    dd_log(@"[action] 点击「转语音」(视频消息)");
     CMessageWrap *msg = dd_msg_of_cell(self);
     dd_media_to_voice(@"视频", msg, ^NSString *{ return dd_video_path_of_cell(self); },
                           ^{ dd_trigger_video_download(msg); });
@@ -1022,7 +688,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 
 %hook AppFileMessageCellView
 - (NSArray *)operationMenuItems {
-    // 建菜单阶段：开关 + 文件类型准入（只读消息字段），绝不解析路径（解析在点击后做，见 WCR 0x8dd96c）
+    // 菜单阶段准入：开关 + 文件类型（只读消息字段）。
     if (!dd_file_has_audio(dd_msg_of_cell(self))) return %orig;
     return dd_inject_items(self, %orig, [DDMediaConvertConfig shared].fileToVoiceEnabled,
                            @"转语音", @selector(dd_mediaToVoice:));
@@ -1034,7 +700,6 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 }
 %new
 - (void)dd_mediaToVoice:(id)sender {
-    dd_log(@"[action] 点击「转语音」(文件消息)");
     CMessageWrap *msg = dd_msg_of_cell(self);
     dd_media_to_voice(@"文件", msg, ^NSString *{ return dd_file_path_of_msg(msg); },
                           ^{ dd_trigger_file_download(msg); });
@@ -1054,7 +719,6 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 }
 %new
 - (void)dd_voiceToFile:(id)sender {
-    dd_log(@"[action] 点击「转文件」(语音消息)");
     dd_voice_to_file(dd_msg_of_cell(self));
 }
 %end
@@ -1069,12 +733,9 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 }
 - (void)ensureTableViewMgr {
     if (self.tableViewManager) return;
+    // 表格容器由 manager 自建（整屏 frame），再靠系统按导航栏/安全区自动补 inset。
     self.tableViewManager = [[objc_getClass("WCTableViewManager") alloc]
                               initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
-}
-- (instancetype)init {
-    if (self = [super init]) [self ensureTableViewMgr];
-    return self;
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -1088,8 +749,8 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     [self ensureTableViewMgr];
     [self buildTable];
     UITableView *tableView = [self.tableViewManager getTableView];
-    tableView.frame = self.view.bounds;
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;   // 自动按导航栏/安全区算 inset
     [self.view addSubview:tableView];
     _originalDelegate = self.tableViewManager.delegate;
     self.tableViewManager.delegate = self;
@@ -1099,71 +760,20 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     [self buildTable];
 }
 - (void)buildTable {
-    [self.tableViewManager clearAllSection];
     Class cellMgr = objc_getClass("WCTableViewCellManager");
     Class secMgr  = objc_getClass("WCTableViewSectionManager");
     DDMediaConvertConfig *cfg = [DDMediaConvertConfig shared];
-
     WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"转换开关"];
     [sec addCell:[cellMgr switchCellForSel:@selector(toggleVideoToVoice:) target:self title:@"视频转语音" on:cfg.videoToVoiceEnabled]];
     [sec addCell:[cellMgr switchCellForSel:@selector(toggleFileToVoice:)  target:self title:@"文件转语音" on:cfg.fileToVoiceEnabled]];
     [sec addCell:[cellMgr switchCellForSel:@selector(toggleVoiceToFile:)  target:self title:@"语音转文件" on:cfg.voiceToFileEnabled]];
     [self.tableViewManager addSection:sec];
-
-    WCTableViewSectionManager *logSec = [secMgr sectionWithHeader:@"调试日志"];
-    [logSec addCell:[cellMgr switchCellForSel:@selector(toggleLog:) target:self title:@"记录调试日志" on:cfg.logEnabled]];
-    DDLogStore *store = [DDLogStore shared];
-    NSString *cnt = [NSString stringWithFormat:@"%lu 条 / %.0f KB",
-                     (unsigned long)[store lineCount], [store fileSize] / 1024.0];
-    [logSec addCell:[cellMgr normalCellForSel:@selector(ddExportLog:) target:self title:@"导出日志" rightValue:cnt]];
-    [logSec addCell:[cellMgr normalCellForSel:@selector(ddClearLog:)  target:self title:@"清空日志" rightValue:@""]];
-    [self.tableViewManager addSection:logSec];
-    [self.tableViewManager reloadTableView];
 }
 - (void)toggleVideoToVoice:(UISwitch *)s { [DDMediaConvertConfig shared].videoToVoiceEnabled = s.on; }
 - (void)toggleFileToVoice:(UISwitch *)s  { [DDMediaConvertConfig shared].fileToVoiceEnabled = s.on; }
 - (void)toggleVoiceToFile:(UISwitch *)s  { [DDMediaConvertConfig shared].voiceToFileEnabled = s.on; }
-- (void)toggleLog:(UISwitch *)s {
-    [DDMediaConvertConfig shared].logEnabled = s.on;
-    [DDLogStore shared].enabled = s.on;
-}
-- (void)ddExportLog:(id)sender {
-    NSString *path = dd_log_export_path();
-    NSUInteger n = [[DDLogStore shared] lineCount];
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"日志已导出"
-                         message:[NSString stringWithFormat:@"%@\n共 %lu 条\n\n可用「分享/存储」保存到文件 App。",
-                                  path.lastPathComponent, (unsigned long)n]
-                  preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"分享/存储" style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-        UIActivityViewController *av = [[UIActivityViewController alloc]
-                                        initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
-        av.popoverPresentationController.sourceView = self.view;
-        av.popoverPresentationController.sourceRect =
-            CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
-        [self presentViewController:av animated:YES completion:nil];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"复制全文" style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-        [UIPasteboard generalPasteboard].string =
-            [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] ?: @"";
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
-}
-- (void)ddClearLog:(id)sender {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清空日志"
-                                                                  message:@"将清空内存缓冲与日志文件，确定？"
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive
-                                            handler:^(UIAlertAction *a) {
-        [[DDLogStore shared] clearAll];
-        [self buildTable];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
-}
+
+// 转发给微信原生 delegate，保留其选中/高亮/高度逻辑。
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)])
         [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
@@ -1181,54 +791,11 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 
 #pragma mark - 注册入口
 
-// 崩溃取证：微信闪退是 ObjC 未捕获异常 → SIGABRT（崩溃报告实证：exception type=objc-exception /
-// signal=SIGABRT）。安装全局异常处理，把异常名 + reason + 调用栈同步写进调试日志并 flush，
-// 这样每次闪退都能在自己的日志里拿到精确证据，不必去系统「分析数据」翻 .ips。
-static NSUncaughtExceptionHandler *dd_prev_exc_handler = NULL;
-static void dd_exception_handler(NSException *exc) {
-    NSString *reason = exc.reason ?: @"(无 reason)";
-    dd_log(@"[CRASH] ===== 未捕获异常 =====");
-    dd_log(@"[CRASH] name=%@ reason=%@", exc.name ?: @"(nil)", reason);
-    NSArray<NSString *> *syms = exc.callStackSymbols ?: [NSThread callStackSymbols];
-    NSUInteger n = syms.count > 40 ? 40 : syms.count;
-    for (NSUInteger i = 0; i < n; i++) dd_log(@"[CRASH] #%lu %@", (unsigned long)i, syms[i]);
-    [[DDLogStore shared] flushSync];
-    if (dd_prev_exc_handler) dd_prev_exc_handler(exc);
-}
-
-// 上面一层只覆盖 ObjC 未捕获异常（→ SIGABRT）。日志实证：文件转语音打出「发送结果=1」之后
-// 仍然闪退，且日志里没有 [CRASH] 段（导出头部「日志条数: 0」= 导出发生在重启之后），
-// 说明崩溃走的是内存破坏路径 SIGSEGV/SIGBUS，压根不经过 NSUncaughtExceptionHandler。
-// 故再挂一层 BSD 信号处理器：只写 async-signal-safe 的 open/write，把信号与回溯栈塞进日志文件。
-static void dd_signal_handler(int sig) {
-    int fd = open(dd_log_c_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (fd < 0) return;
-    const char *name = (sig == SIGSEGV) ? "SIGSEGV"
-                     : (sig == SIGBUS)  ? "SIGBUS"
-                     : (sig == SIGILL)  ? "SIGILL" : "SIGOTHER";
-    char b[128];
-    int len = snprintf(b, sizeof(b), "\n[CRASH] ===== 信号崩溃 ===== signal=%d %s\n[CRASH] backtrace:\n", sig, name);
-    if (len > 0) write(fd, b, (size_t)len);
-    void *bt[40];
-    int n = backtrace(bt, 40);
-    backtrace_symbols_fd(bt, n, fd);
-    close(fd);
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
-
 %ctor {
     @autoreleasepool {
         dd_convert_queue = dispatch_queue_create("com.ddmedia.convert", DISPATCH_QUEUE_SERIAL);
-        [DDLogStore shared].enabled = [DDMediaConvertConfig shared].logEnabled;
-        dd_log(@"[boot] 插件已加载");
-        dd_prev_exc_handler = NSGetUncaughtExceptionHandler();
-        NSSetUncaughtExceptionHandler(&dd_exception_handler);
-        signal(SIGSEGV, &dd_signal_handler);
-        signal(SIGBUS,  &dd_signal_handler);
-        signal(SIGILL,  &dd_signal_handler);
         [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD语音助手"
-                                                              version:@"1.0.27"
+                                                              version:@"1.0.0"
                                                            controller:@"DDMediaConvertSettingsViewController"];
     }
 }
