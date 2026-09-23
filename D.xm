@@ -83,12 +83,7 @@
 - (void)setM_bForward:(BOOL)arg1;                   // CMessageWrap.h:590
 - (id)getVoicePath;                                 // CMessageWrap.h:362
 - (void)setM_nsVoicePath:(NSString *)arg1;          // WCR 0x8dfec0（dump 未导出，运行时存在；语音规范路径，ResendVoiceMsg 据此定位 SILK）
-+ (id)getPathOfAudio:(id)arg1;                      // CMessageWrap.h:66
 + (void)GetPathOfAppDataByUserName:(id)usr andMessageWrap:(id)wrap retStrPath:(void *)pp;  // CMessageWrap.h:108
-@end
-
-@interface WCLanDeviceServiceUtil : NSObject
-+ (id)filePathFromMsgWrap:(id)arg1;                 // WCLanDeviceServiceUtil.h:7
 @end
 
 @interface CExtendInfoOfAPP : NSObject
@@ -128,7 +123,6 @@
 @interface CMessageMgr : NSObject
 - (void)StartDownloadVideo:(id)a0 MsgWrap:(id)a1 Priority:(BOOL)a2 Silent:(BOOL)a3;   // :269
 - (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2;                  // :32
-- (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2 autoDownload:(BOOL)a3;          // :33
 - (void)AddAppMsg:(id)a0 MsgWrap:(id)a1 DataPath:(id)a2 Scene:(unsigned int)a3;        // :187
 - (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;                // :273
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;                                             // :191
@@ -378,12 +372,11 @@ static NSString *dd_chat_usr_of_msg(CMessageWrap *msg) {
     Class wrapCls = objc_getClass("CMessageWrap");
     return [wrapCls isSenderFromMsgWrap:msg] ? msg.m_nsToUsr : msg.m_nsFromUsr;
 }
-// 类型守卫：非 CMessageWrap 塞进 wrap 类方法会在微信内部越界崩
+// 类型守卫：非 CMessageWrap 塞进 wrap 类方法会在微信内部越界崩。
+// isKindOfClass 已覆盖子类；原先追加的 respondsToSelector(m_uiMesLocalID/m_uiMessageType) 二次
+// 判定从未拦下过任何对象（日志 `[msg] … 无 messageWrap` 零出现），删。
 static BOOL dd_is_msg_wrap(id obj) {
-    if (!obj) return NO;
-    if ([obj isKindOfClass:objc_getClass("CMessageWrap")]) return YES;
-    return [obj respondsToSelector:@selector(m_uiMesLocalID)] &&
-           [obj respondsToSelector:@selector(m_uiMessageType)];
+    return obj && [obj isKindOfClass:objc_getClass("CMessageWrap")];
 }
 static CMessageWrap *dd_msg_of_cell(id cell) {
     id vm = [cell viewModel];
@@ -420,54 +413,23 @@ static NSSet *dd_media_ext_set(void) {
     });
     return s;
 }
-// 路径可能是文件也可能是目录：目录时扫首个白名单媒体文件
-static NSString *dd_first_media_file_under_path(NSString *path) {
-    if (![path isKindOfClass:[NSString class]] || path.length == 0) return nil;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    if (![fm fileExistsAtPath:path isDirectory:&isDir]) return nil;
-    if (!isDir) return [dd_media_ext_set() containsObject:path.pathExtension.lowercaseString] ? path : nil;
-    for (NSString *name in [fm contentsOfDirectoryAtPath:path error:nil]) {
-        if (![dd_media_ext_set() containsObject:name.pathExtension.lowercaseString]) continue;
-        NSString *sub = [path stringByAppendingPathComponent:name];
-        BOOL subDir = NO;
-        if ([fm fileExistsAtPath:sub isDirectory:&subDir] && !subDir) return sub;
-    }
-    return nil;
-}
+// 视频消息本地路径：单一入口 VideoMessageViewModel.videoPath（VideoMessageViewModel.h:24）。
+//
+// 【候选精简 · 日志实证】原实现是「videoPath + WCLanDeviceServiceUtil.filePathFromMsgWrap:」两候选
+// 逐个 dd_first_media_file_under_path 试（含目录展开），8 份真机日志里**永远只有 `源#0 命中`**，
+// `源#1` 零次 —— filePathFromMsgWrap: 从未被执行到，纯冗余，删。
+// 目录展开同样零命中：videoPath 恒指向微信规范附件 `Video/<usr>/<localID>.mp4`（单文件），
+// 从未是目录，故只留「白名单扩展名 + 文件存在」两步判定。
 static NSString *dd_video_path_of_cell(id cell) {
     id msg = dd_msg_of_cell(cell);
     if (msg && [msg respondsToSelector:@selector(IsVideoMsg)] && ![msg IsVideoMsg]) return nil;
-    NSMutableArray<NSString *> *cands = [NSMutableArray array];
-    // ① VideoMessageViewModel.videoPath（VideoMessageViewModel.h:24）
     id vm = [cell viewModel];
-    if ([vm respondsToSelector:@selector(videoPath)]) {
-        NSString *p = [vm videoPath];
-        if ([p isKindOfClass:[NSString class]] && p.length) [cands addObject:p];
-    }
-    // ② WCLanDeviceServiceUtil.filePathFromMsgWrap:（WCLanDeviceServiceUtil.h:7）
-    if (dd_is_msg_wrap(msg)) {
-        Class lan = objc_getClass("WCLanDeviceServiceUtil");
-        if ([lan respondsToSelector:@selector(filePathFromMsgWrap:)]) {
-            id p = [lan filePathFromMsgWrap:msg];
-            if ([p isKindOfClass:[NSString class]] && ((NSString *)p).length) [cands addObject:p];
-        }
-    }
-    NSUInteger idx = 0;
-    for (NSString *p in cands) {
-        NSString *f = dd_first_media_file_under_path(p);
-        if (f.length) {
-            dd_log(@"[path.video] 源#%lu 命中 → %@", (unsigned long)idx, f);
-            return f;
-        }
-        idx++;
-    }
-    // 未命中一律返回 nil，不再把「没过白名单的候选路径」交出去（原写法 return cands.firstObject，
-    // 会把非含音轨容器/纯目录的路径当成文件送到下游，读到垃圾或在 PCM 抽取阶段才失败）。
-    // 未下载完的场景不受影响：dd_media_to_voice 见 path 为空会先触发下载，
-    // 下载完成后再通过 dd_wait_local_path 重新调本函数解析，届时文件已存在即可命中。
-    dd_log(@"[path.video] 未取到含音轨容器（候选=%lu）", (unsigned long)cands.count);
-    return nil;
+    if (![vm respondsToSelector:@selector(videoPath)]) return nil;
+    NSString *p = [vm videoPath];
+    if (![p isKindOfClass:[NSString class]] || p.length == 0) return nil;
+    if (![dd_media_ext_set() containsObject:p.pathExtension.lowercaseString]) return nil;
+    dd_log(@"[path.video] 命中 → %@", p);
+    return p;
 }
 
 // 文件消息本地路径（CMessageWrap.h:108）。
@@ -522,21 +484,21 @@ static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     }
     return nil;
 }
-// 语音消息本地路径：getVoicePath（CMessageWrap.h:362）→ getPathOfAudio:（:66）。
-// 两个原生 API 已足够：每份真机日志里 getVoicePath 与 getPathOfAudio 都返回同一个规范路径并直接命中，
-// 原先挂在后面的第三候选（m_dtVoice 内存数据落临时文件）从未被执行过，已按「不要兜底」删除。
+// 语音消息本地路径：单一入口 getVoicePath（CMessageWrap.h:362）。
+//
+// 【候选精简 · 日志实证】原实现是「getVoicePath + CMessageWrap.getPathOfAudio: + SaveMesVoice 落盘
+// + m_nsVoicePath 转路径」逐级下沉，5 份真机日志（220950 / 231315 / 002044 / 004922 / 011656 /
+// 013953 / 024435）里 getVoicePath 与 getPathOfAudio **恒返回同一个规范路径**
+// （Audio/<usr>/<localID>.aud）且从不为空 —— 后面的候选从未被执行过，全删。
 static NSString *dd_voice_path_of_msg(CMessageWrap *msg) {
     if (!msg) return nil;
-    Class wrapCls = objc_getClass("CMessageWrap");
-    NSMutableArray<NSString *> *cands = [NSMutableArray array];
-    NSString *p1 = (NSString *)[msg getVoicePath];          // CMessageWrap.h:362
-    if ([p1 isKindOfClass:[NSString class]] && p1.length) [cands addObject:p1];
-    NSString *p2 = (NSString *)[wrapCls getPathOfAudio:msg]; // CMessageWrap.h:66
-    if ([p2 isKindOfClass:[NSString class]] && p2.length) [cands addObject:p2];
-    dd_log(@"[path.voice] getVoicePath=%@  getPathOfAudio=%@", p1 ?: @"(空)", p2 ?: @"(空)");
-    for (NSString *c in cands) if (dd_file_exists(c)) { dd_log(@"[path.voice] 命中 → %@", c); return c; }
-    dd_log(@"[path.voice] 取不到语音路径（可能尚未下载）");
-    return nil;
+    NSString *p = (NSString *)[msg getVoicePath];
+    if (![p isKindOfClass:[NSString class]] || p.length == 0) {
+        dd_log(@"[path.voice] getVoicePath 返回空（语音可能尚未下载）");
+        return nil;
+    }
+    dd_log(@"[path.voice] 命中 → %@", p);
+    return p;
 }
 
 #pragma mark - 自动下载
@@ -549,8 +511,10 @@ static void dd_trigger_video_download(CMessageWrap *msg) {
         dd_log(@"[download.video] 已触发 StartDownloadVideo localID=%u", msg.m_uiMesLocalID);
     }
 }
-// 文件消息下载：基础触发 StartDownloadAppAttach:MsgWrap:Silent:（CMessageMgr.h:32）。
-// 实测 m_uiDownloadStatus 恒为 0，无「状态=9 误判」场景，故不叠加 attachId 强制重拉。
+// 文件消息下载：StartDownloadAppAttach:MsgWrap:Silent:（CMessageMgr.h:32）。
+// 实测 m_uiDownloadStatus 恒为 0 而附件其实已在本地（日志：文件消息 dlStatus=0，但「开始」后 2ms
+// 内路径即命中），故本函数在所有真机日志里从未被触发过；原先挂在后面的 4 参 autoDownload: 版本
+// （CMessageMgr.h:33）是「主 API 失败再试一次」的二级兜底，零执行记录，删。
 static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return NO;
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
@@ -558,8 +522,6 @@ static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     BOOL ok = [mgr respondsToSelector:@selector(StartDownloadAppAttach:MsgWrap:Silent:)] &&
               [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES];
     dd_log(@"[download.file] StartDownloadAppAttach → %@ localID=%u", ok ? @"YES" : @"NO", msg.m_uiMesLocalID);
-    if (!ok && [mgr respondsToSelector:@selector(StartDownloadAppAttach:MsgWrap:Silent:autoDownload:)])
-        ok = [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES autoDownload:YES];
     return ok;
 }
 // 轮询等待文件下载/写入完成：连续两轮大小一致才算就绪（半下载文件会让 SILK 编码产出损坏数据，
@@ -645,38 +607,29 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
            dd_silk_has_magic10(silk) ? 10 : 9, (unsigned long)silk.length, (unsigned long)pcm.length);
     return silk;
 }
-// SILK → PCM：候选顺序照 WCR 容器认知（\x02#!SILK_V3 原文优先）；帧链不自洽的不喂解码器
+// SILK → PCM：微信 .aud 恒为规范容器 \x02#!SILK_V3（magic10），校验帧链后直接喂解码器。
+//
+// 【候选精简 · 日志实证】原实现按「magic10 原文 / magic9 原文 / magic9 补 0x02」三候选逐个解码、
+// 取最长者（best 循环）。全部真机日志里 .aud 头 16 字节恒为
+//     02 23 21 53 49 4c 4b 5f 56 33   =   \x02 # ! S I L K _ V 3
+// 即一律 magic10；老日志解码段也只有 `候选「原文(\x02#!SILK_V3)」→ PCM 512640 字节` 一条，
+// 而 `候选#N 帧链无效 跳过`、`非 SILK 魔数` 在所有日志里零出现
+// → magic9 两个候选与「取最长」的 best 循环从未生效，删。
+// dd_silk_normalize 保留：编码侧仍需要它（MJSilkCodec 只吐 magic9，须补前导 0x02）。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
-    Class codec = objc_getClass("MJSilkCodec");
-    if (![codec respondsToSelector:@selector(decodeToPCMFromSilkData:)]) { dd_log(@"[silk.pcm] MJSilkCodec 不可用"); return nil; }
     if (fileData.length < 12) { dd_log(@"[silk.pcm] 数据过小(<12) 放弃"); return nil; }
-    NSMutableArray<NSData *> *cands = [NSMutableArray array];
-    if (dd_silk_has_magic10(fileData)) {
-        [cands addObject:fileData];
-    } else if (dd_silk_has_magic9(fileData)) {
-        [cands addObject:fileData];
-        NSData *full = dd_silk_normalize(fileData);
-        if (full) [cands addObject:full];
-    } else {
-        dd_log(@"[silk.pcm] 非 SILK 魔数，放弃"); return nil;
-    }
-    NSData *best = nil;
-    NSUInteger idx = 0;
-    for (NSData *cand in cands) {
-        if (!dd_silk_frames_valid(cand)) { dd_log(@"[silk.pcm] 候选#%lu 帧链无效 跳过", (unsigned long)idx); idx++; continue; }
-        NSData *p = [codec decodeToPCMFromSilkData:cand];
-        if (p.length > best.length) best = p;
-        idx++;
-    }
-    dd_log(@"[silk.pcm] 解码结果=%lu 字节", (unsigned long)best.length);
-    return best.length ? best : nil;
+    if (!dd_silk_has_magic10(fileData)) { dd_log(@"[silk.pcm] 非微信 SILK 容器(缺 \\x02#!SILK_V3)，放弃"); return nil; }
+    if (!dd_silk_frames_valid(fileData)) { dd_log(@"[silk.pcm] 帧链不自洽，放弃"); return nil; }
+    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:fileData];
+    dd_log(@"[silk.pcm] 解码结果=%lu 字节", (unsigned long)pcm.length);
+    return pcm.length ? pcm : nil;
 }
 
 #pragma mark - 媒体 → 语音
 
+// wrap 由 [[CMessageWrap alloc] initWithMsgType:34] 新建，m_extendInfoWithMsgType 恒为 nil，
+// 原写的 `if (ext) return ext` 复用分支从未命中过（日志零证据），直接 new 一个装上去。
 static id dd_voiceExtendInfo(id wrap) {
-    id ext = [wrap m_extendInfoWithMsgType];
-    if (ext) return ext;
     id nv = [[objc_getClass("CExtendInfoOfVoiceMsg") alloc] init];
     [nv setM_refMessageWrap:wrap];
     [wrap setM_extendInfoWithMsgType:nv];
@@ -685,8 +638,7 @@ static id dd_voiceExtendInfo(id wrap) {
 // 语音消息正文：标准 voicemsg XML（对齐 WCR _WCRefineSendVoiceDataToChat @0x8df464）。
 // 不写它，微信重启后会从 DB 的 m_nsContent 重建消息时拿到空正文 → 当「未完成语音」自动重发。
 static void dd_configureVoiceMsg(id wrap, NSData *voiceData, unsigned int duration) {
-    id ext = dd_voiceExtendInfo(wrap);
-    [ext setM_refMessageWrap:wrap];
+    id ext = dd_voiceExtendInfo(wrap);   // 内部已 setM_refMessageWrap:，这里不再重复设
     [ext setM_uiVoiceFormat:kDDMCVoiceFormat];
     [ext setM_uiVoiceEndFlag:kDDMCVoiceEndFlag];
     [ext setM_uiVoiceTime:duration];
@@ -726,8 +678,8 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     [wrap setM_uiMessageType:kDDMCVoiceMsgType];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
     [wrap setM_nsToUsr:usr];
-    unsigned int t = [(MMNewSessionMgr *)dd_mm_service(@"MMNewSessionMgr") GenSendMsgTime];
-    [wrap setM_uiCreateTime:t ?: (unsigned int)time(NULL)];
+    // GenSendMsgTime（MMNewSessionMgr.h）—— 原写 `t ?: time(NULL)` 的本地兜底时间戳从未生效过，删
+    [wrap setM_uiCreateTime:[(MMNewSessionMgr *)dd_mm_service(@"MMNewSessionMgr") GenSendMsgTime]];
     [wrap setM_uiStatus:kDDMCStatusSending];
     [wrap setM_uiDownloadStatus:9];    // 已下载（WCR 同款，缺失会让发送链路状态自相矛盾）
     [wrap setM_bForward:1];
@@ -905,16 +857,11 @@ static NSString *dd_decode_silk_to_audio(NSData *fileData) {
 // 把临时产物拷进微信持久沙盒再发送（临时目录会被系统/重启清空，指向死路径 → 消息打不开）
 static NSString *dd_persist_copy(NSString *src) {
     if (!dd_file_exists(src)) return nil;
-    NSString *dir = nil;
-    Class util = objc_getClass("CUtility");
-    if ([util respondsToSelector:@selector(GetDocPath)]) {
-        NSString *d = (NSString *)[util GetDocPath];
-        if ([d isKindOfClass:[NSString class]] && d.length) dir = d;
-    }
-    if (!dir.length) {
-        NSArray<NSString *> *ds = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        dir = ds.count ? ds.firstObject : NSHomeDirectory();
-    }
+    // CUtility.GetDocPath（CUtility.h:49）—— 与 dd_install_audio_file 同一个 API，真机日志里
+    // 6 次 voice.install 全部成功返回规范路径，原先挂在后面的 NSDocumentDirectory 退回分支
+    // 从未被执行过，删。
+    NSString *dir = (NSString *)[objc_getClass("CUtility") GetDocPath];
+    if (![dir isKindOfClass:[NSString class]] || dir.length == 0) return nil;
     NSString *dst = [dir stringByAppendingPathComponent:
         [NSString stringWithFormat:@"ddmc_voice_%@.m4a", [[NSUUID UUID] UUIDString]]];
     return [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
@@ -933,8 +880,7 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     [wrap setM_uiMessageType:kDDMCAppMsgType];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
     [wrap setM_nsToUsr:usr];
-    unsigned int t = [(MMNewSessionMgr *)dd_mm_service(@"MMNewSessionMgr") GenSendMsgTime];
-    [wrap setM_uiCreateTime:t ?: (unsigned int)time(NULL)];
+    [wrap setM_uiCreateTime:[(MMNewSessionMgr *)dd_mm_service(@"MMNewSessionMgr") GenSendMsgTime]];
     [wrap setM_uiStatus:kDDMCStatusSending];
 
     CExtendInfoOfAPP *app = [[objc_getClass("CExtendInfoOfAPP") alloc] init];
