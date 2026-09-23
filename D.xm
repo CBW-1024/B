@@ -475,16 +475,6 @@ static id dd_app_item_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
     return [msg respondsToSelector:@selector(m_extendInfoWithMsgType)] ? [msg m_extendInfoWithMsgType] : nil;
 }
-static NSString *dd_file_ext_of_msg(CMessageWrap *msg) {
-    id appItem = dd_app_item_of_msg(msg);
-    for (NSString *k in @[@"m_nsAppFileExt", @"m_nsFileExt", @"m_nsAppFileName"]) {
-        id v = [appItem valueForKey:k];
-        if (![v isKindOfClass:[NSString class]] || ((NSString *)v).length == 0) continue;
-        NSString *raw = (NSString *)v;
-        return (raw.pathExtension.length ? raw.pathExtension : raw).lowercaseString;
-    }
-    return nil;
-}
 // 文件消息本地路径：GetPathOfAppData:（CMessageWrap.h:26）+ GetPathOfAppDataByUserName:（:108）
 // + 数据项路径键。注意本函数会在 GetPathOfAppData: 内部崩（未下载/字段残缺）——只在「点击后」调用，
 // 绝不在建菜单阶段调用（参见 WCR WCRefineAppendVoiceToolsMediaMenuItems 0x8dd96c 的做法）。
@@ -1202,7 +1192,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
         dd_convert_queue = dispatch_queue_create("com.ddmedia.convert", DISPATCH_QUEUE_SERIAL);
         [DDLogStore shared].enabled = [DDMediaConvertConfig shared].logEnabled;
         [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD语音助手"
-                                                              version:@"1.0.20"
+                                                              version:@"1.0.21"
                                                            controller:@"DDMediaConvertSettingsViewController"];
     }
 }
