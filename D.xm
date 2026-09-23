@@ -65,7 +65,6 @@
 @property(retain, nonatomic) NSString *m_nsFromUsr;
 - (id)initWithMsgType:(long long)arg1;
 + (BOOL)isSenderFromMsgWrap:(id)arg1;
-+ (id)getPathOfMsgImg:(id)arg1;                     // CMessageWrap.h:72
 - (BOOL)IsVideoMsg;                                 // CMessageWrap.h:155
 - (id)m_extendInfoWithMsgType;                      // CMessageWrap.h:382
 - (void)setM_extendInfoWithMsgType:(id)arg1;        // CMessageWrap.h:637
@@ -469,16 +468,10 @@ static NSString *dd_video_path_of_cell(id cell) {
     return nil;
 }
 
-// 文件/app 消息数据项：走 m_extendInfoWithMsgType（CMessageWrap.h:382）。
-// 注：m_oAppDataItem 在 8.0.79 全库已不存在，不可再用。
-static id dd_app_item_of_msg(CMessageWrap *msg) {
-    if (!dd_is_msg_wrap(msg)) return nil;
-    return [msg respondsToSelector:@selector(m_extendInfoWithMsgType)] ? [msg m_extendInfoWithMsgType] : nil;
-}
-// 文件消息本地路径：GetPathOfAppData:（CMessageWrap.h:26）最权威，但「未下载/字段残缺时内部崩」
-// —— 这正是「文件转语音」点击即崩的根因（后台全局队列 autorelease pool pop + PAC 失败 SIGSEGV）。
-// 故把它降级为「已下载(m_uiDownloadStatus==9)才调用」的兜底，优先用对残缺字段安全的来源：
-// GetPathOfAppDataByUserName:（:108）与 extendInfo 键（CMessageWrap.h:382）。
+// 文件消息本地路径。原生方法两路：
+// ① GetPathOfAppDataByUserName:retStrPath:（CMessageWrap.h:108）—— 对未下载/残缺字段返回空而非崩（安全主路径）
+// ② GetPathOfAppData:（:26）—— 最权威，但「未下载/字段残缺时内部崩」，仅 m_uiDownloadStatus==9（已下载）才调
+// 早期版本把 GetPathOfAppData: 当首选，未下载文件消息点击即崩（后台队列 autorelease pool pop + PAC 失败）。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
     Class wrapCls = objc_getClass("CMessageWrap");
@@ -486,37 +479,14 @@ static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     NSString *p2 = nil;
     [wrapCls GetPathOfAppDataByUserName:dd_current_usr_name() andMessageWrap:msg retStrPath:&p2];
     if ([p2 isKindOfClass:[NSString class]] && p2.length) [cands addObject:p2];
-    id appItem = dd_app_item_of_msg(msg);
-    for (NSString *k in @[@"m_nsAppMediaUrl", @"m_nsFilePath", @"m_nsDataPath"]) {
-        id v = [appItem valueForKey:k];
-        if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length) [cands addObject:v];
-    }
-    NSUInteger idx = 0;
-    for (NSString *c in cands) {
-        if (dd_file_exists(c)) {
-            dd_log(@"[path.file] 命中安全来源#%lu → %@", (unsigned long)idx, c);
-            return c;
-        }
-        idx++;
-    }
-    // 已下载后字段完整，GetPathOfAppData: 才安全；取其权威路径（处理子目录/多分片）
     if (msg.m_uiDownloadStatus == 9) {
         NSString *p = (NSString *)[wrapCls GetPathOfAppData:msg];
         if ([p isKindOfClass:[NSString class]] && p.length) [cands addObject:p];
-        for (NSString *c in cands) if (dd_file_exists(c)) return c;
     }
+    dd_log(@"[path.file] dlStatus=%u 候选数=%lu → %@",
+           msg.m_uiDownloadStatus, (unsigned long)cands.count, [cands componentsJoinedByString:@"; "]);
+    for (NSString *c in cands) if (dd_file_exists(c)) return c;
     return cands.lastObject;   // 未下载完也返回路径供下载轮询
-}
-// 应用视频/视频号视频路径：与文件消息同通道
-static NSString *dd_appvideo_path_of_msg(CMessageWrap *msg) {
-    NSString *p = dd_file_path_of_msg(msg);
-    if (p.length) return p;
-    id appItem = dd_app_item_of_msg(msg);
-    for (NSString *k in @[@"m_nsDataPath", @"videoPath", @"m_nsVideoPath", @"localPath"]) {
-        id v = [appItem valueForKey:k];
-        if ([v isKindOfClass:[NSString class]] && dd_file_exists(v)) return v;
-    }
-    return nil;
 }
 // 语音消息本地路径：getVoicePath（CMessageWrap.h:362）→ getPathOfAudio:（:66）→ m_dtVoice 兜底
 static NSString *dd_voice_path_of_msg(CMessageWrap *msg) {
@@ -685,12 +655,7 @@ static NSString *dd_install_audio_file(CMessageWrap *wrap, NSString *src) {
                                                             LocalID:wrap.m_uiMesLocalID
                                                             DocPath:[objc_getClass("CUtility") GetDocPath]];
     }
-    if (!p.length) {
-        p = [[(NSString *)[objc_getClass("CMessageWrap") getPathOfMsgImg:wrap]
-              stringByReplacingOccurrencesOfString:@"Img" withString:@"Audio"]
-             stringByReplacingOccurrencesOfString:@".pic" withString:@".aud"];
-    }
-    if (!p.length) return nil;
+    if (!p.length) return nil;   // 仅 GetPathOfMesAudio:LocalID:DocPath: 原生路径（对齐 WCR，不靠字符串替换 hack）
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:[p stringByDeletingLastPathComponent]
   withIntermediateDirectories:YES attributes:nil error:nil];
@@ -772,7 +737,8 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
 static void dd_media_to_voice(CMessageWrap *msg, NSString *(^pathBlock)(void), void(^downloadBlock)(void)) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
-    dd_log(@"[media→voice] ==== 开始 ==== type=%u localID=%u chat=%@", msg.m_uiMessageType, msg.m_uiMesLocalID, usr ?: @"(nil)");
+    dd_log(@"[media→voice] ==== 开始 ==== type=%u localID=%u dlStatus=%u chat=%@",
+           msg.m_uiMessageType, msg.m_uiMesLocalID, msg.m_uiDownloadStatus, usr ?: @"(nil)");
     dispatch_async(dd_convert_queue, ^{
         NSString *path = pathBlock();
         if (!dd_file_exists(path)) {
@@ -1015,7 +981,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)dd_mediaToVoice:(id)sender {
     dd_log(@"[action] 点击「转语音」(视频号)");
     CMessageWrap *msg = dd_msg_of_cell(self);
-    dd_media_to_voice(msg, ^NSString *{ return dd_appvideo_path_of_msg(msg); },
+    dd_media_to_voice(msg, ^NSString *{ return dd_file_path_of_msg(msg); },
                           ^{ dd_trigger_file_download(msg); });
 }
 %end
@@ -1184,7 +1150,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
         dd_convert_queue = dispatch_queue_create("com.ddmedia.convert", DISPATCH_QUEUE_SERIAL);
         [DDLogStore shared].enabled = [DDMediaConvertConfig shared].logEnabled;
         [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD语音助手"
-                                                              version:@"1.0.22"
+                                                              version:@"1.0.23"
                                                            controller:@"DDMediaConvertSettingsViewController"];
     }
 }
