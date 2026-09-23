@@ -17,6 +17,10 @@
 #include <string.h>
 #include <limits.h>
 #include <math.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <execinfo.h>
 
 // CI（Xcode 26 / iOS 26 SDK）开 -Werror，这两类警告会变 error
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -76,10 +80,9 @@
 - (void)setM_nsContent:(id)arg1;                    // CMessageWrap.h:676
 - (unsigned int)m_uiDownloadStatus;                 // CMessageWrap.h:513
 - (void)setM_uiDownloadStatus:(unsigned int)arg1;   // CMessageWrap.h:711
-- (BOOL)m_bForward;                                 // CMessageWrap.h:269
 - (void)setM_bForward:(BOOL)arg1;                   // CMessageWrap.h:590
 - (id)getVoicePath;                                 // CMessageWrap.h:362
-    - (void)setM_nsVoicePath:(NSString *)arg1;          // WCR 0x8dfec0（dump 未导出，运行时存在；语音规范路径，ResendVoiceMsg 据此定位 SILK）
+- (void)setM_nsVoicePath:(NSString *)arg1;          // WCR 0x8dfec0（dump 未导出，运行时存在；语音规范路径，ResendVoiceMsg 据此定位 SILK）
 + (id)getPathOfAudio:(id)arg1;                      // CMessageWrap.h:66
 + (void)GetPathOfAppDataByUserName:(id)usr andMessageWrap:(id)wrap retStrPath:(void *)pp;  // CMessageWrap.h:108
 @end
@@ -95,11 +98,9 @@
 @property(nonatomic) unsigned long long m_uiAppDataSize;
 @property(retain, nonatomic) NSString *m_nsAppMediaUrl;
 @property(retain, nonatomic) NSString *m_nsAppAttachID;
-- (id)m_nsTitle;
-- (void)setM_nsTitle:(id)arg1;
-- (BOOL)m_bAppAttachExistInSvr;
-- (void)setM_bAppAttachExistInSvr:(BOOL)arg1;
 - (id)init;
+- (void)setM_nsTitle:(id)arg1;
+- (void)setM_bAppAttachExistInSvr:(BOOL)arg1;
 @end
 
 @interface CExtendInfoOfVoiceMsg : NSObject
@@ -247,9 +248,12 @@ static dispatch_queue_t dd_convert_queue;
 - (unsigned long long)fileSize;
 @end
 
+// 崩溃信号处理器只能用 async-signal-safe 的 open/write，不能走 Objective-C，
+// 故在此缓存日志文件的 C 路径（init 时写入一次，之后只读）。
+static char dd_log_c_path[PATH_MAX] = {0};
+
 @implementation DDLogStore {
     NSFileHandle *_handle;
-    NSMutableArray<NSString *> *_lines;
     dispatch_queue_t _q;
 }
 + (instancetype)shared {
@@ -261,7 +265,6 @@ static dispatch_queue_t dd_convert_queue;
 - (instancetype)init {
     if (self = [super init]) {
         _q = dispatch_queue_create("com.ddvoice.log", DISPATCH_QUEUE_SERIAL);
-        _lines = [NSMutableArray array];
         _enabled = YES;
         // 日志落 Library/Preferences/DDMediaConvertLogs：Documents/下载缓存会被微信清理，重启即丢。
         NSArray<NSString *> *libDirs = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
@@ -274,6 +277,7 @@ static dispatch_queue_t dd_convert_queue;
         if (![fm fileExistsAtPath:_logPath]) [fm createFileAtPath:_logPath contents:nil attributes:nil];
         _handle = [NSFileHandle fileHandleForWritingAtPath:_logPath];
         [_handle seekToEndOfFile];
+        strlcpy(dd_log_c_path, _logPath.fileSystemRepresentation, sizeof(dd_log_c_path));
     }
     return self;
 }
@@ -281,9 +285,6 @@ static dispatch_queue_t dd_convert_queue;
     if (!line.length) return;
     // 同步写 + 每条 fsync：崩溃瞬间的日志也必须落盘（异步写会在闪退时丢日志，无法定位问题）
     dispatch_sync(_q, ^{
-        if (self->_lines.count >= 3000)
-            [self->_lines removeObjectsInRange:NSMakeRange(0, 750)];
-        [self->_lines addObject:line];
         NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
         [self->_handle seekToEndOfFile];
         [self->_handle writeData:d];
@@ -292,7 +293,17 @@ static dispatch_queue_t dd_convert_queue;
     });
 }
 - (void)flushSync { dispatch_sync(_q, ^{ [self->_handle synchronizeFile]; }); }
-- (NSUInteger)lineCount { __block NSUInteger n = 0; dispatch_sync(_q, ^{ n = _lines.count; }); return n; }
+// 行数按磁盘文件统计：闪退重启后内存计数归零（导出头部出现过「日志条数: 0 文件大小: 4685」），
+// 只有文件行数才与实际导出的正文一致。
+- (NSUInteger)lineCount {
+    __block NSUInteger n = 0;
+    dispatch_sync(_q, ^{
+        NSString *s = [NSString stringWithContentsOfFile:self->_logPath encoding:NSUTF8StringEncoding error:nil];
+        NSUInteger c = s.length ? [s componentsSeparatedByString:@"\n"].count : 0;
+        n = c > 1 ? c - 1 : 0;
+    });
+    return n;
+}
 - (unsigned long long)fileSize {
     __block unsigned long long sz = 0;
     dispatch_sync(_q, ^{
@@ -302,7 +313,6 @@ static dispatch_queue_t dd_convert_queue;
 }
 - (void)clearAll {
     dispatch_sync(_q, ^{
-        [self->_lines removeAllObjects];
         [self->_handle closeFile];
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm removeItemAtPath:self->_logPath error:nil];
@@ -1152,12 +1162,37 @@ static void dd_exception_handler(NSException *exc) {
     if (dd_prev_exc_handler) dd_prev_exc_handler(exc);
 }
 
+// 上面一层只覆盖 ObjC 未捕获异常（→ SIGABRT）。日志实证：文件转语音打出「发送结果=1」之后
+// 仍然闪退，且日志里没有 [CRASH] 段（导出头部「日志条数: 0」= 导出发生在重启之后），
+// 说明崩溃走的是内存破坏路径 SIGSEGV/SIGBUS，压根不经过 NSUncaughtExceptionHandler。
+// 故再挂一层 BSD 信号处理器：只写 async-signal-safe 的 open/write，把信号与回溯栈塞进日志文件。
+static void dd_signal_handler(int sig) {
+    int fd = open(dd_log_c_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) return;
+    const char *name = (sig == SIGSEGV) ? "SIGSEGV"
+                     : (sig == SIGBUS)  ? "SIGBUS"
+                     : (sig == SIGILL)  ? "SIGILL" : "SIGOTHER";
+    char b[128];
+    int len = snprintf(b, sizeof(b), "\n[CRASH] ===== 信号崩溃 ===== signal=%d %s\n[CRASH] backtrace:\n", sig, name);
+    if (len > 0) write(fd, b, (size_t)len);
+    void *bt[40];
+    int n = backtrace(bt, 40);
+    backtrace_symbols_fd(bt, n, fd);
+    close(fd);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 %ctor {
     @autoreleasepool {
         dd_convert_queue = dispatch_queue_create("com.ddmedia.convert", DISPATCH_QUEUE_SERIAL);
         [DDLogStore shared].enabled = [DDMediaConvertConfig shared].logEnabled;
+        dd_log(@"[boot] 插件已加载");
         dd_prev_exc_handler = NSGetUncaughtExceptionHandler();
         NSSetUncaughtExceptionHandler(&dd_exception_handler);
+        signal(SIGSEGV, &dd_signal_handler);
+        signal(SIGBUS,  &dd_signal_handler);
+        signal(SIGILL,  &dd_signal_handler);
         [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD语音助手"
                                                               version:@"1.0.27"
                                                            controller:@"DDMediaConvertSettingsViewController"];
