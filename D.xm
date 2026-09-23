@@ -972,6 +972,43 @@ static void dd_voice_to_file(CMessageWrap *msg) {
 
 #pragma mark - 菜单注入
 
+// 文件消息「转语音」的准入白名单：**必须含音轨**的容器才挂按钮。
+// 图片（png/jpg/gif/webp/heic/bmp）、文档（txt/pdf/doc/xls/zip…）没有音轨，抽出来是空 PCM，
+// 挂了按钮点了必然失败 —— 故一律不挂（用户实证：txt / 图片文件的长按菜单上不该出现「转语音」）。
+// WCR 的白名单（@0x152e00）只认视频/图片容器，是因为它的「媒体→语音」还兼做图片转文字等语义；
+// 本插件只做音轨抽取，故按「含音轨」重新划分：音频容器 + 视频容器。
+static NSSet *dd_audio_ext_set(void) {
+    static NSSet *s; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithObjects:
+             // 音频容器
+             @"mp3", @"wav", @"m4a", @"aac", @"flac", @"ogg", @"oga", @"opus",
+             @"caf", @"aiff", @"aif", @"m4r", @"amr", @"wma", @"ape", @"au",
+             // 视频容器（含音轨，可抽取）
+             @"mp4", @"mov", @"m4v", @"avi", @"mkv", @"flv", @"webm", @"3gp", @"wmv", @"mpg", @"mpeg", nil];
+    });
+    return s;
+}
+// 菜单构建阶段判定：只读消息自带字段，绝不解析路径（解析留到点击后，见 WCR 0x8dd96c）。
+// 扩展名取 CExtendInfoOfAPP.m_nsAppFileExt（WCR 同款字段，@三方对比 §1.2），
+// 该字段为空时取 m_nsAppFileName 的 pathExtension —— 两个字段都是消息内存里的现成值，无副作用。
+static BOOL dd_file_has_audio(CMessageWrap *msg) {
+    if (!dd_is_msg_wrap(msg)) return NO;
+    id app = [msg m_extendInfoWithMsgType];
+    if (!app) return NO;
+    NSString *ext = nil;
+    if ([app respondsToSelector:@selector(m_nsAppFileExt)])
+        ext = [(CExtendInfoOfAPP *)app m_nsAppFileExt];
+    if (![ext isKindOfClass:[NSString class]] || ext.length == 0) {
+        if ([app respondsToSelector:@selector(m_nsAppFileName)])
+            ext = ((NSString *)[(CExtendInfoOfAPP *)app m_nsAppFileName]).pathExtension;
+    }
+    if (![ext isKindOfClass:[NSString class]] || ext.length == 0) return NO;
+    BOOL hit = [dd_audio_ext_set() containsObject:ext.lowercaseString];
+    if (!hit) dd_log(@"[menu] 文件非含音轨容器 ext=%@ → 不挂「转语音」", ext.lowercaseString);
+    return hit;
+}
+
 // 按 userInfo 标记去重（MMMenuItem 无 title/action getter，无法按 action 比对）。
 // 基类与四个子类各 hook 一次 operationMenuItems，两层叠加时同一 action 会注入两次。
 static NSString *dd_menu_token(SEL action) {
@@ -1022,12 +1059,14 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 
 %hook AppFileMessageCellView
 - (NSArray *)operationMenuItems {
-    // 建菜单阶段只读开关，绝不解析路径（路径解析在点击后做，见 WCR 0x8dd96c）
+    // 建菜单阶段：开关 + 文件类型准入（只读消息字段），绝不解析路径（解析在点击后做，见 WCR 0x8dd96c）
+    if (!dd_file_has_audio(dd_msg_of_cell(self))) return %orig;
     return dd_inject_items(self, %orig, [DDMediaConvertConfig shared].fileToVoiceEnabled,
                            @"转语音", @selector(dd_mediaToVoice:));
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(dd_mediaToVoice:) && [DDMediaConvertConfig shared].fileToVoiceEnabled) return YES;
+    if (action == @selector(dd_mediaToVoice:))
+        return [DDMediaConvertConfig shared].fileToVoiceEnabled && dd_file_has_audio(dd_msg_of_cell(self));
     return %orig;
 }
 %new
