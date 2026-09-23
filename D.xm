@@ -458,14 +458,34 @@ static NSString *dd_video_path_of_cell(id cell) {
 }
 
 // 文件消息本地路径（CMessageWrap.h:108）。
-// 【实证】本方法能正确返回路径：日志里 2.mp3 / 3.m4r 均解析成功。文件消息的崩溃发生在「发送之后」，
-// 不在本方法 —— 曾误判为本方法破坏堆状态，改走 GetPathOfAppData:LocalID:FileExt:retStrPath:（:106）
-// / CExtendInfoOfAPP.getFileExt 后，日志显示连「命中」都打不出（004922），崩点被推到更早，已回退。
+//
+// 【崩溃根因 · 实证：09-24 01:58 / 01:59 两份日志 + SIGSEGV 信号栈】
+// 原写法 `NSString *p = nil; ... retStrPath:&p;`，p 是 __strong 局部变量。而头文件签名是
+//   +(void) GetPathOfAppDataByUserName:(id) andMessageWrap:(id) retStrPath:(void *)
+// 即「返回 void + void* 出参」。微信内部往 *pp 写入的是 **autorelease（+0）**字符串，而 ARC
+// 对 void* 出参完全不感知：不会为写入的对象补 retain，却在 p 出作用域时照常 release 一次
+// → 对象被**多释放一次**。之后任何一个 autorelease pool pop 再 release 这个已销毁的对象就炸。
+// 崩溃栈两份一致（signal=11 SIGSEGV）：
+//     objc_autoreleasePoolPop + 244
+//     ├─ 01:58 那次：CFRunLoopRunSpecific（主线程 runloop 的 pool）
+//     └─ 01:59 那次：_pthread_wqthread（dd_convert_queue 的 pool）
+// 崩点随「pool 何时被 pop」漂移 —— 所以表象是「发送结果=1 之后随机闪退」。
+// 由此解释全部历史现象：
+//   · 只有文件消息崩：视频走 VideoMessageViewModel.videoPath、语音走 getVoicePath /
+//     GetPathOfMesAudio:LocalID:DocPath:，全是**返回值** API，ARC 管理正确；
+//     retStrPath: 是全工程唯一的 void* 出参调用点。
+//   · 曾换成 GetPathOfAppData:LocalID:FileExt:retStrPath:（:106）照样崩 —— 同样是 void* 出参。
+//   · 路径解析曾搬到主线程 → 崩得更早：主线程 runloop pool 每次循环都 pop，double release 立刻爆。
+// 反汇编对照：WCRefine.dylib 字符串表与 selref 中**不存在** GetPathOfAppDataByUserName:...:
+// retStrPath:（也没有 filePathFromMsgWrap），WCR 只用返回值版 `+(id) GetPathOfAppData:(id)`
+// （CMessageWrap.h:26，selref 槽 0x269e218）—— WCR 从不让 ARC 去猜 void* 出参的所有权。
+// 修法：用 __unsafe_unretained 接住出参（ARC 不 release 它），再赋给 __strong 让 ARC 正常持有。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
-    NSString *p = nil;
+    NSString * __unsafe_unretained raw = nil;
     [objc_getClass("CMessageWrap") GetPathOfAppDataByUserName:dd_current_usr_name()
-                                          andMessageWrap:msg retStrPath:&p];
+                                          andMessageWrap:msg retStrPath:(void *)&raw];
+    NSString *p = raw;   // __strong：ARC 在此 retain，与出作用域时的 release 配平
     if ([p isKindOfClass:[NSString class]] && p.length) {
         if (dd_file_exists(p)) { dd_log(@"[path.file] 命中 → %@", p); return p; }
         return p;   // 未下载完也返回路径供下载轮询
@@ -582,14 +602,12 @@ static NSData *dd_silk_normalize(NSData *d) {
 }
 // PCM → SILK（WCRefine sub_0x8f2804 @0x8f2890）。
 //
-// 【崩溃实证 · 勿恢复回环解码验证】原实现编码后调 decodeToPCMFromSilkData: 把产物解回 PCM 做
-// 「能不能解回来」的验证。真机日志 + 信号栈证明它就是闪退根因：
-//   01:39:23 文件→语音 36s 素材 → 回环一次性解出 PCM 1157120 字节 → 发送结果=1
-//   01:39:2x [CRASH] signal=11 SIGSEGV
-//            _pthread_wqthread → _dispatch_root_queue_drain → objc_autoreleasePoolPop → objc_release
-//   同样链路的 16s 素材（回环 PCM 512640 字节）从不崩溃 —— 一次性解码的堆破坏随 PCM 长度触发，
-//   超过约 1MB 即写坏堆，随后 dd_convert_queue 的 autorelease pool 释放任何对象都会炸。
-// 该检查同时也从未失败过（每份日志恒为「选中可解码容器」），属纯冗余，故删除。
+// 【注释纠错】此处曾断言「回环解码验证是闪退根因」，**该结论已被证伪，勿采信**：
+//   v1.0.27 删除回环解码后，09-24 01:58 / 01:59 两份日志仍复现同样的 SIGSEGV，且第二次的素材
+//   只有 16s（PCM 512640 字节，与从不崩溃的视频素材同规模）—— 崩溃与 PCM 长度无关。
+//   真根因是 dd_file_path_of_msg 里 retStrPath: 出参的 ARC over-release，见该函数注释。
+// 回环解码之所以仍不恢复：它把整段音频一次性解成 PCM（36s → 1157120 字节）只为做「能不能解
+// 回来」的验证，而每份日志它恒为通过（从未拦下过任何问题），属纯冗余 + 额外大内存分配。
 // 产物校验交由 dd_silk_frames_valid 承担：纯字节扫描帧链，不进解码器、不分配大内存。
 static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (pcm.length == 0) return nil;
