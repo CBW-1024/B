@@ -104,7 +104,6 @@
 @end
 
 @interface CExtendInfoOfVoiceMsg : NSObject
-- (id)m_dtVoice;                                    // :12
 - (void)setM_dtVoice:(id)arg1;                      // :27
 - (void)setM_refMessageWrap:(id)arg1;               // :28
 - (void)setM_uiVoiceEndFlag:(unsigned int)arg1;     // :30
@@ -509,7 +508,9 @@ static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     }
     return nil;
 }
-// 语音消息本地路径：getVoicePath（CMessageWrap.h:362）→ getPathOfAudio:（:66）→ m_dtVoice 兜底
+// 语音消息本地路径：getVoicePath（CMessageWrap.h:362）→ getPathOfAudio:（:66）。
+// 两个原生 API 已足够：每份真机日志里 getVoicePath 与 getPathOfAudio 都返回同一个规范路径并直接命中，
+// 原先挂在后面的第三候选（m_dtVoice 内存数据落临时文件）从未被执行过，已按「不要兜底」删除。
 static NSString *dd_voice_path_of_msg(CMessageWrap *msg) {
     if (!msg) return nil;
     Class wrapCls = objc_getClass("CMessageWrap");
@@ -520,14 +521,6 @@ static NSString *dd_voice_path_of_msg(CMessageWrap *msg) {
     if ([p2 isKindOfClass:[NSString class]] && p2.length) [cands addObject:p2];
     dd_log(@"[path.voice] getVoicePath=%@  getPathOfAudio=%@", p1 ?: @"(空)", p2 ?: @"(空)");
     for (NSString *c in cands) if (dd_file_exists(c)) { dd_log(@"[path.voice] 命中 → %@", c); return c; }
-    NSData *d = (NSData *)((CExtendInfoOfVoiceMsg *)[msg m_extendInfoWithMsgType]).m_dtVoice;
-    if (d.length) {
-        NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                         [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"]];
-        [d writeToFile:tmp atomically:YES];
-        dd_log(@"[path.voice] 内存 m_dtVoice 落临时 → %@", tmp);
-        return tmp;
-    }
     dd_log(@"[path.voice] 取不到语音路径（可能尚未下载）");
     return nil;
 }
