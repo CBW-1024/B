@@ -163,12 +163,22 @@
 + (id)encodeToSilkFromPCMData:(id)a0;
 @end
 
+// 微信原生文件下载抽象：AppFileMessageCellView.onClkDownload / fileTransferTask:onProgress:completed: 同款。
+// 直接调 CMessageMgr StartDownloadAppAttach:MsgWrap: 第一参是 delegate/viewController，传 nil 只会
+// “登记”而不真正拉取数据（→ 用户看到的“触发一下就停了”）。改用 task，由微信内部统一驱动 CDN 下载 + 进度。
+@interface MsgFileTransferTask : NSObject
++ (id)taskFromMessageWrap:(id)msgWrap;
+- (id)filePath;
+- (BOOL)isFileExist;
+- (BOOL)isCompleted;
+- (unsigned long long)state;
+- (int)progress;
+- (void)startTransfer;
+- (void)stopTransfer;
+@end
+
 @interface CMessageMgr : NSObject
 - (void)StartDownloadVideo:(id)a0 MsgWrap:(id)a1 Priority:(BOOL)a2 Silent:(BOOL)a3;
-- (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2;
-- (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2 autoDownload:(BOOL)a3;
-- (BOOL)InAppAttachDownloading:(id)a0 MsgWrap:(id)a1;
-- (void)StopDownloadSilentAppAttach:(id)a0 MsgWrap:(id)a1;
 - (void)AddAppMsg:(id)a0 MsgWrap:(id)a1 DataPath:(id)a2 Scene:(unsigned int)a3;
 - (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;
@@ -607,36 +617,25 @@ static void dd_run_on_main_sync(void(^block)(void)) {
     dispatch_async(dispatch_get_main_queue(), ^{ block(); dispatch_semaphore_signal(sem); });
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
 }
-// 微信是否标注该附件“下载中”（主线程查询）。
-static BOOL dd_app_attach_downloading(CMessageWrap *msg) {
-    if (!dd_is_msg_wrap(msg)) return NO;
-    __block BOOL r = NO;
-    dd_run_on_main_sync(^{
-        CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-        if (mgr) r = [mgr InAppAttachDownloading:nil MsgWrap:msg];
-    });
-    return r;
-}
-// 触发文件下载。⚠️ 必须用 autoDownload:YES 的 3 参版本：2 参 Silent: 版内部默认不自动拉取，
-// 只会“登记”一次就停（即用户看到的“触发一下就停了”）。头文件 CMessageMgr.h:33 印证存在该变体。
+// 触发文件下载（微信原生 MsgFileTransferTask 方式）。⚠️ 不走 CMessageMgr StartDownloadAppAttach：
+// 该 API 第一参是 delegate/viewController，传 nil 只会“登记”而不真正拉取数据（→ “触发一下就停了”）。
+// 原生文件下载由 MsgFileTransferTask 驱动（AppFileMessageCellView.onClkDownload 同款），内部统一走
+// CDN 拉取 + 进度回调 + modMsgStatus，filePath 即落盘路径。需在主线程发起。
 static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return NO;
     __block BOOL ok = NO;
     dd_run_on_main_sync(^{
-        CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-        if (mgr) ok = [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES autoDownload:YES];
+        MsgFileTransferTask *task = [objc_getClass("MsgFileTransferTask") taskFromMessageWrap:msg];
+        if (task) { [task startTransfer]; ok = YES; }
     });
     return ok;
 }
-// 等待文件下载完成：微信标注“下载中”时持续等待（不因瞬时大小不变而提前返回）；
-// 若卡死（始终无文件 / 有文件但从未观测到下载中、疑似上次残留半下载）则先停掉可能残留的
-// “下载中”状态再重启（预算上限 2 次）；文件出现后要求“微信已停下载 + 两轮大小一致”才算完整，
-// 避免半下载文件被拿去编码，也避免对已下载完成的文件误触发重启。
+// 等待文件下载完成：轮询落盘路径，连续两轮大小一致才算完整（半下载文件拿去编码会出损坏数据）。
+// 若长时间无文件出现（startTransfer 未真正发车），最多重新发车一次（预算 1 次），避免“只触发一下就停”。
 static NSString *dd_wait_local_path(CMessageWrap *msg, NSString *(^pathBlock)(void), NSTimeInterval timeout) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     long long prevSize = -1;
-    BOOL seenDownloading = NO;
-    int reTriggerBudget = 2;
+    BOOL reTriggered = NO;
     while ([deadline timeIntervalSinceNow] > 0) {
         NSString *p = pathBlock();
         long long sz = -1;
@@ -644,22 +643,12 @@ static NSString *dd_wait_local_path(CMessageWrap *msg, NSString *(^pathBlock)(vo
             NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
             sz = a ? [a[NSFileSize] longLongValue] : -1;
         }
-        BOOL downloading = dd_app_attach_downloading(msg);
-        if (downloading) seenDownloading = YES;
-        // 完成：微信已停下载 且 文件非空且两轮大小一致。
-        if (!downloading && sz > 0 && sz == prevSize) return p;
+        if (sz > 0 && sz == prevSize) return p;   // 两轮大小一致 → 完整
         prevSize = sz;
-        // 卡死重启：已等 >3s，且(始终无文件 或 有文件但从未见下载中) 且 预算充足。
-        BOOL stalled = (!dd_file_exists(p)) || (!seenDownloading && sz > 0 && sz == prevSize);
-        if (reTriggerBudget > 0 && stalled && [deadline timeIntervalSinceNow] < timeout - 3.0) {
-            reTriggerBudget--;
-            dd_run_on_main_sync(^{
-                CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-                if (mgr) {
-                    [mgr StopDownloadSilentAppAttach:nil MsgWrap:msg];
-                    [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES autoDownload:YES];
-                }
-            });
+        // 卡死重启：已等 >3s 且始终无文件 → 重新发车一次。
+        if (!reTriggered && !dd_file_exists(p) && [deadline timeIntervalSinceNow] < timeout - 3.0) {
+            reTriggered = YES;
+            dd_trigger_file_download(msg);
         }
         [NSThread sleepForTimeInterval:0.5];
     }
