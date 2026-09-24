@@ -531,7 +531,7 @@ typedef NS_ENUM(NSInteger, DDFMediaKind) {
     DDFMediaKindLive    = 2,
 };
 
-// 深色模式配色：直接走动态色（仅支持 iOS 18+，动态色必然可用）。
+// 深色模式配色：直接走动态色
 static UIColor *ddf_card_bg(void) {
     return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
         return tc.userInterfaceStyle == UIUserInterfaceStyleDark
@@ -945,9 +945,9 @@ static UIColor *ddf_track_bg(void) {
     }
 }
 
-// 图片/实况进度：已就绪数 / 总数（封顶 181s）。
+// 图片/实况进度：已就绪数 / 总数（封顶 60s）。
 - (void)ddfWaitMedia:(NSArray *)pending liveSubs:(NSMutableSet *)liveSubs {
-    const NSInteger cap = 181;
+    const NSInteger cap = 60;
     NSInteger total = pending.count;
     for (NSInteger s = 0; s <= cap; s++) {
         NSInteger ready = 0;
