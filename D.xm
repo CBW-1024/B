@@ -19,10 +19,12 @@
 - (id)getTableView;
 - (void)addSection:(id)arg1;
 - (void)reloadTableView;
+@property (nonatomic, weak) id delegate;
 @end
 
 @interface WCTableViewSectionManager : NSObject
 + (id)defaultSection;
++ (id)sectionWithHeader:(id)arg1;
 - (void)addCell:(id)arg1;
 @end
 
@@ -1386,61 +1388,76 @@ static char kDDFLineKey;
 
 #pragma mark - 设置界面
 
-@interface DDForwardSettingsViewController : UIViewController
-@property (nonatomic, strong) WCTableViewManager *tableViewMgr;
+@interface DDForwardSettingsViewController : UIViewController <UITableViewDelegate>
+@property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @end
 
-@implementation DDForwardSettingsViewController
-
-- (void)ensureTableViewMgr {
-    if (_tableViewMgr) return;
-    Class mgrCls = objc_getClass("WCTableViewManager");
-    if (!mgrCls) return;
-    WCTableViewManager *mgr = [mgrCls alloc];
-    _tableViewMgr = [mgr initWithFrame:[UIScreen mainScreen].bounds
-                                 style:UITableViewStyleInsetGrouped];
+@implementation DDForwardSettingsViewController {
+    id<UITableViewDelegate> _originalDelegate;
 }
-
+- (void)ensureTableViewMgr {
+    if (self.tableViewManager) return;
+    self.tableViewManager = [[objc_getClass("WCTableViewManager") alloc]
+                              initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
+}
 - (instancetype)init {
-    if (self = [super init]) {
-        [self ensureTableViewMgr];
-    }
+    if (self = [super init]) [self ensureTableViewMgr];
     return self;
 }
-
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD朋友圈转发";
+    self.title = @"朋友圈转发设置";
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    [appearance configureWithDefaultBackground];
+    appearance.shadowColor = nil;
+    self.navigationItem.standardAppearance = appearance;
+    self.navigationItem.scrollEdgeAppearance = appearance;
+    self.navigationItem.compactAppearance = appearance;
     [self ensureTableViewMgr];
-    if (!_tableViewMgr) return;
+    if (!_tableViewManager) return;
     [self buildTable];
-    UITableView *tableView = [self.tableViewMgr getTableView];
-    tableView.frame = self.view.bounds;
+    UITableView *tableView = [self.tableViewManager getTableView];
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     [self.view addSubview:tableView];
+    _originalDelegate = self.tableViewManager.delegate;
+    self.tableViewManager.delegate = self;
 }
-
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self buildTable];
+}
 - (void)buildTable {
-    Class cellCls = objc_getClass("WCTableViewCellManager");
-    Class secCls  = objc_getClass("WCTableViewSectionManager");
-    if (!cellCls || !secCls || !_tableViewMgr) return;
+    [_tableViewManager clearAllSection];
+    Class cellMgr = objc_getClass("WCTableViewCellManager");
+    Class secMgr  = objc_getClass("WCTableViewSectionManager");
+    if (!cellMgr || !secMgr) return;
 
-    [self.tableViewMgr clearAllSection];
     DDFConfig *cfg = DDFConfig.shared;
+    WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"转发设置"];
+    if (!sec) return;
+    [sec addCell:[cellMgr switchCellForSel:@selector(onEnabledSwitch:)
+                                    target:self
+                                     title:@"朋友圈转发"
+                                        on:cfg.enabled]];
+    [_tableViewManager addSection:sec];
 
-    WCTableViewSectionManager *section = [secCls defaultSection];
-    [section addCell:[cellCls switchCellForSel:@selector(onEnabledSwitch:)
-                                        target:self
-                                         title:@"朋友圈转发"
-                                            on:cfg.enabled]];
-    [self.tableViewMgr addSection:section];
-
-    [self.tableViewMgr reloadTableView];
+    [_tableViewManager reloadTableView];
 }
-
-- (void)onEnabledSwitch:(UISwitch *)sender        { DDFConfig.shared.enabled = sender.isOn; [self buildTable]; }
-
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)])
+        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+}
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)])
+        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
+}
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)])
+        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
+    return UITableViewAutomaticDimension;
+}
+- (void)onEnabledSwitch:(UISwitch *)sender { DDFConfig.shared.enabled = sender.isOn; }
 @end
 
 #pragma mark - 注册
