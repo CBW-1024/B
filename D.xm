@@ -631,11 +631,9 @@ static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     return ok;
 }
 // 等待文件下载完成：轮询落盘路径，连续两轮大小一致才算完整（半下载文件拿去编码会出损坏数据）。
-// 若长时间无文件出现（startTransfer 未真正发车），最多重新发车一次（预算 1 次），避免“只触发一下就停”。
-static NSString *dd_wait_local_path(CMessageWrap *msg, NSString *(^pathBlock)(void), NSTimeInterval timeout) {
+static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     long long prevSize = -1;
-    BOOL reTriggered = NO;
     while ([deadline timeIntervalSinceNow] > 0) {
         NSString *p = pathBlock();
         long long sz = -1;
@@ -645,11 +643,6 @@ static NSString *dd_wait_local_path(CMessageWrap *msg, NSString *(^pathBlock)(vo
         }
         if (sz > 0 && sz == prevSize) return p;   // 两轮大小一致 → 完整
         prevSize = sz;
-        // 卡死重启：已等 >3s 且始终无文件 → 重新发车一次。
-        if (!reTriggered && !dd_file_exists(p) && [deadline timeIntervalSinceNow] < timeout - 3.0) {
-            reTriggered = YES;
-            dd_trigger_file_download(msg);
-        }
         [NSThread sleepForTimeInterval:0.5];
     }
     return nil;
@@ -792,7 +785,7 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         // 路径存在但内容未就绪（占位/空文件）→ 仍触发下载再等待。
         if (!dd_media_file_ready(path)) {
             if (downloadBlock) downloadBlock();
-            path = dd_wait_local_path(msg, pathBlock, kDDVCDownloadTimeout);
+            path = dd_wait_local_path(pathBlock, kDDVCDownloadTimeout);
         }
         if (!dd_media_file_ready(path)) return;
         double duration = 0;
