@@ -447,7 +447,7 @@ static NSInteger dd_hub_token = 0;   // 自增任务号
 
 // 提示挂在微信自己的主窗口上。
 // 设备上可能装有 iConsole 等调试浮层，它会另建一个同级别的窗口，必须有确定性优先级：
-// 先按「根控制器是微信主 Tab」认，其次按「根控制器不是调试浮层」认，最后才退回 keyWindow。
+// 先按「根控制器是微信主 Tab」认，其次按「根控制器不是调试浮层」认，都认不到就不显示提示。
 static UIWindow *dd_main_window(void) {
     UIWindow *fallback = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -460,7 +460,7 @@ static UIWindow *dd_main_window(void) {
             if (!fallback && ![rootName hasPrefix:@"iConsole"] && ![rootName hasPrefix:@"FLEX"]) fallback = w;
         }
     }
-    return fallback ?: [UIApplication sharedApplication].keyWindow;
+    return fallback;
 }
 // 提示卡片：尺寸 / 位置 / 配色与朋友圈转发浮卡一致，进度条为来回滚动的不确定样式。
 static UIView *dd_hub_card(BOOL create) {
