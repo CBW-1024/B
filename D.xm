@@ -630,19 +630,16 @@ static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     });
     return ok;
 }
-// 等待文件下载完成：轮询落盘路径，连续两轮大小一致才算完整（半下载文件拿去编码会出损坏数据）。
+// 等待文件下载完成：轮询落盘路径，文件存在且非空即返回。微信 transfer task 写完才落最终路径，无需两轮校验。
 static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-    long long prevSize = -1;
     while ([deadline timeIntervalSinceNow] > 0) {
         NSString *p = pathBlock();
-        long long sz = -1;
         if (dd_file_exists(p)) {
             NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
-            sz = a ? [a[NSFileSize] longLongValue] : -1;
+            long long sz = a ? [a[NSFileSize] longLongValue] : 0;
+            if (sz > 0) return p;
         }
-        if (sz > 0 && sz == prevSize) return p;   // 两轮大小一致 → 完整
-        prevSize = sz;
         [NSThread sleepForTimeInterval:0.5];
     }
     return nil;
@@ -787,7 +784,6 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
             if (downloadBlock) downloadBlock();
             path = dd_wait_local_path(pathBlock, kDDVCDownloadTimeout);
         }
-        if (!dd_media_file_ready(path)) return;
         double duration = 0;
         NSData *aud = nil;
         // 文件消息本地路径必带原始扩展名（文件名来自 CExtendInfoOfAPP.m_nsAppFileName），
