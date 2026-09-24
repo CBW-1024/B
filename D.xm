@@ -482,9 +482,31 @@ static NSString *DDFLivePhotoVideoPath(WCMediaItem *live) {
 @property (nonatomic, assign) NSTimeInterval pendingTextStamp;
 @property (nonatomic, assign) BOOL busy;
 @property (nonatomic, strong) id retainedCommentDetailVC;
+@property (nonatomic, weak) UIWindow *ddfWindow;   // 进度卡挂载的窗口，由触发浮窗直接给出，不再遍历窗口列表
 + (instancetype)shared;
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView;
 - (NSString *)consumePendingText;
+@end
+
+// 进度浮卡子类：宽度随窗口变化（autoresizingMask 左右各留 16 边距）后，
+// 在 layoutSubviews 内按当前宽度重排子视图，从而适配横竖屏与窗口尺寸变化。
+@interface DDFProgressCardView : UIView
+@end
+@implementation DDFProgressCardView
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    UILabel *title = objc_getAssociatedObject(self, "ddfTitle");
+    UILabel *sub   = objc_getAssociatedObject(self, "ddfSub");
+    UIProgressView *bar = objc_getAssociatedObject(self, "ddfBar");
+    UILabel *pct = objc_getAssociatedObject(self, "ddfPct");
+    CGFloat w = self.bounds.size.width;
+    CGFloat padX = 14.0, labelH = 18.0;
+    title.frame = CGRectMake(padX, 8, w / 2 - padX, labelH);
+    sub.frame   = CGRectMake(w / 2, 8, w / 2 - padX, labelH);
+    CGFloat barY = 30.0, barH = 4.0;
+    bar.frame  = CGRectMake(padX, barY, w - 2 * padX - 36.0, barH);
+    pct.frame  = CGRectMake(w - padX - 34.0, barY - 2.0, 34.0, labelH);
+}
 @end
 
 @implementation DDFEngine
@@ -496,7 +518,7 @@ static NSString *DDFLivePhotoVideoPath(WCMediaItem *live) {
     return e;
 }
 
-#pragma mark HUD（下载进度条：白色圆角浮卡 + 类型化标题 + 计数/预耗时 + 灰底绿条 + 绿色百分比）
+#pragma mark HUD（下载进度条：圆角浮卡 + 类型化标题 + 计数/预耗时 + 灰底绿条 + 绿色百分比，支持深色模式，尺寸跟随窗口）
 
 static const NSInteger kDDFProgressHUDTag = 0x44444602;
 
@@ -506,8 +528,41 @@ typedef NS_ENUM(NSInteger, DDFMediaKind) {
     DDFMediaKindLive    = 2,
 };
 
+// 深色模式配色：直接走动态色（仅支持 iOS 18+，动态色必然可用）。
+static UIColor *ddf_card_bg(void) {
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+             ? [UIColor colorWithWhite:0.12 alpha:0.95]
+             : [UIColor colorWithWhite:1.0 alpha:0.95];
+    }];
+}
+static UIColor *ddf_text_primary(void) {
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+             ? [UIColor colorWithWhite:1.0 alpha:0.9]
+             : [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.9];
+    }];
+}
+static UIColor *ddf_text_secondary(void) {
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+             ? [UIColor colorWithWhite:1.0 alpha:0.5]
+             : [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.35];
+    }];
+}
+static UIColor *ddf_track_bg(void) {
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+             ? [UIColor colorWithWhite:1.0 alpha:0.12]
+             : [UIColor colorWithWhite:0.0 alpha:0.06];
+    }];
+}
+
+// 进度浮卡（DDFProgressCardView，定义见本文件前部）的布局逻辑在 layoutSubviews 内完成，
+// 窗口尺寸变化时自动按当前宽度重排子视图。
+
 - (UIView *)ddfProgressCard {
-    UIWindow *win = DDFKeyWindow();
+    UIWindow *win = self.ddfWindow;   // 直接挂触发浮窗所在的主窗口，不遍历窗口列表
     if (!win) return nil;
     CGFloat cardW = win.bounds.size.width - 32.0;
     CGFloat cardH = 56.0;
@@ -517,10 +572,9 @@ typedef NS_ENUM(NSInteger, DDFMediaKind) {
         CGFloat sa = win.safeAreaInsets.top;
         if (sa > 0) topInset = sa + 8.0;
     }
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(16.0, topInset, cardW, cardH)];
-    card.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.95];
+    DDFProgressCardView *card = [[DDFProgressCardView alloc] initWithFrame:CGRectMake(16.0, topInset, cardW, cardH)];
+    card.backgroundColor = ddf_card_bg();
     card.layer.cornerRadius = 10.0;
-    card.clipsToBounds = YES;
     card.tag = kDDFProgressHUDTag;
     card.alpha = 0.0;
 
@@ -529,16 +583,18 @@ typedef NS_ENUM(NSInteger, DDFMediaKind) {
     card.layer.shadowOffset = CGSizeMake(0, 2);
     card.layer.shadowOpacity = 0.08;
     card.layer.shadowRadius = 6;
+    // 宽度跟随窗口变化：左右各留 16 边距（autoresizing 默认固定左右边距、仅宽度弹性）。
+    card.autoresizingMask = UIViewAutoresizingFlexibleWidth;
 
     CGFloat padX = 14.0;
     CGFloat labelH = 18.0;
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(padX, 8, cardW / 2 - padX, labelH)];
-    title.textColor = [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.9];
+    title.textColor = ddf_text_primary();
     title.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
 
     UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(cardW / 2, 8, cardW / 2 - padX, labelH)];
-    sub.textColor = [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.35];
+    sub.textColor = ddf_text_secondary();
     sub.font = [UIFont systemFontOfSize:11.0];
     sub.textAlignment = NSTextAlignmentRight;
     sub.text = @"";
@@ -546,7 +602,7 @@ typedef NS_ENUM(NSInteger, DDFMediaKind) {
     CGFloat barY = 30.0, barH = 4.0;
     UIProgressView *bar = [[UIProgressView alloc] initWithFrame:CGRectMake(padX, barY, cardW - 2 * padX - 36.0, barH)];
     bar.progressTintColor = [UIColor colorWithRed:0.03 green:0.76 blue:0.38 alpha:1.0];
-    bar.trackTintColor = [UIColor colorWithWhite:0.0 alpha:0.06];
+    bar.trackTintColor = ddf_track_bg();
     bar.progress = 0.0;
     bar.layer.cornerRadius = 2.0;
     bar.clipsToBounds = YES;
@@ -575,7 +631,7 @@ typedef NS_ENUM(NSInteger, DDFMediaKind) {
 }
 
 - (UIView *)ddfProgressHUD {
-    UIWindow *win = DDFKeyWindow();
+    UIWindow *win = self.ddfWindow;
     return win ? [win viewWithTag:kDDFProgressHUDTag] : nil;
 }
 
@@ -722,6 +778,8 @@ typedef NS_ENUM(NSInteger, DDFMediaKind) {
     if (self.busy) { return; }
     self.busy = YES;
 
+    // 进度卡直接挂在触发浮窗所在的主窗口上，不遍历窗口列表（避免被 iConsole 之类浮层换类名干扰）。
+    self.ddfWindow = floatView.window;
     UIViewController *host = DDFTopViewController(floatView.navigationController);
     if ([floatView respondsToSelector:@selector(hide)]) [floatView hide];
 
