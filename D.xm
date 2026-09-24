@@ -199,7 +199,7 @@
 @interface VideoMessageViewModel : BaseMessageViewModel
 - (id)videoPath;
 @end
-@interface BaseChatCellView : NSObject
+@interface BaseChatCellView : UIView
 @property (readonly, nonatomic) id viewModel;
 @end
 @interface BaseMessageCellView : BaseChatCellView
@@ -439,43 +439,47 @@ static void dd_log_clear(void) {
 
 #define kDDHubTag 0x44444603
 
-static const void *kDDHubTitleKey  = &kDDHubTitleKey;
-static const void *kDDHubSliderKey = &kDDHubSliderKey;
+static NSInteger dd_hub_count  = 0;   // 进行中的任务数
+static NSInteger dd_hub_token  = 0;   // 自增任务号
+static UIView  *dd_hub_card;          // 提示卡片，自建自持
+static UILabel *dd_hub_title;
+static UIView  *dd_hub_track;
+static UIView  *dd_hub_slider;
 
-static NSInteger dd_hub_count = 0;   // 进行中的任务数
-static NSInteger dd_hub_token = 0;   // 自增任务号
-
-// 提示挂在微信自己的主窗口上。
-// 设备上可能装有 iConsole 等调试浮层，它会另建一个同级别的窗口，必须有确定性优先级：
-// 先按「根控制器是微信主 Tab」认，其次按「根控制器不是调试浮层」认，都认不到就不显示提示。
-static UIWindow *dd_main_window(void) {
-    UIWindow *fallback = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-            if (w.hidden) continue;
-            UIViewController *root = w.rootViewController;
-            NSString *rootName = root ? NSStringFromClass([root class]) : @"";
-            if ([rootName isEqualToString:@"MainTabBarViewController"]) return w;
-            if (!fallback && ![rootName hasPrefix:@"iConsole"] && ![rootName hasPrefix:@"FLEX"]) fallback = w;
-        }
+// 卡片 / 标题 / 进度槽配色：深色模式走动态色，浅色基准与朋友圈转发浮卡一致。
+static UIColor *dd_hub_card_color(void) {
+    if ([UIColor respondsToSelector:@selector(colorWithDynamicProvider:)]) {
+        return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+                 ? [UIColor colorWithWhite:0.12 alpha:0.95]
+                 : [UIColor colorWithWhite:1.0 alpha:0.95];
+        }];
     }
-    return fallback;
+    return [UIColor colorWithWhite:1.0 alpha:0.95];
 }
-// 提示卡片：尺寸 / 位置 / 配色与朋友圈转发浮卡一致，进度条为来回滚动的不确定样式。
-static UIView *dd_hub_card(BOOL create) {
-    UIWindow *win = dd_main_window();
-    if (!win) return nil;
-    UIView *card = [win viewWithTag:kDDHubTag];
-    if (card || !create) return card;
-
-    CGFloat cardW = win.bounds.size.width - 32.0, cardH = 56.0;
-    CGFloat topInset = 8.0;
-    if ([win respondsToSelector:@selector(safeAreaInsets)]) {
-        CGFloat sa = win.safeAreaInsets.top;
-        if (sa > 0) topInset = sa + 8.0;
+static UIColor *dd_hub_title_color(void) {
+    if ([UIColor respondsToSelector:@selector(colorWithDynamicProvider:)]) {
+        return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+                 ? [UIColor colorWithWhite:1.0 alpha:0.9]
+                 : [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.9];
+        }];
     }
-    card = [[UIView alloc] initWithFrame:CGRectMake(16.0, topInset, cardW, cardH)];
+    return [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.9];
+}
+static UIColor *dd_hub_track_color(void) {
+    if ([UIColor respondsToSelector:@selector(colorWithDynamicProvider:)]) {
+        return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
+                 ? [UIColor colorWithWhite:1.0 alpha:0.12]
+                 : [UIColor colorWithWhite:0.0 alpha:0.06];
+        }];
+    }
+    return [UIColor colorWithWhite:0.0 alpha:0.06];
+}
+// 建卡片：尺寸 / 位置 / 配色与朋友圈转发浮卡一致，进度条为来回滚动的不确定样式。
+static void dd_hub_build(void) {
+    UIView *card = [[UIView alloc] initWithFrame:CGRectZero];
     card.tag = kDDHubTag;
     card.alpha = 0.0;
     card.userInteractionEnabled = NO;
@@ -485,88 +489,85 @@ static UIView *dd_hub_card(BOOL create) {
     card.layer.shadowOffset = CGSizeMake(0, 2);
     card.layer.shadowOpacity = 0.08;
     card.layer.shadowRadius = 6.0;
-    if ([UIColor respondsToSelector:@selector(colorWithDynamicProvider:)]) {
-        card.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
-                 ? [UIColor colorWithWhite:0.12 alpha:0.95]
-                 : [UIColor colorWithWhite:1.0 alpha:0.95];
-        }];
-    } else {
-        card.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.95];
-    }
+    card.backgroundColor = dd_hub_card_color();
 
-    CGFloat padX = 14.0, barY = 30.0, barW = cardW - 2 * padX;
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(padX, 8.0, barW, 18.0)];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
     title.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
-    if ([UIColor respondsToSelector:@selector(colorWithDynamicProvider:)]) {
-        title.textColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
-                 ? [UIColor colorWithWhite:1.0 alpha:0.9]
-                 : [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.9];
-        }];
-    } else {
-        title.textColor = [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.9];
-    }
+    title.textColor = dd_hub_title_color();
     [card addSubview:title];
-    objc_setAssociatedObject(card, kDDHubTitleKey, title, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    UIView *track = [[UIView alloc] initWithFrame:CGRectMake(padX, barY, barW, 4.0)];
+    UIView *track = [[UIView alloc] initWithFrame:CGRectZero];
+    track.backgroundColor = dd_hub_track_color();
     track.layer.cornerRadius = 2.0;
     track.clipsToBounds = YES;
-    if ([UIColor respondsToSelector:@selector(colorWithDynamicProvider:)]) {
-        track.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-            return tc.userInterfaceStyle == UIUserInterfaceStyleDark
-                 ? [UIColor colorWithWhite:1.0 alpha:0.12]
-                 : [UIColor colorWithWhite:0.0 alpha:0.06];
-        }];
-    } else {
-        track.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.06];
-    }
     [card addSubview:track];
 
-    UIView *slider = [[UIView alloc] initWithFrame:CGRectMake(0, 0, barW * 0.35, 4.0)];
+    UIView *slider = [[UIView alloc] initWithFrame:CGRectZero];
     slider.backgroundColor = [UIColor colorWithRed:0.03 green:0.76 blue:0.38 alpha:1.0];
     slider.layer.cornerRadius = 2.0;
     [track addSubview:slider];
-    objc_setAssociatedObject(card, kDDHubSliderKey, slider, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    dd_hub_card = card;
+    dd_hub_title = title;
+    dd_hub_track = track;
+    dd_hub_slider = slider;
+}
+// 每次显示前按当前窗口重排，横竖屏 / 换窗口都能对上。
+static void dd_hub_layout(UIWindow *win) {
+    CGFloat cardW = win.bounds.size.width - 32.0;
+    CGFloat topInset = 8.0;
+    if ([win respondsToSelector:@selector(safeAreaInsets)]) {
+        CGFloat sa = win.safeAreaInsets.top;
+        if (sa > 0) topInset = sa + 8.0;
+    }
+    dd_hub_card.frame = CGRectMake(16.0, topInset, cardW, 56.0);
+    CGFloat barW = cardW - 28.0;
+    dd_hub_title.frame  = CGRectMake(14.0, 8.0, barW, 18.0);
+    dd_hub_track.frame  = CGRectMake(14.0, 30.0, barW, 4.0);
+    dd_hub_slider.frame = CGRectMake(0, 0, barW * 0.35, 4.0);
+}
+// 来回滚动的不确定进度条，每次显示前重启一次。
+static void dd_hub_start_slider(void) {
+    CGFloat barW = dd_hub_track.bounds.size.width;
+    dd_hub_slider.frame = CGRectMake(0, 0, barW * 0.35, 4.0);
+    [dd_hub_slider.layer removeAllAnimations];
     [UIView animateWithDuration:1.1
                           delay:0
                         options:UIViewAnimationOptionRepeat | UIViewAnimationOptionAutoreverse | UIViewAnimationOptionCurveEaseInOut
                      animations:^{
-                         CGRect f = slider.frame;
+                         CGRect f = dd_hub_slider.frame;
                          f.origin.x = barW * 0.65;
-                         slider.frame = f;
+                         dd_hub_slider.frame = f;
                      }
                      completion:nil];
-
-    [win addSubview:card];
-    dd_log(@"hub card win=%@ root=%@ level=%.0f card=%@",
-           NSStringFromClass([win class]),
-           win.rootViewController ? NSStringFromClass([win.rootViewController class]) : @"(nil)",
-           (double)win.windowLevel, NSStringFromCGRect(card.frame));
-    return card;
 }
 static void dd_hub_refresh_title(void) {
-    UILabel *title = objc_getAssociatedObject(dd_hub_card(NO), kDDHubTitleKey);
-    title.text = dd_hub_count > 1
+    dd_hub_title.text = dd_hub_count > 1
         ? [NSString stringWithFormat:@"正在转换中 (%ld)", (long)dd_hub_count]
         : @"正在转换中";
 }
-// 任务开始：计数 +1，卡片首次出现时淡入。
-static NSInteger dd_hub_begin(void) {
+// 任务开始。win 由触发菜单的 cell 直接给出，不遍历窗口列表——
+// 设备上若装有 iConsole 一类浮层，窗口类名会被换掉，靠类名或 keyWindow 都认不准。
+static NSInteger dd_hub_begin(UIWindow *win) {
     if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ dd_hub_begin(); });
+        dispatch_async(dispatch_get_main_queue(), ^{ dd_hub_begin(win); });
         return 0;
     }
+    if (!win) { dd_log(@"hub begin abort: no window"); return 0; }
     dd_hub_token++;
     NSInteger token = dd_hub_token;
-    UIView *card = dd_hub_card(YES);
-    if (!card) { dd_hub_token--; dd_log(@"hub begin abort: no window"); return 0; }
+    if (!dd_hub_card) dd_hub_build();
+    if (dd_hub_card.superview != win) [win addSubview:dd_hub_card];
+    dd_hub_layout(win);
+    dd_hub_start_slider();
+    [win bringSubviewToFront:dd_hub_card];
     dd_hub_count++;
-    [card.superview bringSubviewToFront:card];
-    [UIView animateWithDuration:0.2 animations:^{ card.alpha = 1.0; }];
+    [UIView animateWithDuration:0.2 animations:^{ dd_hub_card.alpha = 1.0; }];
     dd_hub_refresh_title();
-    dd_log(@"hub begin token=%ld count=%ld", (long)token, (long)dd_hub_count);
+    dd_log(@"hub begin token=%ld count=%ld win=%@ root=%@ card=%@",
+           (long)token, (long)dd_hub_count, NSStringFromClass([win class]),
+           win.rootViewController ? NSStringFromClass([win.rootViewController class]) : @"(nil)",
+           NSStringFromCGRect(dd_hub_card.frame));
     return token;
 }
 // 任务结束：计数 -1，归零后淡出移除。
@@ -579,12 +580,11 @@ static void dd_hub_finish(void) {
     dd_hub_count--;
     dd_log(@"hub finish count=%ld", (long)dd_hub_count);
     if (dd_hub_count > 0) { dd_hub_refresh_title(); return; }
-    UIView *card = dd_hub_card(NO);
     [UIView animateWithDuration:0.2
-                     animations:^{ card.alpha = 0.0; }
+                     animations:^{ dd_hub_card.alpha = 0.0; }
                      completion:^(BOOL f) {
                          // 淡出期间可能又开始了新任务，此时卡片仍在用，不能移除。
-                         if (dd_hub_count == 0) [card removeFromSuperview];
+                         if (dd_hub_count == 0) [dd_hub_card removeFromSuperview];
                      }];
 }
 
@@ -1014,10 +1014,10 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
 }
 // 媒体 → 语音：未下载则先触发下载，完成后抽音轨 / 复用 SILK，编码成微信语音后发送。
 // 提示从菜单点击起，到微信回传发送结果为止（成功 / 失败都收起）。
-static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^pathBlock)(void), void(^downloadBlock)(void)) {
+static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^pathBlock)(void), void(^downloadBlock)(void), UIWindow *win) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
-    NSInteger token = dd_hub_begin();
+    NSInteger token = dd_hub_begin(win);
     dd_log(@"convert start tag=%@ token=%ld usr=%@", tag, (long)token, usr);
     dispatch_async(dd_convert_queue, ^{
         NSString *path = pathBlock();
@@ -1180,11 +1180,11 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     return YES;
 }
 // 语音消息 → 文件消息。提示从菜单点击起，到上传结束（成功 / 失败）为止。
-static void dd_voice_to_file(CMessageWrap *msg) {
+static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
     NSString *fn  = [NSString stringWithFormat:@"语音_%u.m4a", (unsigned int)time(NULL)];
-    NSInteger token = dd_hub_begin();
+    NSInteger token = dd_hub_begin(win);
     dd_log(@"tofile start token=%ld usr=%@", (long)token, usr);
     dispatch_async(dd_convert_queue, ^{
         NSString *p = dd_voice_path_of_msg(msg);
@@ -1372,7 +1372,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)dd_mediaToVoice:(id)sender {
     CMessageWrap *msg = dd_msg_of_cell(self);
     dd_media_to_voice(@"视频", msg, ^NSString *{ return dd_video_path_of_cell(self); },
-                          ^{ dd_trigger_video_download(msg); });
+                          ^{ dd_trigger_video_download(msg); }, self.window);
 }
 %end
 
@@ -1393,7 +1393,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)dd_mediaToVoice:(id)sender {
     CMessageWrap *msg = dd_msg_of_cell(self);
     dd_media_to_voice(@"文件", msg, ^NSString *{ return dd_file_path_of_msg(msg); },
-                          ^{ dd_trigger_file_download(msg); });
+                          ^{ dd_trigger_file_download(msg); }, self.window);
 }
 %end
 
@@ -1436,7 +1436,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 }
 %new
 - (void)dd_voiceToFile:(id)sender {
-    dd_voice_to_file(dd_msg_of_cell(self));
+    dd_voice_to_file(dd_msg_of_cell(self), self.window);
 }
 %new
 - (void)onForward:(id)sender {
