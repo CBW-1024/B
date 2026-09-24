@@ -269,7 +269,7 @@ static inline id DDMGetFrameFacade(void) {
 
 @interface WCSNSMessage : NSObject
 @property (nonatomic) unsigned int delStatus;
-@property (retain, nonatomic) WCUserComment *comment;
+@property (retain, nonatomic) id comment;
 @end
 
 @interface WCPlayerConfigFullScreenViewController : UIViewController
@@ -1459,7 +1459,8 @@ static NSString *ddmDeletedMarkText(void) {
     return (t.length ? t : kDDMDefaultDeletedMark);
 }
 static void ddmInjectMarkIntoComment(id c) {
-    if (![c isKindOfClass:[WCUserComment class]]) return;
+    Class commentCls = objc_getClass("WCUserComment");
+    if (!commentCls || ![c isKindOfClass:commentCls]) return;
     NSString *mark = ddmDeletedMarkText();
     NSString *s = [c content];
     if ([s isKindOfClass:[NSString class]] && s.length) {
