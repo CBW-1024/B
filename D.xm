@@ -846,18 +846,20 @@ static NSString *dd_voice_path_of_msg(CMessageWrap *msg) {
 
 #pragma mark - 语音转换：自动下载
 
-static void dd_trigger_video_download(CMessageWrap *msg) {
-    if (!msg) return;
-    CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-    dd_log(@"download trigger video lid=%u mgr=%d", msg.m_uiMesLocalID, mgr != nil);
-    [mgr StartDownloadVideo:nil MsgWrap:msg Priority:YES Silent:YES];
-}
 // 主线程同步执行（微信下载/状态查询 API 需主线程；convert 队列调用安全，不会死锁）。
 static void dd_run_on_main_sync(void(^block)(void)) {
     if ([NSThread isMainThread]) { block(); return; }
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     dispatch_async(dispatch_get_main_queue(), ^{ block(); dispatch_semaphore_signal(sem); });
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+}
+static void dd_trigger_video_download(CMessageWrap *msg) {
+    if (!msg) return;
+    dd_run_on_main_sync(^{
+        CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
+        dd_log(@"download trigger video lid=%u mgr=%d", msg.m_uiMesLocalID, mgr != nil);
+        [mgr StartDownloadVideo:nil MsgWrap:msg Priority:YES Silent:YES];
+    });
 }
 // 触发文件下载：用微信原生文件传输任务发起（AppFileMessageCellView 的「下载」同款）。
 static BOOL dd_trigger_file_download(CMessageWrap *msg) {
@@ -1371,7 +1373,9 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 %new
 - (void)dd_mediaToVoice:(id)sender {
     CMessageWrap *msg = dd_msg_of_cell(self);
-    dd_media_to_voice(@"视频", msg, ^NSString *{ return dd_video_path_of_cell(self); },
+    // 路径在主线程一次取好：菜单关闭后 cell 随时会被列表回收，不能在后台队列里再访问它。
+    NSString *videoPath = dd_video_path_of_cell(self);
+    dd_media_to_voice(@"视频", msg, ^NSString *{ return videoPath; },
                           ^{ dd_trigger_video_download(msg); }, self.window);
 }
 %end
