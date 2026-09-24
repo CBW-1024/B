@@ -597,9 +597,16 @@ static void dd_trigger_video_download(CMessageWrap *msg) {
 }
 static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return NO;
-    CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-    if (!mgr) return NO;
-    return [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES];
+    // 微信下载 API 需在主线程发起，故切到主线程并同步等待结果。
+    __block BOOL ok = NO;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
+        if (mgr) ok = [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES];
+        dispatch_semaphore_signal(sem);
+    });
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
+    return ok;
 }
 // 轮询等待文件就绪：连续两轮大小一致才返回（半下载文件会让编码产出损坏数据）。
 static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
@@ -616,6 +623,13 @@ static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval
         [NSThread sleepForTimeInterval:0.5];
     }
     return nil;
+}
+// 媒体文件是否真正就绪：路径存在且非空。占位/空文件判定为未就绪，仍须先下载。
+static BOOL dd_media_file_ready(NSString *path) {
+    if (!dd_file_exists(path)) return NO;
+    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    long long sz = a ? [a[NSFileSize] longLongValue] : 0;
+    return sz > 0;
 }
 
 #pragma mark - 语音转换：SILK 容器
@@ -738,23 +752,28 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
     return reader.status == AVAssetReaderStatusCompleted ? pcm : nil;
 }
 // 媒体 → 语音：确保已下载 → 抽音轨/复用 SILK → 编码 → 发送。
+// 修复：下载就绪判定改为"文件非空且就绪"，杜绝占位/空路径跳过下载；
+// 解码按文件魔术字节判定 SILK（不再依赖扩展名，下载文件可能无扩展名）。
 static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^pathBlock)(void), void(^downloadBlock)(void)) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
     dispatch_async(dd_convert_queue, ^{
         NSString *path = pathBlock();
-        if (!dd_file_exists(path)) {
+        // 路径存在但内容未就绪（占位/空文件）→ 仍触发下载再等待。
+        if (!dd_media_file_ready(path)) {
             if (downloadBlock) downloadBlock();
             path = dd_wait_local_path(pathBlock, kDDVCDownloadTimeout);
         }
-        if (!dd_file_exists(path)) return;
+        if (!dd_media_file_ready(path)) return;
         double duration = 0;
         NSData *aud = nil;
+        // 文件消息本地路径必带原始扩展名（文件名来自 CExtendInfoOfAPP.m_nsAppFileName），
+        // 微信也按扩展名分派格式，故按扩展名路由即可：aud/silk 是微信 SILK → 原样复用；
+        // 其余（mp3/wav/m4a/mov/mp4…）抽 PCM 再编码。不再靠魔术字节判类型。
         NSString *ext = path.pathExtension.lowercaseString;
-        // 源是微信 SILK 容器（aud/silk）→ 原样复用，不二次编码；帧链不自洽直接放弃。
         if ([ext isEqualToString:@"aud"] || [ext isEqualToString:@"silk"]) {
             NSData *raw = [NSData dataWithContentsOfFile:path];
-            if (!dd_silk_frames_valid(raw)) return;
+            if (!dd_silk_frames_valid(raw)) return;   // 帧链不自洽直接放弃
             aud = raw;
             NSData *pcm = dd_decode_silk_to_pcm(raw);
             duration = (double)pcm.length / (double)(kDDVCVoiceSampleRate * 2);
