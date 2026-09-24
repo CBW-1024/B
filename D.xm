@@ -282,7 +282,7 @@ static BOOL dd_voice_forward_enabled(void) {
 #define kDDVCAppMsgType   49
 #define kDDVCAppInnerFile 6
 #define kDDVCVoiceSampleRate 16000
-#define kDDVCDownloadTimeout 60.0
+#define kDDVCDownloadTimeout 90.0
 
 @interface DDVoiceConvertConfig : NSObject
 + (instancetype)shared;
@@ -621,7 +621,7 @@ static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval
             long long sz = a ? [a[NSFileSize] longLongValue] : 0;
             if (sz > 0) return p;
         }
-        [NSThread sleepForTimeInterval:1.0];
+        [NSThread sleepForTimeInterval:0.5];
     }
     return nil;
 }
