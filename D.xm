@@ -34,27 +34,27 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
 @end
 
-@interface WCDataItem : NSObject
-@property (retain, nonatomic) WCContentItem *contentObj;
-@property (retain, nonatomic) NSString *contentDesc;
-@property (retain, nonatomic) NSString *tid;
-@property (retain, nonatomic) NSString *username;
-+ (id)fromNSCodingBuffer:(NSData *)buffer;
-- (NSData *)toNSCodingBuffer;
-- (BOOL)isVideo;
-- (BOOL)isPhoto;
-- (BOOL)hasLivePhoto;
-- (BOOL)isTypeThatSupportsLivePhoto;
-- (BOOL)isFeedOfMine;
-- (NSArray *)getNeedBatchDownloadMedias;
+@interface WCContentItem : NSObject
+@property (retain, nonatomic) NSMutableArray *mediaList;   // 锚定 WCContentItem.h:71  -(id) mediaList;
+@property (nonatomic) int type;                            // 锚定 WCContentItem.h:88  -(int) type;
++ (BOOL)isVideoType:(long long)type;                       // 锚定 WCContentItem.h:5   +(BOOL) isVideoType:(long long);
++ (BOOL)isPhotoType:(long long)type;                       // 锚定 WCContentItem.h:43  +(BOOL) isPhotoType:(long long);
++ (BOOL)isTypeThatSupportsLivePhoto:(long long)type;       // 锚定 WCContentItem.h:44  +(BOOL) isTypeThatSupportsLivePhoto:(long long);
 @end
 
-@interface WCContentItem : NSObject
-@property (retain, nonatomic) NSMutableArray *mediaList;
-@property (nonatomic) int type;
-+ (BOOL)isVideoType:(long long)type;
-+ (BOOL)isPhotoType:(long long)type;
-+ (BOOL)isTypeThatSupportsLivePhoto:(long long)type;
+@interface WCDataItem : NSObject
+@property (retain, nonatomic) WCContentItem *contentObj;   // 锚定 WCDataItem.h:215  -(id) contentObj;
+@property (retain, nonatomic) NSString *contentDesc;       // 锚定 WCDataItem.h:213  -(id) contentDesc;
+@property (retain, nonatomic) NSString *tid;               // 锚定 WCDataItem.h:279  -(id) tid;
+@property (retain, nonatomic) NSString *username;          // 锚定 WCDataItem.h:288  -(id) username;
++ (id)fromNSCodingBuffer:(NSData *)buffer;                 // 锚定 WCDataItem.h:7    +(id) fromNSCodingBuffer:(id);
+- (NSData *)toNSCodingBuffer;                              // 锚定 WCDataItem.h:281  -(id) toNSCodingBuffer;
+- (BOOL)isVideo;                                           // 锚定 WCDataItem.h:182  -(BOOL) isVideo;
+- (BOOL)isPhoto;                                           // 锚定 WCDataItem.h:165  -(BOOL) isPhoto;
+- (BOOL)hasLivePhoto;                                      // 锚定 WCDataItem.h:124  -(BOOL) hasLivePhoto;
+- (BOOL)isTypeThatSupportsLivePhoto;                       // 锚定 WCDataItem.h:177  -(BOOL) isTypeThatSupportsLivePhoto;
+- (BOOL)isFeedOfMine;                                      // 锚定 WCDataItem.h:149  -(BOOL) isFeedOfMine;
+- (NSArray *)getNeedBatchDownloadMedias;                   // 锚定 WCDataItem.h:238  -(id) getNeedBatchDownloadMedias;
 @end
 
 @interface WCMediaItem : NSObject
