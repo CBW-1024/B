@@ -288,7 +288,6 @@ static BOOL dd_voice_forward_enabled(void) {
 #define kDDVCAppInnerFile 6
 #define kDDVCVoiceSampleRate 16000
 #define kDDVCDownloadTimeout 90.0
-#define kDDSendWaitTimeout   30.0
 
 @interface DDVoiceConvertConfig : NSObject
 + (instancetype)shared;
@@ -486,13 +485,11 @@ static CMessageWrap *dd_send_voice(NSString *usr, NSString *audPath, unsigned in
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
     return wrap;
 }
-// 等待消息真正发出：轮询 m_uiStatus，离开「发送中」即视为发送完成（成功或失败）。
+// 等待消息真正发出：轮询 m_uiStatus，离开「发送中」即视为发送完成。
 // 必须在后台队列调用，不能阻塞主线程。
 static void dd_wait_send_done(CMessageWrap *wrap) {
     if (!wrap) return;
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:kDDSendWaitTimeout];
-    while ([deadline timeIntervalSinceNow] > 0) {
-        if ([wrap m_uiStatus] != kDDMsgStatusSending) return;
+    while ([wrap m_uiStatus] == kDDMsgStatusSending) {
         [NSThread sleepForTimeInterval:0.5];
     }
 }
