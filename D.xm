@@ -54,7 +54,7 @@
 
 @interface CMessageWrap : NSObject
 + (BOOL)isSenderFromMsgWrap:(id)arg1;
-+ (id)GetPathOfAppData:(id)localID;
++ (id)GetPathOfAppData:(id)msgWrap;
 - (id)initWithMsgType:(long long)arg1;
 - (BOOL)IsVoiceMsg;
 - (BOOL)IsVideoMsg;
@@ -568,15 +568,17 @@ static NSString *dd_video_path_of_cell(id cell) {
     if (![dd_media_ext_set() containsObject:p.pathExtension.lowercaseString]) return nil;
     return p;
 }
-// 文件消息本地路径（WCR 干净做法）：仅用消息自身 localID 走 GetPathOfAppData:(id) 直接取
-// 该消息真实落盘路径，按消息区分、不依赖用户名。
+// 文件消息本地路径（WCR 干净做法）：直接把消息 wrap 自身传给 +[CMessageWrap GetPathOfAppData:(id)]，
+// 由微信按该 wrap 的真实 localID/用户名算出落盘路径，按消息区分、不依赖外部用户名。
 // 旧写法 GetPathOfAppDataByUserName:... 按「用户名+消息」算「预期路径」，对未下载文件会返回
 // 已存在的占位路径（→ 跳过下载 → 不同文件转出相同语音），且一旦 dd_current_usr_name 算错会让
 // 所有文件落到同一路径。GetPathOfAppData:(id) 不碰用户名，从根上规避这两类「所有语音都一样」。
+// ⚠️ 关键：WCR 取证确认该方法的实参是 CMessageWrap 实例本身（WCR 以 objc_storeWeak 持有该实参后传入），
+// 方法内部对实参发 m_uiMesLocalID 等消息取路径。传 localID 的 NSNumber 会让 NSNumber 收到未识别
+// selector → 文件转语音直接闪退。故此处必须传 msg 而非 @(msg.m_uiMesLocalID)。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
-    NSNumber *lid = [NSNumber numberWithUnsignedInt:msg.m_uiMesLocalID];
-    NSString *p = (NSString *)[objc_getClass("CMessageWrap") GetPathOfAppData:lid];
+    NSString *p = (NSString *)[objc_getClass("CMessageWrap") GetPathOfAppData:msg];
     if ([p isKindOfClass:[NSString class]] && p.length) return p;
     return nil;
 }
