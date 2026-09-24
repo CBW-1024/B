@@ -1,4 +1,4 @@
-//  DD语音助手 —— 单文件越狱插件（Theos/Logos，arm64/arm64e，iOS 18+）
+//  DD语音助手 —— 单文件越狱插件（Theos/Logos）
 //
 //  功能：
 //    · 语音转发：收藏语音 / 语音消息一键转发，长按菜单加「转发」
@@ -1142,7 +1142,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD语音助手";
+    self.title = @"语音助手设置";
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
     appearance.shadowColor = nil;
@@ -1190,9 +1190,9 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     [sec addCell:[cellMgr switchCellForSel:@selector(onMsgSwitch:) target:self title:@"语音消息转发" on:cfg.msgEnabled]];
     [_tableViewManager addSection:sec];
 
-    // 分组二：语音转换设置（语音转换）
+    // 分组二：转换设置（语音转换）
     DDVoiceConvertConfig *mc = [DDVoiceConvertConfig shared];
-    WCTableViewSectionManager *sec2 = [secMgr sectionWithHeader:@"语音转换设置"];
+    WCTableViewSectionManager *sec2 = [secMgr sectionWithHeader:@"转换设置"];
     if (sec2) {
         [sec2 addCell:[cellMgr switchCellForSel:@selector(onVideoToVoiceSwitch:) target:self title:@"视频转语音" on:mc.videoToVoiceEnabled]];
         [sec2 addCell:[cellMgr switchCellForSel:@selector(onFileToVoiceSwitch:)  target:self title:@"文件转语音" on:mc.fileToVoiceEnabled]];
