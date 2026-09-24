@@ -54,7 +54,7 @@
 
 @interface CMessageWrap : NSObject
 + (BOOL)isSenderFromMsgWrap:(id)arg1;
-+ (void)GetPathOfAppDataByUserName:(id)usr andMessageWrap:(id)wrap retStrPath:(void *)pp;
++ (id)GetPathOfAppData:(id)localID;
 - (id)initWithMsgType:(long long)arg1;
 - (BOOL)IsVoiceMsg;
 - (BOOL)IsVideoMsg;
@@ -568,15 +568,15 @@ static NSString *dd_video_path_of_cell(id cell) {
     if (![dd_media_ext_set() containsObject:p.pathExtension.lowercaseString]) return nil;
     return p;
 }
-// 文件消息本地路径。GetPathOfAppDataByUserName:...retStrPath: 是 void* 出参，
-// 微信向 *pp 写入 autorelease(+0) 字符串，ARC 不感知其所有权；必须用 __unsafe_unretained
-// 接住出参再赋给 __strong，否则出作用域时 ARC 多 release 一次导致 over-release 崩溃。
+// 文件消息本地路径（WCR 干净做法）：仅用消息自身 localID 走 GetPathOfAppData:(id) 直接取
+// 该消息真实落盘路径，按消息区分、不依赖用户名。
+// 旧写法 GetPathOfAppDataByUserName:... 按「用户名+消息」算「预期路径」，对未下载文件会返回
+// 已存在的占位路径（→ 跳过下载 → 不同文件转出相同语音），且一旦 dd_current_usr_name 算错会让
+// 所有文件落到同一路径。GetPathOfAppData:(id) 不碰用户名，从根上规避这两类「所有语音都一样」。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
-    NSString * __unsafe_unretained raw = nil;
-    [objc_getClass("CMessageWrap") GetPathOfAppDataByUserName:dd_current_usr_name()
-                                          andMessageWrap:msg retStrPath:(void *)&raw];
-    NSString *p = raw;
+    NSNumber *lid = [NSNumber numberWithUnsignedInt:msg.m_uiMesLocalID];
+    NSString *p = (NSString *)[objc_getClass("CMessageWrap") GetPathOfAppData:lid];
     if ([p isKindOfClass:[NSString class]] && p.length) return p;
     return nil;
 }
