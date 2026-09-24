@@ -55,6 +55,8 @@
 - (BOOL)isTypeThatSupportsLivePhoto;
 - (BOOL)isFeedOfMine;
 - (NSArray *)getNeedBatchDownloadMedias;
+- (BOOL)isWeiShang;
+- (void)setExtFlag:(unsigned int)arg1;
 @end
 
 @interface WCMediaItem : NSObject
@@ -244,12 +246,61 @@ static inline id DDMGetFrameFacade(void) {
 - (void)stopLoadingAndShowOK:(NSString *)text duration:(double)duration;
 @end
 
+#pragma mark - 朋友圈辅助功能类声明
+
+@interface WCContentItemViewTemplateVideo : UIView
+- (void)autoPlayWithoutSound;
+@end
+
+@interface WCTimeLineCellView : UIView
+- (void)initPrivacyButton:(id)arg1;
+- (void)layoutSubviews;
++ (BOOL)shouldShowFullTextButtonWithDataItem:(id)arg1;
+@end
+
+@interface MMUIButton : UIButton
+@end
+
+@interface WCUserComment : NSObject
+@property (nonatomic) BOOL bDeleted;
+@property (nonatomic) BOOL deletedByFeedOwner;
+@property (retain, nonatomic) id content;
+@end
+
+@interface WCSNSMessage : NSObject
+@property (nonatomic) unsigned int delStatus;
+@property (retain, nonatomic) WCUserComment *comment;
+@end
+
+@interface WCPlayerConfigFullScreenViewController : UIViewController
+- (void)onFullScreenSingleTap;
+- (BOOL)shouldShowProgressBar;
+- (BOOL)autoShowProgressBarWithThreshold;
+@end
+
 #pragma mark - 配置
 
-static NSString * const kDDMEnabled = @"DDForward_Enabled";
+static NSString * const kDDMEnabled            = @"DDForward_Enabled";
+static NSString * const kDDMDeletedComment     = @"DDMoments_antiDeleteSnsComment";
+static NSString * const kDDMPrivacyIcon        = @"DDMoments_disableSnsPrivacyIcon";
+static NSString * const kDDMGroupFold          = @"DDMoments_disableSnsGroupFold";
+static NSString * const kDDMTextFold           = @"DDMoments_disableSnsTextFold";
+static NSString * const kDDMVideoAutoPlay      = @"DDMoments_disableSnsVideoAutoPlay";
+static NSString * const kDDMVideoTapClose      = @"DDMoments_disableSnsVideoTapClose";
+static NSString * const kDDMVideoProgressBar   = @"DDMoments_snsVideoProgressBar";
+static NSString * const kDDMDeletedCommentMark = @"DDMoments_deletedCommentMark";
+
+static NSString * const kDDMDefaultDeletedMark = @"[对方已删除] ";
 
 @interface DDMConfig : NSObject
 @property (assign, nonatomic) BOOL enabled;
+@property (assign, nonatomic) BOOL antiDeleteSnsComment;
+@property (assign, nonatomic) BOOL disableSnsPrivacyIcon;
+@property (assign, nonatomic) BOOL disableSnsGroupFold;
+@property (assign, nonatomic) BOOL disableSnsTextFold;
+@property (assign, nonatomic) BOOL disableSnsVideoAutoPlay;
+@property (assign, nonatomic) BOOL disableSnsVideoTapClose;
+@property (assign, nonatomic) BOOL snsVideoProgressBar;
 + (instancetype)shared;
 @end
 
@@ -264,7 +315,15 @@ static NSString * const kDDMEnabled = @"DDForward_Enabled";
 
 - (instancetype)init {
     if (self = [super init]) {
-        _enabled = [[NSUserDefaults standardUserDefaults] boolForKey:kDDMEnabled];
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        _enabled                 = [ud boolForKey:kDDMEnabled];
+        _antiDeleteSnsComment    = [ud boolForKey:kDDMDeletedComment];
+        _disableSnsPrivacyIcon   = [ud boolForKey:kDDMPrivacyIcon];
+        _disableSnsGroupFold     = [ud boolForKey:kDDMGroupFold];
+        _disableSnsTextFold      = [ud boolForKey:kDDMTextFold];
+        _disableSnsVideoAutoPlay = [ud boolForKey:kDDMVideoAutoPlay];
+        _disableSnsVideoTapClose = [ud boolForKey:kDDMVideoTapClose];
+        _snsVideoProgressBar     = [ud boolForKey:kDDMVideoProgressBar];
     }
     return self;
 }
@@ -275,6 +334,13 @@ static NSString * const kDDMEnabled = @"DDForward_Enabled";
 }
 
 - (void)setEnabled:(BOOL)v { _enabled = v; [self persist:@(v) key:kDDMEnabled]; }
+- (void)setAntiDeleteSnsComment:(BOOL)v { _antiDeleteSnsComment = v; [self persist:@(v) key:kDDMDeletedComment]; }
+- (void)setDisableSnsPrivacyIcon:(BOOL)v { _disableSnsPrivacyIcon = v; [self persist:@(v) key:kDDMPrivacyIcon]; }
+- (void)setDisableSnsGroupFold:(BOOL)v { _disableSnsGroupFold = v; [self persist:@(v) key:kDDMGroupFold]; }
+- (void)setDisableSnsTextFold:(BOOL)v { _disableSnsTextFold = v; [self persist:@(v) key:kDDMTextFold]; }
+- (void)setDisableSnsVideoAutoPlay:(BOOL)v { _disableSnsVideoAutoPlay = v; [self persist:@(v) key:kDDMVideoAutoPlay]; }
+- (void)setDisableSnsVideoTapClose:(BOOL)v { _disableSnsVideoTapClose = v; [self persist:@(v) key:kDDMVideoTapClose]; }
+- (void)setSnsVideoProgressBar:(BOOL)v { _snsVideoProgressBar = v; [self persist:@(v) key:kDDMVideoProgressBar]; }
 
 @end
 
@@ -1385,6 +1451,117 @@ static char kDDMLineKey;
 
 %end
 
+#pragma mark - 朋友圈辅助功能
+
+// 查看已删除评论：评论被删（delStatus=1）时保留内容并加标记前缀。
+static NSString *ddmDeletedMarkText(void) {
+    NSString *t = [[NSUserDefaults standardUserDefaults] stringForKey:kDDMDeletedCommentMark];
+    return (t.length ? t : kDDMDefaultDeletedMark);
+}
+static void ddmInjectMarkIntoComment(id c) {
+    if (![c isKindOfClass:[WCUserComment class]]) return;
+    NSString *mark = ddmDeletedMarkText();
+    NSString *s = [c content];
+    if ([s isKindOfClass:[NSString class]] && s.length) {
+        if (![s hasPrefix:mark]) {
+            [c setContent:[mark stringByAppendingString:s]];
+        }
+        return;
+    }
+    NSString *bare = [mark stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (![s hasPrefix:bare]) {
+        [c setContent:bare];
+    }
+}
+%hook WCSNSMessage
+- (void)setDelStatus:(unsigned int)status {
+    if (![DDMConfig shared].antiDeleteSnsComment) { %orig; return; }
+    if (status == 1) {
+        id c = [self comment];
+        ddmInjectMarkIntoComment(c);
+        %orig(0);
+        return;
+    }
+    %orig;
+}
+%end
+
+// 禁用朋友圈视频自动播放
+%hook WCContentItemViewTemplateVideo
+- (void)autoPlayWithoutSound {
+    if ([DDMConfig shared].disableSnsVideoAutoPlay) return;
+    %orig;
+}
+%end
+
+// 禁用朋友圈“谁可以看”隐私图标 + 长文字折叠
+%hook WCTimeLineCellView
+- (void)initPrivacyButton:(id)arg1 {
+    %orig;
+    if ([DDMConfig shared].disableSnsPrivacyIcon) {
+        Ivar privacyIvar = class_getInstanceVariable([self class], "m_privacyButton");
+        MMUIButton *btn = privacyIvar ? object_getIvar(self, privacyIvar) : nil;
+        if (btn) {
+            [btn setImage:nil forState:0];
+            [btn setAlpha:0.0];
+            [btn setUserInteractionEnabled:NO];
+        }
+    }
+}
+- (void)layoutSubviews {
+    %orig;
+    if ([DDMConfig shared].disableSnsPrivacyIcon) {
+        Ivar privacyIvar = class_getInstanceVariable([self class], "m_privacyButton");
+        MMUIButton *privacyBtn = privacyIvar ? object_getIvar(self, privacyIvar) : nil;
+        Ivar deleteIvar = class_getInstanceVariable([self class], "m_deleteButton");
+        MMUIButton *deleteBtn  = deleteIvar ? object_getIvar(self, deleteIvar) : nil;
+        if (privacyBtn && deleteBtn && privacyBtn.superview && deleteBtn.superview && !deleteBtn.hidden) {
+            CGFloat pMinX = CGRectGetMinX(privacyBtn.frame);
+            CGFloat dMinX = CGRectGetMinX(deleteBtn.frame);
+            if (dMinX > pMinX + 0.5) {
+                CGRect dFrame = deleteBtn.frame;
+                dFrame.origin.x = pMinX;
+                [deleteBtn setFrame:dFrame];
+            }
+        }
+    }
+}
++ (BOOL)shouldShowFullTextButtonWithDataItem:(id)arg1 {
+    if ([DDMConfig shared].disableSnsTextFold) return NO;
+    return %orig;
+}
+%end
+
+// 禁用朋友圈微商折叠
+%hook WCDataItem
+- (BOOL)isWeiShang {
+    if ([DDMConfig shared].disableSnsGroupFold) return NO;
+    return %orig;
+}
+- (void)setExtFlag:(unsigned int)arg1 {
+    %orig;
+    if ([DDMConfig shared].disableSnsGroupFold) {
+        MSHookIvar<char>(self, "_isWeiShang") = 0;
+    }
+}
+%end
+
+// 禁用朋友圈视频点击关闭 + 启用视频进度条
+%hook WCPlayerConfigFullScreenViewController
+- (void)onFullScreenSingleTap {
+    if ([DDMConfig shared].disableSnsVideoTapClose) return;
+    %orig;
+}
+- (BOOL)shouldShowProgressBar {
+    if ([DDMConfig shared].snsVideoProgressBar) return YES;
+    return %orig;
+}
+- (BOOL)autoShowProgressBarWithThreshold {
+    if ([DDMConfig shared].snsVideoProgressBar) return YES;
+    return %orig;
+}
+%end
+
 #pragma mark - 设置界面
 
 @interface DDMSettingsViewController : UIViewController <UITableViewDelegate>
@@ -1441,6 +1618,37 @@ static char kDDMLineKey;
                                         on:cfg.enabled]];
     [_tableViewManager addSection:sec];
 
+    WCTableViewSectionManager *aux = [secMgr sectionWithHeader:@"辅助设置"];
+    [aux addCell:[cellMgr switchCellForSel:@selector(onAntiDeleteSwitch:)
+                                   target:self
+                                    title:@"查看已删评论"
+                                       on:cfg.antiDeleteSnsComment]];
+    [aux addCell:[cellMgr switchCellForSel:@selector(onPrivacySwitch:)
+                                   target:self
+                                    title:@"禁用隐私图标"
+                                       on:cfg.disableSnsPrivacyIcon]];
+    [aux addCell:[cellMgr switchCellForSel:@selector(onGroupFoldSwitch:)
+                                   target:self
+                                    title:@"禁用微商折叠"
+                                       on:cfg.disableSnsGroupFold]];
+    [aux addCell:[cellMgr switchCellForSel:@selector(onTextFoldSwitch:)
+                                   target:self
+                                    title:@"禁用文字折叠"
+                                       on:cfg.disableSnsTextFold]];
+    [aux addCell:[cellMgr switchCellForSel:@selector(onVideoAutoPlaySwitch:)
+                                   target:self
+                                    title:@"禁用自动播放"
+                                       on:cfg.disableSnsVideoAutoPlay]];
+    [aux addCell:[cellMgr switchCellForSel:@selector(onVideoTapCloseSwitch:)
+                                   target:self
+                                    title:@"禁用点击关闭"
+                                       on:cfg.disableSnsVideoTapClose]];
+    [aux addCell:[cellMgr switchCellForSel:@selector(onVideoProgressBarSwitch:)
+                                   target:self
+                                    title:@"启用视频进度"
+                                       on:cfg.snsVideoProgressBar]];
+    [_tableViewManager addSection:aux];
+
     [_tableViewManager reloadTableView];
 }
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1457,6 +1665,13 @@ static char kDDMLineKey;
     return UITableViewAutomaticDimension;
 }
 - (void)onEnabledSwitch:(UISwitch *)sender { DDMConfig.shared.enabled = sender.isOn; }
+- (void)onAntiDeleteSwitch:(UISwitch *)s       { DDMConfig.shared.antiDeleteSnsComment = s.on; }
+- (void)onPrivacySwitch:(UISwitch *)s          { DDMConfig.shared.disableSnsPrivacyIcon = s.on; }
+- (void)onGroupFoldSwitch:(UISwitch *)s        { DDMConfig.shared.disableSnsGroupFold = s.on; }
+- (void)onTextFoldSwitch:(UISwitch *)s         { DDMConfig.shared.disableSnsTextFold = s.on; }
+- (void)onVideoAutoPlaySwitch:(UISwitch *)s    { DDMConfig.shared.disableSnsVideoAutoPlay = s.on; }
+- (void)onVideoTapCloseSwitch:(UISwitch *)s    { DDMConfig.shared.disableSnsVideoTapClose = s.on; }
+- (void)onVideoProgressBarSwitch:(UISwitch *)s { DDMConfig.shared.snsVideoProgressBar = s.on; }
 @end
 
 #pragma mark - 注册
