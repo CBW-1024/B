@@ -19,6 +19,8 @@
 @interface DDProgressHub : NSObject
 + (NSString *)begin;                  // 登记新任务，返回 token（标题显示并发数）
 + (void)complete:(NSString *)token;   // 结束任务（全部结束则收起卡片）
++ (void)waitSendSuccess:(unsigned int)localID token:(NSString *)token;  // 登记“等发送成功”
++ (void)sendSuccess:(unsigned int)localID;   // 微信回调发送成功，按 localID 收起对应任务
 @end
 
 @interface WCPluginsMgr : NSObject
@@ -163,6 +165,10 @@
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3;
 @end
 
+@interface BaseMsgContentViewController : NSObject
+- (void)OnMsgSendSuccess:(id)msgWrap;
+@end
+
 @interface MJSilkCodec : NSObject
 + (id)decodeToPCMFromSilkData:(id)a0;
 + (id)encodeToSilkFromPCMData:(id)a0;
@@ -172,12 +178,9 @@
 @interface MsgFileTransferTask : NSObject
 + (id)taskFromMessageWrap:(id)msgWrap;
 - (id)filePath;
-- (BOOL)isFileExist;
 - (BOOL)isCompleted;
-- (unsigned long long)state;
 - (int)progress;
 - (void)startTransfer;
-- (void)stopTransfer;
 @end
 
 @interface CMessageMgr : NSObject
@@ -485,14 +488,6 @@ static CMessageWrap *dd_send_voice(NSString *usr, NSString *audPath, unsigned in
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
     return wrap;
 }
-// 等待消息真正发出：轮询 m_uiStatus，离开「发送中」即视为发送完成。
-// 必须在后台队列调用，不能阻塞主线程。
-static void dd_wait_send_done(CMessageWrap *wrap) {
-    if (!wrap) return;
-    while ([wrap m_uiStatus] == kDDMsgStatusSending) {
-        [NSThread sleepForTimeInterval:0.5];
-    }
-}
 // 收藏外壳：数据未就绪则下载后注入 m_dtVoice 再发送。
 static void dd_ensure_fav_voice_data(id msg) {
     if ([dd_voice_data(msg) length] > 0) return;
@@ -672,9 +667,6 @@ static UIWindow *dd_progress_key_window(void) {
 @implementation DDProgressHub
 
 static const NSInteger kDDHubTag = 0x44444801;
-static const NSTimeInterval kDDHubMinShow = 0.6;  // 最短展示时长，避免转换过快导致浮卡闪一下
-static NSTimeInterval dd_hub_shown_at = 0;
-static BOOL dd_hub_dismissing = NO;
 
 + (NSMutableDictionary<NSString *, NSNumber *> *)dd_tasks {
     static NSMutableDictionary *d;
@@ -688,6 +680,13 @@ static BOOL dd_hub_dismissing = NO;
     dispatch_once(&once, ^{ l = [NSLock new]; });
     return l;
 }
+// localID → token：已发起发送、等待微信回调“发送成功”的任务。
++ (NSMutableDictionary<NSNumber *, NSString *> *)dd_pending {
+    static NSMutableDictionary *d;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
 + (NSString *)begin {
     NSString *token = [NSUUID UUID].UUIDString;
     [[self dd_lock] lock]; [[self dd_tasks] setObject:@1 forKey:token]; [[self dd_lock] unlock];
@@ -700,6 +699,18 @@ static BOOL dd_hub_dismissing = NO;
     dispatch_async(dispatch_get_main_queue(), ^{
         if ([self dd_tasks].count == 0) [self dd_dismiss]; else [self dd_render];
     });
+}
++ (void)waitSendSuccess:(unsigned int)localID token:(NSString *)token {
+    if (!localID || !token) { if (token) [self complete:token]; return; }
+    [[self dd_lock] lock]; [self dd_pending][@(localID)] = token; [[self dd_lock] unlock];
+}
++ (void)sendSuccess:(unsigned int)localID {
+    if (!localID) return;
+    [[self dd_lock] lock];
+    NSString *token = [self dd_pending][@(localID)];
+    if (token) [[self dd_pending] removeObjectForKey:@(localID)];
+    [[self dd_lock] unlock];
+    if (token) [self complete:token];
 }
 + (UIView *)dd_make_card:(UIWindow *)win {
     CGFloat cardW = win.bounds.size.width - 32.0;
@@ -757,8 +768,6 @@ static BOOL dd_hub_dismissing = NO;
     objc_setAssociatedObject(card, "ddhTitle", title, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [win addSubview:card];
     [UIView animateWithDuration:0.2 animations:^{ card.alpha = 1.0; }];
-    dd_hub_shown_at = [NSDate timeIntervalSinceReferenceDate];
-    dd_hub_dismissing = NO;
     return card;
 }
 + (void)dd_render {
@@ -776,17 +785,8 @@ static BOOL dd_hub_dismissing = NO;
     UIWindow *win = dd_progress_key_window();
     UIView *card = win ? [win viewWithTag:kDDHubTag] : nil;
     if (!card) return;
-    if (dd_hub_dismissing) return;
-    dd_hub_dismissing = YES;
-    NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - dd_hub_shown_at;
-    NSTimeInterval delay = elapsed < kDDHubMinShow ? (kDDHubMinShow - elapsed) : 0;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [[self dd_lock] lock]; NSInteger n = [self dd_tasks].count; [[self dd_lock] unlock];
-        if (n > 0) { dd_hub_dismissing = NO; return; }   // 等待期间又有新任务，取消本次收起
-        [UIView animateWithDuration:0.2 animations:^{ card.alpha = 0; }
-                         completion:^(BOOL f){ [card removeFromSuperview]; dd_hub_dismissing = NO; }];
-    });
+    [UIView animateWithDuration:0.2 animations:^{ card.alpha = 0; }
+                     completion:^(BOOL f){ [card removeFromSuperview]; }];
 }
 @end
 
@@ -910,7 +910,7 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
     return reader.status == AVAssetReaderStatusCompleted ? pcm : nil;
 }
 // 媒体 → 语音：未下载则先触发下载，完成后抽音轨 / 复用 SILK，编码成微信语音后发送。
-static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^pathBlock)(void), MsgFileTransferTask *(^downloadBlock)(void)) {
+static void dd_media_to_voice(CMessageWrap *msg, NSString *(^pathBlock)(void), MsgFileTransferTask *(^downloadBlock)(void)) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
     dispatch_async(dd_convert_queue, ^{
@@ -944,12 +944,8 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         if (ms > 60000) ms = 60000;
         dispatch_async(dispatch_get_main_queue(), ^{
             CMessageWrap *sent = dd_send_voice(usr, tmp, ms);   // 发送须在主线程发起
-            if (!sent) { if (token) [DDProgressHub complete:token]; return; }
-            // 提示持续到真正发送完成（状态离开「发送中」），轮询放后台，不阻塞主线程。
-            dispatch_async(dd_convert_queue, ^{
-                dd_wait_send_done(sent);
-                if (token) [DDProgressHub complete:token];
-            });
+            // 提示持续到微信回调「发送成功」为止（按 localID 命中）；发送未发起则立即收起。
+            [DDProgressHub waitSendSuccess:[sent m_uiMesLocalID] token:token];
         });
     });
 }
@@ -1067,11 +1063,7 @@ static void dd_voice_to_file(CMessageWrap *msg) {
         if (!m4a.length) { if (token) [DDProgressHub complete:token]; return; }
         dispatch_async(dispatch_get_main_queue(), ^{
             CMessageWrap *sent = dd_send_file_to_chat(usr, m4a, fn);   // 发送须在主线程发起
-            if (!sent) { if (token) [DDProgressHub complete:token]; return; }
-            dispatch_async(dd_convert_queue, ^{
-                dd_wait_send_done(sent);
-                if (token) [DDProgressHub complete:token];
-            });
+            [DDProgressHub waitSendSuccess:[sent m_uiMesLocalID] token:token];
         });
     });
 }
@@ -1112,6 +1104,29 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     [items addObject:item];
     return items;
 }
+
+#pragma mark - Hook：发送成功回调（提示的收起点）
+
+// 微信核心消息管理器的真实「发送成功」回调，语音/文件消息通用。
+// 按 localID 命中我们登记的待完成任务，收起进度提示。
+%hook CMessageMgr
+- (void)updateMsgSourceOnSendSuccess:(id)msgWrap secMsgSource:(id)src svrTime:(unsigned int)t {
+    %orig;
+    if ([msgWrap respondsToSelector:@selector(m_uiMesLocalID)]) {
+        [DDProgressHub sendSuccess:[msgWrap m_uiMesLocalID]];
+    }
+}
+%end
+
+// 聊天页的发送成功回调，作为并联兜底信号（与上面幂等：先命中者收起，另一个空转）。
+%hook BaseMsgContentViewController
+- (void)OnMsgSendSuccess:(id)msgWrap {
+    %orig;
+    if ([msgWrap respondsToSelector:@selector(m_uiMesLocalID)]) {
+        [DDProgressHub sendSuccess:[msgWrap m_uiMesLocalID]];
+    }
+}
+%end
 
 #pragma mark - Hook：自定义语音秒数上行改写
 
@@ -1217,7 +1232,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 %new
 - (void)dd_mediaToVoice:(id)sender {
     CMessageWrap *msg = dd_msg_of_cell(self);
-    dd_media_to_voice(@"视频", msg, ^NSString *{ return dd_video_path_of_cell(self); },
+    dd_media_to_voice(msg, ^NSString *{ return dd_video_path_of_cell(self); },
                           ^MsgFileTransferTask *(void){ dd_trigger_video_download(msg); return nil; });
 }
 %end
@@ -1238,7 +1253,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 %new
 - (void)dd_mediaToVoice:(id)sender {
     CMessageWrap *msg = dd_msg_of_cell(self);
-    dd_media_to_voice(@"文件", msg, ^NSString *{ return dd_file_path_of_msg(msg); },
+    dd_media_to_voice(msg, ^NSString *{ return dd_file_path_of_msg(msg); },
                           ^MsgFileTransferTask *(void){ return dd_trigger_file_download(msg); });
 }
 %end
