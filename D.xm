@@ -288,6 +288,7 @@ static BOOL dd_voice_forward_enabled(void) {
 #define kDDVCAppInnerFile 6
 #define kDDVCVoiceSampleRate 16000
 #define kDDVCDownloadTimeout 90.0
+#define kDDSendWaitTimeout   30.0
 
 @interface DDVoiceConvertConfig : NSObject
 + (instancetype)shared;
@@ -461,11 +462,12 @@ static unsigned int dd_new_voice_local_id(void) {
 // 数据合法性由来源侧保证：媒体转语音在各自上游已校验 SILK（L770/L675）；转发（原生语音、收藏）
 // 数据为微信产出，直接信任。故此处不重复帧链校验——收藏语音 m_dtVoice 走临时文件兜底，
 // 不含本地 .aud 的完整帧链，会被帧链校验误杀。
-static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
+// 返回已发出的 wrap（用于等待发送结果），失败返回 nil。
+static CMessageWrap *dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     NSData *data = [NSData dataWithContentsOfFile:audPath];
-    if (data.length == 0) return NO;
+    if (data.length == 0) return nil;
     AudioSender *sender = (AudioSender *)dd_mm_service(@"AudioSender");
-    if (!sender) return NO;
+    if (!sender) return nil;
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVoiceMsgType];
     [wrap setM_uiMessageType:kDDVoiceMsgType];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
@@ -482,7 +484,17 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     if (voicePath.length) [wrap setM_nsVoicePath:voicePath];
     [mgr SaveMesVoice:nil MsgWrap:wrap];
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
-    return YES;
+    return wrap;
+}
+// 等待消息真正发出：轮询 m_uiStatus，离开「发送中」即视为发送完成（成功或失败）。
+// 必须在后台队列调用，不能阻塞主线程。
+static void dd_wait_send_done(CMessageWrap *wrap) {
+    if (!wrap) return;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:kDDSendWaitTimeout];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        if ([wrap m_uiStatus] != kDDMsgStatusSending) return;
+        [NSThread sleepForTimeInterval:0.5];
+    }
 }
 // 收藏外壳：数据未就绪则下载后注入 m_dtVoice 再发送。
 static void dd_ensure_fav_voice_data(id msg) {
@@ -506,9 +518,9 @@ static BOOL dd_take_over_voice_msg(id msg, id contact) {
             });
             return YES;
         }
-        return dd_send_voice(usr, audPath, duration);
+        return dd_send_voice(usr, audPath, duration) != nil;
     }
-    return dd_send_voice(usr, audPath, duration);
+    return dd_send_voice(usr, audPath, duration) != nil;
 }
 // 批量转发逐条接管，返回需走原实现的消息。
 static NSArray *dd_take_over_voice_list(NSArray *src, id contact) {
@@ -622,13 +634,23 @@ static MsgFileTransferTask *dd_trigger_file_download(CMessageWrap *msg) {
 static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout, MsgFileTransferTask *task) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     while ([deadline timeIntervalSinceNow] > 0) {
-        // 优先用 transfer task 的真实落盘路径；无 task（视频）或尚未就绪时回退到 pathBlock。
-        NSString *tp = (task && [task respondsToSelector:@selector(filePath)]) ? [task filePath] : nil;
-        NSString *p = (tp.length ? tp : (pathBlock ? pathBlock() : nil));
-        if (dd_file_exists(p)) {
-            NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
-            long long sz = a ? [a[NSFileSize] longLongValue] : 0;
-            if (sz > 0) return p;
+        // 有 task 时必须以真实完成态把关：微信流式写入目标路径，
+        // 光看“文件存在且 >0”会拿到刚写头几字节的半成品，导致后续转换失败/发空语音。
+        BOOL completed = YES;
+        if (task) {
+            BOOL flag = ([task respondsToSelector:@selector(isCompleted)] && [task isCompleted]);
+            int prog = ([task respondsToSelector:@selector(progress)] ? [task progress] : 0);
+            completed = flag || prog >= 100;
+        }
+        if (completed) {
+            // 优先用 transfer task 的真实落盘路径；无 task（视频）时回退到 pathBlock。
+            NSString *tp = (task && [task respondsToSelector:@selector(filePath)]) ? [task filePath] : nil;
+            NSString *p = (tp.length ? tp : (pathBlock ? pathBlock() : nil));
+            if (dd_file_exists(p)) {
+                NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+                long long sz = a ? [a[NSFileSize] longLongValue] : 0;
+                if (sz > 0) return p;
+            }
         }
         [NSThread sleepForTimeInterval:0.5];
     }
@@ -763,6 +785,8 @@ static BOOL dd_hub_dismissing = NO;
     NSTimeInterval delay = elapsed < kDDHubMinShow ? (kDDHubMinShow - elapsed) : 0;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        [[self dd_lock] lock]; NSInteger n = [self dd_tasks].count; [[self dd_lock] unlock];
+        if (n > 0) { dd_hub_dismissing = NO; return; }   // 等待期间又有新任务，取消本次收起
         [UIView animateWithDuration:0.2 animations:^{ card.alpha = 0; }
                          completion:^(BOOL f){ [card removeFromSuperview]; dd_hub_dismissing = NO; }];
     });
@@ -922,8 +946,13 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         if (ms == 0) ms = 1000;
         if (ms > 60000) ms = 60000;
         dispatch_async(dispatch_get_main_queue(), ^{
-            dd_send_voice(usr, tmp, ms);
-            if (token) [DDProgressHub complete:token];
+            CMessageWrap *sent = dd_send_voice(usr, tmp, ms);   // 发送须在主线程发起
+            if (!sent) { if (token) [DDProgressHub complete:token]; return; }
+            // 提示持续到真正发送完成（状态离开「发送中」），轮询放后台，不阻塞主线程。
+            dispatch_async(dd_convert_queue, ^{
+                dd_wait_send_done(sent);
+                if (token) [DDProgressHub complete:token];
+            });
         });
     });
 }
@@ -990,12 +1019,13 @@ static NSString *dd_persist_copy(NSString *src) {
     return [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
 }
 // 发送 m4a 文件消息：AddAppMsg 本地落库 → StartUploadAppMsg 触发上传。
-static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName) {
+// 返回已发出的 wrap（用于等待发送结果），失败返回 nil。
+static CMessageWrap *dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName) {
     NSString *persistPath = dd_persist_copy(m4aPath);
     if (persistPath.length) m4aPath = persistPath;
-    if (!dd_file_exists(m4aPath) || !usr.length) return NO;
+    if (!dd_file_exists(m4aPath) || !usr.length) return nil;
     NSData *fdata = [NSData dataWithContentsOfFile:m4aPath];
-    if (fdata.length == 0) return NO;
+    if (fdata.length == 0) return nil;
     unsigned long long fsize = fdata.length;
 
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVCAppMsgType];
@@ -1023,7 +1053,7 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
     [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
-    return YES;
+    return wrap;
 }
 // 语音消息 → 文件消息。
 static void dd_voice_to_file(CMessageWrap *msg) {
@@ -1039,8 +1069,12 @@ static void dd_voice_to_file(CMessageWrap *msg) {
         NSString *m4a = dd_decode_silk_to_audio(silk);
         if (!m4a.length) { if (token) [DDProgressHub complete:token]; return; }
         dispatch_async(dispatch_get_main_queue(), ^{
-            dd_send_file_to_chat(usr, m4a, fn);
-            if (token) [DDProgressHub complete:token];
+            CMessageWrap *sent = dd_send_file_to_chat(usr, m4a, fn);   // 发送须在主线程发起
+            if (!sent) { if (token) [DDProgressHub complete:token]; return; }
+            dispatch_async(dd_convert_queue, ^{
+                dd_wait_send_done(sent);
+                if (token) [DDProgressHub complete:token];
+            });
         });
     });
 }
