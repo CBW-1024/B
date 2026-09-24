@@ -338,14 +338,6 @@ static BOOL dd_is_msg_wrap(id obj) {
 static CMessageWrap *dd_msg_of_cell(id cell) {
     return [[cell viewModel] messageWrap];
 }
-// 微信发送走异步后台队列，保活 wrap 防止其在回调前被 ARC 释放。
-static void dd_retain_wrap(id wrap) {
-    if (!wrap) return;
-    static NSMutableArray *pool = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ pool = [NSMutableArray array]; });
-    @synchronized (pool) { [pool addObject:wrap]; }
-}
 // 语音消息归属：群聊/发送方返回 toUsr，否则返回 fromUsr。
 static NSString *dd_chat_usr_of_msg(CMessageWrap *msg) {
     return [objc_getClass("CMessageWrap") isSenderFromMsgWrap:msg] ? msg.m_nsToUsr : msg.m_nsFromUsr;
@@ -475,7 +467,6 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     [wrap setM_uiStatus:kDDMsgStatusSending];
     [wrap setM_uiDownloadStatus:9];
     [wrap setM_bForward:1];
-    dd_retain_wrap(wrap);
     dd_configure_voice_msg(wrap, data, duration);
 
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
@@ -890,7 +881,6 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
         @"<msg><appmsg appid=\"\" sdkver=\"0\"><title>%@</title><des></des><type>6</type>"
          "<appattach><totallen>%llu</totallen><attachid></attachid><fileext>%@</fileext>"
          "<filename>%@</filename></appattach></appmsg></msg>", fileName, fsize, @"m4a", fileName]];
-    dd_retain_wrap(wrap);
 
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
