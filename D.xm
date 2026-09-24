@@ -445,20 +445,26 @@ static const void *kDDHubSliderKey = &kDDHubSliderKey;
 static NSInteger dd_hub_count = 0;   // 进行中的任务数
 static NSInteger dd_hub_token = 0;   // 自增任务号
 
-static UIWindow *dd_key_window(void) {
-    UIWindow *found = nil;
+// 提示挂在微信自己的主窗口上。
+// 设备上可能装有 iConsole 等调试浮层，它会另建一个同级别的窗口，必须有确定性优先级：
+// 先按「根控制器是微信主 Tab」认，其次按「根控制器不是调试浮层」认，最后才退回 keyWindow。
+static UIWindow *dd_main_window(void) {
+    UIWindow *fallback = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-            if (w.isKeyWindow) return w;
-            if (!found && !w.hidden) found = w;
+            if (w.hidden) continue;
+            UIViewController *root = w.rootViewController;
+            NSString *rootName = root ? NSStringFromClass([root class]) : @"";
+            if ([rootName isEqualToString:@"MainTabBarViewController"]) return w;
+            if (!fallback && ![rootName hasPrefix:@"iConsole"] && ![rootName hasPrefix:@"FLEX"]) fallback = w;
         }
     }
-    return found;
+    return fallback ?: [UIApplication sharedApplication].keyWindow;
 }
 // 提示卡片：尺寸 / 位置 / 配色与朋友圈转发浮卡一致，进度条为来回滚动的不确定样式。
 static UIView *dd_hub_card(BOOL create) {
-    UIWindow *win = dd_key_window();
+    UIWindow *win = dd_main_window();
     if (!win) return nil;
     UIView *card = [win viewWithTag:kDDHubTag];
     if (card || !create) return card;
@@ -534,6 +540,10 @@ static UIView *dd_hub_card(BOOL create) {
                      completion:nil];
 
     [win addSubview:card];
+    dd_log(@"hub card win=%@ root=%@ level=%.0f card=%@",
+           NSStringFromClass([win class]),
+           win.rootViewController ? NSStringFromClass([win.rootViewController class]) : @"(nil)",
+           (double)win.windowLevel, NSStringFromCGRect(card.frame));
     return card;
 }
 static void dd_hub_refresh_title(void) {
@@ -550,9 +560,11 @@ static NSInteger dd_hub_begin(void) {
     }
     dd_hub_token++;
     NSInteger token = dd_hub_token;
-    if (!dd_hub_card(YES)) { dd_hub_token--; return 0; }
+    UIView *card = dd_hub_card(YES);
+    if (!card) { dd_hub_token--; dd_log(@"hub begin abort: no window"); return 0; }
     dd_hub_count++;
-    [UIView animateWithDuration:0.2 animations:^{ dd_hub_card(NO).alpha = 1.0; }];
+    [card.superview bringSubviewToFront:card];
+    [UIView animateWithDuration:0.2 animations:^{ card.alpha = 1.0; }];
     dd_hub_refresh_title();
     dd_log(@"hub begin token=%ld count=%ld", (long)token, (long)dd_hub_count);
     return token;
