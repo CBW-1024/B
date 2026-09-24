@@ -166,6 +166,9 @@
 @interface CMessageMgr : NSObject
 - (void)StartDownloadVideo:(id)a0 MsgWrap:(id)a1 Priority:(BOOL)a2 Silent:(BOOL)a3;
 - (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2;
+- (BOOL)StartDownloadAppAttach:(id)a0 MsgWrap:(id)a1 Silent:(BOOL)a2 autoDownload:(BOOL)a3;
+- (BOOL)InAppAttachDownloading:(id)a0 MsgWrap:(id)a1;
+- (void)StopDownloadSilentAppAttach:(id)a0 MsgWrap:(id)a1;
 - (void)AddAppMsg:(id)a0 MsgWrap:(id)a1 DataPath:(id)a2 Scene:(unsigned int)a3;
 - (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;
@@ -597,30 +600,66 @@ static void dd_trigger_video_download(CMessageWrap *msg) {
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr StartDownloadVideo:nil MsgWrap:msg Priority:YES Silent:YES];
 }
+// 主线程同步执行（微信下载/状态查询 API 需主线程；convert 队列调用安全，不会死锁）。
+static void dd_run_on_main_sync(void(^block)(void)) {
+    if ([NSThread isMainThread]) { block(); return; }
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{ block(); dispatch_semaphore_signal(sem); });
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+}
+// 微信是否标注该附件“下载中”（主线程查询）。
+static BOOL dd_app_attach_downloading(CMessageWrap *msg) {
+    if (!dd_is_msg_wrap(msg)) return NO;
+    __block BOOL r = NO;
+    dd_run_on_main_sync(^{
+        CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
+        if (mgr) r = [mgr InAppAttachDownloading:nil MsgWrap:msg];
+    });
+    return r;
+}
+// 触发文件下载。⚠️ 必须用 autoDownload:YES 的 3 参版本：2 参 Silent: 版内部默认不自动拉取，
+// 只会“登记”一次就停（即用户看到的“触发一下就停了”）。头文件 CMessageMgr.h:33 印证存在该变体。
 static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return NO;
-    // 微信下载 API 需在主线程发起，故切到主线程并同步等待结果。
     __block BOOL ok = NO;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    dispatch_async(dispatch_get_main_queue(), ^{
+    dd_run_on_main_sync(^{
         CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-        if (mgr) ok = [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES];
-        dispatch_semaphore_signal(sem);
+        if (mgr) ok = [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES autoDownload:YES];
     });
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
     return ok;
 }
-// 轮询等待文件就绪：连续两轮大小一致才返回（半下载文件会让编码产出损坏数据）。
-static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
+// 等待文件下载完成：微信标注“下载中”时持续等待（不因瞬时大小不变而提前返回）；
+// 若卡死（始终无文件 / 有文件但从未观测到下载中、疑似上次残留半下载）则先停掉可能残留的
+// “下载中”状态再重启（预算上限 2 次）；文件出现后要求“微信已停下载 + 两轮大小一致”才算完整，
+// 避免半下载文件被拿去编码，也避免对已下载完成的文件误触发重启。
+static NSString *dd_wait_local_path(CMessageWrap *msg, NSString *(^pathBlock)(void), NSTimeInterval timeout) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     long long prevSize = -1;
+    BOOL seenDownloading = NO;
+    int reTriggerBudget = 2;
     while ([deadline timeIntervalSinceNow] > 0) {
         NSString *p = pathBlock();
+        long long sz = -1;
         if (dd_file_exists(p)) {
             NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
-            long long sz = a ? [a[NSFileSize] longLongValue] : -1;
-            if (sz > 0 && sz == prevSize) return p;
-            prevSize = sz;
+            sz = a ? [a[NSFileSize] longLongValue] : -1;
+        }
+        BOOL downloading = dd_app_attach_downloading(msg);
+        if (downloading) seenDownloading = YES;
+        // 完成：微信已停下载 且 文件非空且两轮大小一致。
+        if (!downloading && sz > 0 && sz == prevSize) return p;
+        prevSize = sz;
+        // 卡死重启：已等 >3s，且(始终无文件 或 有文件但从未见下载中) 且 预算充足。
+        BOOL stalled = (!dd_file_exists(p)) || (!seenDownloading && sz > 0 && sz == prevSize);
+        if (reTriggerBudget > 0 && stalled && [deadline timeIntervalSinceNow] < timeout - 3.0) {
+            reTriggerBudget--;
+            dd_run_on_main_sync(^{
+                CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
+                if (mgr) {
+                    [mgr StopDownloadSilentAppAttach:nil MsgWrap:msg];
+                    [mgr StartDownloadAppAttach:nil MsgWrap:msg Silent:YES autoDownload:YES];
+                }
+            });
         }
         [NSThread sleepForTimeInterval:0.5];
     }
@@ -764,7 +803,7 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         // 路径存在但内容未就绪（占位/空文件）→ 仍触发下载再等待。
         if (!dd_media_file_ready(path)) {
             if (downloadBlock) downloadBlock();
-            path = dd_wait_local_path(pathBlock, kDDVCDownloadTimeout);
+            path = dd_wait_local_path(msg, pathBlock, kDDVCDownloadTimeout);
         }
         if (!dd_media_file_ready(path)) return;
         double duration = 0;
