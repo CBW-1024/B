@@ -16,20 +16,6 @@
 
 #pragma mark - 微信类前向声明
 
-@interface DDDownloadWaiter : NSObject
-+ (void)waitMsg:(id)msg task:(id)task pathBlock:(NSString *(^)(void))pathBlock
-          token:(NSString *)token then:(void (^)(NSString *path))then;  // 登记等下载完成
-+ (void)poke;                         // 下载结束回调：复查等待项，就绪则继续
-+ (void)videoDone:(id)msgWrap;        // 视频下载成功回调（按消息命中）
-@end
-
-@interface DDProgressHub : NSObject
-+ (NSString *)begin;                  // 登记新任务，返回 token（标题显示并发数）
-+ (void)complete:(NSString *)token;   // 结束任务（全部结束则收起卡片）
-+ (void)waitSendSuccess:(unsigned int)localID token:(NSString *)token;  // 登记“等发送成功”
-+ (void)sendSuccess:(unsigned int)localID;   // 微信回调发送成功，按 localID 收起对应任务
-@end
-
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -87,10 +73,6 @@
 - (void)setM_bForward:(BOOL)arg1;
 - (id)getVoicePath;
 - (void)setM_nsVoicePath:(NSString *)arg1;
-// 视频下载落盘路径候选（对齐 DD朋友圈转发的多候选取可用）
-- (id)GetCdnDownloadPathOfVideo;
-- (id)getFormatVideoPath;
-- (id)getTempVideoPath;
 @end
 
 @interface CExtendInfoOfVoiceMsg : NSObject
@@ -176,10 +158,6 @@
 - (void)ForwardMsgList:(id)arg1 ToContact:(id)arg2 batchRevokeScene:(unsigned long long)arg3;
 @end
 
-@interface BaseMsgContentViewController : NSObject
-- (void)OnMsgSendSuccess:(id)msgWrap;
-@end
-
 @interface MJSilkCodec : NSObject
 + (id)decodeToPCMFromSilkData:(id)a0;
 + (id)encodeToSilkFromPCMData:(id)a0;
@@ -189,10 +167,12 @@
 @interface MsgFileTransferTask : NSObject
 + (id)taskFromMessageWrap:(id)msgWrap;
 - (id)filePath;
+- (BOOL)isFileExist;
 - (BOOL)isCompleted;
-- (BOOL)isFail;
+- (unsigned long long)state;
 - (int)progress;
 - (void)startTransfer;
+- (void)stopTransfer;
 @end
 
 @interface CMessageMgr : NSObject
@@ -201,20 +181,7 @@
 - (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;
 - (BOOL)SaveMesVoice:(id)a0 MsgWrap:(id)a1;
-- (void)updateMsgSourceOnSendSuccess:(id)msgWrap secMsgSource:(id)src svrTime:(unsigned int)t;
 @end
-
-// CDN 下载结束回调（文件/app attach 下载完成）。
-@interface CdnComMgr : NSObject
-- (void)OnDownloadEnd:(id)info;
-@end
-
-// 聊天消息媒体下载器（原生视频下载入口，与其完成回调同源）。
-@interface MMImgDownloader_Message : NSObject
-- (void)startDownloadVideo:(id)msgWrap bHD:(BOOL)hd bSave:(BOOL)save bSilent:(BOOL)silent;
-- (void)OnMsgDownloadVideoSuccess:(id)msgWrap;
-@end
-
 
 @interface BaseMessageViewModel : NSObject
 - (id)messageWrap;
@@ -315,6 +282,7 @@ static BOOL dd_voice_forward_enabled(void) {
 #define kDDVCAppMsgType   49
 #define kDDVCAppInnerFile 6
 #define kDDVCVoiceSampleRate 16000
+#define kDDVCDownloadTimeout 60.0
 
 @interface DDVoiceConvertConfig : NSObject
 + (instancetype)shared;
@@ -488,12 +456,11 @@ static unsigned int dd_new_voice_local_id(void) {
 // 数据合法性由来源侧保证：媒体转语音在各自上游已校验 SILK（L770/L675）；转发（原生语音、收藏）
 // 数据为微信产出，直接信任。故此处不重复帧链校验——收藏语音 m_dtVoice 走临时文件兜底，
 // 不含本地 .aud 的完整帧链，会被帧链校验误杀。
-// 返回已发出的 wrap（用于等待发送结果），失败返回 nil。
-static CMessageWrap *dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
+static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     NSData *data = [NSData dataWithContentsOfFile:audPath];
-    if (data.length == 0) return nil;
+    if (data.length == 0) return NO;
     AudioSender *sender = (AudioSender *)dd_mm_service(@"AudioSender");
-    if (!sender) return nil;
+    if (!sender) return NO;
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVoiceMsgType];
     [wrap setM_uiMessageType:kDDVoiceMsgType];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
@@ -510,7 +477,7 @@ static CMessageWrap *dd_send_voice(NSString *usr, NSString *audPath, unsigned in
     if (voicePath.length) [wrap setM_nsVoicePath:voicePath];
     [mgr SaveMesVoice:nil MsgWrap:wrap];
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
-    return wrap;
+    return YES;
 }
 // 收藏外壳：数据未就绪则下载后注入 m_dtVoice 再发送。
 static void dd_ensure_fav_voice_data(id msg) {
@@ -534,9 +501,9 @@ static BOOL dd_take_over_voice_msg(id msg, id contact) {
             });
             return YES;
         }
-        return dd_send_voice(usr, audPath, duration) != nil;
+        return dd_send_voice(usr, audPath, duration);
     }
-    return dd_send_voice(usr, audPath, duration) != nil;
+    return dd_send_voice(usr, audPath, duration);
 }
 // 批量转发逐条接管，返回需走原实现的消息。
 static NSArray *dd_take_over_voice_list(NSArray *src, id contact) {
@@ -596,43 +563,14 @@ static NSSet *dd_media_ext_set(void) {
     });
     return s;
 }
-// 严格可用性：必须是常规文件且非空（对齐 DD朋友圈转发的 DDFFileUsable，避免把目录/占位当成品）。
-static BOOL dd_file_usable(NSString *path) {
-    if (path.length == 0) return NO;
-    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    if (!a) return NO;
-    if (![a[NSFileType] isEqual:NSFileTypeRegular]) return NO;
-    return [a fileSize] > 0;
-}
-// 视频消息本地路径（基于 msg）：多候选依次尝试（对齐 DD朋友圈转发），
-// 优先取可用且扩展名命中白名单者，否则退回第一个可用文件。
-static NSString *dd_video_path_of_msg(CMessageWrap *msg) {
-    if (!msg) return nil;
-    if ([msg respondsToSelector:@selector(IsVideoMsg)] && ![msg IsVideoMsg]) return nil;
-    NSMutableArray *cands = [NSMutableArray array];
-    NSString *(^add)(id) = ^NSString *(id raw) {
-        if ([raw isKindOfClass:[NSString class]] && ((NSString *)raw).length) [cands addObject:raw];
-        return nil;
-    };
-    if ([msg respondsToSelector:@selector(GetCdnDownloadPathOfVideo)]) add([msg GetCdnDownloadPathOfVideo]);
-    if ([msg respondsToSelector:@selector(getFormatVideoPath)])      add([msg getFormatVideoPath]);
-    if ([msg respondsToSelector:@selector(getTempVideoPath)])        add([msg getTempVideoPath]);
-    NSString *fallback = nil;
-    for (NSString *p in cands) {
-        if (!dd_file_usable(p)) continue;
-        if (!fallback) fallback = p;
-        if ([dd_media_ext_set() containsObject:p.pathExtension.lowercaseString]) return p;
-    }
-    return fallback;
-}
-// 视频消息本地路径（基于 cell）：viewModel.videoPath 优先，未就绪则回落到 msg 多候选。
+// 视频消息本地路径：VideoMessageViewModel.videoPath。扩展名需命中白名单。
 static NSString *dd_video_path_of_cell(id cell) {
     id msg = dd_msg_of_cell(cell);
-    if (msg && [msg respondsToSelector:@selector(IsVideoMsg)] && ![msg IsVideoMsg]) return nil;
-    NSString *vp = [(VideoMessageViewModel *)[cell viewModel] videoPath];
-    if ([vp isKindOfClass:[NSString class]] && vp.length && dd_file_usable(vp)
-        && [dd_media_ext_set() containsObject:vp.pathExtension.lowercaseString]) return vp;
-    return dd_video_path_of_msg(msg);
+    if (msg && ![msg IsVideoMsg]) return nil;
+    NSString *p = [(VideoMessageViewModel *)[cell viewModel] videoPath];
+    if (![p isKindOfClass:[NSString class]] || p.length == 0) return nil;
+    if (![dd_media_ext_set() containsObject:p.pathExtension.lowercaseString]) return nil;
+    return p;
 }
 // 文件消息本地路径：传消息 wrap 本身给 +[CMessageWrap GetPathOfAppData:(id)]，由微信按该消息算出真实落盘路径。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
@@ -651,11 +589,10 @@ static NSString *dd_voice_path_of_msg(CMessageWrap *msg) {
 
 #pragma mark - 语音转换：自动下载
 
-// 原生：MMImgDownloader_Message 是聊天消息媒体下载器，触发与完成回调同源。
 static void dd_trigger_video_download(CMessageWrap *msg) {
     if (!msg) return;
-    id dl = dd_mm_service(@"MMImgDownloader_Message");
-    [dl startDownloadVideo:msg bHD:YES bSave:NO bSilent:YES];
+    CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
+    [mgr StartDownloadVideo:nil MsgWrap:msg Priority:YES Silent:YES];
 }
 // 主线程同步执行（微信下载/状态查询 API 需主线程；convert 队列调用安全，不会死锁）。
 static void dd_run_on_main_sync(void(^block)(void)) {
@@ -665,245 +602,36 @@ static void dd_run_on_main_sync(void(^block)(void)) {
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
 }
 // 触发文件下载：用微信原生文件传输任务发起（AppFileMessageCellView 的「下载」同款）。
-// 返回 transfer task（用于读取真实下载进度）；失败返回 nil。
-static MsgFileTransferTask *dd_trigger_file_download(CMessageWrap *msg) {
-    if (!dd_is_msg_wrap(msg)) return nil;
-    __block MsgFileTransferTask *task = nil;
+static BOOL dd_trigger_file_download(CMessageWrap *msg) {
+    if (!dd_is_msg_wrap(msg)) return NO;
+    __block BOOL ok = NO;
     dd_run_on_main_sync(^{
-        task = [objc_getClass("MsgFileTransferTask") taskFromMessageWrap:msg];
-        if (task) [task startTransfer];
+        MsgFileTransferTask *task = [objc_getClass("MsgFileTransferTask") taskFromMessageWrap:msg];
+        if (task) { [task startTransfer]; ok = YES; }
     });
-    return task;
+    return ok;
 }
-
-#pragma mark - 进度提示（单卡聚合多任务）
-
-static UIWindow *dd_progress_key_window(void) {
-    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if ([s isKindOfClass:UIWindowScene.class]) {
-            for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                if (w.isKeyWindow) return w;
-            }
+// 等待文件下载完成：轮询落盘路径，文件存在且非空即返回。
+static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        NSString *p = pathBlock();
+        if (dd_file_exists(p)) {
+            NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+            long long sz = a ? [a[NSFileSize] longLongValue] : 0;
+            if (sz > 0) return p;
         }
+        [NSThread sleepForTimeInterval:1.0];
     }
     return nil;
 }
-
-// 全局唯一浮卡：标题统一「正在转换中 (N)」，进度条为来回滚动的 indeterminate 样式（无百分比）。
-// 任意线程调用都安全：内部统一切主线程渲染。卡片视觉复刻朋友圈转发的白底圆角 + 绿条。
-@implementation DDProgressHub
-
-static const NSInteger kDDHubTag = 0x44444801;
-
-+ (NSMutableDictionary<NSString *, NSNumber *> *)dd_tasks {
-    static NSMutableDictionary *d;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
-    return d;
-}
-+ (NSLock *)dd_lock {
-    static NSLock *l;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ l = [NSLock new]; });
-    return l;
-}
-// localID → token：已发起发送、等待微信回调“发送成功”的任务。
-+ (NSMutableDictionary<NSNumber *, NSString *> *)dd_pending {
-    static NSMutableDictionary *d;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
-    return d;
-}
-+ (NSString *)begin {
-    NSString *token = [NSUUID UUID].UUIDString;
-    [[self dd_lock] lock]; [[self dd_tasks] setObject:@1 forKey:token]; [[self dd_lock] unlock];
-    dispatch_async(dispatch_get_main_queue(), ^{ [self dd_render]; });
-    return token;
-}
-+ (void)complete:(NSString *)token {
-    if (!token) return;
-    [[self dd_lock] lock]; [[self dd_tasks] removeObjectForKey:token]; [[self dd_lock] unlock];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if ([self dd_tasks].count == 0) [self dd_dismiss]; else [self dd_render];
-    });
-}
-+ (void)waitSendSuccess:(unsigned int)localID token:(NSString *)token {
-    if (!localID || !token) { if (token) [self complete:token]; return; }
-    [[self dd_lock] lock]; [self dd_pending][@(localID)] = token; [[self dd_lock] unlock];
-}
-+ (void)sendSuccess:(unsigned int)localID {
-    if (!localID) return;
-    [[self dd_lock] lock];
-    NSString *token = [self dd_pending][@(localID)];
-    if (token) [[self dd_pending] removeObjectForKey:@(localID)];
-    [[self dd_lock] unlock];
-    if (token) [self complete:token];
-}
-+ (UIView *)dd_make_card:(UIWindow *)win {
-    CGFloat cardW = win.bounds.size.width - 32.0;
-    CGFloat cardH = 56.0;
-    CGFloat topInset = 8.0;
-    if ([win respondsToSelector:@selector(safeAreaInsets)]) {
-        CGFloat sa = win.safeAreaInsets.top;
-        if (sa > 0) topInset = sa + 8.0;
-    }
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(16.0, topInset, cardW, cardH)];
-    card.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-        return [UIColor colorWithWhite:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 0.12 : 1.0 alpha:0.95];
-    }];
-    card.layer.cornerRadius = 10.0;
-    card.clipsToBounds = YES;
-    card.tag = kDDHubTag;
-    card.alpha = 0.0;
-    card.userInteractionEnabled = NO;
-    card.layer.shadowColor = [UIColor blackColor].CGColor;
-    card.layer.shadowOffset = CGSizeMake(0, 2);
-    card.layer.shadowOpacity = 0.08;
-    card.layer.shadowRadius = 6;
-
-    CGFloat padX = 14.0;
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(padX, 8, cardW - 2 * padX, 18)];
-    title.textColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-        return [UIColor colorWithWhite:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 0.95 : 0.0 alpha:0.9];
-    }];
-    title.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-
-    // 来回滚动的 indeterminate 进度条（无百分比）。barY 与 DD朋友圈转发对齐。
-    CGFloat barY = 30.0, barH = 4.0;
-    CGFloat barW = cardW - 2 * padX;
-    UIView *track = [[UIView alloc] initWithFrame:CGRectMake(padX, barY, barW, barH)];
-    track.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-        return [UIColor colorWithWhite:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 1.0 : 0.0 alpha:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 0.12 : 0.06];
-    }];
-    track.layer.cornerRadius = barH / 2.0;
-    track.clipsToBounds = YES;
-
-    CGFloat chunkW = barW * 0.3;
-    UIView *chunk = [[UIView alloc] initWithFrame:CGRectMake(0, 0, chunkW, barH)];
-    chunk.backgroundColor = [UIColor colorWithRed:0.03 green:0.76 blue:0.38 alpha:1.0];
-    chunk.layer.cornerRadius = barH / 2.0;
-    [track addSubview:chunk];
-
-    [UIView animateWithDuration:1.2 delay:0
-                        options:UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionRepeat | UIViewAnimationOptionAutoreverse
-                     animations:^{
-        chunk.frame = CGRectMake(barW - chunkW, 0, chunkW, barH);
-    } completion:nil];
-
-    [card addSubview:title];
-    [card addSubview:track];
-    objc_setAssociatedObject(card, "ddhTitle", title, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [win addSubview:card];
-    [UIView animateWithDuration:0.2 animations:^{ card.alpha = 1.0; }];
-    return card;
-}
-+ (void)dd_render {
-    UIWindow *win = dd_progress_key_window();
-    if (!win) return;
-    UIView *card = [win viewWithTag:kDDHubTag] ?: [self dd_make_card:win];
-    if (!card) return;
-    NSDictionary *tasks = [[self dd_tasks] copy];
-    NSInteger n = tasks.count;
-    if (n == 0) { [self dd_dismiss]; return; }
-    UILabel *title = objc_getAssociatedObject(card, "ddhTitle");
-    title.text = [NSString stringWithFormat:@"正在转换中 (%ld)", (long)n];
-}
-+ (void)dd_dismiss {
-    UIWindow *win = dd_progress_key_window();
-    UIView *card = win ? [win viewWithTag:kDDHubTag] : nil;
-    if (!card) return;
-    [UIView animateWithDuration:0.2 animations:^{ card.alpha = 0; }
-                     completion:^(BOOL f){ [card removeFromSuperview]; }];
-}
-@end
-
-#pragma mark - 下载等待（由 CDN 下载结束回调唤醒，不轮询）
-
-// 登记“等下载完成”；下载结束回调触发 poke 时复查各自的真实完成态，就绪才继续。
-// 不阻塞 convert 队列：未就绪就一直挂着，就绪/失败才收尾。
-@implementation DDDownloadWaiter
-
-+ (NSMutableArray *)dd_waits {
-    static NSMutableArray *a;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ a = [NSMutableArray array]; });
-    return a;
-}
-+ (NSLock *)dd_wlock {
-    static NSLock *l;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ l = [NSLock new]; });
-    return l;
-}
-// 就绪判定：文件真实落盘，且（有 task 时）task 报告完成；视频无 task，看成功回调标记。
-+ (BOOL)dd_ready:(NSDictionary *)w {
-    NSString *(^pathBlock)(void) = w[@"pathBlock"];
-    NSString *p = pathBlock ? pathBlock() : nil;
-    if (!dd_file_exists(p)) return NO;
-    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+// 媒体文件是否真正就绪：路径存在且非空。占位/空文件判定为未就绪，仍须先下载。
+static BOOL dd_media_file_ready(NSString *path) {
+    if (!dd_file_exists(path)) return NO;
+    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
     long long sz = a ? [a[NSFileSize] longLongValue] : 0;
-    if (sz <= 0) return NO;
-    MsgFileTransferTask *task = w[@"task"];
-    if (task) {
-        if ([task respondsToSelector:@selector(isCompleted)] && [task isCompleted]) return YES;
-        if ([task respondsToSelector:@selector(progress)] && [task progress] >= 100) return YES;
-        return NO;
-    }
-    return [w[@"videoDone"] boolValue];
+    return sz > 0;
 }
-+ (void)waitMsg:(id)msg task:(MsgFileTransferTask *)task
-      pathBlock:(NSString *(^)(void))pathBlock token:(NSString *)token
-           then:(void (^)(NSString *path))then {
-    NSMutableDictionary *w = [NSMutableDictionary dictionary];
-    if (msg) w[@"msg"] = msg;
-    if (task) w[@"task"] = task;
-    if (pathBlock) w[@"pathBlock"] = pathBlock;
-    if (token) w[@"token"] = token;
-    if (then) w[@"then"] = then;
-    // 已就绪（本来就已下载）直接继续，无需等回调。
-    if ([self dd_ready:w]) {
-        NSString *p = pathBlock ? pathBlock() : nil;
-        dispatch_async(dd_convert_queue, ^{ if (then) then(p); });
-        return;
-    }
-    [[self dd_wlock] lock]; [[self dd_waits] addObject:w]; [[self dd_wlock] unlock];
-}
-+ (void)poke {
-    [[self dd_wlock] lock];
-    NSArray *snapshot = [[self dd_waits] copy];
-    [[self dd_wlock] unlock];
-    for (NSDictionary *w in snapshot) {
-        if ([self dd_ready:w]) {
-            [self dd_remove:w];
-            NSString *(^pathBlock)(void) = w[@"pathBlock"];
-            void (^then)(NSString *) = w[@"then"];
-            NSString *p = pathBlock ? pathBlock() : nil;
-            if (then) dispatch_async(dd_convert_queue, ^{ then(p); });
-            continue;
-        }
-        // 下载失败：收起提示，放弃等待，避免永久挂起。
-        MsgFileTransferTask *task = w[@"task"];
-        if (task && [task respondsToSelector:@selector(isFail)] && [task isFail]) {
-            [self dd_remove:w];
-            NSString *token = w[@"token"];
-            if (token) [DDProgressHub complete:token];
-        }
-    }
-}
-+ (void)dd_remove:(NSDictionary *)w {
-    [[self dd_wlock] lock]; [[self dd_waits] removeObjectIdenticalTo:w]; [[self dd_wlock] unlock];
-}
-// 视频下载成功回调：按消息命中标记，再复查。
-+ (void)videoDone:(id)msgWrap {
-    if (!msgWrap) return;
-    [[self dd_wlock] lock];
-    for (NSMutableDictionary *w in [self dd_waits]) {
-        if (w[@"msg"] == msgWrap && !w[@"task"]) w[@"videoDone"] = @YES;
-    }
-    [[self dd_wlock] unlock];
-    [self poke];
-}
-@end
 
 #pragma mark - 语音转换：SILK 容器
 
@@ -1025,45 +753,42 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
     return reader.status == AVAssetReaderStatusCompleted ? pcm : nil;
 }
 // 媒体 → 语音：未下载则先触发下载，完成后抽音轨 / 复用 SILK，编码成微信语音后发送。
-static void dd_media_to_voice(CMessageWrap *msg, NSString *(^pathBlock)(void), MsgFileTransferTask *(^downloadBlock)(void)) {
+static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^pathBlock)(void), void(^downloadBlock)(void)) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
     dispatch_async(dd_convert_queue, ^{
-        NSString *token = [DDProgressHub begin];
-        // 直接以 transfer task 的真实完成态为准：取得/发起下载任务，再等待真正落盘。
-        // 已下完的 task 立即返回，不会误跳过下载，也不会因“猜路径”与真实落盘路径不一致而误判超时。
-        MsgFileTransferTask *task = downloadBlock ? downloadBlock() : nil;
-        // 事件驱动：下载完成由 CDN 回调唤醒，就绪后才执行后续（不轮询、不阻塞队列）。
-        [DDDownloadWaiter waitMsg:msg task:task pathBlock:pathBlock token:token then:^(NSString *path) {
-            double duration = 0;
-            NSData *aud = nil;
-            // 按扩展名路由：aud/silk 为微信 SILK 终态，原样复用；其余抽 PCM 再编码为 SILK。
-            NSString *ext = path.pathExtension.lowercaseString;
-            if ([ext isEqualToString:@"aud"] || [ext isEqualToString:@"silk"]) {
-                NSData *raw = [NSData dataWithContentsOfFile:path];
-                if (!dd_silk_frames_valid(raw)) { if (token) [DDProgressHub complete:token]; return; }
-                aud = raw;
-                NSData *pcm = dd_decode_silk_to_pcm(raw);
-                duration = (double)pcm.length / (double)(kDDVCVoiceSampleRate * 2);
-            } else {
-                NSData *pcm = dd_extract_pcm(path, &duration);
-                if (pcm.length == 0) { if (token) [DDProgressHub complete:token]; return; }
-                duration = (double)pcm.length / (double)(kDDVCVoiceSampleRate * 2);
-                aud = dd_encode_pcm_to_silk(pcm);
-                if (aud.length == 0) { if (token) [DDProgressHub complete:token]; return; }
-            }
-            NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                             [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"]];
-            [aud writeToFile:tmp atomically:YES];
-            unsigned int ms = (unsigned int)(duration * 1000);
-            if (ms == 0) ms = 1000;
-            if (ms > 60000) ms = 60000;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                CMessageWrap *sent = dd_send_voice(usr, tmp, ms);   // 发送须在主线程发起
-                // 提示持续到微信回调「发送成功」为止（按 localID 命中）；发送未发起则立即收起。
-                [DDProgressHub waitSendSuccess:[sent m_uiMesLocalID] token:token];
-            });
-        }];
+        NSString *path = pathBlock();
+        // 路径存在但内容未就绪（占位/空文件）→ 仍触发下载再等待。
+        if (!dd_media_file_ready(path)) {
+            if (downloadBlock) downloadBlock();
+            path = dd_wait_local_path(pathBlock, kDDVCDownloadTimeout);
+        }
+        double duration = 0;
+        NSData *aud = nil;
+        // 按扩展名路由：aud/silk 为微信 SILK 终态，原样复用；其余抽 PCM 再编码为 SILK。
+        NSString *ext = path.pathExtension.lowercaseString;
+        if ([ext isEqualToString:@"aud"] || [ext isEqualToString:@"silk"]) {
+            NSData *raw = [NSData dataWithContentsOfFile:path];
+            if (!dd_silk_frames_valid(raw)) return;   // 帧链不自洽直接放弃
+            aud = raw;
+            NSData *pcm = dd_decode_silk_to_pcm(raw);
+            duration = (double)pcm.length / (double)(kDDVCVoiceSampleRate * 2);
+        } else {
+            NSData *pcm = dd_extract_pcm(path, &duration);
+            if (pcm.length == 0) return;
+            duration = (double)pcm.length / (double)(kDDVCVoiceSampleRate * 2);
+            aud = dd_encode_pcm_to_silk(pcm);
+            if (aud.length == 0) return;
+        }
+        NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"aud"]];
+        [aud writeToFile:tmp atomically:YES];
+        unsigned int ms = (unsigned int)(duration * 1000);
+        if (ms == 0) ms = 1000;
+        if (ms > 60000) ms = 60000;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            dd_send_voice(usr, tmp, ms);
+        });
     });
 }
 
@@ -1129,13 +854,12 @@ static NSString *dd_persist_copy(NSString *src) {
     return [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
 }
 // 发送 m4a 文件消息：AddAppMsg 本地落库 → StartUploadAppMsg 触发上传。
-// 返回已发出的 wrap（用于等待发送结果），失败返回 nil。
-static CMessageWrap *dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName) {
+static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName) {
     NSString *persistPath = dd_persist_copy(m4aPath);
     if (persistPath.length) m4aPath = persistPath;
-    if (!dd_file_exists(m4aPath) || !usr.length) return nil;
+    if (!dd_file_exists(m4aPath) || !usr.length) return NO;
     NSData *fdata = [NSData dataWithContentsOfFile:m4aPath];
-    if (fdata.length == 0) return nil;
+    if (fdata.length == 0) return NO;
     unsigned long long fsize = fdata.length;
 
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVCAppMsgType];
@@ -1163,7 +887,7 @@ static CMessageWrap *dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSSt
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
     [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
-    return wrap;
+    return YES;
 }
 // 语音消息 → 文件消息。
 static void dd_voice_to_file(CMessageWrap *msg) {
@@ -1171,16 +895,14 @@ static void dd_voice_to_file(CMessageWrap *msg) {
     NSString *usr = dd_chat_usr_of_msg(msg);
     NSString *fn  = [NSString stringWithFormat:@"语音_%u.m4a", (unsigned int)time(NULL)];
     dispatch_async(dd_convert_queue, ^{
-        NSString *token = [DDProgressHub begin];
         NSString *p = dd_voice_path_of_msg(msg);
-        if (!dd_file_exists(p)) { if (token) [DDProgressHub complete:token]; return; }
+        if (!dd_file_exists(p)) return;
         NSData *silk = [NSData dataWithContentsOfFile:p];
-        if (silk.length < 12) { if (token) [DDProgressHub complete:token]; return; }
+        if (silk.length < 12) return;
         NSString *m4a = dd_decode_silk_to_audio(silk);
-        if (!m4a.length) { if (token) [DDProgressHub complete:token]; return; }
+        if (!m4a.length) return;
         dispatch_async(dispatch_get_main_queue(), ^{
-            CMessageWrap *sent = dd_send_file_to_chat(usr, m4a, fn);   // 发送须在主线程发起
-            [DDProgressHub waitSendSuccess:[sent m_uiMesLocalID] token:token];
+            dd_send_file_to_chat(usr, m4a, fn);
         });
     });
 }
@@ -1221,47 +943,6 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     [items addObject:item];
     return items;
 }
-
-#pragma mark - Hook：发送成功回调（提示的收起点）
-
-// 微信核心消息管理器的真实「发送成功」回调，语音/文件消息通用。
-// 按 localID 命中我们登记的待完成任务，收起进度提示。
-%hook CMessageMgr
-- (void)updateMsgSourceOnSendSuccess:(id)msgWrap secMsgSource:(id)src svrTime:(unsigned int)t {
-    %orig;
-    if ([msgWrap respondsToSelector:@selector(m_uiMesLocalID)]) {
-        [DDProgressHub sendSuccess:[msgWrap m_uiMesLocalID]];
-    }
-}
-%end
-
-// 聊天页的发送成功回调，作为并联兜底信号（与上面幂等：先命中者收起，另一个空转）。
-%hook BaseMsgContentViewController
-- (void)OnMsgSendSuccess:(id)msgWrap {
-    %orig;
-    if ([msgWrap respondsToSelector:@selector(m_uiMesLocalID)]) {
-        [DDProgressHub sendSuccess:[msgWrap m_uiMesLocalID]];
-    }
-}
-%end
-
-#pragma mark - Hook：下载完成（唤醒等待中的转换）
-
-// CDN 下载结束（文件/app attach）：唤醒所有等待项，各自复查自己的完成态。
-%hook CdnComMgr
-- (void)OnDownloadEnd:(id)info {
-    %orig;
-    [DDDownloadWaiter poke];
-}
-%end
-
-// 视频下载成功（原生回调，与 startDownloadVideo: 同源）：按消息命中标记后再复查。
-%hook MMImgDownloader_Message
-- (void)OnMsgDownloadVideoSuccess:(id)msgWrap {
-    %orig;
-    [DDDownloadWaiter videoDone:msgWrap];
-}
-%end
 
 #pragma mark - Hook：自定义语音秒数上行改写
 
@@ -1367,8 +1048,8 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 %new
 - (void)dd_mediaToVoice:(id)sender {
     CMessageWrap *msg = dd_msg_of_cell(self);
-    dd_media_to_voice(msg, ^NSString *{ return dd_video_path_of_cell(self); },
-                          ^MsgFileTransferTask *(void){ dd_trigger_video_download(msg); return nil; });
+    dd_media_to_voice(@"视频", msg, ^NSString *{ return dd_video_path_of_cell(self); },
+                          ^{ dd_trigger_video_download(msg); });
 }
 %end
 
@@ -1388,8 +1069,8 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 %new
 - (void)dd_mediaToVoice:(id)sender {
     CMessageWrap *msg = dd_msg_of_cell(self);
-    dd_media_to_voice(msg, ^NSString *{ return dd_file_path_of_msg(msg); },
-                          ^MsgFileTransferTask *(void){ return dd_trigger_file_download(msg); });
+    dd_media_to_voice(@"文件", msg, ^NSString *{ return dd_file_path_of_msg(msg); },
+                          ^{ dd_trigger_file_download(msg); });
 }
 %end
 
@@ -1502,7 +1183,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
         [self.secondsField addTarget:self action:@selector(onSecondsChanged:) forControlEvents:UIControlEventEditingChanged];
         [sec addCell:[cellMgr normalCellForSel:nil
                                         target:nil
-                                         title:@"   ↳自定义秒数"
+                                         title:@"↳自定义秒数"
                                      rightView:[self inputRowWithField:self.secondsField action:@selector(onSecondsConfirmed:)]]];
     }
     [sec addCell:[cellMgr switchCellForSel:@selector(onFavSwitch:) target:self title:@"收藏语音转发" on:cfg.favEnabled]];
