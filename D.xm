@@ -100,6 +100,7 @@
 - (void)setM_bAppAttachExistInSvr:(BOOL)arg1;
 @end
 
+// 语音上传项。其 m_uiLocalID 与 CMessageWrap.m_uiMesLocalID 不是同一编号（实测相差 1），不可混用。
 @interface UploadVoiceWrap : NSObject
 @property(nonatomic) unsigned int m_uiVoiceTime;
 @property(nonatomic) unsigned int m_uiLocalID;
@@ -184,25 +185,12 @@
 - (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;
 - (BOOL)SaveMesVoice:(id)a0 MsgWrap:(id)a1;
-// 发送结果回调：语音走上传通道，文件消息走 AppMsg 通道，两者不同源。
-- (void)AsyncOnSendVoiceError:(id)a0 MsgWrap:(id)a1 ErroNO:(unsigned int)a2;
-- (void)onCompeleteAppMsg:(id)a0 oriMesSvrID:(long long)a1;
-- (void)OnSendMessageFail:(id)a0;
-- (void)OnSendMessageSuccess:(id)a0;
 @end
 
-// 语音上传/发送结果回调。语音不发 CGI，走 CDN 或旧上传通道，故不能用 CMessageMgr 的成功回调判定。
+// 语音上传结果回调（仅供日志确认消息最终是否发出）。
 @interface UploadVoiceCDNMgr : NSObject
 - (void)handleSendVoiceSuccess:(id)a0;
 - (void)handleSendVoiceFail:(id)a0;
-- (void)handleUploadCDNSuccess:(id)a0;
-@end
-@interface MMNewUploadVoiceMgr : NSObject
-- (void)HandleUploadVoiceOK:(id)a0;
-@end
-// 文件消息（AppMsg）上传完成。
-@interface MMAppMsgUploadMgr : NSObject
-- (void)appMsgUploadComplete:(id)a0;
 @end
 
 @interface BaseMessageViewModel : NSObject
@@ -588,45 +576,12 @@ static void dd_hub_finish(void) {
                      }];
 }
 
-// 已发起、等待发送结果的任务，按登记顺序存放。
-static NSMutableArray *dd_hub_pending(void) {
-    static NSMutableArray *a;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ a = [NSMutableArray array]; });
-    return a;
-}
-// 登记：发送前记下 localID，供发送结果回调认领。
-static void dd_hub_watch(unsigned int localID, NSInteger token) {
-    if (localID == 0 || token == 0) return;
-    [dd_hub_pending() addObject:@{@"lid": @(localID), @"token": @(token)}];
-    dd_log(@"hub watch lid=%u token=%ld", localID, (long)token);
-}
-// 回调参数可能是 CMessageWrap（m_uiMesLocalID）或 UploadVoiceWrap（m_uiLocalID）。
+// 回调参数可能是 CMessageWrap（m_uiMesLocalID）或 UploadVoiceWrap（m_uiLocalID），仅用于日志。
 static unsigned int dd_local_id_of(id obj) {
     if (!obj) return 0;
     if ([obj respondsToSelector:@selector(m_uiMesLocalID)]) return [(CMessageWrap *)obj m_uiMesLocalID];
     if ([obj respondsToSelector:@selector(m_uiLocalID)]) return [(UploadVoiceWrap *)obj m_uiLocalID];
     return 0;
-}
-// 发送结果：命中登记项则收起；参数取不到 localID 时认领最早任务，避免提示永久挂起。
-static void dd_hub_on_result(id arg, NSString *event, BOOL success) {
-    unsigned int lid = dd_local_id_of(arg);
-    dd_log(@"result event=%@ arg=%@ lid=%u ok=%d", event, NSStringFromClass([arg class]), lid, success);
-    NSMutableArray *p = dd_hub_pending();
-    if (p.count == 0) return;
-    NSUInteger idx = NSNotFound;
-    if (lid) {
-        for (NSUInteger i = 0; i < p.count; i++) {
-            if ([p[i][@"lid"] unsignedIntValue] == lid) { idx = i; break; }
-        }
-    } else {
-        idx = 0;   // 参数不可识别，按发起顺序认领最早的
-    }
-    if (idx == NSNotFound) return;
-    NSInteger token = [p[idx][@"token"] integerValue];
-    [p removeObjectAtIndex:idx];
-    dd_log(@"result done token=%ld lid=%u ok=%d", (long)token, lid, success);
-    dd_hub_finish();
 }
 
 #pragma mark - 语音扩展信息（dd_voice_extend_info）
@@ -742,13 +697,12 @@ static unsigned int dd_new_voice_local_id(void) {
 // 数据合法性由来源侧保证：媒体转语音在各自上游已校验 SILK（L770/L675）；转发（原生语音、收藏）
 // 数据为微信产出，直接信任。故此处不重复帧链校验——收藏语音 m_dtVoice 走临时文件兜底，
 // 不含本地 .aud 的完整帧链，会被帧链校验误杀。
-static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration, NSInteger hubToken) {
+static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     NSData *data = [NSData dataWithContentsOfFile:audPath];
     if (data.length == 0) { dd_log(@"send_voice abort: empty aud"); return NO; }
     AudioSender *sender = (AudioSender *)dd_mm_service(@"AudioSender");
     if (!sender) { dd_log(@"send_voice abort: no AudioSender"); return NO; }
-    dd_log(@"send_voice enter usr=%@ dur=%u bytes=%lu token=%ld", usr, duration,
-           (unsigned long)data.length, (long)hubToken);
+    dd_log(@"send_voice enter usr=%@ dur=%u bytes=%lu", usr, duration, (unsigned long)data.length);
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVoiceMsgType];
     [wrap setM_uiMessageType:kDDVoiceMsgType];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
@@ -762,7 +716,6 @@ static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddLocalMsg:usr MsgWrap:wrap];
     dd_log(@"send_voice AddLocalMsg lid=%u status=%u", wrap.m_uiMesLocalID, wrap.m_uiStatus);
-    dd_hub_watch(wrap.m_uiMesLocalID, hubToken);
     NSString *voicePath = dd_install_audio_file(wrap, audPath);
     if (voicePath.length) [wrap setM_nsVoicePath:voicePath];
     dd_log(@"send_voice voicePath=%@", voicePath ?: @"(nil)");
@@ -789,13 +742,13 @@ static BOOL dd_take_over_voice_msg(id msg, id contact) {
         if (favItem) {
             dd_download_fav_item_then(favItem, ^{
                 dd_ensure_fav_voice_data(msg);
-                dd_send_voice(usr, dd_audio_path_for_msg(msg), duration, 0);
+                dd_send_voice(usr, dd_audio_path_for_msg(msg), duration);
             });
             return YES;
         }
-        return dd_send_voice(usr, audPath, duration, 0);
+        return dd_send_voice(usr, audPath, duration);
     }
-    return dd_send_voice(usr, audPath, duration, 0);
+    return dd_send_voice(usr, audPath, duration);
 }
 // 批量转发逐条接管，返回需走原实现的消息。
 static NSArray *dd_take_over_voice_list(NSArray *src, id contact) {
@@ -1103,10 +1056,10 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         if (ms > 60000) ms = 60000;
         dd_log(@"convert done tag=%@ ms=%u aud=%lu", tag, ms, (unsigned long)aud.length);
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!dd_send_voice(usr, tmp, ms, token)) {
-                dd_log(@"convert abort tag=%@ reason=sendNotStarted", tag);
-                dd_hub_finish();
-            }
+            BOOL ok = dd_send_voice(usr, tmp, ms);
+            dd_log(@"convert sent tag=%@ ok=%d", tag, (int)ok);
+            // AddLocalMsg 后消息已入库并出现在会话，提示到此收起，不等上传结果。
+            dd_hub_finish();
         });
     });
 }
@@ -1173,7 +1126,7 @@ static NSString *dd_persist_copy(NSString *src) {
     return [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
 }
 // 发送 m4a 文件消息：AddAppMsg 本地落库 → StartUploadAppMsg 触发上传。
-static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName, NSInteger hubToken) {
+static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName) {
     NSString *persistPath = dd_persist_copy(m4aPath);
     if (persistPath.length) m4aPath = persistPath;
     if (!dd_file_exists(m4aPath) || !usr.length) {
@@ -1182,8 +1135,7 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     }
     NSData *fdata = [NSData dataWithContentsOfFile:m4aPath];
     if (fdata.length == 0) { dd_log(@"send_file abort: empty file"); return NO; }
-    dd_log(@"send_file enter usr=%@ name=%@ bytes=%lu token=%ld", usr, fileName,
-           (unsigned long)fdata.length, (long)hubToken);
+    dd_log(@"send_file enter usr=%@ name=%@ bytes=%lu", usr, fileName, (unsigned long)fdata.length);
     unsigned long long fsize = fdata.length;
 
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVCAppMsgType];
@@ -1211,7 +1163,6 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
     dd_log(@"send_file AddAppMsg lid=%u status=%u", wrap.m_uiMesLocalID, wrap.m_uiStatus);
-    dd_hub_watch(wrap.m_uiMesLocalID, hubToken);
     [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
     dd_log(@"send_file StartUploadAppMsg lid=%u", wrap.m_uiMesLocalID);
     return YES;
@@ -1244,10 +1195,10 @@ static void dd_voice_to_file(CMessageWrap *msg) {
         }
         dd_log(@"tofile done m4a=%@ size=%lld", m4a, dd_file_size(m4a));
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!dd_send_file_to_chat(usr, m4a, fn, token)) {
-                dd_log(@"tofile abort reason=sendNotStarted");
-                dd_hub_finish();
-            }
+            BOOL ok = dd_send_file_to_chat(usr, m4a, fn);
+            dd_log(@"tofile sent ok=%d", (int)ok);
+            // 消息已入库并出现在会话，提示到此收起，不等上传结果。
+            dd_hub_finish();
         });
     });
 }
@@ -1289,56 +1240,18 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     return items;
 }
 
-#pragma mark - Hook：发送结果（提示的收起信号）
+#pragma mark - Hook：发送结果（仅记日志）
 
-// 语音不经 CGI 发送，成功回调落在上传通道上；文件消息落在 AppMsg 通道上。
-// 只有真正的「发送完成 / 发送失败」才收起提示，中间态（CDN 上传完）仅记日志。
+// 语音不经 CGI 发送，结果回调落在上传通道上。提示已在「发送发起后」收起，
+// 这里只留日志，用于事后确认消息最终有没有发出去。
 %hook UploadVoiceCDNMgr
 - (void)handleSendVoiceSuccess:(id)arg {
     %orig;
-    dd_hub_on_result(arg, @"CDN.sendVoiceSuccess", YES);
+    dd_log(@"send result=success lid=%u", dd_local_id_of(arg));
 }
 - (void)handleSendVoiceFail:(id)arg {
     %orig;
-    dd_hub_on_result(arg, @"CDN.sendVoiceFail", NO);
-}
-- (void)handleUploadCDNSuccess:(id)arg {
-    %orig;
-    dd_log(@"send event=CDN.uploadCDNSuccess lid=%u (not terminal)", dd_local_id_of(arg));
-}
-%end
-
-%hook MMNewUploadVoiceMgr
-- (void)HandleUploadVoiceOK:(id)arg {
-    %orig;
-    dd_hub_on_result(arg, @"UploadVoiceMgr.OK", YES);
-}
-%end
-
-%hook MMAppMsgUploadMgr
-- (void)appMsgUploadComplete:(id)arg {
-    %orig;
-    dd_hub_on_result(arg, @"AppMsg.uploadComplete", YES);
-}
-%end
-
-%hook CMessageMgr
-- (void)onCompeleteAppMsg:(id)arg oriMesSvrID:(long long)svrId {
-    %orig;
-    dd_hub_on_result(arg, @"CMessageMgr.onCompeleteAppMsg", YES);
-}
-- (void)AsyncOnSendVoiceError:(id)usr MsgWrap:(id)wrap ErroNO:(unsigned int)err {
-    %orig;
-    dd_log(@"send event=CMessageMgr.AsyncOnSendVoiceError err=%u lid=%u", err, dd_local_id_of(wrap));
-    dd_hub_on_result(wrap, @"CMessageMgr.AsyncOnSendVoiceError", NO);
-}
-- (void)OnSendMessageFail:(id)arg {
-    %orig;
-    dd_hub_on_result(arg, @"CMessageMgr.OnSendMessageFail", NO);
-}
-- (void)OnSendMessageSuccess:(id)arg {
-    %orig;
-    dd_log(@"send event=CMessageMgr.OnSendMessageSuccess lid=%u (not terminal)", dd_local_id_of(arg));
+    dd_log(@"send result=fail lid=%u", dd_local_id_of(arg));
 }
 %end
 
