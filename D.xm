@@ -1,5 +1,5 @@
 
-// DDWCForward：为微信朋友圈添加"转发"能力。
+// DDWCMoments：为微信朋友圈添加转发能力。
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -110,7 +110,7 @@
 @end
 
 // 经 MMContext → serviceCenter → getService: 取 WCFacade 单例。
-static inline id DDFGetFrameFacade(void) {
+static inline id DDMGetFrameFacade(void) {
 
     Class ctxCls = objc_getClass("MMContext");
     if (ctxCls && [ctxCls respondsToSelector:@selector(currentContext)]) {
@@ -248,25 +248,25 @@ static inline id DDFGetFrameFacade(void) {
 
 #pragma mark - 配置
 
-static NSString * const kDDFEnabled = @"DDForward_Enabled";
+static NSString * const kDDMEnabled = @"DDForward_Enabled";
 
-@interface DDFConfig : NSObject
+@interface DDMConfig : NSObject
 @property (assign, nonatomic) BOOL enabled;
 + (instancetype)shared;
 @end
 
-@implementation DDFConfig
+@implementation DDMConfig
 
 + (instancetype)shared {
-    static DDFConfig *cfg = nil;
+    static DDMConfig *cfg = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ cfg = [DDFConfig new]; });
+    dispatch_once(&once, ^{ cfg = [DDMConfig new]; });
     return cfg;
 }
 
 - (instancetype)init {
     if (self = [super init]) {
-        _enabled = [[NSUserDefaults standardUserDefaults] boolForKey:kDDFEnabled];
+        _enabled = [[NSUserDefaults standardUserDefaults] boolForKey:kDDMEnabled];
     }
     return self;
 }
@@ -276,23 +276,23 @@ static NSString * const kDDFEnabled = @"DDForward_Enabled";
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
-- (void)setEnabled:(BOOL)v { _enabled = v; [self persist:@(v) key:kDDFEnabled]; }
+- (void)setEnabled:(BOOL)v { _enabled = v; [self persist:@(v) key:kDDMEnabled]; }
 
 @end
 
 #pragma mark - 运行时工具
 
-static BOOL DDFFileUsable(NSString *path);
-static NSString *DDFLivePhotoVideoPath(WCMediaItem *live);
+static BOOL DDMFileUsable(NSString *path);
+static NSString *DDMLivePhotoVideoPath(WCMediaItem *live);
 
-static double DDFVideoDuration(NSString *path) {
-    if (!DDFFileUsable(path)) return 0;
+static double DDMVideoDuration(NSString *path) {
+    if (!DDMFileUsable(path)) return 0;
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
     CMTime d = asset.duration;
     return CMTIME_IS_NUMERIC(d) ? CMTimeGetSeconds(d) : 0;
 }
 
-static UIWindow *DDFKeyWindow(void) {
+static UIWindow *DDMKeyWindow(void) {
     UIWindow *found = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
@@ -304,8 +304,8 @@ static UIWindow *DDFKeyWindow(void) {
     return found;
 }
 
-static UIViewController *DDFTopViewController(UIViewController *root) {
-    UIViewController *vc = root ?: DDFKeyWindow().rootViewController;
+static UIViewController *DDMTopViewController(UIViewController *root) {
+    UIViewController *vc = root ?: DDMKeyWindow().rootViewController;
     while (vc) {
         if (vc.presentedViewController) { vc = vc.presentedViewController; continue; }
         if ([vc isKindOfClass:UINavigationController.class]) {
@@ -323,25 +323,25 @@ static UIViewController *DDFTopViewController(UIViewController *root) {
     return vc;
 }
 
-static NSString *DDFTempDir(void) {
+static NSString *DDMTempDir(void) {
     static NSString *dir = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDForward"];
+        dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDMoments"];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
                                   withIntermediateDirectories:YES attributes:nil error:nil];
     });
     return dir;
 }
 
-static void DDFCleanTempDir(void) {
+static void DDMCleanTempDir(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *name in [fm contentsOfDirectoryAtPath:DDFTempDir() error:nil]) {
-        [fm removeItemAtPath:[DDFTempDir() stringByAppendingPathComponent:name] error:nil];
+    for (NSString *name in [fm contentsOfDirectoryAtPath:DDMTempDir() error:nil]) {
+        [fm removeItemAtPath:[DDMTempDir() stringByAppendingPathComponent:name] error:nil];
     }
 }
 
-static BOOL DDFFileUsable(NSString *path) {
+static BOOL DDMFileUsable(NSString *path) {
     if (path.length == 0) return NO;
     NSDictionary *attr = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
     if (!attr) return NO;
@@ -350,24 +350,24 @@ static BOOL DDFFileUsable(NSString *path) {
     return [attr fileSize] > 0;
 }
 
-static NSString *DDFFirstUsablePath(NSArray<NSString *> *candidates) {
-    for (NSString *p in candidates) if (DDFFileUsable(p)) return p;
+static NSString *DDMFirstUsablePath(NSArray<NSString *> *candidates) {
+    for (NSString *p in candidates) if (DDMFileUsable(p)) return p;
     return nil;
 }
 
-static NSString *DDFCopyToTemp(NSString *srcPath, NSString *ext) {
-    if (!DDFFileUsable(srcPath)) return nil;
+static NSString *DDMCopyToTemp(NSString *srcPath, NSString *ext) {
+    if (!DDMFileUsable(srcPath)) return nil;
 
     NSString *realPath = srcPath;
     NSURL *resolved = [[NSURL fileURLWithPath:srcPath] URLByResolvingSymlinksInPath];
-    if (resolved && [resolved path] && ![[resolved path] isEqualToString:srcPath] && DDFFileUsable([resolved path])) {
+    if (resolved && [resolved path] && ![[resolved path] isEqualToString:srcPath] && DDMFileUsable([resolved path])) {
         realPath = [resolved path];
     }
     NSString *realExt = [realPath pathExtension].lowercaseString;
     if (realExt.length == 0) realExt = [ext lowercaseString];
     if (realExt.length == 0) realExt = @"jpg";
     NSString *name = [NSString stringWithFormat:@"%@.%@", NSUUID.UUID.UUIDString, realExt];
-    NSString *dst = [DDFTempDir() stringByAppendingPathComponent:name];
+    NSString *dst = [DDMTempDir() stringByAppendingPathComponent:name];
     NSError *err = nil;
     if (![NSFileManager.defaultManager copyItemAtPath:realPath toPath:dst error:&err]) {
         return nil;
@@ -375,8 +375,8 @@ static NSString *DDFCopyToTemp(NSString *srcPath, NSString *ext) {
     return dst;
 }
 
-static UIImage *DDFVideoFirstFrame(NSString *path) {
-    if (!DDFFileUsable(path)) return nil;
+static UIImage *DDMVideoFirstFrame(NSString *path) {
+    if (!DDMFileUsable(path)) return nil;
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
     AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
     gen.appliesPreferredTrackTransform = YES;
@@ -389,59 +389,59 @@ static UIImage *DDFVideoFirstFrame(NSString *path) {
 
 #pragma mark - 媒体路径解析
 
-static NSString *DDFImagePath(WCMediaItem *item) {
+static NSString *DDMImagePath(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
     if ([item respondsToSelector:@selector(pathForData)])      [cands addObject:[item pathForData] ?: @""];
     if ([item respondsToSelector:@selector(pathForExistData)]) [cands addObject:[item pathForExistData] ?: @""];
-    return DDFFirstUsablePath(cands);
+    return DDMFirstUsablePath(cands);
 }
 
-static NSString *DDFVideoPath(WCMediaItem *item) {
+static NSString *DDMVideoPath(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
     if ([item respondsToSelector:@selector(pathForSightData)])    [cands addObject:[item pathForSightData] ?: @""];
     if ([item respondsToSelector:@selector(getFormatVideoPath)])  [cands addObject:[item getFormatVideoPath] ?: @""];
     if ([item respondsToSelector:@selector(tempPathForSightData)])[cands addObject:[item tempPathForSightData] ?: @""];
     if ([item respondsToSelector:@selector(getTempVideoPath)])    [cands addObject:[item getTempVideoPath] ?: @""];
-    return DDFFirstUsablePath(cands);
+    return DDMFirstUsablePath(cands);
 }
 
-static NSString *DDFLiveVideoPath(WCMediaItem *live) {
+static NSString *DDMLiveVideoPath(WCMediaItem *live) {
     if (!live) return nil;
     NSMutableArray *cands = [NSMutableArray array];
     if ([live respondsToSelector:@selector(pathForSightData)])     [cands addObject:[live pathForSightData] ?: @""];
     if ([live respondsToSelector:@selector(tempPathForSightData)]) [cands addObject:[live tempPathForSightData] ?: @""];
     if ([live respondsToSelector:@selector(getFormatVideoPath)])   [cands addObject:[live getFormatVideoPath] ?: @""];
     if ([live respondsToSelector:@selector(getTempVideoPath)])    [cands addObject:[live getTempVideoPath] ?: @""];
-    return DDFFirstUsablePath(cands);
+    return DDMFirstUsablePath(cands);
 }
 
-static NSString *DDFPersistentSightPath(WCMediaItem *item) {
+static NSString *DDMPersistentSightPath(WCMediaItem *item) {
     if (!item) return nil;
     NSMutableArray *cands = [NSMutableArray array];
     if ([item respondsToSelector:@selector(pathForSightData)])     [cands addObject:[item pathForSightData] ?: @""];
     if ([item respondsToSelector:@selector(tempPathForSightData)]) [cands addObject:[item tempPathForSightData] ?: @""];
-    return DDFFirstUsablePath(cands);
+    return DDMFirstUsablePath(cands);
 }
 
-static UIImage *DDFThumbImage(WCMediaItem *item) {
+static UIImage *DDMThumbImage(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
     if ([item respondsToSelector:@selector(getThumbImagePath)]) [cands addObject:[item getThumbImagePath] ?: @""];
     if ([item respondsToSelector:@selector(pathForPreview)])    [cands addObject:[item pathForPreview] ?: @""];
-    NSString *p = DDFFirstUsablePath(cands);
+    NSString *p = DDMFirstUsablePath(cands);
     return p ? [UIImage imageWithContentsOfFile:p] : nil;
 }
 
 #pragma mark - 实况照片运动视频：转码为真实可播放视频
 
-static NSString *DDFTranscodeWxamToMov(NSString *src) {
-    if (!DDFFileUsable(src)) return nil;
+static NSString *DDMTranscodeWxamToMov(NSString *src) {
+    if (!DDMFileUsable(src)) return nil;
     NSURL *inURL = [NSURL fileURLWithPath:src];
     AVAsset *asset = [AVAsset assetWithURL:inURL];
     NSArray *tracks = asset ? [asset tracksWithMediaType:AVMediaTypeVideo] : nil;
     if (tracks.count == 0) {
         return nil;
     }
-    NSString *dst = [DDFTempDir() stringByAppendingPathComponent:
+    NSString *dst = [DDMTempDir() stringByAppendingPathComponent:
         [NSString stringWithFormat:@"%@.mov", [NSUUID.UUID UUIDString]]];
 
     AVAssetExportSession *exp = [AVAssetExportSession exportSessionWithAsset:asset
@@ -455,37 +455,37 @@ static NSString *DDFTranscodeWxamToMov(NSString *src) {
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     [exp exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
-    if (exp.status == AVAssetExportSessionStatusCompleted && DDFFileUsable(dst)) {
+    if (exp.status == AVAssetExportSessionStatusCompleted && DDMFileUsable(dst)) {
         return dst;
     }
     return nil;
 }
 
-static NSString *DDFLivePhotoVideoPath(WCMediaItem *live) {
+static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     if (!live) return nil;
 
-    NSString *decoded = DDFFirstUsablePath(@[
+    NSString *decoded = DDMFirstUsablePath(@[
         ([live respondsToSelector:@selector(getFormatVideoPath)] ? [live getFormatVideoPath] : @""),
         ([live respondsToSelector:@selector(getTempVideoPath)]  ? [live getTempVideoPath]  : @""),
     ]);
     if (decoded) {
-        NSString *cp = DDFCopyToTemp(decoded, @"mov");
+        NSString *cp = DDMCopyToTemp(decoded, @"mov");
         if (cp) return cp;
     }
 
-    NSString *wxam = DDFPersistentSightPath(live);
+    NSString *wxam = DDMPersistentSightPath(live);
     if (!wxam) return nil;
-    return DDFTranscodeWxamToMov(wxam);
+    return DDMTranscodeWxamToMov(wxam);
 }
 
 #pragma mark - 转发引擎
 
-@interface DDFEngine : NSObject
+@interface DDMEngine : NSObject
 @property (nonatomic, strong) NSString *pendingText;
 @property (nonatomic, assign) NSTimeInterval pendingTextStamp;
 @property (nonatomic, assign) BOOL busy;
 @property (nonatomic, strong) id retainedCommentDetailVC;
-@property (nonatomic, weak) UIWindow *ddfWindow;   // 进度卡挂载的窗口，由触发浮窗直接给出，不再遍历窗口列表
+@property (nonatomic, weak) UIWindow *ddmWindow;   // 进度卡挂载的窗口，由触发浮窗直接给出，不再遍历窗口列表
 + (instancetype)shared;
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView;
 - (NSString *)consumePendingText;
@@ -493,15 +493,15 @@ static NSString *DDFLivePhotoVideoPath(WCMediaItem *live) {
 
 // 进度浮卡子类：宽度随窗口变化（autoresizingMask 左右各留 16 边距）后，
 // 在 layoutSubviews 内按当前宽度重排子视图，从而适配横竖屏与窗口尺寸变化。
-@interface DDFProgressCardView : UIView
+@interface DDMProgressCardView : UIView
 @end
-@implementation DDFProgressCardView
+@implementation DDMProgressCardView
 - (void)layoutSubviews {
     [super layoutSubviews];
-    UILabel *title = objc_getAssociatedObject(self, "ddfTitle");
-    UILabel *sub   = objc_getAssociatedObject(self, "ddfSub");
-    UIProgressView *bar = objc_getAssociatedObject(self, "ddfBar");
-    UILabel *pct = objc_getAssociatedObject(self, "ddfPct");
+    UILabel *title = objc_getAssociatedObject(self, "ddmTitle");
+    UILabel *sub   = objc_getAssociatedObject(self, "ddmSub");
+    UIProgressView *bar = objc_getAssociatedObject(self, "ddmBar");
+    UILabel *pct = objc_getAssociatedObject(self, "ddmPct");
     CGFloat w = self.bounds.size.width;
     CGFloat padX = 14.0, labelH = 18.0;
     title.frame = CGRectMake(padX, 8, w / 2 - padX, labelH);
@@ -512,48 +512,48 @@ static NSString *DDFLivePhotoVideoPath(WCMediaItem *live) {
 }
 @end
 
-@implementation DDFEngine
+@implementation DDMEngine
 
 + (instancetype)shared {
-    static DDFEngine *e = nil;
+    static DDMEngine *e = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ e = [DDFEngine new]; });
+    dispatch_once(&once, ^{ e = [DDMEngine new]; });
     return e;
 }
 
 #pragma mark HUD（下载进度条：圆角浮卡 + 类型化标题 + 计数/预耗时 + 灰底绿条 + 绿色百分比，支持深色模式，尺寸跟随窗口）
 
-static const NSInteger kDDFProgressHUDTag = 0x44444602;
+static const NSInteger kDDMProgressHUDTag = 0x44444602;
 
-typedef NS_ENUM(NSInteger, DDFMediaKind) {
-    DDFMediaKindImages  = 0,
-    DDFMediaKindVideo   = 1,
-    DDFMediaKindLive    = 2,
+typedef NS_ENUM(NSInteger, DDMMediaKind) {
+    DDMMediaKindImages  = 0,
+    DDMMediaKindVideo   = 1,
+    DDMMediaKindLive    = 2,
 };
 
 // 深色模式配色：直接走动态色
-static UIColor *ddf_card_bg(void) {
+static UIColor *ddm_card_bg(void) {
     return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
         return tc.userInterfaceStyle == UIUserInterfaceStyleDark
              ? [UIColor colorWithWhite:0.12 alpha:0.95]
              : [UIColor colorWithWhite:1.0 alpha:0.95];
     }];
 }
-static UIColor *ddf_text_primary(void) {
+static UIColor *ddm_text_primary(void) {
     return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
         return tc.userInterfaceStyle == UIUserInterfaceStyleDark
              ? [UIColor colorWithWhite:1.0 alpha:0.9]
              : [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.9];
     }];
 }
-static UIColor *ddf_text_secondary(void) {
+static UIColor *ddm_text_secondary(void) {
     return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
         return tc.userInterfaceStyle == UIUserInterfaceStyleDark
              ? [UIColor colorWithWhite:1.0 alpha:0.5]
              : [UIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:0.35];
     }];
 }
-static UIColor *ddf_track_bg(void) {
+static UIColor *ddm_track_bg(void) {
     return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
         return tc.userInterfaceStyle == UIUserInterfaceStyleDark
              ? [UIColor colorWithWhite:1.0 alpha:0.12]
@@ -561,11 +561,11 @@ static UIColor *ddf_track_bg(void) {
     }];
 }
 
-// 进度浮卡（DDFProgressCardView，定义见本文件前部）的布局逻辑在 layoutSubviews 内完成，
+// 进度浮卡（DDMProgressCardView，定义见本文件前部）的布局逻辑在 layoutSubviews 内完成，
 // 窗口尺寸变化时自动按当前宽度重排子视图。
 
-- (UIView *)ddfProgressCard {
-    UIWindow *win = self.ddfWindow;   // 直接挂触发浮窗所在的主窗口，不遍历窗口列表
+- (UIView *)ddmProgressCard {
+    UIWindow *win = self.ddmWindow;   // 直接挂触发浮窗所在的主窗口，不遍历窗口列表
     if (!win) return nil;
     CGFloat cardW = win.bounds.size.width - 32.0;
     CGFloat cardH = 56.0;
@@ -575,10 +575,10 @@ static UIColor *ddf_track_bg(void) {
         CGFloat sa = win.safeAreaInsets.top;
         if (sa > 0) topInset = sa + 8.0;
     }
-    DDFProgressCardView *card = [[DDFProgressCardView alloc] initWithFrame:CGRectMake(16.0, topInset, cardW, cardH)];
-    card.backgroundColor = ddf_card_bg();
+    DDMProgressCardView *card = [[DDMProgressCardView alloc] initWithFrame:CGRectMake(16.0, topInset, cardW, cardH)];
+    card.backgroundColor = ddm_card_bg();
     card.layer.cornerRadius = 10.0;
-    card.tag = kDDFProgressHUDTag;
+    card.tag = kDDMProgressHUDTag;
     card.alpha = 0.0;
 
     card.userInteractionEnabled = NO;
@@ -593,11 +593,11 @@ static UIColor *ddf_track_bg(void) {
     CGFloat labelH = 18.0;
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(padX, 8, cardW / 2 - padX, labelH)];
-    title.textColor = ddf_text_primary();
+    title.textColor = ddm_text_primary();
     title.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
 
     UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(cardW / 2, 8, cardW / 2 - padX, labelH)];
-    sub.textColor = ddf_text_secondary();
+    sub.textColor = ddm_text_secondary();
     sub.font = [UIFont systemFontOfSize:11.0];
     sub.textAlignment = NSTextAlignmentRight;
     sub.text = @"";
@@ -605,7 +605,7 @@ static UIColor *ddf_track_bg(void) {
     CGFloat barY = 30.0, barH = 4.0;
     UIProgressView *bar = [[UIProgressView alloc] initWithFrame:CGRectMake(padX, barY, cardW - 2 * padX - 36.0, barH)];
     bar.progressTintColor = [UIColor colorWithRed:0.03 green:0.76 blue:0.38 alpha:1.0];
-    bar.trackTintColor = ddf_track_bg();
+    bar.trackTintColor = ddm_track_bg();
     bar.progress = 0.0;
     bar.layer.cornerRadius = 2.0;
     bar.clipsToBounds = YES;
@@ -620,37 +620,37 @@ static UIColor *ddf_track_bg(void) {
     [card addSubview:sub];
     [card addSubview:bar];
     [card addSubview:pct];
-    objc_setAssociatedObject(card, "ddfTitle", title, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(card, "ddfSub", sub, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(card, "ddfBar", bar, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(card, "ddfPct", pct, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(card, "ddmTitle", title, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(card, "ddmSub", sub, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(card, "ddmBar", bar, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(card, "ddmPct", pct, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    objc_setAssociatedObject(card, "ddfMediaKind", @(DDFMediaKindImages), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(card, "ddfTotalCount", @1, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(card, "ddmMediaKind", @(DDMMediaKindImages), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(card, "ddmTotalCount", @1, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     [win addSubview:card];
     [UIView animateWithDuration:0.2 animations:^{ card.alpha = 1.0; }];
     return card;
 }
 
-- (UIView *)ddfProgressHUD {
-    UIWindow *win = self.ddfWindow;
-    return win ? [win viewWithTag:kDDFProgressHUDTag] : nil;
+- (UIView *)ddmProgressHUD {
+    UIWindow *win = self.ddmWindow;
+    return win ? [win viewWithTag:kDDMProgressHUDTag] : nil;
 }
 
 - (void)showHUDForItem:(WCDataItem *)item {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *card = [self ddfProgressHUD] ?: [self ddfProgressCard];
+        UIView *card = [self ddmProgressHUD] ?: [self ddmProgressCard];
         if (!card) return;
 
         BOOL isVideo = [item respondsToSelector:@selector(isVideo)] && [item isVideo];
-        DDFMediaKind kind = DDFMediaKindImages;
+        DDMMediaKind kind = DDMMediaKindImages;
         NSInteger totalCount = 1;
         NSString *initialTitle = @"正在准备转发…";
         NSString *initialSub = @"";
 
         if (isVideo) {
-            kind = DDFMediaKindVideo;
+            kind = DDMMediaKindVideo;
             initialTitle = @"视频加载中";
             initialSub = @"0%";
         } else {
@@ -662,11 +662,11 @@ static UIColor *ddf_track_bg(void) {
                 if ([m respondsToSelector:@selector(isLivePhoto)] && [m isLivePhoto]) { hasLive = YES; break; }
             }
             if (hasLive && totalCount == 1) {
-                kind = DDFMediaKindLive;
+                kind = DDMMediaKindLive;
                 initialTitle = @"获取 live图";
                 initialSub = @"0/1";
             } else {
-                kind = DDFMediaKindImages;
+                kind = DDMMediaKindImages;
 
                 initialTitle = (totalCount > 1)
                     ? [NSString stringWithFormat:@"获取图 0/%ld", (long)totalCount]
@@ -675,63 +675,63 @@ static UIColor *ddf_track_bg(void) {
             }
         }
 
-        objc_setAssociatedObject(card, "ddfMediaKind", @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(card, "ddfTotalCount", @(totalCount), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(card, "ddmMediaKind", @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(card, "ddmTotalCount", @(totalCount), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-        UILabel *title = objc_getAssociatedObject(card, "ddfTitle");
+        UILabel *title = objc_getAssociatedObject(card, "ddmTitle");
         title.text = initialTitle;
-        UILabel *sub = objc_getAssociatedObject(card, "ddfSub");
+        UILabel *sub = objc_getAssociatedObject(card, "ddmSub");
         sub.text = initialSub;
-        UIProgressView *bar = objc_getAssociatedObject(card, "ddfBar");
+        UIProgressView *bar = objc_getAssociatedObject(card, "ddmBar");
         [bar setProgress:0.0 animated:NO];
-        UILabel *pct = objc_getAssociatedObject(card, "ddfPct");
+        UILabel *pct = objc_getAssociatedObject(card, "ddmPct");
         pct.text = @"0%";
     });
 }
 
 - (void)showHUD:(NSString *)text {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *card = [self ddfProgressHUD] ?: [self ddfProgressCard];
+        UIView *card = [self ddmProgressHUD] ?: [self ddmProgressCard];
         if (!card) return;
-        UILabel *title = objc_getAssociatedObject(card, "ddfTitle");
+        UILabel *title = objc_getAssociatedObject(card, "ddmTitle");
         title.text = text ?: @"正在准备转发…";
-        UILabel *sub = objc_getAssociatedObject(card, "ddfSub");
+        UILabel *sub = objc_getAssociatedObject(card, "ddmSub");
         sub.text = @"";
-        UIProgressView *bar = objc_getAssociatedObject(card, "ddfBar");
+        UIProgressView *bar = objc_getAssociatedObject(card, "ddmBar");
         [bar setProgress:0.0 animated:NO];
-        UILabel *pct = objc_getAssociatedObject(card, "ddfPct");
+        UILabel *pct = objc_getAssociatedObject(card, "ddmPct");
         pct.text = @"0%";
     });
 }
 
-- (void)ddfSetProgress:(float)p {
+- (void)ddmSetProgress:(float)p {
     p = MAX(0.0, MIN(1.0, p));
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *card = [self ddfProgressHUD];
+        UIView *card = [self ddmProgressHUD];
         if (!card) return;
-        UIProgressView *bar = objc_getAssociatedObject(card, "ddfBar");
+        UIProgressView *bar = objc_getAssociatedObject(card, "ddmBar");
         [bar setProgress:p animated:YES];
 
         int pctVal = (int)(p * 100);
-        UILabel *pctLbl = objc_getAssociatedObject(card, "ddfPct");
+        UILabel *pctLbl = objc_getAssociatedObject(card, "ddmPct");
         pctLbl.text = [NSString stringWithFormat:@"%d%%", pctVal];
 
-        NSNumber *kindObj = objc_getAssociatedObject(card, "ddfMediaKind");
-        NSNumber *totalObj = objc_getAssociatedObject(card, "ddfTotalCount");
-        DDFMediaKind kind = kindObj ? (DDFMediaKind)[kindObj integerValue] : DDFMediaKindImages;
+        NSNumber *kindObj = objc_getAssociatedObject(card, "ddmMediaKind");
+        NSNumber *totalObj = objc_getAssociatedObject(card, "ddmTotalCount");
+        DDMMediaKind kind = kindObj ? (DDMMediaKind)[kindObj integerValue] : DDMMediaKindImages;
         NSInteger total = totalObj ? [totalObj integerValue] : 1;
         NSInteger done = (NSInteger)(p * total + 0.5);
         if (done > total) done = total;
 
-        UILabel *title = objc_getAssociatedObject(card, "ddfTitle");
-        UILabel *sub = objc_getAssociatedObject(card, "ddfSub");
+        UILabel *title = objc_getAssociatedObject(card, "ddmTitle");
+        UILabel *sub = objc_getAssociatedObject(card, "ddmSub");
 
         switch (kind) {
-            case DDFMediaKindLive:
+            case DDMMediaKindLive:
 
                 sub.text = [NSString stringWithFormat:@"%ld/%ld", (long)done, (long)total];
                 break;
-            case DDFMediaKindVideo:
+            case DDMMediaKindVideo:
 
                 sub.text = [NSString stringWithFormat:@"%d%%", pctVal];
                 break;
@@ -747,7 +747,7 @@ static UIColor *ddf_track_bg(void) {
 
 - (void)dismissHUD {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *card = [self ddfProgressHUD];
+        UIView *card = [self ddmProgressHUD];
         if (!card) return;
         [UIView animateWithDuration:0.2 animations:^{ card.alpha = 0.0; }
                          completion:^(BOOL fin){ [card removeFromSuperview]; }];
@@ -756,13 +756,13 @@ static UIColor *ddf_track_bg(void) {
 
 - (void)failHUD:(NSString *)text {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *card = [self ddfProgressHUD];
+        UIView *card = [self ddmProgressHUD];
         if (!card) { self.busy = NO; return; }
-        UILabel *title = objc_getAssociatedObject(card, "ddfTitle");
+        UILabel *title = objc_getAssociatedObject(card, "ddmTitle");
         title.text = text ?: @"失败";
-        UILabel *sub = objc_getAssociatedObject(card, "ddfSub");
+        UILabel *sub = objc_getAssociatedObject(card, "ddmSub");
         sub.text = @"";
-        UIProgressView *bar = objc_getAssociatedObject(card, "ddfBar");
+        UIProgressView *bar = objc_getAssociatedObject(card, "ddmBar");
         bar.hidden = YES;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -782,11 +782,11 @@ static UIColor *ddf_track_bg(void) {
     self.busy = YES;
 
     // 进度卡直接挂在触发浮窗所在的主窗口上，不遍历窗口列表（避免被 iConsole 之类浮层换类名干扰）。
-    self.ddfWindow = floatView.window;
-    UIViewController *host = DDFTopViewController(floatView.navigationController);
+    self.ddmWindow = floatView.window;
+    UIViewController *host = DDMTopViewController(floatView.navigationController);
     if ([floatView respondsToSelector:@selector(hide)]) [floatView hide];
 
-    DDFCleanTempDir();
+    DDMCleanTempDir();
     [self showHUDForItem:item];
 
     __weak typeof(self) weakSelf = self;
@@ -814,13 +814,13 @@ static UIColor *ddf_track_bg(void) {
     NSMutableSet *seen = [NSMutableSet set];
 
     BOOL (^isLocal)(WCMediaItem *) = ^BOOL(WCMediaItem *m) {
-        if (DDFImagePath(m)) return YES;
-        if (DDFPersistentSightPath(m)) return YES;
+        if (DDMImagePath(m)) return YES;
+        if (DDMPersistentSightPath(m)) return YES;
         return NO;
     };
 
     BOOL (^isLiveLocal)(WCMediaItem *) = ^BOOL(WCMediaItem *m) {
-        return DDFPersistentSightPath(m) != nil;
+        return DDMPersistentSightPath(m) != nil;
     };
 
     void (^add)(WCMediaItem *, BOOL) = ^(WCMediaItem *m, BOOL isLive) {
@@ -854,18 +854,18 @@ static UIColor *ddf_track_bg(void) {
     NSMutableSet *liveSubs = [NSMutableSet set];
     NSArray *pending = [self collectPendingMediaOf:item liveSubs:liveSubs];
     if (pending.count == 0) {
-        [self ddfSetProgress:1.0];
+        [self ddmSetProgress:1.0];
         dispatch_async(dispatch_get_main_queue(), completion);
         return;
     }
 
-    id facade = DDFGetFrameFacade();
+    id facade = DDMGetFrameFacade();
     if (!facade) { dispatch_async(dispatch_get_main_queue(), completion); return; }
 
     long long contentType = ([item.contentObj respondsToSelector:@selector(type)] ? [item.contentObj type] : -1);
     Class ci = objc_getClass("WCContentItem");
     BOOL contentIsVideo = ci && [ci respondsToSelector:@selector(isVideoType:)] && [ci isVideoType:contentType];
-    BOOL (^ddfIsSightVideo)(WCMediaItem *) = ^BOOL(WCMediaItem *m) {
+    BOOL (^ddmIsSightVideo)(WCMediaItem *) = ^BOOL(WCMediaItem *m) {
 
         long long mt = [m respondsToSelector:@selector(mediaType)] ? [m mediaType] : -1;
         if (mt == 1) return NO;
@@ -878,7 +878,7 @@ static UIColor *ddf_track_bg(void) {
     __block id videoMgr = nil;
     for (WCMediaItem *m in pending) {
         BOOL isLiveSub = [liveSubs containsObject:m];
-        if (isLiveSub || ddfIsSightVideo(m)) {
+        if (isLiveSub || ddmIsSightVideo(m)) {
 
             if (![facade respondsToSelector:@selector(videoDownloadCdnMgrForCategory:)]) continue;
             id vMgr = [facade videoDownloadCdnMgrForCategory:(long long)arc4random_uniform(10)];
@@ -900,45 +900,45 @@ static UIColor *ddf_track_bg(void) {
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         if (isVideo) {
-            [self ddfWaitVideo:pending videoMgr:videoMgr];
+            [self ddmWaitVideo:pending videoMgr:videoMgr];
         } else {
-            [self ddfWaitMedia:pending liveSubs:liveSubs];
+            [self ddmWaitMedia:pending liveSubs:liveSubs];
         }
-        [self ddfSetProgress:1.0];
+        [self ddmSetProgress:1.0];
         dispatch_async(dispatch_get_main_queue(), completion);
     });
 }
 
-- (BOOL)ddfVideoReady:(WCMediaItem *)m {
+- (BOOL)ddmVideoReady:(WCMediaItem *)m {
     if ([m respondsToSelector:@selector(getFormatVideoPath)]) {
         NSString *p = [m getFormatVideoPath];
         if (p && [[NSFileManager defaultManager] fileExistsAtPath:p]) return YES;
     }
-    NSString *p = DDFVideoPath(m) ?: DDFLiveVideoPath(m);
-    if (p && DDFFileUsable(p)) return YES;
-    return [self ddfImageReady:m];
+    NSString *p = DDMVideoPath(m) ?: DDMLiveVideoPath(m);
+    if (p && DDMFileUsable(p)) return YES;
+    return [self ddmImageReady:m];
 }
 
-- (BOOL)ddfImageReady:(WCMediaItem *)m {
+- (BOOL)ddmImageReady:(WCMediaItem *)m {
     if ([m respondsToSelector:@selector(imageOfSize:)]) {
 
         id img = ((id (*)(id, SEL, long long))objc_msgSend)(m, @selector(imageOfSize:), 2LL);
         if (img) return YES;
     }
-    NSString *p = DDFImagePath(m);
-    return (p && DDFFileUsable(p));
+    NSString *p = DDMImagePath(m);
+    return (p && DDMFileUsable(p));
 }
 
 // 视频进度：时间驱动，已等待秒 / 60（封顶 60s）。
-- (void)ddfWaitVideo:(NSArray *)pending videoMgr:(id)videoMgr {
+- (void)ddmWaitVideo:(NSArray *)pending videoMgr:(id)videoMgr {
     const NSInteger cap = 60;
     for (NSInteger s = 0; s <= cap; s++) {
         BOOL allReady = YES;
         for (WCMediaItem *m in pending) {
-            if (![self ddfVideoReady:m]) { allReady = NO; break; }
+            if (![self ddmVideoReady:m]) { allReady = NO; break; }
         }
-        if (allReady) { [self ddfSetProgress:1.0]; return; }
-        [self ddfSetProgress:(float)s / (float)cap];
+        if (allReady) { [self ddmSetProgress:1.0]; return; }
+        [self ddmSetProgress:(float)s / (float)cap];
         if (s >= cap) break;
         if (videoMgr && [videoMgr respondsToSelector:@selector(CheckQueue)]) [videoMgr performSelector:@selector(CheckQueue)];
         [NSThread sleepForTimeInterval:1.0];
@@ -946,16 +946,16 @@ static UIColor *ddf_track_bg(void) {
 }
 
 // 图片/实况进度：已就绪数 / 总数（封顶 60s）。
-- (void)ddfWaitMedia:(NSArray *)pending liveSubs:(NSMutableSet *)liveSubs {
+- (void)ddmWaitMedia:(NSArray *)pending liveSubs:(NSMutableSet *)liveSubs {
     const NSInteger cap = 60;
     NSInteger total = pending.count;
     for (NSInteger s = 0; s <= cap; s++) {
         NSInteger ready = 0;
         for (WCMediaItem *m in pending) {
-            BOOL ok = [liveSubs containsObject:m] ? [self ddfVideoReady:m] : [self ddfImageReady:m];
+            BOOL ok = [liveSubs containsObject:m] ? [self ddmVideoReady:m] : [self ddmImageReady:m];
             if (ok) ready++;
         }
-        [self ddfSetProgress:(float)ready / (float)total];
+        [self ddmSetProgress:(float)ready / (float)total];
         if (ready >= total) return;
         if (s >= cap) break;
         [NSThread sleepForTimeInterval:1.0];
@@ -983,14 +983,14 @@ static UIColor *ddf_track_bg(void) {
     WCContentItem *content = item.contentObj;
     WCMediaItem *videoItem = nil;
     for (WCMediaItem *m in content.mediaList) {
-        NSString *vp = DDFVideoPath(m);
+        NSString *vp = DDMVideoPath(m);
         if (vp) { videoItem = m; break; }
     }
     if (!videoItem) {
         [self failHUD:@"视频未下载完整"];
         return;
     }
-    NSString *src = DDFVideoPath(videoItem);
+    NSString *src = DDMVideoPath(videoItem);
     if (!src) {
         [self failHUD:@"视频未下载完整"];
         return;
@@ -999,18 +999,18 @@ static UIColor *ddf_track_bg(void) {
     NSString *local = nil;
     for (int attempt = 0; attempt < 5 && !local; attempt++) {
         if (attempt > 0) [NSThread sleepForTimeInterval:0.4];
-        NSString *s = DDFVideoPath(videoItem);
-        if (s && DDFFileUsable(s)) local = DDFCopyToTemp(s, @"mp4");
+        NSString *s = DDMVideoPath(videoItem);
+        if (s && DDMFileUsable(s)) local = DDMCopyToTemp(s, @"mp4");
     }
     if (!local) {
         [self failHUD:@"视频准备失败"];
         return;
     }
-    [self presentVideoWithLocalPath:local thumb:DDFThumbImage(videoItem) item:item host:host];
+    [self presentVideoWithLocalPath:local thumb:DDMThumbImage(videoItem) item:item host:host];
 }
 
 - (void)presentVideoWithLocalPath:(NSString *)path thumb:(UIImage *)thumb item:(WCDataItem *)item host:(UIViewController *)host {
-    if (!DDFFileUsable(path)) {
+    if (!DDMFileUsable(path)) {
         [self failHUD:@"视频准备失败"];
         return;
     }
@@ -1021,7 +1021,7 @@ static UIColor *ddf_track_bg(void) {
         return;
     }
 
-    if (!thumb) thumb = DDFVideoFirstFrame(path);
+    if (!thumb) thumb = DDMVideoFirstFrame(path);
 
     NSURL *url = [NSURL fileURLWithPath:path];
     SightDraft *draft = thumb ? [draftCls draftWithVideoURL:url thumbImage:thumb]
@@ -1039,7 +1039,7 @@ static UIColor *ddf_track_bg(void) {
     [self stashTextOf:item];
     [self dismissHUD];
 
-    [self ddfPushSightCommit:draft host:host];
+    [self ddmPushSightCommit:draft host:host];
     self.busy = NO;
 }
 
@@ -1053,13 +1053,13 @@ static UIColor *ddf_track_bg(void) {
     NSMutableArray *assets = [NSMutableArray array];
 
     for (WCMediaItem *m in item.contentObj.mediaList) {
-        NSString *imgSrc = DDFImagePath(m);
+        NSString *imgSrc = DDMImagePath(m);
         if (!imgSrc) continue;
-        NSString *imgLocal = DDFCopyToTemp(imgSrc, @"jpg");
+        NSString *imgLocal = DDMCopyToTemp(imgSrc, @"jpg");
         if (!imgLocal) continue;
 
         WCMediaItem *live = [m respondsToSelector:@selector(livePhotoMediaItem)] ? m.livePhotoMediaItem : nil;
-        NSString *movLocal = (live ? DDFLivePhotoVideoPath(live) : nil);
+        NSString *movLocal = (live ? DDMLivePhotoVideoPath(live) : nil);
 
         NSString *assetPath = movLocal ?: imgLocal;
         MMAssetForLocalImage *asset = [[localImgCls alloc] initWithUrl:[NSURL fileURLWithPath:assetPath]
@@ -1074,18 +1074,18 @@ static UIColor *ddf_track_bg(void) {
             asset.localAssetId  = assetPath;
         }
 
-        MMImage *mm = [self ddfMakeMMImage:imgLocal asset:asset liveVideoPath:movLocal];
+        MMImage *mm = [self ddmMakeMMImage:imgLocal asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
     }
 
     if (assets.count == 0) { [self presentLegacyForward:item host:host]; return; }
     [self stashTextOf:item];
     [self dismissHUD];
-    [self ddfPushImageCommit:assets host:host];
+    [self ddmPushImageCommit:assets host:host];
     self.busy = NO;
 }
 
-- (MMImage *)ddfMakeMMImage:(NSString *)imgLocal asset:(id)asset liveVideoPath:(NSString *)movLocal {
+- (MMImage *)ddmMakeMMImage:(NSString *)imgLocal asset:(id)asset liveVideoPath:(NSString *)movLocal {
     Class mmImgCls = objc_getClass("MMImage");
     if (!mmImgCls) return nil;
     if (asset && [asset respondsToSelector:@selector(_getImageTypeFromData:)]) {
@@ -1118,7 +1118,7 @@ static UIColor *ddf_track_bg(void) {
             long long sz = (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize];
             [asset setLivePhotoVideoSize:sz];
         }
-        if ([asset respondsToSelector:@selector(setLivePhotoDuration:)]) [asset setLivePhotoDuration:DDFVideoDuration(movLocal)];
+        if ([asset respondsToSelector:@selector(setLivePhotoDuration:)]) [asset setLivePhotoDuration:DDMVideoDuration(movLocal)];
     }
     return mmImg;
 }
@@ -1153,18 +1153,18 @@ static UIColor *ddf_track_bg(void) {
     return cls ? [[cls alloc] init] : nil;
 }
 
-- (void)ddfPresentCommitVC:(UIViewController *)vc host:(UIViewController *)host {
+- (void)ddmPresentCommitVC:(UIViewController *)vc host:(UIViewController *)host {
     if (!vc) { [self failHUD:@"打开发布界面失败"]; return; }
 
     dispatch_async(dispatch_get_main_queue(), ^{
         UINavigationController *nav = host.navigationController;
-        if (!nav) nav = DDFTopViewController(nil).navigationController;
+        if (!nav) nav = DDMTopViewController(nil).navigationController;
         if (!nav) { [self failHUD:@"打开发布界面失败"]; return; }
         [nav pushViewController:vc animated:YES];
     });
 }
 
-- (void)ddfPushSightCommit:(id)draft host:(UIViewController *)host {
+- (void)ddmPushSightCommit:(id)draft host:(UIViewController *)host {
     Class cls = objc_getClass("WCNewCommitViewController");
     if (!cls || ![cls instancesRespondToSelector:@selector(initWithSightDraft:)]) {
         [self failHUD:@"当前版本不支持"]; return;
@@ -1177,16 +1177,16 @@ static UIColor *ddf_track_bg(void) {
         if ([vc respondsToSelector:@selector(setDelegate:)]) [vc performSelector:@selector(setDelegate:) withObject:detail];
         self.retainedCommentDetailVC = detail;
     }
-    [self ddfPresentCommitVC:vc host:host];
+    [self ddmPresentCommitVC:vc host:host];
 }
 
-- (void)ddfPushImageCommit:(NSArray *)assets host:(UIViewController *)host {
+- (void)ddmPushImageCommit:(NSArray *)assets host:(UIViewController *)host {
     Class cls = objc_getClass("WCNewCommitViewController");
     if (!cls || ![cls instancesRespondToSelector:@selector(initWithImages:contacts:)]) {
         [self failHUD:@"当前版本不支持"]; return;
     }
     WCNewCommitViewController *vc = [(WCNewCommitViewController *)[cls alloc] initWithImages:[assets mutableCopy] contacts:nil];
-    [self ddfPresentCommitVC:vc host:host];
+    [self ddmPresentCommitVC:vc host:host];
 }
 
 - (void)presentLegacyForward:(WCDataItem *)item host:(UIViewController *)host {
@@ -1206,7 +1206,7 @@ static UIColor *ddf_track_bg(void) {
 
 // 转发图标：是微信主题 SVG 资源，
 // 须经 WCSDKAdapter +svgImageNamed:size:color: 渲染，UIImage imageNamed: 取不到。
-static UIImage *DDFShareIcon(void) {
+static UIImage *DDMShareIcon(void) {
     UIImage *img = nil;
     Class adapter = NSClassFromString(@"WCSDKAdapter");
     if (adapter && [adapter respondsToSelector:@selector(svgImageNamed:size:color:)]) {
@@ -1219,11 +1219,11 @@ static UIImage *DDFShareIcon(void) {
     return img;
 }
 
-static char kDDFShareBtnKey;
-static char kDDFLineKey;
+static char kDDMShareBtnKey;
+static char kDDMLineKey;
 
-@interface WCOperateFloatView (DDForward)
-- (void)ddf_onForwardTapped:(UIButton *)sender;
+@interface WCOperateFloatView (DDMoments)
+- (void)ddm_onForwardTapped:(UIButton *)sender;
 - (void)initForwardButton;
 - (void)initForwardLineView;
 @end
@@ -1250,12 +1250,12 @@ static char kDDFLineKey;
 // 在评论按钮右侧注入"转发"按钮，图标。
 - (void)initForwardButton {
     UIButton *cmtBtn = self.m_commentBtn;
-    if (!cmtBtn || objc_getAssociatedObject(self, &kDDFShareBtnKey)) return;
+    if (!cmtBtn || objc_getAssociatedObject(self, &kDDMShareBtnKey)) return;
 
     UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     shareBtn.tintColor = [UIColor whiteColor];
 
-    UIImage *icon = DDFShareIcon();
+    UIImage *icon = DDMShareIcon();
     if (icon) icon = [icon imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
     [shareBtn setImage:icon forState:UIControlStateNormal];
 
@@ -1267,27 +1267,27 @@ static char kDDFLineKey;
                                 cmtBtn.frame.origin.y,
                                 cmtBtn.frame.size.width,
                                 cmtBtn.frame.size.height);
-    [shareBtn addTarget:self action:@selector(ddf_onForwardTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [shareBtn addTarget:self action:@selector(ddm_onForwardTapped:) forControlEvents:UIControlEventTouchUpInside];
     shareBtn.hidden = YES;
     [self addSubview:shareBtn];
-    objc_setAssociatedObject(self, &kDDFShareBtnKey, shareBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, &kDDMShareBtnKey, shareBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 %new
 - (void)initForwardLineView {
-    if (objc_getAssociatedObject(self, &kDDFLineKey)) return;
+    if (objc_getAssociatedObject(self, &kDDMLineKey)) return;
     Ivar lineIvar = class_getInstanceVariable([self class], "m_lineView");
     UIImageView *origLine = lineIvar ? object_getIvar(self, lineIvar) : nil;
     if ([origLine isKindOfClass:UIImageView.class]) {
         UIImageView *clone = [[UIImageView alloc] initWithImage:origLine.image];
         clone.hidden = YES;
         [self addSubview:clone];
-        objc_setAssociatedObject(self, &kDDFLineKey, clone, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, &kDDMLineKey, clone, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
 %new
-- (void)ddf_onForwardTapped:(UIButton *)sender {
+- (void)ddm_onForwardTapped:(UIButton *)sender {
 
     UIResponder *r = self;
     while ((r = r.nextResponder)) {
@@ -1298,18 +1298,18 @@ static char kDDFLineKey;
     }
     WCDataItem *item = self.m_item;
     if (!item) return;
-    [[DDFEngine shared] forwardDataItem:item hostView:self];
+    [[DDMEngine shared] forwardDataItem:item hostView:self];
 }
 
 - (void)layoutSubviews {
     %orig;
 
-    UIButton *shareBtn = objc_getAssociatedObject(self, &kDDFShareBtnKey);
-    UIImageView *line  = objc_getAssociatedObject(self, &kDDFLineKey);
+    UIButton *shareBtn = objc_getAssociatedObject(self, &kDDMShareBtnKey);
+    UIImageView *line  = objc_getAssociatedObject(self, &kDDMLineKey);
     UIButton *likeBtn = self.m_likeBtn;
     UIButton *cmtBtn  = self.m_commentBtn;
 
-    BOOL show = DDFConfig.shared.enabled && shareBtn && likeBtn && cmtBtn && shareBtn.superview == self;
+    BOOL show = DDMConfig.shared.enabled && shareBtn && likeBtn && cmtBtn && shareBtn.superview == self;
     shareBtn.hidden = !show;
     line.hidden = !show;
     if (!show) return;
@@ -1356,7 +1356,7 @@ static char kDDFLineKey;
     if (!fv) return;
     WCDataItem *item = [fv respondsToSelector:@selector(m_item)] ? fv.m_item : nil;
     if (!item) return;
-    [[DDFEngine shared] forwardDataItem:item hostView:fv];
+    [[DDMEngine shared] forwardDataItem:item hostView:fv];
 }
 
 %end
@@ -1375,7 +1375,7 @@ static char kDDFLineKey;
 
 - (void)initTextViewContent {
     %orig;
-    NSString *text = [[DDFEngine shared] consumePendingText];
+    NSString *text = [[DDMEngine shared] consumePendingText];
     if (text.length == 0) return;
     MMGrowTextView *grow = [self respondsToSelector:@selector(textView)] ? self.textView : nil;
     UITextView *tv = [grow respondsToSelector:@selector(textView)] ? grow.textView : nil;
@@ -1389,11 +1389,11 @@ static char kDDFLineKey;
 
 #pragma mark - 设置界面
 
-@interface DDForwardSettingsViewController : UIViewController <UITableViewDelegate>
+@interface DDMSettingsViewController : UIViewController <UITableViewDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @end
 
-@implementation DDForwardSettingsViewController {
+@implementation DDMSettingsViewController {
     id<UITableViewDelegate> _originalDelegate;
 }
 - (void)ensureTableViewMgr {
@@ -1407,7 +1407,7 @@ static char kDDFLineKey;
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"朋友圈转发设置";
+    self.title = @"朋友圈助手设置";
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
     appearance.shadowColor = nil;
@@ -1434,7 +1434,7 @@ static char kDDFLineKey;
     Class secMgr  = objc_getClass("WCTableViewSectionManager");
     if (!cellMgr || !secMgr) return;
 
-    DDFConfig *cfg = DDFConfig.shared;
+    DDMConfig *cfg = DDMConfig.shared;
     WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"转发设置"];
     if (!sec) return;
     [sec addCell:[cellMgr switchCellForSel:@selector(onEnabledSwitch:)
@@ -1458,19 +1458,19 @@ static char kDDFLineKey;
         return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
     return UITableViewAutomaticDimension;
 }
-- (void)onEnabledSwitch:(UISwitch *)sender { DDFConfig.shared.enabled = sender.isOn; }
+- (void)onEnabledSwitch:(UISwitch *)sender { DDMConfig.shared.enabled = sender.isOn; }
 @end
 
 #pragma mark - 注册
 
-// 注册设置页：仅一个"朋友圈转发"开关。
+// 注册设置页：朋友圈转发开关。
 %ctor {
     @autoreleasepool {
         Class mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD朋友圈转发"
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD朋友圈助手"
                                                       version:@"1.0.0"
-                                                   controller:@"DDForwardSettingsViewController"];
+                                                   controller:@"DDMSettingsViewController"];
         }
     }
 }
