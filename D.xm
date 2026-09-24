@@ -717,7 +717,7 @@ static const NSInteger kDDHubTag = 0x44444801;
     CGFloat barW = cardW - 2 * padX;
     UIView *track = [[UIView alloc] initWithFrame:CGRectMake(padX, barY, barW, barH)];
     track.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
-        return [UIColor colorWithWhite:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 1.0 : 0.0 alpha:0.12];
+        return [UIColor colorWithWhite:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 1.0 : 0.0 alpha:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 0.12 : 0.06];
     }];
     track.layer.cornerRadius = barH / 2.0;
     track.clipsToBounds = YES;
