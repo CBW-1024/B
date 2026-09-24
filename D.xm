@@ -692,7 +692,9 @@ static const NSInteger kDDHubTag = 0x44444801;
         if (sa > 0) topInset = sa + 8.0;
     }
     UIView *card = [[UIView alloc] initWithFrame:CGRectMake(16.0, topInset, cardW, cardH)];
-    card.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.95];
+    card.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return [UIColor colorWithWhite:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 0.12 : 1.0 alpha:0.95];
+    }];
     card.layer.cornerRadius = 10.0;
     card.clipsToBounds = YES;
     card.tag = kDDHubTag;
@@ -705,14 +707,18 @@ static const NSInteger kDDHubTag = 0x44444801;
 
     CGFloat padX = 14.0;
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(padX, 8, cardW - 2 * padX, 18)];
-    title.textColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.9];
+    title.textColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return [UIColor colorWithWhite:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 0.95 : 0.0 alpha:0.9];
+    }];
     title.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
 
     // 来回滚动的 indeterminate 进度条（无百分比）。barY 与 DD朋友圈转发对齐。
     CGFloat barY = 30.0, barH = 4.0;
     CGFloat barW = cardW - 2 * padX;
     UIView *track = [[UIView alloc] initWithFrame:CGRectMake(padX, barY, barW, barH)];
-    track.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.06];
+    track.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        return [UIColor colorWithWhite:tc.userInterfaceStyle == UIUserInterfaceStyleDark ? 1.0 : 0.0 alpha:0.12];
+    }];
     track.layer.cornerRadius = barH / 2.0;
     track.clipsToBounds = YES;
 
@@ -909,9 +915,9 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         unsigned int ms = (unsigned int)(duration * 1000);
         if (ms == 0) ms = 1000;
         if (ms > 60000) ms = 60000;
-        if (token) [DDProgressHub complete:token];
         dispatch_async(dispatch_get_main_queue(), ^{
             dd_send_voice(usr, tmp, ms);
+            if (token) [DDProgressHub complete:token];
         });
     });
 }
@@ -1026,9 +1032,9 @@ static void dd_voice_to_file(CMessageWrap *msg) {
         if (silk.length < 12) { if (token) [DDProgressHub complete:token]; return; }
         NSString *m4a = dd_decode_silk_to_audio(silk);
         if (!m4a.length) { if (token) [DDProgressHub complete:token]; return; }
-        if (token) [DDProgressHub complete:token];
         dispatch_async(dispatch_get_main_queue(), ^{
             dd_send_file_to_chat(usr, m4a, fn);
+            if (token) [DDProgressHub complete:token];
         });
     });
 }
