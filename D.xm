@@ -453,10 +453,12 @@ static unsigned int dd_new_voice_local_id(void) {
 // 发送语音到会话：AddLocalMsg 分配 localID → 写 SILK 到规范路径 → SaveMesVoice → ResendVoiceMsg。
 // 必须显式 setM_nsVoicePath，否则 ResendVoiceMsg 回退按 localID 重算路径易读坏文件。
 // SaveMesVoice 首参传 nil（实际两参，传 NSData 会被当路径）。
-// 数据须为合法 SILK（帧链自洽），否则丢弃不发送。
+// 数据合法性由来源侧保证：媒体转语音在各自上游已校验 SILK（L770/L675）；转发（原生语音、收藏）
+// 数据为微信产出，直接信任。故此处不重复帧链校验——收藏语音 m_dtVoice 走临时文件兜底，
+// 不含本地 .aud 的完整帧链，会被帧链校验误杀。
 static BOOL dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     NSData *data = [NSData dataWithContentsOfFile:audPath];
-    if (data.length == 0 || !dd_silk_frames_valid(data)) return NO;
+    if (data.length == 0) return NO;
     AudioSender *sender = (AudioSender *)dd_mm_service(@"AudioSender");
     if (!sender) return NO;
     CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVoiceMsgType];
