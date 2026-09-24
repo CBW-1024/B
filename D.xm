@@ -1175,7 +1175,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)dd_mediaToVoice:(id)sender {
     CMessageWrap *msg = dd_msg_of_cell(self);
     dd_media_to_voice(@"视频", msg, ^NSString *{ return dd_video_path_of_cell(self); },
-                          ^{ dd_trigger_video_download(msg); return nil; });
+                          ^MsgFileTransferTask *(void){ dd_trigger_video_download(msg); return nil; });
 }
 %end
 
@@ -1196,7 +1196,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 - (void)dd_mediaToVoice:(id)sender {
     CMessageWrap *msg = dd_msg_of_cell(self);
     dd_media_to_voice(@"文件", msg, ^NSString *{ return dd_file_path_of_msg(msg); },
-                          ^{ return dd_trigger_file_download(msg); });
+                          ^MsgFileTransferTask *(void){ return dd_trigger_file_download(msg); });
 }
 %end
 
