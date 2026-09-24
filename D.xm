@@ -1541,7 +1541,11 @@ static void ddmInjectMarkIntoComment(id c) {
 - (void)setExtFlag:(unsigned int)arg1 {
     %orig;
     if ([DDMConfig shared].disableSnsGroupFold) {
-        MSHookIvar<char>(self, "_isWeiShang") = 0;
+        Ivar wsIvar = class_getInstanceVariable([self class], "_isWeiShang");
+        if (wsIvar) {
+            char *p = (char *)(__bridge void *)self + ivar_getOffset(wsIvar);
+            *p = 0;
+        }
     }
 }
 %end
