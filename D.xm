@@ -1,14 +1,10 @@
-//  DD语音助手 —— 合并版单文件插件（Theos/Logos，arm64/arm64e，iOS 18+）
+//  DD语音助手 —— 单文件越狱插件（Theos/Logos，arm64/arm64e，iOS 18+）
 //
-//  两大功能模块：
-//    A. 语音转发（DD语音助手原生）
-//        · 收藏语音转发：把微信收藏里的语音直接转发
-//        · 语音消息转发：普通语音消息长按加「转发」
-//        · 自定义语音秒数：改写上行 PB 时长（1~60s）
-//    B. 媒体互转（原 DDMediaConvert 提取合并）
-//        · 视频 / 文件消息 →「转语音」→ SILK 语音消息
-//        · 语音消息       →「转文件」→ m4a 文件消息
-//        未下载的媒体先触发微信自动下载，下载完成后再转换。
+//  功能：
+//    · 语音转发：收藏语音 / 语音消息一键转发，长按菜单加「转发」
+//    · 自定义语音秒数：改写上行语音 PB 时长（1~60s）
+//    · 语音转换：视频 / 文件消息 →「转语音」(SILK)，语音消息 →「转文件」(m4a)
+//      （未下载的媒体先触发微信自动下载，完成后再转换）
 //
 //  方法签名锚定微信 8.0.79 头文件 dump。
 
@@ -18,7 +14,7 @@
 #import <objc/runtime.h>
 #include <string.h>
 
-#pragma mark - 微信类前向声明（两边并集，去重）
+#pragma mark - 微信类前向声明
 
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
@@ -202,7 +198,7 @@
 - (id)operationMenuItems;
 @end
 
-#pragma mark - 配置 A：语音转发 / 自定义秒数（DDVoiceConfig）
+#pragma mark - 配置：语音转发 / 自定义秒数（DDVoiceConfig）
 
 #define kDDVoiceEnableFav @"kDDVoiceEnableFav"
 #define kDDVoiceEnableMsg @"kDDVoiceEnableMsg"
@@ -266,54 +262,54 @@ static BOOL dd_voice_forward_enabled(void) {
     return c.favEnabled || c.msgEnabled;
 }
 
-#pragma mark - 配置 B：媒体互转开关（DDMediaConvertConfig）
+#pragma mark - 配置：语音转换开关（DDVoiceConvertConfig）
 
-#define kDDMCVideoToVoice @"kDDMCVideoToVoice"
-#define kDDMCFileToVoice  @"kDDMCFileToVoice"
-#define kDDMCVoiceToFile  @"kDDMCVoiceToFile"
+#define kDDVCVideoToVoice @"kDDVCVideoToVoice"
+#define kDDVCFileToVoice  @"kDDVCFileToVoice"
+#define kDDVCVoiceToFile  @"kDDVCVoiceToFile"
 
-#define kDDMCAppMsgType   49
-#define kDDMCAppInnerFile 6
-#define kDDMCVoiceSampleRate 16000
-#define kDDMCDownloadTimeout 90.0
+#define kDDVCAppMsgType   49
+#define kDDVCAppInnerFile 6
+#define kDDVCVoiceSampleRate 16000
+#define kDDVCDownloadTimeout 90.0
 
-@interface DDMediaConvertConfig : NSObject
+@interface DDVoiceConvertConfig : NSObject
 + (instancetype)shared;
 @property (assign, nonatomic) BOOL videoToVoiceEnabled;
 @property (assign, nonatomic) BOOL fileToVoiceEnabled;
 @property (assign, nonatomic) BOOL voiceToFileEnabled;
 @end
 
-@implementation DDMediaConvertConfig
+@implementation DDVoiceConvertConfig
 + (instancetype)shared {
-    static DDMediaConvertConfig *c = nil;
+    static DDVoiceConvertConfig *c = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ c = [DDMediaConvertConfig new]; });
+    dispatch_once(&once, ^{ c = [DDVoiceConvertConfig new]; });
     return c;
 }
 + (void)initialize {
-    if (self != [DDMediaConvertConfig class]) return;
+    if (self != [DDVoiceConvertConfig class]) return;
     [NSUserDefaults.standardUserDefaults registerDefaults:@{
-        kDDMCVideoToVoice: @NO, kDDMCFileToVoice: @NO, kDDMCVoiceToFile: @NO,
+        kDDVCVideoToVoice: @NO, kDDVCFileToVoice: @NO, kDDVCVoiceToFile: @NO,
     }];
 }
 - (instancetype)init {
     if (self = [super init]) {
-        _videoToVoiceEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDMCVideoToVoice];
-        _fileToVoiceEnabled  = [NSUserDefaults.standardUserDefaults boolForKey:kDDMCFileToVoice];
-        _voiceToFileEnabled  = [NSUserDefaults.standardUserDefaults boolForKey:kDDMCVoiceToFile];
+        _videoToVoiceEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVCVideoToVoice];
+        _fileToVoiceEnabled  = [NSUserDefaults.standardUserDefaults boolForKey:kDDVCFileToVoice];
+        _voiceToFileEnabled  = [NSUserDefaults.standardUserDefaults boolForKey:kDDVCVoiceToFile];
     }
     return self;
 }
-- (void)setVideoToVoiceEnabled:(BOOL)v { _videoToVoiceEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDMCVideoToVoice]; }
-- (void)setFileToVoiceEnabled:(BOOL)v { _fileToVoiceEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDMCFileToVoice]; }
-- (void)setVoiceToFileEnabled:(BOOL)v { _voiceToFileEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDMCVoiceToFile]; }
+- (void)setVideoToVoiceEnabled:(BOOL)v { _videoToVoiceEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVCVideoToVoice]; }
+- (void)setFileToVoiceEnabled:(BOOL)v { _fileToVoiceEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVCFileToVoice]; }
+- (void)setVoiceToFileEnabled:(BOOL)v { _voiceToFileEnabled = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kDDVCVoiceToFile]; }
 @end
 
 // 编解码非线程安全，所有媒体转换统一走此串行队列。
 static dispatch_queue_t dd_convert_queue;
 
-#pragma mark - 通用工具（去重，仅一份）
+#pragma mark - 通用工具
 
 static BOOL dd_file_exists(NSString *path) {
     return path.length && [[NSFileManager defaultManager] fileExistsAtPath:path];
@@ -344,7 +340,7 @@ static NSString *dd_chat_usr_of_msg(CMessageWrap *msg) {
     return [objc_getClass("CMessageWrap") isSenderFromMsgWrap:msg] ? msg.m_nsToUsr : msg.m_nsFromUsr;
 }
 
-#pragma mark - 语音扩展信息（统一 dd_voice_extend_info(create)）
+#pragma mark - 语音扩展信息（dd_voice_extend_info）
 
 static id dd_voice_extend_info(id wrap, BOOL create) {
     id ext = [wrap m_extendInfoWithMsgType];
@@ -370,7 +366,7 @@ static BOOL dd_inject_voice_data(id wrap, NSData *voiceData) {
     return YES;
 }
 
-#pragma mark - 自定义语音秒数（唯一落点）
+#pragma mark - 自定义语音秒数
 
 // 秒 → 毫秒（m_uiVoiceTime 单位为毫秒）。关闭/空/0 → 原样返回；
 // 超出 1~60 钳到边界；声明时长超过真实音频时长则回退真实值。
@@ -439,9 +435,9 @@ static NSString *dd_audio_path_for_msg(id msg) {
     return tmp;
 }
 
-#pragma mark - 语音发送（统一用 DDMediaConvert 验证栈）
+#pragma mark - 语音发送
 
-// 下列函数在文件后部（媒体互转区）定义，供本区 dd_send_voice 调用，先前向声明。
+// 下列函数在文件后部（语音转换区）定义，供本区 dd_send_voice 调用，先前向声明。
 static BOOL dd_silk_frames_valid(NSData *d);
 static void dd_configure_voice_msg(id wrap, NSData *voiceData, unsigned int duration);
 static NSString *dd_install_audio_file(CMessageWrap *wrap, NSString *src);
@@ -547,7 +543,7 @@ static void dd_append_voice_msg(id favItem, id controller) {
     [(NSMutableArray *)store addObject:wrap];
 }
 
-#pragma mark - 媒体互转：路径解析
+#pragma mark - 语音转换：路径解析
 
 // 含音轨 / 可复用容器白名单。视频路径解析与文件菜单准入共用。
 // 音频视频容器可由 AVAssetReader 抽音轨再编 SILK；图片/文档无音轨，一律排除；
@@ -592,7 +588,7 @@ static NSString *dd_voice_path_of_msg(CMessageWrap *msg) {
     return p;
 }
 
-#pragma mark - 媒体互转：自动下载
+#pragma mark - 语音转换：自动下载
 
 static void dd_trigger_video_download(CMessageWrap *msg) {
     if (!msg) return;
@@ -622,7 +618,7 @@ static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval
     return nil;
 }
 
-#pragma mark - 媒体互转：SILK 容器
+#pragma mark - 语音转换：SILK 容器
 
 // 微信 .aud 头部为 \x02#!SILK_V3（10 字节）；MJSilkCodec 仅吐 9 字节 #!SILK_V3，须补前导 0x02。
 static BOOL dd_silk_has_magic9(NSData *d) {
@@ -675,7 +671,7 @@ static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     return pcm.length ? pcm : nil;
 }
 
-#pragma mark - 媒体互转：语音构造与发送
+#pragma mark - 语音转换：语音构造与发送
 
 // 填充语音消息扩展信息与 voicemsg XML 正文。
 // 不写正文则微信重启重建消息时拿到空正文 → 当作未完成语音自动重发。
@@ -719,7 +715,7 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
     if (!track) return nil;
     NSDictionary *outSettings = @{
         AVFormatIDKey: @(kAudioFormatLinearPCM),
-        AVSampleRateKey: @(kDDMCVoiceSampleRate),
+        AVSampleRateKey: @(kDDVCVoiceSampleRate),
         AVNumberOfChannelsKey: @1,
         AVLinearPCMBitDepthKey: @16,
         AVLinearPCMIsFloatKey: @NO,
@@ -749,7 +745,7 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         NSString *path = pathBlock();
         if (!dd_file_exists(path)) {
             if (downloadBlock) downloadBlock();
-            path = dd_wait_local_path(pathBlock, kDDMCDownloadTimeout);
+            path = dd_wait_local_path(pathBlock, kDDVCDownloadTimeout);
         }
         if (!dd_file_exists(path)) return;
         double duration = 0;
@@ -761,11 +757,11 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
             if (!dd_silk_frames_valid(raw)) return;
             aud = raw;
             NSData *pcm = dd_decode_silk_to_pcm(raw);
-            duration = (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2);
+            duration = (double)pcm.length / (double)(kDDVCVoiceSampleRate * 2);
         } else {
             NSData *pcm = dd_extract_pcm(path, &duration);
             if (pcm.length == 0) return;
-            duration = (double)pcm.length / (double)(kDDMCVoiceSampleRate * 2);
+            duration = (double)pcm.length / (double)(kDDVCVoiceSampleRate * 2);
             aud = dd_encode_pcm_to_silk(pcm);
             if (aud.length == 0) return;
         }
@@ -781,12 +777,12 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
     });
 }
 
-#pragma mark - 媒体互转：语音 → 文件
+#pragma mark - 语音转换：语音 → 文件
 
 // PCM → WAV（44 字节 RIFF 头，16bit / 单声道 / 16000Hz）。
 static NSData *dd_wav_of_pcm(NSData *pcm) {
     if (pcm.length == 0) return nil;
-    const uint32_t sampleRate = (uint32_t)kDDMCVoiceSampleRate;
+    const uint32_t sampleRate = (uint32_t)kDDVCVoiceSampleRate;
     const uint16_t channels = 1, bits = 16;
     unsigned char hdr[44] = {0};
     uint32_t riffSize = (uint32_t)(36 + pcm.length);
@@ -839,7 +835,7 @@ static NSString *dd_persist_copy(NSString *src) {
     NSString *dir = (NSString *)[objc_getClass("CUtility") GetDocPath];
     if (![dir isKindOfClass:[NSString class]] || dir.length == 0) return nil;
     NSString *dst = [dir stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"ddmc_voice_%@.m4a", [[NSUUID UUID] UUIDString]]];
+        [NSString stringWithFormat:@"ddvc_voice_%@.m4a", [[NSUUID UUID] UUIDString]]];
     return [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
 }
 // 发送 m4a 文件消息：AddAppMsg 本地落库 → StartUploadAppMsg 触发上传。
@@ -851,15 +847,15 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     if (fdata.length == 0) return NO;
     unsigned long long fsize = fdata.length;
 
-    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDMCAppMsgType];
-    [wrap setM_uiMessageType:kDDMCAppMsgType];
+    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVCAppMsgType];
+    [wrap setM_uiMessageType:kDDVCAppMsgType];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
     [wrap setM_nsToUsr:usr];
     [wrap setM_uiCreateTime:[(MMNewSessionMgr *)dd_mm_service(@"MMNewSessionMgr") GenSendMsgTime]];
     [wrap setM_uiStatus:kDDMsgStatusSending];
 
     CExtendInfoOfAPP *app = [[objc_getClass("CExtendInfoOfAPP") alloc] init];
-    [app setM_uiAppMsgInnerType:kDDMCAppInnerFile];
+    [app setM_uiAppMsgInnerType:kDDVCAppInnerFile];
     [app setM_nsAppFileName:fileName];
     [app setM_nsAppFileExt:@"m4a"];
     [app setM_uiAppDataSize:fsize];
@@ -897,7 +893,7 @@ static void dd_voice_to_file(CMessageWrap *msg) {
     });
 }
 
-#pragma mark - 媒体互转：菜单注入
+#pragma mark - 语音转换：菜单注入
 
 // 文件消息「转语音」准入：扩展名需命中白名单。菜单构建阶段只判消息自带字段，不解析路径。
 static BOOL dd_file_has_audio(CMessageWrap *msg) {
@@ -912,7 +908,7 @@ static BOOL dd_file_has_audio(CMessageWrap *msg) {
 }
 // 用 userInfo 标记去重（MMMenuItem 无 title/action getter）。
 static NSString *dd_menu_token(SEL action) {
-    return [@"ddmc:" stringByAppendingString:NSStringFromSelector(action)];
+    return [@"ddvc:" stringByAppendingString:NSStringFromSelector(action)];
 }
 // 注入菜单项（svg 图标 + 标题，一级平铺项）。已注入则跳过。
 static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSString *title, SEL action) {
@@ -1028,11 +1024,11 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 
 %hook VideoMessageCellView
 - (NSArray *)operationMenuItems {
-    return dd_inject_items(self, %orig, [DDMediaConvertConfig shared].videoToVoiceEnabled,
+    return dd_inject_items(self, %orig, [DDVoiceConvertConfig shared].videoToVoiceEnabled,
                            @"转语音", @selector(dd_mediaToVoice:));
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(dd_mediaToVoice:) && [DDMediaConvertConfig shared].videoToVoiceEnabled) return YES;
+    if (action == @selector(dd_mediaToVoice:) && [DDVoiceConvertConfig shared].videoToVoiceEnabled) return YES;
     return %orig;
 }
 %new
@@ -1048,12 +1044,12 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 %hook AppFileMessageCellView
 - (NSArray *)operationMenuItems {
     if (!dd_file_has_audio(dd_msg_of_cell(self))) return %orig;
-    return dd_inject_items(self, %orig, [DDMediaConvertConfig shared].fileToVoiceEnabled,
+    return dd_inject_items(self, %orig, [DDVoiceConvertConfig shared].fileToVoiceEnabled,
                            @"转语音", @selector(dd_mediaToVoice:));
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (action == @selector(dd_mediaToVoice:))
-        return [DDMediaConvertConfig shared].fileToVoiceEnabled && dd_file_has_audio(dd_msg_of_cell(self));
+        return [DDVoiceConvertConfig shared].fileToVoiceEnabled && dd_file_has_audio(dd_msg_of_cell(self));
     return %orig;
 }
 %new
@@ -1064,7 +1060,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 }
 %end
 
-#pragma mark - Hook：语音消息（合并）→ 转文件 + 转发
+#pragma mark - Hook：语音消息 → 转文件 + 转发
 
 %hook VoiceMessageCellView
 - (NSArray *)operationMenuItems {
@@ -1072,7 +1068,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     NSMutableArray *items = [NSMutableArray arrayWithCapacity:original.count + 2];
     [items addObjectsFromArray:original];
     // 语音转文件：注入 svg 图标项（带 userInfo 去重）。
-    if ([DDMediaConvertConfig shared].voiceToFileEnabled) {
+    if ([DDVoiceConvertConfig shared].voiceToFileEnabled) {
         NSString *token = dd_menu_token(@selector(dd_voiceToFile:));
         BOOL have = NO;
         for (MMMenuItem *it in items) {
@@ -1097,7 +1093,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     return items;
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(dd_voiceToFile:) && [DDMediaConvertConfig shared].voiceToFileEnabled) return YES;
+    if (action == @selector(dd_voiceToFile:) && [DDVoiceConvertConfig shared].voiceToFileEnabled) return YES;
     if (action == @selector(onForward:) && dd_voice_msg_enabled()) return YES;
     return %orig;
 }
@@ -1111,14 +1107,14 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 }
 %end
 
-#pragma mark - 设置界面（唯一入口：DDVoiceSettingsViewController）
+#pragma mark - 设置界面（唯一入口：DDSettingsViewController）
 
-@interface DDVoiceSettingsViewController : UIViewController <UITableViewDelegate, UITextFieldDelegate>
+@interface DDSettingsViewController : UIViewController <UITableViewDelegate, UITextFieldDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @property (nonatomic, strong) UITextField *secondsField;
 @end
 
-@implementation DDVoiceSettingsViewController {
+@implementation DDSettingsViewController {
     id<UITableViewDelegate> _originalDelegate;
 }
 - (void)ensureTableViewMgr {
@@ -1180,8 +1176,8 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     [sec addCell:[cellMgr switchCellForSel:@selector(onMsgSwitch:) target:self title:@"语音消息转发" on:cfg.msgEnabled]];
     [_tableViewManager addSection:sec];
 
-    // 分组二：语音转换设置（媒体互转）
-    DDMediaConvertConfig *mc = [DDMediaConvertConfig shared];
+    // 分组二：语音转换设置（语音转换）
+    DDVoiceConvertConfig *mc = [DDVoiceConvertConfig shared];
     WCTableViewSectionManager *sec2 = [secMgr sectionWithHeader:@"语音转换设置"];
     if (sec2) {
         [sec2 addCell:[cellMgr switchCellForSel:@selector(onVideoToVoiceSwitch:) target:self title:@"视频转语音" on:mc.videoToVoiceEnabled]];
@@ -1207,9 +1203,9 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 }
 - (void)onFavSwitch:(UISwitch *)s { [DDVoiceConfig sharedConfig].favEnabled = s.on; }
 - (void)onMsgSwitch:(UISwitch *)s { [DDVoiceConfig sharedConfig].msgEnabled = s.on; }
-- (void)onVideoToVoiceSwitch:(UISwitch *)s { [DDMediaConvertConfig shared].videoToVoiceEnabled = s.on; }
-- (void)onFileToVoiceSwitch:(UISwitch *)s  { [DDMediaConvertConfig shared].fileToVoiceEnabled = s.on; }
-- (void)onVoiceToFileSwitch:(UISwitch *)s  { [DDMediaConvertConfig shared].voiceToFileEnabled = s.on; }
+- (void)onVideoToVoiceSwitch:(UISwitch *)s { [DDVoiceConvertConfig shared].videoToVoiceEnabled = s.on; }
+- (void)onFileToVoiceSwitch:(UISwitch *)s  { [DDVoiceConvertConfig shared].fileToVoiceEnabled = s.on; }
+- (void)onVoiceToFileSwitch:(UISwitch *)s  { [DDVoiceConvertConfig shared].voiceToFileEnabled = s.on; }
 // 开关切换即重建表格（开启则展开输入框）
 - (void)onSecondsSwitch:(UISwitch *)s {
     [DDVoiceConfig sharedConfig].voiceSecondsEnabled = s.isOn;
@@ -1260,9 +1256,9 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 
 %ctor {
     @autoreleasepool {
-        dd_convert_queue = dispatch_queue_create("com.ddmc.convert", DISPATCH_QUEUE_SERIAL);
+        dd_convert_queue = dispatch_queue_create("com.ddvc.convert", DISPATCH_QUEUE_SERIAL);
         [[objc_getClass("WCPluginsMgr") sharedInstance] registerControllerWithTitle:@"DD语音助手"
                                                                           version:@"1.3.0"
-                                                                       controller:@"DDVoiceSettingsViewController"];
+                                                                       controller:@"DDSettingsViewController"];
     }
 }
