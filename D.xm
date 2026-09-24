@@ -34,8 +34,6 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
 @end
 
-@class WCContentItem;
-
 @interface WCDataItem : NSObject
 @property (retain, nonatomic) WCContentItem *contentObj;
 @property (retain, nonatomic) NSString *contentDesc;
