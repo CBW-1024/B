@@ -617,11 +617,14 @@ static MsgFileTransferTask *dd_trigger_file_download(CMessageWrap *msg) {
     });
     return task;
 }
-// 等待文件下载完成：轮询落盘路径，文件存在且非空即返回。进度提示为 indeterminate 样式，无需上报数值。
-static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
+// 等待媒体真正落盘：以 transfer task 的真实完成态为准（filePath / isCompleted），
+// 无 task 时（视频）回退到 pathBlock 路径轮询。文件存在且非空即返回。indeterminate 提示，无需上报数值。
+static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout, MsgFileTransferTask *task) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     while ([deadline timeIntervalSinceNow] > 0) {
-        NSString *p = pathBlock();
+        // 优先用 transfer task 的真实落盘路径；无 task（视频）或尚未就绪时回退到 pathBlock。
+        NSString *tp = (task && [task respondsToSelector:@selector(filePath)]) ? [task filePath] : nil;
+        NSString *p = (tp.length ? tp : (pathBlock ? pathBlock() : nil));
         if (dd_file_exists(p)) {
             NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
             long long sz = a ? [a[NSFileSize] longLongValue] : 0;
@@ -630,13 +633,6 @@ static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval
         [NSThread sleepForTimeInterval:0.5];
     }
     return nil;
-}
-// 媒体文件是否真正就绪：路径存在且非空。占位/空文件判定为未就绪，仍须先下载。
-static BOOL dd_media_file_ready(NSString *path) {
-    if (!dd_file_exists(path)) return NO;
-    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    long long sz = a ? [a[NSFileSize] longLongValue] : 0;
-    return sz > 0;
 }
 
 #pragma mark - 进度提示（单卡聚合多任务）
@@ -657,6 +653,9 @@ static UIWindow *dd_progress_key_window(void) {
 @implementation DDProgressHub
 
 static const NSInteger kDDHubTag = 0x44444801;
+static const NSTimeInterval kDDHubMinShow = 0.6;  // 最短展示时长，避免转换过快导致浮卡闪一下
+static NSTimeInterval dd_hub_shown_at = 0;
+static BOOL dd_hub_dismissing = NO;
 
 + (NSMutableDictionary<NSString *, NSNumber *> *)dd_tasks {
     static NSMutableDictionary *d;
@@ -739,6 +738,8 @@ static const NSInteger kDDHubTag = 0x44444801;
     objc_setAssociatedObject(card, "ddhTitle", title, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [win addSubview:card];
     [UIView animateWithDuration:0.2 animations:^{ card.alpha = 1.0; }];
+    dd_hub_shown_at = [NSDate timeIntervalSinceReferenceDate];
+    dd_hub_dismissing = NO;
     return card;
 }
 + (void)dd_render {
@@ -756,8 +757,15 @@ static const NSInteger kDDHubTag = 0x44444801;
     UIWindow *win = dd_progress_key_window();
     UIView *card = win ? [win viewWithTag:kDDHubTag] : nil;
     if (!card) return;
-    [UIView animateWithDuration:0.2 animations:^{ card.alpha = 0; }
-                     completion:^(BOOL f){ [card removeFromSuperview]; }];
+    if (dd_hub_dismissing) return;
+    dd_hub_dismissing = YES;
+    NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - dd_hub_shown_at;
+    NSTimeInterval delay = elapsed < kDDHubMinShow ? (kDDHubMinShow - elapsed) : 0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.2 animations:^{ card.alpha = 0; }
+                         completion:^(BOOL f){ [card removeFromSuperview]; dd_hub_dismissing = NO; }];
+    });
 }
 @end
 
@@ -886,12 +894,10 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
     NSString *usr = dd_chat_usr_of_msg(msg);
     dispatch_async(dd_convert_queue, ^{
         NSString *token = [DDProgressHub begin];
-        NSString *path = pathBlock();
-        // 路径存在但内容未就绪（占位/空文件）→ 仍触发下载再等待。
-        if (!dd_media_file_ready(path)) {
-            if (downloadBlock) downloadBlock();
-            path = dd_wait_local_path(pathBlock, kDDVCDownloadTimeout);
-        }
+        // 直接以 transfer task 的真实完成态为准：取得/发起下载任务，再等待真正落盘。
+        // 已下完的 task 立即返回，不会误跳过下载，也不会因“猜路径”与真实落盘路径不一致而误判超时。
+        MsgFileTransferTask *task = downloadBlock ? downloadBlock() : nil;
+        NSString *path = dd_wait_local_path(pathBlock, kDDVCDownloadTimeout, task);
         double duration = 0;
         NSData *aud = nil;
         // 按扩展名路由：aud/silk 为微信 SILK 终态，原样复用；其余抽 PCM 再编码为 SILK。
