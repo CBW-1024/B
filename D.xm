@@ -163,9 +163,7 @@
 + (id)encodeToSilkFromPCMData:(id)a0;
 @end
 
-// 微信原生文件下载抽象：AppFileMessageCellView.onClkDownload / fileTransferTask:onProgress:completed: 同款。
-// 直接调 CMessageMgr StartDownloadAppAttach:MsgWrap: 第一参是 delegate/viewController，传 nil 只会
-// “登记”而不真正拉取数据（→ 用户看到的“触发一下就停了”）。改用 task，由微信内部统一驱动 CDN 下载 + 进度。
+// 微信原生文件下载任务（AppFileMessageCellView 的「下载」同款）。需在主线程发起，filePath 为落盘路径。
 @interface MsgFileTransferTask : NSObject
 + (id)taskFromMessageWrap:(id)msgWrap;
 - (id)filePath;
@@ -581,14 +579,7 @@ static NSString *dd_video_path_of_cell(id cell) {
     if (![dd_media_ext_set() containsObject:p.pathExtension.lowercaseString]) return nil;
     return p;
 }
-// 文件消息本地路径（WCR 干净做法）：直接把消息 wrap 自身传给 +[CMessageWrap GetPathOfAppData:(id)]，
-// 由微信按该 wrap 的真实 localID/用户名算出落盘路径，按消息区分、不依赖外部用户名。
-// 旧写法 GetPathOfAppDataByUserName:... 按「用户名+消息」算「预期路径」，对未下载文件会返回
-// 已存在的占位路径（→ 跳过下载 → 不同文件转出相同语音），且一旦 dd_current_usr_name 算错会让
-// 所有文件落到同一路径。GetPathOfAppData:(id) 不碰用户名，从根上规避这两类「所有语音都一样」。
-// ⚠️ 关键：WCR 取证确认该方法的实参是 CMessageWrap 实例本身（WCR 以 objc_storeWeak 持有该实参后传入），
-// 方法内部对实参发 m_uiMesLocalID 等消息取路径。传 localID 的 NSNumber 会让 NSNumber 收到未识别
-// selector → 文件转语音直接闪退。故此处必须传 msg 而非 @(msg.m_uiMesLocalID)。
+// 文件消息本地路径：传消息 wrap 本身给 +[CMessageWrap GetPathOfAppData:(id)]，由微信按该消息算出真实落盘路径。
 static NSString *dd_file_path_of_msg(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return nil;
     NSString *p = (NSString *)[objc_getClass("CMessageWrap") GetPathOfAppData:msg];
@@ -617,10 +608,7 @@ static void dd_run_on_main_sync(void(^block)(void)) {
     dispatch_async(dispatch_get_main_queue(), ^{ block(); dispatch_semaphore_signal(sem); });
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
 }
-// 触发文件下载（微信原生 MsgFileTransferTask 方式）。⚠️ 不走 CMessageMgr StartDownloadAppAttach：
-// 该 API 第一参是 delegate/viewController，传 nil 只会“登记”而不真正拉取数据（→ “触发一下就停了”）。
-// 原生文件下载由 MsgFileTransferTask 驱动（AppFileMessageCellView.onClkDownload 同款），内部统一走
-// CDN 拉取 + 进度回调 + modMsgStatus，filePath 即落盘路径。需在主线程发起。
+// 触发文件下载：用微信原生文件传输任务发起（AppFileMessageCellView 的「下载」同款）。
 static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     if (!dd_is_msg_wrap(msg)) return NO;
     __block BOOL ok = NO;
@@ -630,7 +618,7 @@ static BOOL dd_trigger_file_download(CMessageWrap *msg) {
     });
     return ok;
 }
-// 等待文件下载完成：轮询落盘路径，文件存在且非空即返回。微信 transfer task 写完才落最终路径，无需两轮校验。
+// 等待文件下载完成：轮询落盘路径，文件存在且非空即返回。
 static NSString *dd_wait_local_path(NSString *(^pathBlock)(void), NSTimeInterval timeout) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     while ([deadline timeIntervalSinceNow] > 0) {
@@ -771,9 +759,7 @@ static NSData *dd_extract_pcm(NSString *mediaPath, double *outDuration) {
     }
     return reader.status == AVAssetReaderStatusCompleted ? pcm : nil;
 }
-// 媒体 → 语音：确保已下载 → 抽音轨/复用 SILK → 编码 → 发送。
-// 修复：下载就绪判定改为"文件非空且就绪"，杜绝占位/空路径跳过下载；
-// 解码按文件魔术字节判定 SILK（不再依赖扩展名，下载文件可能无扩展名）。
+// 媒体 → 语音：未下载则先触发下载，完成后抽音轨 / 复用 SILK，编码成微信语音后发送。
 static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^pathBlock)(void), void(^downloadBlock)(void)) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
@@ -786,9 +772,7 @@ static void dd_media_to_voice(NSString *tag, CMessageWrap *msg, NSString *(^path
         }
         double duration = 0;
         NSData *aud = nil;
-        // 文件消息本地路径必带原始扩展名（文件名来自 CExtendInfoOfAPP.m_nsAppFileName），
-        // 微信也按扩展名分派格式，故按扩展名路由即可：aud/silk 是微信 SILK → 原样复用；
-        // 其余（mp3/wav/m4a/mov/mp4…）抽 PCM 再编码。不再靠魔术字节判类型。
+        // 按扩展名路由：aud/silk 为微信 SILK 终态，原样复用；其余抽 PCM 再编码为 SILK。
         NSString *ext = path.pathExtension.lowercaseString;
         if ([ext isEqualToString:@"aud"] || [ext isEqualToString:@"silk"]) {
             NSData *raw = [NSData dataWithContentsOfFile:path];
@@ -1296,7 +1280,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     @autoreleasepool {
         dd_convert_queue = dispatch_queue_create("com.ddvc.convert", DISPATCH_QUEUE_SERIAL);
         [[objc_getClass("WCPluginsMgr") sharedInstance] registerControllerWithTitle:@"DD语音助手"
-                                                                          version:@"1.3.0"
+                                                                          version:@"1.0.0"
                                                                        controller:@"DDSettingsViewController"];
     }
 }
