@@ -19,7 +19,7 @@
 
 #pragma mark - 微信私有接口声明
 
-// 微信“我”页设置入口，用于注册本插件设置页。
+// 微信“我”页插件管理入口，用于注册本插件设置页。
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -1572,7 +1572,7 @@ static void ddmInjectMarkIntoComment(id c) {
 
 #pragma mark - 注册入口
 
-// 将设置页注册到微信“我”页（依赖第三方 WCPluginsMgr，做存在性守卫避免启动崩溃）。
+// 将设置页注册到微信“我”页插件管理（依赖第三方 WCPluginsMgr，做存在性守卫避免启动崩溃）。
 %ctor {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
