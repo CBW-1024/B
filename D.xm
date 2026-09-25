@@ -19,7 +19,7 @@
 
 #pragma mark - 微信私有接口声明
 
-// 微信插件管理入口，用于注册本插件设置页。
+// 微信“我”页设置入口，用于注册本插件设置页。
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -243,6 +243,7 @@ static NSString * const kDDMRemoveOriginalLoc    = @"DDMoments_removeOriginalLoc
 // 已删评论标记。
 static NSString * const kDDMDeletedCommentMark   = @"DDMoments_deletedCommentMark";
 static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
+static char kDDMForwardTextKey;
 
 @interface DDMConfig : NSObject
 @property (assign, nonatomic) BOOL forwardEnabled;          // 启用一键转发（总开关；开启时展开“移除原始位置”）
@@ -505,14 +506,12 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
 #pragma mark - 转发引擎
 
 @interface DDMEngine : NSObject
-@property (nonatomic, strong) NSString *pendingText;
-@property (nonatomic, assign) NSTimeInterval pendingTextStamp;
 @property (nonatomic, assign) BOOL busy;
 @property (nonatomic, strong) id retainedCommentDetailVC;
 @property (nonatomic, weak) UIWindow *ddmWindow;   // 进度卡挂载的窗口，由触发浮窗直接给出
 + (instancetype)shared;
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView;
-- (NSString *)consumePendingText;
+- (void)ddmAttachCaptionOf:(WCDataItem *)item toCommitVC:(WCNewCommitViewController *)vc;
 @end
 
 // 进度浮卡：窗口宽度变化时按当前宽度重排子视图。
@@ -994,7 +993,6 @@ static UIColor *ddm_track_bg(void) {
     SightDraft *draft = thumb ? [draftCls draftWithVideoURL:url thumbImage:thumb]
                               : [draftCls draftWithVideoURL:url];
 
-    [self stashTextOf:item];
     [self dismissHUD];
 
     [self ddmPushSightCommit:draft item:item host:host];
@@ -1034,7 +1032,6 @@ static UIColor *ddm_track_bg(void) {
     }
 
     if (assets.count == 0) { [self presentLegacyForward:item host:host]; return; }
-    [self stashTextOf:item];
     [self dismissHUD];
     [self ddmPushImageCommit:assets item:item host:host];
     self.busy = NO;
@@ -1072,25 +1069,6 @@ static UIColor *ddm_track_bg(void) {
     return mmImg;
 }
 
-#pragma mark 文案暂存
-
-// 暂存原帖文案，供发布器回填。
-- (void)stashTextOf:(WCDataItem *)item {
-    NSString *text = item.contentDesc;
-    text = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    self.pendingText = text.length > 0 ? text : nil;
-    self.pendingTextStamp = NSDate.date.timeIntervalSince1970;
-}
-
-// 取出暂存文案（8s 内有效）。
-- (NSString *)consumePendingText {
-    NSString *t = self.pendingText;
-    self.pendingText = nil;
-    if (!t) return nil;
-    if (NSDate.date.timeIntervalSince1970 - self.pendingTextStamp > 8.0) return nil;
-    return t;
-}
-
 #pragma mark 路由调用
 
 // 生成发布上报会话（优先宿主 VC 方法，回退默认构造）。
@@ -1124,6 +1102,14 @@ static UIColor *ddm_track_bg(void) {
     }
 }
 
+// 把原帖文案贴到发布器 VC 实例（关联对象），供文本框初始化时回填；绑定到具体 VC 避免文案泄漏到无关发布。
+- (void)ddmAttachCaptionOf:(WCDataItem *)item toCommitVC:(WCNewCommitViewController *)vc {
+    if (!vc || !item) return;
+    NSString *text = [item.contentDesc stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (text.length == 0) return;
+    objc_setAssociatedObject(vc, &kDDMForwardTextKey, text, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 // 视频发布：构造 WCNewCommitViewController(sightDraft) 并推入。
 - (void)ddmPushSightCommit:(id)draft item:(WCDataItem *)item host:(UIViewController *)host {
     Class cls = objc_getClass("WCNewCommitViewController");
@@ -1135,6 +1121,7 @@ static UIColor *ddm_track_bg(void) {
         self.retainedCommentDetailVC = detail;
     }
     [self ddmApplyLocation:[item locationInfo] toCommitVC:vc];
+    [self ddmAttachCaptionOf:item toCommitVC:vc];
     [self ddmPresentCommitVC:vc host:host];
 }
 
@@ -1143,6 +1130,7 @@ static UIColor *ddm_track_bg(void) {
     Class cls = objc_getClass("WCNewCommitViewController");
     WCNewCommitViewController *vc = [(WCNewCommitViewController *)[cls alloc] initWithImages:[assets mutableCopy] contacts:nil];
     [self ddmApplyLocation:[item locationInfo] toCommitVC:vc];
+    [self ddmAttachCaptionOf:item toCommitVC:vc];
     [self ddmPresentCommitVC:vc host:host];
 }
 
@@ -1329,10 +1317,10 @@ static char kDDMLineKey;
     if (self.m_isUseMMAsset) self.bHideAddView = NO;
 }
 
-// 文本框初始化后回填暂存文案。
+// 文本框初始化后回填绑定到本 VC 的原帖文案。
 - (void)initTextViewContent {
     %orig;
-    NSString *text = [[DDMEngine shared] consumePendingText];
+    NSString *text = objc_getAssociatedObject(self, &kDDMForwardTextKey);
     if (text.length == 0) return;
     UITextView *tv = self.textView.textView;
     if (![tv isKindOfClass:UITextView.class]) return;
@@ -1584,7 +1572,7 @@ static void ddmInjectMarkIntoComment(id c) {
 
 #pragma mark - 注册入口
 
-// 将设置页注册到插件管理（依赖第三方 WCPluginsMgr，做存在性守卫避免启动崩溃）。
+// 将设置页注册到微信“我”页（依赖第三方 WCPluginsMgr，做存在性守卫避免启动崩溃）。
 %ctor {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
