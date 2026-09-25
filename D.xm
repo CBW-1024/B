@@ -1185,6 +1185,7 @@ static UIImage *DDMShareIcon(void) {
 
 static char kDDMShareBtnKey;
 static char kDDMLineKey;
+static char kDDMSizedKey;
 
 @interface WCOperateFloatView (DDMoments)
 - (void)ddm_onForwardTapped:(UIButton *)sender;
@@ -1204,6 +1205,23 @@ static char kDDMLineKey;
 - (void)showWithItemData:(id)itemData tipPoint:(struct CGPoint)tipPoint {
     %orig;
     [self initForwardLineView];
+    // 在微信入场动画前先把浮窗定型为三列并居中一次，使转发列随弹窗一起平滑入场。
+    UIButton *cmt = self.m_commentBtn;
+    UIButton *like = self.m_likeBtn;
+    if (cmt && like && cmt.frame.size.width > 0 && like.frame.size.width > 0) {
+        CGFloat gap = cmt.frame.origin.x - (like.frame.origin.x + like.frame.size.width);
+        if (gap <= 0 || gap > 60) gap = 8.0;
+        CGFloat needW = CGRectGetMaxX(cmt.frame) + gap + cmt.frame.size.width;
+        if (fabs(self.bounds.size.width - needW) > 0.5) {
+            CGPoint c = self.center;
+            CGRect fr = self.frame;
+            fr.size.width = needW;
+            self.frame = fr;
+            self.center = CGPointMake(c.x, c.y);
+            if (self.superview) self.center = CGPointMake(self.superview.bounds.size.width / 2.0, self.center.y);
+        }
+        objc_setAssociatedObject(self, &kDDMSizedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
 }
 
 %new
@@ -1287,14 +1305,20 @@ static char kDDMLineKey;
         if (!CGRectEqualToRect(line.frame, lf)) line.frame = lf;
     }
 
-    // 第三列：仅加宽外层 self（承载容器 / 圆角背景若设 autoresizing 会跟随拉伸）；不动 center，避免打断微信入场动画。
-    CGFloat needW = CGRectGetMaxX(target) + likeBtn.frame.origin.x;
-    if (fabs(self.bounds.size.width - needW) > 0.5) {
-        CGPoint center = self.center;
-        CGRect f = self.frame;
-        f.size.width = needW;
-        self.frame = f;
-        self.center = CGPointMake(center.x, center.y);
+    // 第三列：仅在尚未定型时把外层 self 加宽并居中一次，避免动画过程中反复改 frame 导致转发列出现不流畅。
+    if (![objc_getAssociatedObject(self, &kDDMSizedKey) boolValue]) {
+        CGFloat needW = CGRectGetMaxX(target) + likeBtn.frame.origin.x;
+        if (fabs(self.bounds.size.width - needW) > 0.5) {
+            CGPoint center = self.center;
+            CGRect f = self.frame;
+            f.size.width = needW;
+            self.frame = f;
+            self.center = CGPointMake(center.x, center.y);
+            if (self.superview) {
+                self.center = CGPointMake(self.superview.bounds.size.width / 2.0, self.center.y);
+            }
+        }
+        objc_setAssociatedObject(self, &kDDMSizedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
