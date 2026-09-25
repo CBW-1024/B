@@ -134,26 +134,22 @@ static inline id DDMGetFrameFacade(void) {
 @property (retain, nonatomic) WCOperateFloatView *floatOperateView;
 @end
 
-// 本地资源基类。
+// 本地资源基类。PKC 的实况资产就是用它（NSClassFromString(@"MMAsset")），
+// 而不是 MMAssetForLocalImage —— 后者带 localFilePath / localAssetId，
+// 微信拿到就能直接引用文件，草稿只记路径；基类配合 URLWithString:（无 scheme）
+// 解析不出可引用的本地路径，微信只能自行复制，草稿重开才不会空。
 @interface MMAsset : NSObject
 @property (nonatomic) BOOL m_isUseLivePhoto;
 @property (retain, nonatomic) NSString *m_livePhotoVideoPath;
 @property (nonatomic) double livePhotoDuration;
 @property (nonatomic) long long livePhotoVideoSize;
-@end
-
-// 本地图片 / Live Photo 资源。
-@interface MMAssetForLocalImage : MMAsset
-@property (retain, nonatomic) NSString *localAssetId;
-@property (retain, nonatomic) NSString *localFilePath;
-@property (nonatomic) long long imageDataType;
 - (id)initWithUrl:(NSURL *)url IsNeedOrigin:(BOOL)isNeedOrigin;
-- (long long)_getImageTypeFromData:(NSData *)arg1;
 @end
 
 // 微信图片封装：发布时承载本地图片与 Live Photo 信息。
 @interface MMImage : UIImage
 - (id)initWithImage:(id)arg1;
+- (void)commonInit;
 @property (retain, nonatomic) MMAsset *m_asset;
 @property (nonatomic) BOOL isLivePhoto;
 @property (retain, nonatomic) NSString *livePhotoVideoPath;
@@ -1007,9 +1003,16 @@ static UIColor *ddm_track_bg(void) {
 
 #pragma mark 图片 / LivePhoto 链路
 
-// 图片 / Live Photo 转发：构建本地资源 → 组装 MMImage（含 Live Photo 保真）→ 唤起发布器。
+// 图片 / Live Photo 转发：组装 MMImage（含 Live Photo 保真）→ 唤起发布器。
+//
+// 对齐 PKC（反汇编取证 PA/PB 两条转发链结论一致）：
+//   · 普通图片不构造任何资产，MMImage 只承载 UIImage，微信会自行持有并写进自己的草稿目录。
+//     一旦挂上资产，微信就认为"已有文件可引用"，草稿只记路径 —— 我们的文件在 tmp，
+//     被回收后重开草稿就只剩文案。
+//   · 只有 Live Photo 才构造资产，且用 MMAsset 基类 + URLWithString:（PKC 原样）。
+//     URLWithString: 不带 file:// scheme，微信解析不出可引用的本地路径，被迫自行复制。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
-    Class localImgCls = objc_getClass("MMAssetForLocalImage");
+    Class assetCls = objc_getClass("MMAsset");
 
     NSMutableArray *assets = [NSMutableArray array];
 
@@ -1019,21 +1022,16 @@ static UIColor *ddm_track_bg(void) {
         NSString *imgLocal = DDMCopyToTemp(imgSrc, @"jpg");
         if (!imgLocal) continue;
 
-        WCMediaItem *live = m.livePhotoMediaItem;
-        NSString *movLocal = (live ? DDMLivePhotoVideoPath(live) : nil);
+        NSString *movLocal = (m.livePhotoMediaItem ? DDMLivePhotoVideoPath(m.livePhotoMediaItem) : nil);
 
-        NSString *assetPath = movLocal ?: imgLocal;
-        // 用 URLWithString: 而非 fileURLWithPath:，与 PKC 实况资产构造逐字一致。
-        // 且绝不手动写 localFilePath / localAssetId：那会把 tmp 路径钉进资产，
-        // 发布器「保留」时草稿记下的就是这个路径，tmp 被回收后草稿重开只剩文案。
-        // 路径交给 initWithUrl: 内部自行处置（PKC 全程不碰这两个字段，实况转发实测不丢）。
-        MMAssetForLocalImage *asset = [[localImgCls alloc] initWithUrl:[NSURL URLWithString:assetPath]
-                                                              IsNeedOrigin:YES];
-        if (!asset && movLocal) {
-            assetPath = imgLocal;
-            asset = [[localImgCls alloc] initWithUrl:[NSURL URLWithString:assetPath] IsNeedOrigin:YES];
+        // 普通图片 asset 传 nil；只有实况才建资产。
+        // 资产构造失败时退化成普通图片（丢实况，但不丢图）。
+        MMAsset *asset = nil;
+        if (movLocal) {
+            asset = [(MMAsset *)[assetCls alloc] initWithUrl:[NSURL URLWithString:movLocal]
+                                               IsNeedOrigin:YES];
+            if (!asset) movLocal = nil;
         }
-        if (!asset) continue;
 
         MMImage *mm = [self ddmMakeMMImage:imgLocal asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
@@ -1046,19 +1044,20 @@ static UIColor *ddm_track_bg(void) {
 }
 
 // 构建 MMImage；若为 Live Photo，保真运动视频信息。
-- (MMImage *)ddmMakeMMImage:(NSString *)imgLocal asset:(id)asset liveVideoPath:(NSString *)movLocal {
+// asset 为 nil 表示普通图片 —— 此时不挂 m_asset，微信自行持有图片数据。
+- (MMImage *)ddmMakeMMImage:(NSString *)imgLocal
+                      asset:(MMAsset *)asset
+              liveVideoPath:(NSString *)movLocal {
     Class mmImgCls = objc_getClass("MMImage");
-    NSData *raw = [NSData dataWithContentsOfFile:imgLocal options:NSDataReadingMappedIfSafe error:nil];
-    if (raw.length > 0) {
-        long long t = (long long)[asset _getImageTypeFromData:raw];
-        if (t != 0) ((MMAssetForLocalImage *)asset).imageDataType = t;
-    }
     UIImage *ui = [UIImage imageWithContentsOfFile:imgLocal];
     MMImage *mmImg = ui ? (MMImage *)[(MMImage *)[mmImgCls alloc] initWithImage:ui] : [[mmImgCls alloc] init];
     if (!mmImg) return nil;
-    mmImg.m_asset = asset;
 
-    if (movLocal) {
+    // 只有实况才挂资产。普通图片挂上会让微信改成"引用我们的 tmp 文件"，
+    // 点「保留」后草稿只留路径，tmp 回收即空。
+    if (asset) mmImg.m_asset = asset;
+
+    if (movLocal && asset) {
         // 实况照片保真：标记 isLivePhoto + imageFrom + 运动视频路径与尺寸。
         mmImg.isLivePhoto = YES;
         mmImg.livePhotoVideoPath = movLocal;
@@ -1068,12 +1067,17 @@ static UIColor *ddm_track_bg(void) {
         [extra setValue:movLocal forKey:@"ExportedLivePhotoPath"];
         [mmImg setValue:extra forKey:@"tempExtraInfo"];
 
-        ((MMAssetForLocalImage *)asset).m_isUseLivePhoto = YES;
-        ((MMAssetForLocalImage *)asset).m_livePhotoVideoPath = movLocal;
+        asset.m_isUseLivePhoto = YES;
+        asset.m_livePhotoVideoPath = movLocal;
         long long sz = (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize];
-        ((MMAssetForLocalImage *)asset).livePhotoVideoSize = sz;
-        ((MMAssetForLocalImage *)asset).livePhotoDuration = DDMVideoDuration(movLocal);
+        asset.livePhotoVideoSize = sz;
+        asset.livePhotoDuration = DDMVideoDuration(movLocal);
     }
+
+    // 对齐 PKC：必调。PKC 在 initWithImage: 之后必调一次，实况则在 setM_asset: 之后再调一次，
+    // 说明它不会清掉 m_asset；放在所有字段设完之后统一调一次即可覆盖两种情况。
+    [mmImg commonInit];
+
     return mmImg;
 }
 
