@@ -65,6 +65,8 @@
 - (NSArray *)getNeedBatchDownloadMedias;                    // 需要批量下载的媒体
 - (BOOL)isWeiShang;                                         // 是否微商
 - (void)setExtFlag:(unsigned int)arg1;                      // 设置扩展标记（含微商标记）
+- (id)locationInfo;                                          // 位置 / POI 信息（锚定 WCDataItem.h:250）
+- (void)setLocationInfo:(id)arg1;                            // 设置位置 / POI 信息（锚定 WCDataItem.h:436）
 @end
 
 // 朋友圈单条媒体（图片 / 视频 / Live Photo）。
@@ -235,8 +237,8 @@ static inline id DDMGetFrameFacade(void) {
 
 #pragma mark - 配置
 
-// 转发开关：存储键沿用旧名 DDForward_Enabled，兼容历史版本已保存的偏好，不可改名。
-static NSString * const kDDMForwardEnabled       = @"DDForward_Enabled";
+// 转发开关：存储键独立为新键，不再读取旧插件 DDForward_Enabled 的残留偏好。
+static NSString * const kDDMForwardEnabled       = @"DDMoments_forwardEnabled";
 
 // 辅助设置：存储键统一为 DDMoments_<属性名>，属性名与界面标题一一对应。
 static NSString * const kDDMViewDeletedComment   = @"DDMoments_viewDeletedComment";    // 查看已删评论
@@ -246,6 +248,7 @@ static NSString * const kDDMDisableTextFold      = @"DDMoments_disableTextFold";
 static NSString * const kDDMDisableVideoAutoPlay = @"DDMoments_disableVideoAutoPlay";  // 禁用自动播放
 static NSString * const kDDMDisableVideoTapClose = @"DDMoments_disableVideoTapClose";  // 禁用点击关闭
 static NSString * const kDDMEnableVideoProgress  = @"DDMoments_enableVideoProgress";   // 启用视频进度
+static NSString * const kDDMRemoveOriginalLoc    = @"DDMoments_removeOriginalLocation"; // 转发时移除原始位置（转发子项）
 
 // 已删评论标记前缀（默认文案，预留可定制）。
 static NSString * const kDDMDeletedCommentMark   = @"DDMoments_deletedCommentMark";
@@ -260,6 +263,7 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 @property (assign, nonatomic) BOOL disableVideoAutoPlay; // 禁用自动播放
 @property (assign, nonatomic) BOOL disableVideoTapClose; // 禁用点击关闭
 @property (assign, nonatomic) BOOL enableVideoProgress;  // 启用视频进度
+@property (assign, nonatomic) BOOL removeOriginalLocation; // 转发时移除原始位置（转发子项，仅在转发开关打开时展开）
 + (instancetype)shared;
 @end
 
@@ -283,6 +287,7 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
         _disableVideoAutoPlay     = [ud boolForKey:kDDMDisableVideoAutoPlay];
         _disableVideoTapClose     = [ud boolForKey:kDDMDisableVideoTapClose];
         _enableVideoProgress      = [ud boolForKey:kDDMEnableVideoProgress];
+        _removeOriginalLocation   = [ud boolForKey:kDDMRemoveOriginalLoc];
     }
     return self;
 }
@@ -300,6 +305,7 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 - (void)setDisableVideoAutoPlay:(BOOL)v     { _disableVideoAutoPlay = v;     [self persist:@(v) key:kDDMDisableVideoAutoPlay]; }
 - (void)setDisableVideoTapClose:(BOOL)v     { _disableVideoTapClose = v;     [self persist:@(v) key:kDDMDisableVideoTapClose]; }
 - (void)setEnableVideoProgress:(BOOL)v      { _enableVideoProgress = v;      [self persist:@(v) key:kDDMEnableVideoProgress]; }
+- (void)setRemoveOriginalLocation:(BOOL)v   { _removeOriginalLocation = v;   [self persist:@(v) key:kDDMRemoveOriginalLoc]; }
 
 @end
 
@@ -836,20 +842,19 @@ static UIColor *ddm_track_bg(void) {
     __weak typeof(self) weakSelf = self;
 
     [self downloadAllMediaOf:item completion:^{
-        WCDataItem *work = [weakSelf deepCopyDataItem:item] ?: item;
+        WCDataItem *work = [weakSelf deepCopyDataItem:item];
+        if ([DDMConfig shared].removeOriginalLocation) {
+            [work setLocationInfo:nil];  // WCDataItem.setLocationInfo:，锚定 WCDataItem.h:436
+        }
         [weakSelf routeForwardForItem:work host:host];
     }];
 }
 
-// 深拷贝数据项（序列化再反序列化），隔离原始对象。
+// 深拷贝数据项（序列化再反序列化），隔离原始对象。toNSCodingBuffer / fromNSCodingBuffer: 已在
+// WCDataItem 声明（锚定微信头文件 8.0.79），直接调用；拷贝失败返回 nil，由调用方决定中止。
 - (WCDataItem *)deepCopyDataItem:(WCDataItem *)item {
-    if (![item respondsToSelector:@selector(toNSCodingBuffer)]) return nil;
     NSData *buf = [item toNSCodingBuffer];
-    if (buf.length == 0) return nil;
-    Class cls = objc_getClass("WCDataItem");
-    if (![cls respondsToSelector:@selector(fromNSCodingBuffer:)]) return nil;
-    WCDataItem *copied = [cls fromNSCodingBuffer:buf];
-    return copied;
+    return [objc_getClass("WCDataItem") fromNSCodingBuffer:buf];
 }
 
 #pragma mark 下载
@@ -1620,6 +1625,13 @@ static void ddmInjectMarkIntoComment(id c) {
                                     target:self
                                      title:@"朋友圈转发"
                                         on:cfg.forwardEnabled]];
+    // 转发开关打开时展开子项：移除原始位置。
+    if (cfg.forwardEnabled) {
+        [sec addCell:[cellMgr switchCellForSel:@selector(onRemoveOriginalLocationSwitch:)
+                                        target:self
+                                         title:@"移除原始位置"
+                                            on:cfg.removeOriginalLocation]];
+    }
     [_tableViewManager addSection:sec];
 
     WCTableViewSectionManager *aux = [secMgr sectionWithHeader:@"辅助设置"];
@@ -1671,6 +1683,7 @@ static void ddmInjectMarkIntoComment(id c) {
 }
 // 仅“朋友圈转发”开关（将来会展开子项）在切换时即时重建表格。
 - (void)onForwardEnabledSwitch:(UISwitch *)s        { DDMConfig.shared.forwardEnabled = s.isOn; [self buildTable]; }
+- (void)onRemoveOriginalLocationSwitch:(UISwitch *)s { DDMConfig.shared.removeOriginalLocation = s.isOn; }
 - (void)onViewDeletedCommentSwitch:(UISwitch *)s   { DDMConfig.shared.viewDeletedComment = s.isOn; }
 - (void)onDisablePrivacyIconSwitch:(UISwitch *)s   { DDMConfig.shared.disablePrivacyIcon = s.isOn; }
 - (void)onDisableWeiShangFoldSwitch:(UISwitch *)s  { DDMConfig.shared.disableWeiShangFold = s.isOn; }
@@ -1686,10 +1699,8 @@ static void ddmInjectMarkIntoComment(id c) {
 %ctor {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
-        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD朋友圈助手"
-                                                     version:@"1.0.0"
-                                                  controller:@"DDMSettingsViewController"];
-        }
+        [[mgr sharedInstance] registerControllerWithTitle:@"DD朋友圈助手"
+                                                 version:@"1.0.0"
+                                              controller:@"DDMSettingsViewController"];
     }
 }
