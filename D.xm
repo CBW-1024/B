@@ -247,6 +247,9 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 
 // 转发文案关联对象键：将原文案绑定到发布器 VC，供 viewDidLoad 回填（替代原 8s 全局槽）。
 static char kDDMForwardTextKey;
+// 转发文案在原始数据项上的暂存键：深拷贝 / 清理缓存后的序列化可能丢失 contentDesc，
+// 故文案在 forwardDataItem 入口从原始 item 提取，绑到 work 随链路传递。
+static char kDDMWorkCaptionKey;
 
 @interface DDMConfig : NSObject
 @property (assign, nonatomic) BOOL forwardEnabled;          // 启用一键转发（总开关；开启时展开“移除原始位置”）
@@ -778,6 +781,10 @@ static UIColor *ddm_track_bg(void) {
     [self downloadAllMediaOf:item completion:^{
         // 深拷贝失败（如清理缓存后）时回退原件，避免 work 为 nil 触发原生转发崩溃。
         WCDataItem *work = [weakSelf deepCopyDataItem:item] ?: item;
+        // 文案从原始 item 提取：深拷贝（NSCoding 序列化）在清理缓存后可能丢失 contentDesc，
+        // 故在入口就抓取原文案，绑到 work 随链路传递，发布器再用它回填。
+        NSString *cap = [item.contentDesc stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (cap.length > 0) objc_setAssociatedObject(work, &kDDMWorkCaptionKey, cap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (work != item) {  // 仅在独立副本上改位置，不污染原帖
             if ([DDMConfig shared].removeOriginalLocation) {
                 [work setLocationInfo:nil];
@@ -1075,8 +1082,9 @@ static UIColor *ddm_track_bg(void) {
 
 // 将原帖文案绑定到发布器 VC（关联对象），供 viewDidLoad 回填。绑定 VC 实例可避免连转两条串文案，
 // 且无需 8s 时效（只要 VC 还活着，文案就在）。
+// 文案取自 work 上绑定的原文案（forwardDataItem 入口抓取），绕开深拷贝可能丢失的 contentDesc。
 - (void)ddmAttachCaptionOf:(WCDataItem *)item toCommitVC:(UIViewController *)vc {
-    NSString *text = [item.contentDesc stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *text = objc_getAssociatedObject(item, &kDDMWorkCaptionKey);
     if (text.length == 0) return;
     objc_setAssociatedObject(vc, &kDDMForwardTextKey, text, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
