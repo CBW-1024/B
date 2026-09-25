@@ -2,8 +2,8 @@
 // 微信朋友圈增强插件（Theos / Logos，arm64 / arm64e，iOS 18+）
 //
 // 功能：
-//   1. 朋友圈转发 —— 在朋友圈操作浮窗（点赞 / 评论条）注入“转发”按钮，
-//      支持图片、视频、Live Photo 与纯文字转发，下载完成后直接唤起微信发布器。
+//   1. 启用朋友圈转发 —— 在朋友圈操作浮窗（点赞 / 评论条）注入“转发”按钮，支持图片、
+//      视频、Live Photo 与纯文字转发。下载完成后唤起微信发布器，并可选择保留 / 移除原作者位置。
 //   2. 辅助设置 —— 7 项独立开关：查看已删评论、禁用隐私图标、禁用微商折叠、
 //      禁用文字折叠、禁用自动播放、禁用点击关闭、启用视频进度条。
 //
@@ -11,9 +11,11 @@
 //   - 所有对微信私有类的引用均走运行时获取（objc_getClass / class_getInstanceVariable），
 //     不在编译期登记私有类符号，避免链接失败（tweak 无私有类实现）。
 //   - 私有接口声明锚定微信 8.0.79 头文件 dump，仅保留本插件实际调用的方法。
+//   - 转发位置处理：默认保留原作者位置；开启“移除原始位置”后清空副本的 locationInfo，
+//     再由发布器 setPoiInfo: / setBShowLocation: 落到新帖，保证开 / 关两种语义都生效。
 //   - 进度浮卡挂载于触发浮窗所在主窗口，支持深色模式与窗口尺寸自适应。
 //   - 设置页重建遵循“基础双重建 + 展开型开关即时重建”：viewDidLoad / viewWillAppear
-//     始终重建；仅“朋友圈转发”开关（将来会展开子项）在回调内即时重建。
+//     始终重建；“启用朋友圈转发”开关展开“移除原始位置”子项，故其回调内即时重建。
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -84,11 +86,13 @@
 - (NSString *)tempPathForSightData;                            // 短视频临时路径
 - (NSString *)getFormatVideoPath;                              // 转码后视频路径
 - (NSString *)getTempVideoPath;                                // 临时视频路径
+- (id)imageOfSize:(long long)arg1;                             // 内存图（按尺寸取）
 @end
 
 // 微信视频下载管理器（经 WCFacade 取得，StartDownloadVideo: 被实际调用）。
 @interface WCDownloadVideoCDNMgr : NSObject
 - (unsigned long long)StartDownloadVideo:(id)arg1;
+- (void)CheckQueue;
 @end
 
 // 微信业务门面：经它获取下载管理器，触发 CDN 下载。
@@ -108,20 +112,11 @@
 @property (readonly, nonatomic) MMServiceCenter *serviceCenter;
 @end
 
-// 经微信服务链取 WCFacade 单例，失败返回 nil。
+// 经微信服务链取 WCFacade 单例。currentContext / serviceCenter / getService: 均已声明，直接调用。
 static inline id DDMGetFrameFacade(void) {
-    Class ctxCls = objc_getClass("MMContext");
-    if (ctxCls && [ctxCls respondsToSelector:@selector(currentContext)]) {
-        id ctx = [ctxCls currentContext];
-        if (ctx && [ctx respondsToSelector:@selector(serviceCenter)]) {
-            id center = [ctx serviceCenter];
-            if (center && [center respondsToSelector:@selector(getService:)]) {
-                id facade = [center getService:objc_getClass("WCFacade")];
-                if (facade) return facade;
-            }
-        }
-    }
-    return nil;
+    MMContext *ctx = [objc_getClass("MMContext") currentContext];
+    MMServiceCenter *center = ctx.serviceCenter;
+    return [center getService:objc_getClass("WCFacade")];
 }
 
 // 朋友圈操作浮窗（点赞 / 评论条）。
@@ -198,6 +193,9 @@ static inline id DDMGetFrameFacade(void) {
 - (void)textViewTextDidChange;
 - (instancetype)initWithImages:(id)arg1 contacts:(id)arg2;
 - (instancetype)initWithSightDraft:(id)arg1;
+- (void)setPoiInfo:(id)arg1;            // 写入 POI / 位置信息（锚定 WCNewCommitViewController.h:315）
+- (void)setBShowLocation:(BOOL)arg1;    // 是否展示位置（锚定 WCNewCommitViewController.h:276）
+- (void)setDelegate:(id)arg1;           // 设置代理（锚定 WCNewCommitViewController.h:280）
 @end
 
 // 朋友圈视频模板视图：禁用自动播放。
@@ -248,14 +246,14 @@ static NSString * const kDDMDisableTextFold      = @"DDMoments_disableTextFold";
 static NSString * const kDDMDisableVideoAutoPlay = @"DDMoments_disableVideoAutoPlay";  // 禁用自动播放
 static NSString * const kDDMDisableVideoTapClose = @"DDMoments_disableVideoTapClose";  // 禁用点击关闭
 static NSString * const kDDMEnableVideoProgress  = @"DDMoments_enableVideoProgress";   // 启用视频进度
-static NSString * const kDDMRemoveOriginalLoc    = @"DDMoments_removeOriginalLocation"; // 转发时移除原始位置（转发子项）
+static NSString * const kDDMRemoveOriginalLoc    = @"DDMoments_removeOriginalLocation"; // 移除原始位置：开=去位置，关=保留位置（转发子项）
 
 // 已删评论标记前缀（默认文案，预留可定制）。
 static NSString * const kDDMDeletedCommentMark   = @"DDMoments_deletedCommentMark";
 static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 
 @interface DDMConfig : NSObject
-@property (assign, nonatomic) BOOL forwardEnabled;       // 朋友圈转发（独立开关，仅控制转发按钮是否注入）
+@property (assign, nonatomic) BOOL forwardEnabled;       // 启用朋友圈转发（独立开关，控制转发按钮注入；开启时展开“移除原始位置”子项）
 @property (assign, nonatomic) BOOL viewDeletedComment;   // 查看已删评论
 @property (assign, nonatomic) BOOL disablePrivacyIcon;   // 禁用隐私图标
 @property (assign, nonatomic) BOOL disableWeiShangFold;  // 禁用微商折叠
@@ -263,7 +261,7 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 @property (assign, nonatomic) BOOL disableVideoAutoPlay; // 禁用自动播放
 @property (assign, nonatomic) BOOL disableVideoTapClose; // 禁用点击关闭
 @property (assign, nonatomic) BOOL enableVideoProgress;  // 启用视频进度
-@property (assign, nonatomic) BOOL removeOriginalLocation; // 转发时移除原始位置（转发子项，仅在转发开关打开时展开）
+@property (assign, nonatomic) BOOL removeOriginalLocation; // 移除原始位置：开=清空副本位置，关=保留原作者位置（转发子项，仅转发开启时展开）
 + (instancetype)shared;
 @end
 
@@ -427,21 +425,21 @@ static UIImage *DDMVideoFirstFrame(NSString *path) {
 
 #pragma mark - 媒体路径解析
 
-// 图片优先路径。
+// 图片优先路径。pathForData / pathForExistData 均已声明，直接调用。
 static NSString *DDMImagePath(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
-    if ([item respondsToSelector:@selector(pathForData)])      [cands addObject:[item pathForData] ?: @""];
-    if ([item respondsToSelector:@selector(pathForExistData)]) [cands addObject:[item pathForExistData] ?: @""];
+    [cands addObject:[item pathForData] ?: @""];
+    [cands addObject:[item pathForExistData] ?: @""];
     return DDMFirstUsablePath(cands);
 }
 
 // 视频优先路径（短视频 / 转码 / 临时路径）。
 static NSString *DDMVideoPath(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
-    if ([item respondsToSelector:@selector(pathForSightData)])    [cands addObject:[item pathForSightData] ?: @""];
-    if ([item respondsToSelector:@selector(getFormatVideoPath)])  [cands addObject:[item getFormatVideoPath] ?: @""];
-    if ([item respondsToSelector:@selector(tempPathForSightData)])[cands addObject:[item tempPathForSightData] ?: @""];
-    if ([item respondsToSelector:@selector(getTempVideoPath)])    [cands addObject:[item getTempVideoPath] ?: @""];
+    [cands addObject:[item pathForSightData] ?: @""];
+    [cands addObject:[item getFormatVideoPath] ?: @""];
+    [cands addObject:[item tempPathForSightData] ?: @""];
+    [cands addObject:[item getTempVideoPath] ?: @""];
     return DDMFirstUsablePath(cands);
 }
 
@@ -449,10 +447,10 @@ static NSString *DDMVideoPath(WCMediaItem *item) {
 static NSString *DDMLiveVideoPath(WCMediaItem *live) {
     if (!live) return nil;
     NSMutableArray *cands = [NSMutableArray array];
-    if ([live respondsToSelector:@selector(pathForSightData)])     [cands addObject:[live pathForSightData] ?: @""];
-    if ([live respondsToSelector:@selector(tempPathForSightData)]) [cands addObject:[live tempPathForSightData] ?: @""];
-    if ([live respondsToSelector:@selector(getFormatVideoPath)])   [cands addObject:[live getFormatVideoPath] ?: @""];
-    if ([live respondsToSelector:@selector(getTempVideoPath)])    [cands addObject:[live getTempVideoPath] ?: @""];
+    [cands addObject:[live pathForSightData] ?: @""];
+    [cands addObject:[live tempPathForSightData] ?: @""];
+    [cands addObject:[live getFormatVideoPath] ?: @""];
+    [cands addObject:[live getTempVideoPath] ?: @""];
     return DDMFirstUsablePath(cands);
 }
 
@@ -460,16 +458,16 @@ static NSString *DDMLiveVideoPath(WCMediaItem *live) {
 static NSString *DDMPersistentSightPath(WCMediaItem *item) {
     if (!item) return nil;
     NSMutableArray *cands = [NSMutableArray array];
-    if ([item respondsToSelector:@selector(pathForSightData)])     [cands addObject:[item pathForSightData] ?: @""];
-    if ([item respondsToSelector:@selector(tempPathForSightData)]) [cands addObject:[item tempPathForSightData] ?: @""];
+    [cands addObject:[item pathForSightData] ?: @""];
+    [cands addObject:[item tempPathForSightData] ?: @""];
     return DDMFirstUsablePath(cands);
 }
 
 // 图片缩略图路径（缩略图 / 预览图）。
 static UIImage *DDMThumbImage(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
-    if ([item respondsToSelector:@selector(getThumbImagePath)]) [cands addObject:[item getThumbImagePath] ?: @""];
-    if ([item respondsToSelector:@selector(pathForPreview)])    [cands addObject:[item pathForPreview] ?: @""];
+    [cands addObject:[item getThumbImagePath] ?: @""];
+    [cands addObject:[item pathForPreview] ?: @""];
     NSString *p = DDMFirstUsablePath(cands);
     return p ? [UIImage imageWithContentsOfFile:p] : nil;
 }
@@ -510,8 +508,8 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     if (!live) return nil;
 
     NSString *decoded = DDMFirstUsablePath(@[
-        ([live respondsToSelector:@selector(getFormatVideoPath)] ? [live getFormatVideoPath] : @""),
-        ([live respondsToSelector:@selector(getTempVideoPath)]  ? [live getTempVideoPath]  : @""),
+        ([live getFormatVideoPath] ?: @""),
+        ([live getTempVideoPath]  ?: @""),
     ]);
     if (decoded) {
         NSString *cp = DDMCopyToTemp(decoded, @"mov");
@@ -615,10 +613,8 @@ static UIColor *ddm_track_bg(void) {
     CGFloat cardH = 56.0;
 
     CGFloat topInset = 8.0;
-    if ([win respondsToSelector:@selector(safeAreaInsets)]) {
-        CGFloat sa = win.safeAreaInsets.top;
-        if (sa > 0) topInset = sa + 8.0;
-    }
+    CGFloat sa = win.safeAreaInsets.top;
+    if (sa > 0) topInset = sa + 8.0;
     DDMProgressCardView *card = [[DDMProgressCardView alloc] initWithFrame:CGRectMake(16.0, topInset, cardW, cardH)];
     card.backgroundColor = ddm_card_bg();
     card.layer.cornerRadius = 10.0;
@@ -689,7 +685,7 @@ static UIColor *ddm_track_bg(void) {
         UIView *card = [self ddmProgressHUD] ?: [self ddmProgressCard];
         if (!card) return;
 
-        BOOL isVideo = [item respondsToSelector:@selector(isVideo)] && [item isVideo];
+        BOOL isVideo = item.isVideo;
         DDMMediaKind kind = DDMMediaKindImages;
         NSInteger totalCount = 1;
         NSString *initialTitle = @"正在准备转发…";
@@ -700,12 +696,12 @@ static UIColor *ddm_track_bg(void) {
             initialTitle = @"视频加载中";
             initialSub = @"0%";
         } else {
-            id content = [item respondsToSelector:@selector(contentObj)] ? item.contentObj : nil;
-            NSArray *mediaList = ([content respondsToSelector:@selector(mediaList)] ? [(id)content mediaList] : nil);
+            WCContentItem *content = item.contentObj;
+            NSArray *mediaList = content.mediaList;
             totalCount = MAX(1, mediaList.count);
             BOOL hasLive = NO;
-            for (id m in mediaList) {
-                if ([m respondsToSelector:@selector(isLivePhoto)] && [m isLivePhoto]) { hasLive = YES; break; }
+            for (WCMediaItem *m in mediaList) {
+                if (m.isLivePhoto) { hasLive = YES; break; }
             }
             if (hasLive && totalCount == 1) {
                 kind = DDMMediaKindLive;
@@ -728,22 +724,6 @@ static UIColor *ddm_track_bg(void) {
         title.text = initialTitle;
         UILabel *sub = objc_getAssociatedObject(card, "ddmSub");
         sub.text = initialSub;
-        UIProgressView *bar = objc_getAssociatedObject(card, "ddmBar");
-        [bar setProgress:0.0 animated:NO];
-        UILabel *pct = objc_getAssociatedObject(card, "ddmPct");
-        pct.text = @"0%";
-    });
-}
-
-// 通用进度 HUD（仅更新标题）。
-- (void)showHUD:(NSString *)text {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *card = [self ddmProgressHUD] ?: [self ddmProgressCard];
-        if (!card) return;
-        UILabel *title = objc_getAssociatedObject(card, "ddmTitle");
-        title.text = text ?: @"正在准备转发…";
-        UILabel *sub = objc_getAssociatedObject(card, "ddmSub");
-        sub.text = @"";
         UIProgressView *bar = objc_getAssociatedObject(card, "ddmBar");
         [bar setProgress:0.0 animated:NO];
         UILabel *pct = objc_getAssociatedObject(card, "ddmPct");
@@ -803,29 +783,9 @@ static UIColor *ddm_track_bg(void) {
     });
 }
 
-// 失败 HUD：展示错误文案，1.6s 后收起并解锁。
-- (void)failHUD:(NSString *)text {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *card = [self ddmProgressHUD];
-        if (!card) { self.busy = NO; return; }
-        UILabel *title = objc_getAssociatedObject(card, "ddmTitle");
-        title.text = text ?: @"失败";
-        UILabel *sub = objc_getAssociatedObject(card, "ddmSub");
-        sub.text = @"";
-        UIProgressView *bar = objc_getAssociatedObject(card, "ddmBar");
-        bar.hidden = YES;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:0.2 animations:^{ card.alpha = 0.0; }
-                             completion:^(BOOL fin){ [card removeFromSuperview]; }];
-            self.busy = NO;
-        });
-    });
-}
-
 #pragma mark 入口
 
-// 转发主入口：清理临时目录 → 展示进度 HUD → 下载媒体 → 分流到发布器。
+// 转发主入口：清理临时目录 → 展示进度 HUD → 下载媒体 → 处理位置 → 分流到发布器。
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView {
     if (!item) return;
     if (self.busy) { return; }
@@ -834,7 +794,7 @@ static UIColor *ddm_track_bg(void) {
     // 进度卡直接挂在触发浮窗所在的主窗口上，不遍历窗口列表（避免被 iConsole 之类浮层换类名干扰）。
     self.ddmWindow = floatView.window;
     UIViewController *host = DDMTopViewController(floatView.navigationController);
-    if ([floatView respondsToSelector:@selector(hide)]) [floatView hide];
+    [floatView hide];
 
     DDMCleanTempDir();
     [self showHUDForItem:item];
@@ -844,7 +804,9 @@ static UIColor *ddm_track_bg(void) {
     [self downloadAllMediaOf:item completion:^{
         WCDataItem *work = [weakSelf deepCopyDataItem:item];
         if ([DDMConfig shared].removeOriginalLocation) {
-            [work setLocationInfo:nil];  // WCDataItem.setLocationInfo:，锚定 WCDataItem.h:436
+            [work setLocationInfo:nil];                       // 去位置：WCDataItem.setLocationInfo:（WCDataItem.h:436）
+        } else if ([item locationInfo]) {
+            [work setLocationInfo:[item locationInfo]];       // 保位置：深拷贝不一定序列化 locationInfo，从原件补回
         }
         [weakSelf routeForwardForItem:work host:host];
     }];
@@ -884,14 +846,12 @@ static UIColor *ddm_track_bg(void) {
         [pending addObject:m];
     };
 
-    if ([item respondsToSelector:@selector(getNeedBatchDownloadMedias)]) {
-        for (WCMediaItem *m in [item getNeedBatchDownloadMedias]) add(m, NO);
-    }
+    for (WCMediaItem *m in [item getNeedBatchDownloadMedias]) add(m, NO);
 
     WCContentItem *content = item.contentObj;
-    for (WCMediaItem *m in ([content respondsToSelector:@selector(mediaList)] ? content.mediaList : @[])) {
+    for (WCMediaItem *m in content.mediaList) {
         add(m, NO);
-        WCMediaItem *live = [m respondsToSelector:@selector(livePhotoMediaItem)] ? m.livePhotoMediaItem : nil;
+        WCMediaItem *live = m.livePhotoMediaItem;
         if (live) {
             if (liveSubs) [liveSubs addObject:live];
             add(live, YES);
@@ -911,18 +871,15 @@ static UIColor *ddm_track_bg(void) {
     }
 
     id facade = DDMGetFrameFacade();
-    if (!facade) { dispatch_async(dispatch_get_main_queue(), completion); return; }
 
-    long long contentType = ([item.contentObj respondsToSelector:@selector(type)] ? [item.contentObj type] : -1);
-    Class ci = objc_getClass("WCContentItem");
-    BOOL contentIsVideo = ci && [ci respondsToSelector:@selector(isVideoType:)] && [ci isVideoType:contentType];
+    long long contentType = item.contentObj.type;
+    BOOL contentIsVideo = [objc_getClass("WCContentItem") isVideoType:contentType];
     BOOL (^ddmIsSightVideo)(WCMediaItem *) = ^BOOL(WCMediaItem *m) {
-
-        long long mt = [m respondsToSelector:@selector(mediaType)] ? [m mediaType] : -1;
+        long long mt = m.mediaType;
         if (mt == 1) return NO;
         if (contentIsVideo) return YES;
-        if ([m respondsToSelector:@selector(hasSight)] && [m hasSight]) return YES;
-        if ([m respondsToSelector:@selector(isPreloadVideoTask)] && [m isPreloadVideoTask]) return YES;
+        if (m.hasSight) return YES;
+        if (m.isPreloadVideoTask) return YES;
         return NO;
     };
 
@@ -930,24 +887,19 @@ static UIColor *ddm_track_bg(void) {
     for (WCMediaItem *m in pending) {
         BOOL isLiveSub = [liveSubs containsObject:m];
         if (isLiveSub || ddmIsSightVideo(m)) {
-
-            if (![facade respondsToSelector:@selector(videoDownloadCdnMgrForCategory:)]) continue;
             id vMgr = [facade videoDownloadCdnMgrForCategory:(long long)arc4random_uniform(10)];
-            if (vMgr && [vMgr respondsToSelector:@selector(StartDownloadVideo:)]) {
+            if (vMgr) {
                 [vMgr StartDownloadVideo:m];
                 videoMgr = vMgr;
             }
         } else {
-
-            if ([facade respondsToSelector:@selector(imageDownloadCdnMgrForCategory:)])
-                [facade imageDownloadCdnMgrForCategory:0];
-            if (![facade respondsToSelector:@selector(StartDownloadImage:DownloadType:)]) continue;
+            [facade imageDownloadCdnMgrForCategory:0];
             [facade StartDownloadImage:m DownloadType:2];
             [facade StartDownloadImage:m DownloadType:1];
         }
     }
 
-    BOOL isVideo = [item respondsToSelector:@selector(isVideo)] && [item isVideo];
+    BOOL isVideo = item.isVideo;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         if (isVideo) {
@@ -962,22 +914,17 @@ static UIColor *ddm_track_bg(void) {
 
 // 判断单个视频媒体是否就绪。
 - (BOOL)ddmVideoReady:(WCMediaItem *)m {
-    if ([m respondsToSelector:@selector(getFormatVideoPath)]) {
-        NSString *p = [m getFormatVideoPath];
-        if (p && [[NSFileManager defaultManager] fileExistsAtPath:p]) return YES;
-    }
-    NSString *p = DDMVideoPath(m) ?: DDMLiveVideoPath(m);
-    if (p && DDMFileUsable(p)) return YES;
+    NSString *p = [m getFormatVideoPath];
+    if (p && [[NSFileManager defaultManager] fileExistsAtPath:p]) return YES;
+    NSString *alt = DDMVideoPath(m) ?: DDMLiveVideoPath(m);
+    if (alt && DDMFileUsable(alt)) return YES;
     return [self ddmImageReady:m];
 }
 
-// 判断单个图片媒体是否就绪（尝试 imageOfSize: 内存图或落盘路径）。
+// 判断单个图片媒体是否就绪（尝试 imageOfSize: 内存图或落盘路径）。imageOfSize: 已于 WCMediaItem 声明，直接调用。
 - (BOOL)ddmImageReady:(WCMediaItem *)m {
-    if ([m respondsToSelector:@selector(imageOfSize:)]) {
-
-        id img = ((id (*)(id, SEL, long long))objc_msgSend)(m, @selector(imageOfSize:), 2LL);
-        if (img) return YES;
-    }
+    id img = [m imageOfSize:2LL];
+    if (img) return YES;
     NSString *p = DDMImagePath(m);
     return (p && DDMFileUsable(p));
 }
@@ -993,7 +940,7 @@ static UIColor *ddm_track_bg(void) {
         if (allReady) { [self ddmSetProgress:1.0]; return; }
         [self ddmSetProgress:(float)s / (float)cap];
         if (s >= cap) break;
-        if (videoMgr && [videoMgr respondsToSelector:@selector(CheckQueue)]) [videoMgr performSelector:@selector(CheckQueue)];
+        [videoMgr CheckQueue];
         [NSThread sleepForTimeInterval:1.0];
     }
 }
@@ -1020,9 +967,9 @@ static UIColor *ddm_track_bg(void) {
 // 按内容类型分流：视频 / 多图 / 纯文字。
 - (void)routeForwardForItem:(WCDataItem *)item host:(UIViewController *)host {
     WCContentItem *content = item.contentObj;
-    NSArray *mediaList = [content respondsToSelector:@selector(mediaList)] ? content.mediaList : nil;
+    NSArray *mediaList = content.mediaList;
 
-    BOOL isVideo = [item respondsToSelector:@selector(isVideo)] ? [item isVideo] : NO;
+    BOOL isVideo = item.isVideo;
 
     if (isVideo) { [self forwardVideoItem:item host:host]; return; }
     if (mediaList.count > 0) { [self forwardPhotoItem:item host:host]; return; }
@@ -1040,71 +987,40 @@ static UIColor *ddm_track_bg(void) {
         NSString *vp = DDMVideoPath(m);
         if (vp) { videoItem = m; break; }
     }
-    if (!videoItem) {
-        [self failHUD:@"视频未下载完整"];
-        return;
-    }
-    NSString *src = DDMVideoPath(videoItem);
-    if (!src) {
-        [self failHUD:@"视频未下载完整"];
-        return;
-    }
-
     NSString *local = nil;
     for (int attempt = 0; attempt < 5 && !local; attempt++) {
         if (attempt > 0) [NSThread sleepForTimeInterval:0.4];
         NSString *s = DDMVideoPath(videoItem);
         if (s && DDMFileUsable(s)) local = DDMCopyToTemp(s, @"mp4");
     }
-    if (!local) {
-        [self failHUD:@"视频准备失败"];
-        return;
-    }
     [self presentVideoWithLocalPath:local thumb:DDMThumbImage(videoItem) item:item host:host];
 }
 
 // 用本地视频 + 缩略图构建 SightDraft 并唤起视频发布器。
+// SightDraft 为微信私有类，经 objc_getClass 取类（变量发消息，避免链接私有类符号），
+// 其 draftWithVideoURL: / isSightResourceValid 已在头文件声明，直接调用。
 - (void)presentVideoWithLocalPath:(NSString *)path thumb:(UIImage *)thumb item:(WCDataItem *)item host:(UIViewController *)host {
-    if (!DDMFileUsable(path)) {
-        [self failHUD:@"视频准备失败"];
-        return;
-    }
-
-    Class draftCls = objc_getClass("SightDraft");
-    if (!draftCls) {
-        [self failHUD:@"当前版本不支持"];
-        return;
-    }
-
     if (!thumb) thumb = DDMVideoFirstFrame(path);
 
     NSURL *url = [NSURL fileURLWithPath:path];
+    Class draftCls = objc_getClass("SightDraft");
     SightDraft *draft = thumb ? [draftCls draftWithVideoURL:url thumbImage:thumb]
                               : [draftCls draftWithVideoURL:url];
-    if (!draft) {
-        [self failHUD:@"视频草稿创建失败"];
-        return;
-    }
-
-    if ([draft respondsToSelector:@selector(isSightResourceValid)] && ![draft isSightResourceValid]) {
-        [self failHUD:@"视频资源无效"];
-        return;
-    }
 
     [self stashTextOf:item];
     [self dismissHUD];
 
-    [self ddmPushSightCommit:draft host:host];
+    [self ddmPushSightCommit:draft item:item host:host];
     self.busy = NO;
 }
 
 #pragma mark 图片 / LivePhoto 链路
 
 // 图片 / Live Photo 转发：构建本地资源 → 组装 MMImage（含 Live Photo 保真）→ 唤起发布器。
+// MMAssetForLocalImage 为私有类，经 objc_getClass 取类（链接必需），其 initWithUrl:IsNeedOrigin: 已声明，直接调用；
+// MMImage 由 ddmMakeMMImage: 内部按同样方式取类。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
     Class localImgCls = objc_getClass("MMAssetForLocalImage");
-    Class mmImgCls    = objc_getClass("MMImage");
-    if (!localImgCls || !mmImgCls) { [self presentLegacyForward:item host:host]; return; }
 
     NSMutableArray *assets = [NSMutableArray array];
 
@@ -1114,7 +1030,7 @@ static UIColor *ddm_track_bg(void) {
         NSString *imgLocal = DDMCopyToTemp(imgSrc, @"jpg");
         if (!imgLocal) continue;
 
-        WCMediaItem *live = [m respondsToSelector:@selector(livePhotoMediaItem)] ? m.livePhotoMediaItem : nil;
+        WCMediaItem *live = m.livePhotoMediaItem;
         NSString *movLocal = (live ? DDMLivePhotoVideoPath(live) : nil);
 
         NSString *assetPath = movLocal ?: imgLocal;
@@ -1125,10 +1041,8 @@ static UIColor *ddm_track_bg(void) {
             asset = [[localImgCls alloc] initWithUrl:[NSURL fileURLWithPath:assetPath] IsNeedOrigin:YES];
         }
         if (!asset) continue;
-        if ([asset respondsToSelector:@selector(setLocalFilePath:)]) {
-            asset.localFilePath = assetPath;
-            asset.localAssetId  = assetPath;
-        }
+        asset.localFilePath = assetPath;
+        asset.localAssetId  = assetPath;
 
         MMImage *mm = [self ddmMakeMMImage:imgLocal asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
@@ -1137,20 +1051,17 @@ static UIColor *ddm_track_bg(void) {
     if (assets.count == 0) { [self presentLegacyForward:item host:host]; return; }
     [self stashTextOf:item];
     [self dismissHUD];
-    [self ddmPushImageCommit:assets host:host];
+    [self ddmPushImageCommit:assets item:item host:host];
     self.busy = NO;
 }
 
 // 用本地图片 + 资源构建 MMImage；若为 Live Photo，保真运动视频信息。
 - (MMImage *)ddmMakeMMImage:(NSString *)imgLocal asset:(id)asset liveVideoPath:(NSString *)movLocal {
-    Class mmImgCls = objc_getClass("MMImage");
-    if (!mmImgCls) return nil;
-    if (asset && [asset respondsToSelector:@selector(_getImageTypeFromData:)]) {
-        NSData *raw = [NSData dataWithContentsOfFile:imgLocal options:NSDataReadingMappedIfSafe error:nil];
-        if (raw.length > 0) {
-            long long t = (long long)[asset _getImageTypeFromData:raw];
-            if (t != 0 && [asset respondsToSelector:@selector(setImageDataType:)]) ((MMAssetForLocalImage *)asset).imageDataType = t;
-        }
+    Class mmImgCls = objc_getClass("MMImage");   // 私有类，变量发消息（链接必需），initWithImage: / init 已声明
+    NSData *raw = [NSData dataWithContentsOfFile:imgLocal options:NSDataReadingMappedIfSafe error:nil];
+    if (raw.length > 0) {
+        long long t = (long long)[asset _getImageTypeFromData:raw];
+        if (t != 0) ((MMAssetForLocalImage *)asset).imageDataType = t;
     }
     UIImage *ui = [UIImage imageWithContentsOfFile:imgLocal];
     MMImage *mmImg = ui ? (MMImage *)[(MMImage *)[mmImgCls alloc] initWithImage:ui] : [[mmImgCls alloc] init];
@@ -1160,22 +1071,18 @@ static UIColor *ddm_track_bg(void) {
     if (movLocal) {
         // 实况照片保真：标记 isLivePhoto + imageFrom + tempExtraInfo，保证发布为动态实况。
         mmImg.isLivePhoto = YES;
-        if ([mmImg respondsToSelector:@selector(setLivePhotoVideoPath:)]) mmImg.livePhotoVideoPath = movLocal;
-        if ([mmImg respondsToSelector:@selector(setImageFrom:)]) [mmImg setImageFrom:3];
+        mmImg.livePhotoVideoPath = movLocal;
+        [mmImg setImageFrom:3];
 
-        if ([mmImg respondsToSelector:@selector(setValue:forKey:)]) {
-            NSMutableDictionary *extra = [NSMutableDictionary dictionary];
-            [extra setValue:movLocal forKey:@"ExportedLivePhotoPath"];
-            [mmImg setValue:extra forKey:@"tempExtraInfo"];
-        }
+        NSMutableDictionary *extra = [NSMutableDictionary dictionary];
+        [extra setValue:movLocal forKey:@"ExportedLivePhotoPath"];
+        [mmImg setValue:extra forKey:@"tempExtraInfo"];
 
-        if ([asset respondsToSelector:@selector(setM_isUseLivePhoto:)])      [asset setM_isUseLivePhoto:YES];
-        if ([asset respondsToSelector:@selector(setM_livePhotoVideoPath:)])   [asset setM_livePhotoVideoPath:movLocal];
-        if ([asset respondsToSelector:@selector(setLivePhotoVideoSize:)]) {
-            long long sz = (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize];
-            [asset setLivePhotoVideoSize:sz];
-        }
-        if ([asset respondsToSelector:@selector(setLivePhotoDuration:)]) [asset setLivePhotoDuration:DDMVideoDuration(movLocal)];
+        ((MMAssetForLocalImage *)asset).m_isUseLivePhoto = YES;
+        ((MMAssetForLocalImage *)asset).m_livePhotoVideoPath = movLocal;
+        long long sz = (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize];
+        ((MMAssetForLocalImage *)asset).livePhotoVideoSize = sz;
+        ((MMAssetForLocalImage *)asset).livePhotoDuration = DDMVideoDuration(movLocal);
     }
     return mmImg;
 }
@@ -1184,7 +1091,7 @@ static UIColor *ddm_track_bg(void) {
 
 // 暂存原帖文案，供发布器回填。
 - (void)stashTextOf:(WCDataItem *)item {
-    NSString *text = [item respondsToSelector:@selector(contentDesc)] ? item.contentDesc : nil;
+    NSString *text = item.contentDesc;
     text = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     self.pendingText = text.length > 0 ? text : nil;
     self.pendingTextStamp = NSDate.date.timeIntervalSince1970;
@@ -1209,46 +1116,51 @@ static UIColor *ddm_track_bg(void) {
         id s = fn(host, gen, 0);
         if (s) return s;
     }
-    Class cls = objc_getClass("WCMomentsPostReportSession");
-    return cls ? [[cls alloc] init] : nil;
+    return [[objc_getClass("WCMomentsPostReportSession") alloc] init];
 }
 
 // 将发布器 VC 推入宿主导航栈。
 - (void)ddmPresentCommitVC:(UIViewController *)vc host:(UIViewController *)host {
-    if (!vc) { [self failHUD:@"打开发布界面失败"]; return; }
-
     dispatch_async(dispatch_get_main_queue(), ^{
         UINavigationController *nav = host.navigationController;
         if (!nav) nav = DDMTopViewController(nil).navigationController;
-        if (!nav) { [self failHUD:@"打开发布界面失败"]; return; }
         [nav pushViewController:vc animated:YES];
     });
 }
 
-// 视频发布：构造 WCNewCommitViewController(sightDraft) 并推入。
-- (void)ddmPushSightCommit:(id)draft host:(UIViewController *)host {
-    Class cls = objc_getClass("WCNewCommitViewController");
-    if (!cls || ![cls instancesRespondToSelector:@selector(initWithSightDraft:)]) {
-        [self failHUD:@"当前版本不支持"]; return;
+// 把来源位置信息写到发布器：setPoiInfo: 写入 POI（WCNewCommitViewController.h:315），
+// setBShowLocation: 控制是否展示（WCNewCommitViewController.h:276）。loc 为 nil 时关闭位置展示。
+- (void)ddmApplyLocation:(id)loc toCommitVC:(WCNewCommitViewController *)vc {
+    if (!vc) return;
+    if (loc) {
+        [vc setPoiInfo:loc];
+        [vc setBShowLocation:YES];
+    } else {
+        [vc setBShowLocation:NO];
     }
+}
+
+// 视频发布：构造 WCNewCommitViewController(sightDraft) 并推入，附带来源位置。
+// WCNewCommitViewController 为私有类，经 objc_getClass 取类（链接必需）；其 initWithSightDraft: 已声明，直接调用。
+- (void)ddmPushSightCommit:(id)draft item:(WCDataItem *)item host:(UIViewController *)host {
+    Class cls = objc_getClass("WCNewCommitViewController");
     WCNewCommitViewController *vc = [(WCNewCommitViewController *)[cls alloc] initWithSightDraft:draft];
-    if (!vc) { [self failHUD:@"当前版本不支持"]; return; }
 
     id detail = [[NSClassFromString(@"WCCommentDetailViewControllerFB") alloc] init];
     if (detail) {
-        if ([vc respondsToSelector:@selector(setDelegate:)]) [vc performSelector:@selector(setDelegate:) withObject:detail];
+        [vc setDelegate:detail];
         self.retainedCommentDetailVC = detail;
     }
+    [self ddmApplyLocation:[item locationInfo] toCommitVC:vc];
     [self ddmPresentCommitVC:vc host:host];
 }
 
-// 图片发布：构造 WCNewCommitViewController(images) 并推入。
-- (void)ddmPushImageCommit:(NSArray *)assets host:(UIViewController *)host {
+// 图片发布：构造 WCNewCommitViewController(images) 并推入，附带来源位置。
+// WCNewCommitViewController 为私有类，经 objc_getClass 取类（链接必需）；其 initWithImages:contacts: 已声明，直接调用。
+- (void)ddmPushImageCommit:(NSArray *)assets item:(WCDataItem *)item host:(UIViewController *)host {
     Class cls = objc_getClass("WCNewCommitViewController");
-    if (!cls || ![cls instancesRespondToSelector:@selector(initWithImages:contacts:)]) {
-        [self failHUD:@"当前版本不支持"]; return;
-    }
     WCNewCommitViewController *vc = [(WCNewCommitViewController *)[cls alloc] initWithImages:[assets mutableCopy] contacts:nil];
+    [self ddmApplyLocation:[item locationInfo] toCommitVC:vc];
     [self ddmPresentCommitVC:vc host:host];
 }
 
@@ -1256,12 +1168,10 @@ static UIColor *ddm_track_bg(void) {
 - (void)presentLegacyForward:(WCDataItem *)item host:(UIViewController *)host {
     [self dismissHUD];
     Class router = objc_getClass("WCTimelineRouterHelper");
-    SEL sel = @selector(presentForwardViewController:postReportSession:trashReportData:currentViewController:);
-    if ([router respondsToSelector:sel]) {
-        BOOL (*fn)(id, SEL, id, id, id, id) = (BOOL (*)(id, SEL, id, id, id, id))objc_msgSend;
-        if (fn(router, sel, item, [self reportSessionFromHost:host], nil, host)) { self.busy = NO; return; }
-    }
-    [self failHUD:@"无法打开转发界面"];
+    BOOL (*fn)(id, SEL, id, id, id, id) = (BOOL (*)(id, SEL, id, id, id, id))objc_msgSend;
+    if (fn(router, @selector(presentForwardViewController:postReportSession:trashReportData:currentViewController:),
+            item, [self reportSessionFromHost:host], nil, host)) { self.busy = NO; return; }
+    self.busy = NO;
 }
 
 @end
@@ -1272,12 +1182,10 @@ static UIColor *ddm_track_bg(void) {
 static UIImage *DDMShareIcon(void) {
     UIImage *img = nil;
     Class adapter = NSClassFromString(@"WCSDKAdapter");
-    if (adapter && [adapter respondsToSelector:@selector(svgImageNamed:size:color:)]) {
-        UIImage *(*fn)(id, SEL, NSString *, CGSize, UIColor *) =
-            (UIImage *(*)(id, SEL, NSString *, CGSize, UIColor *))objc_msgSend;
-        img = fn(adapter, @selector(svgImageNamed:size:color:),
-                 @"icons_outlined_share", CGSizeMake(18.0, 18.0), [UIColor whiteColor]);
-    }
+    UIImage *(*fn)(id, SEL, NSString *, CGSize, UIColor *) =
+        (UIImage *(*)(id, SEL, NSString *, CGSize, UIColor *))objc_msgSend;
+    img = fn(adapter, @selector(svgImageNamed:size:color:),
+             @"icons_outlined_share", CGSizeMake(18.0, 18.0), [UIColor whiteColor]);
     if (!img) img = [UIImage imageNamed:@"icons_outlined_share"];
     return img;
 }
@@ -1415,9 +1323,9 @@ static char kDDMLineKey;
 %new
 // 浮窗点击转发时由 WCOperateFloatView 响应的事件：直接拉起引擎。
 - (void)onClickForwardBtnOnFloatView {
-    WCOperateFloatView *fv = [self respondsToSelector:@selector(floatOperateView)] ? self.floatOperateView : nil;
+    WCOperateFloatView *fv = self.floatOperateView;
     if (!fv) return;
-    WCDataItem *item = [fv respondsToSelector:@selector(m_item)] ? fv.m_item : nil;
+    WCDataItem *item = fv.m_item;
     if (!item) return;
     [[DDMEngine shared] forwardDataItem:item hostView:fv];
 }
@@ -1431,10 +1339,7 @@ static char kDDMLineKey;
 // 发布器加载后，若是本插件带入的本地资源，显示 + 号（图片选择器）。
 - (void)viewDidLoad {
     %orig;
-    if ([self respondsToSelector:@selector(m_isUseMMAsset)] && self.m_isUseMMAsset &&
-        [self respondsToSelector:@selector(setBHideAddView:)]) {
-        self.bHideAddView = NO;
-    }
+    if (self.m_isUseMMAsset) self.bHideAddView = NO;
 }
 
 // 文本框初始化后回填暂存文案。
@@ -1442,12 +1347,11 @@ static char kDDMLineKey;
     %orig;
     NSString *text = [[DDMEngine shared] consumePendingText];
     if (text.length == 0) return;
-    MMGrowTextView *grow = [self respondsToSelector:@selector(textView)] ? self.textView : nil;
-    UITextView *tv = [grow respondsToSelector:@selector(textView)] ? grow.textView : nil;
+    UITextView *tv = self.textView.textView;
     if (![tv isKindOfClass:UITextView.class]) return;
     if (tv.text.length > 0) return;
     tv.text = text;
-    if ([self respondsToSelector:@selector(textViewTextDidChange)]) [self textViewTextDidChange];
+    [self textViewTextDidChange];
 }
 
 %end
@@ -1616,20 +1520,18 @@ static void ddmInjectMarkIntoComment(id c) {
     [_tableViewManager clearAllSection];
     Class cellMgr = objc_getClass("WCTableViewCellManager");
     Class secMgr  = objc_getClass("WCTableViewSectionManager");
-    if (!cellMgr || !secMgr) return;
 
     DDMConfig *cfg = DDMConfig.shared;
     WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"转发设置"];
-    if (!sec) return;
     [sec addCell:[cellMgr switchCellForSel:@selector(onForwardEnabledSwitch:)
                                     target:self
-                                     title:@"朋友圈转发"
+                                     title:@"启用朋友圈转发"
                                         on:cfg.forwardEnabled]];
     // 转发开关打开时展开子项：移除原始位置。
     if (cfg.forwardEnabled) {
         [sec addCell:[cellMgr switchCellForSel:@selector(onRemoveOriginalLocationSwitch:)
                                         target:self
-                                         title:@"移除原始位置"
+                                         title:@"↳移除原始位置"
                                             on:cfg.removeOriginalLocation]];
     }
     [_tableViewManager addSection:sec];
@@ -1681,7 +1583,7 @@ static void ddmInjectMarkIntoComment(id c) {
         return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
     return UITableViewAutomaticDimension;
 }
-// 仅“朋友圈转发”开关（将来会展开子项）在切换时即时重建表格。
+// “启用朋友圈转发”开关展开“移除原始位置”子项，故其回调内即时重建表格。
 - (void)onForwardEnabledSwitch:(UISwitch *)s        { DDMConfig.shared.forwardEnabled = s.isOn; [self buildTable]; }
 - (void)onRemoveOriginalLocationSwitch:(UISwitch *)s { DDMConfig.shared.removeOriginalLocation = s.isOn; }
 - (void)onViewDeletedCommentSwitch:(UISwitch *)s   { DDMConfig.shared.viewDeletedComment = s.isOn; }
