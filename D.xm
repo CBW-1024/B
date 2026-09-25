@@ -155,7 +155,7 @@ static inline id DDMGetFrameFacade(void) {
 @property (retain, nonatomic) MMAsset *m_asset;
 @property (nonatomic) BOOL isLivePhoto;
 @property (retain, nonatomic) NSString *livePhotoVideoPath;
-@property (retain, nonatomic) NSString *m_assetClassNameStr;   // 草稿 PB 反序列化时据此挑类重建 m_asset
+@property (retain, nonatomic) NSString *m_assetClassNameStr;   // 实况资产类名；刻意不设，避免微信按类名重建 MMAsset 时缺 assetId/assetUrl 而失败
 @property (nonatomic) long long imageFrom;
 @end
 
@@ -1023,13 +1023,11 @@ static UIColor *ddm_track_bg(void) {
 //   · 普通图片不构造任何资产，MMImage 只承载 UIImage。
 //   · 实况挂 MMAsset 基类（m_isUseLivePhoto / m_livePhotoVideoPath 只在这个类上，
 //     MMAssetForLocalImage 继承 NSObject、没有这两个字段，且不遵 NSCoding）。
-//   · 但 URL 必须用 fileURLWithPath:，不能用 PKC 的 URLWithString:。
-//     URLWithString: 造出来的是无 scheme 的 URL，微信解析不出可引用的本地路径，
-//     保存草稿时 copyImageAtAlbumToFile: 复制失败 → setDraftImages: 返回 NO
-//     → 整条草稿不落库（这正是上一版"实况丢图"的原因）。
-//     fileURLWithPath: 带 file:// scheme，微信能解析出路径，复制源又是微信自己的
-//     持久转码产物，复制成功且目标落在微信草稿目录 —— 落库与实况同时保住。
-//     PKC 用 URLWithString: 是因为它不做"保留草稿"，那条路径它根本不走。
+//   · URL 必须用 URLWithString:（PKC 原样，0x117010 URLWithString:x28），不能改成
+//     fileURLWithPath:。PKC 的实况资产就是这么造的，用户实机验证正常。
+//     （此前我改成 fileURLWithPath: 又额外设 m_assetClassNameStr=@"MMAsset"，
+//      反而导致重开草稿丢图：设了类名后微信会按它重建 MMAsset，缺 assetId/assetUrl
+//      必败，连带 MMImage 静帧一起消失。删掉类名、URL 改回 URLWithString 即对齐 PKC。）
 //   · 运动视频只认 [livePhotoMediaItem getFormatVideoPath]，无任何回退（PKC 原样）。
 //     拿不到就降级成普通图片 —— 丢实况动效，但图一定在。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
@@ -1056,7 +1054,7 @@ static UIColor *ddm_track_bg(void) {
         MMAsset *asset = nil;
         if (movLocal && assetCls &&
             [assetCls instancesRespondToSelector:@selector(initWithUrl:IsNeedOrigin:)]) {
-            asset = [(MMAsset *)[assetCls alloc] initWithUrl:[NSURL fileURLWithPath:movLocal]
+            asset = [(MMAsset *)[assetCls alloc] initWithUrl:[NSURL URLWithString:movLocal]
                                                IsNeedOrigin:YES];
             if (!asset) movLocal = nil;
         } else {
@@ -1085,12 +1083,16 @@ static UIColor *ddm_track_bg(void) {
     if (!mmImg) return nil;
 
     if (asset) {
+        // 只挂 m_asset，绝不设 m_assetClassNameStr —— 这是上一轮"重开丢图"的真正元凶。
+        //
+        // 真相（PKC 反汇编逐条对照，0x116f48–0x1170c4 无任何 setM_assetClassNameStr）：
+        //   · MMImage 的静帧来自 initWithImage:，已内嵌进 PB 草稿，与 m_asset 能否重建无关；
+        //   · 一旦设了 m_assetClassNameStr，微信反序列化（PB）会按该类名去 [[MMAsset alloc]
+        //     initWithCoder:] 重建资产；而我们只填了 m_livePhotoVideoPath / m_isUseLivePhoto，
+        //     没有 assetId / assetUrl，重建必然失败，且会连带整张 MMImage 解码失败 → 静帧也消失。
+        //   · 不设类名，微信不尝试重建资产，静帧（独立内嵌）正常显示，实况动效由 URL 兜底。
+        // PKC 实况正常，靠的就是"只挂资产、不设类名"这一条。
         mmImg.m_asset = asset;
-        // MMImage 走 PB 序列化（草稿归档），反序列化时微信靠 m_assetClassNameStr
-        // 决定实例化哪个资产类来重建 m_asset。PKC 从不保留草稿、从不在磁盘上重建资产，
-        // 所以从不设它；我们"保留→重开"必须重建 —— 不设则资产解码失败、
-        // 整张 MMImage 重建失败，重开草稿图不显示（即"丢图"）。值必须等于实际资产类名。
-        mmImg.m_assetClassNameStr = @"MMAsset";
     }
 
     if (movLocal && asset) {
