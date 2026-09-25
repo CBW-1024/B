@@ -19,7 +19,7 @@
 
 #pragma mark - 微信私有接口声明
 
-// 微信“我”页插件管理入口，用于注册本插件设置页。
+// 微信插件管理入口，用于注册本插件设置页。
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -181,6 +181,7 @@ static inline id DDMGetFrameFacade(void) {
 @property (retain, nonatomic) MMGrowTextView *textView;
 @property (nonatomic) BOOL m_isUseMMAsset;
 @property (nonatomic) BOOL bHideAddView;
+@property (nonatomic, retain) id sightDraft;   // 视频(sight)草稿，用于判定当前是否为视频发布器
 - (void)initTextViewContent;
 - (void)textViewTextDidChange;
 - (instancetype)initWithImages:(id)arg1 contacts:(id)arg2;
@@ -243,6 +244,8 @@ static NSString * const kDDMRemoveOriginalLoc    = @"DDMoments_removeOriginalLoc
 // 已删评论标记。
 static NSString * const kDDMDeletedCommentMark   = @"DDMoments_deletedCommentMark";
 static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
+
+// 转发文案关联对象键：将原文案绑定到发布器 VC，供 viewDidLoad 回填（替代原 8s 全局槽）。
 static char kDDMForwardTextKey;
 
 @interface DDMConfig : NSObject
@@ -511,7 +514,6 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
 @property (nonatomic, weak) UIWindow *ddmWindow;   // 进度卡挂载的窗口，由触发浮窗直接给出
 + (instancetype)shared;
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView;
-- (void)ddmAttachCaptionOf:(WCDataItem *)item toCommitVC:(WCNewCommitViewController *)vc;
 @end
 
 // 进度浮卡：窗口宽度变化时按当前宽度重排子视图。
@@ -1069,6 +1071,16 @@ static UIColor *ddm_track_bg(void) {
     return mmImg;
 }
 
+#pragma mark 文案暂存
+
+// 将原帖文案绑定到发布器 VC（关联对象），供 viewDidLoad 回填。绑定 VC 实例可避免连转两条串文案，
+// 且无需 8s 时效（只要 VC 还活着，文案就在）。
+- (void)ddmAttachCaptionOf:(WCDataItem *)item toCommitVC:(UIViewController *)vc {
+    NSString *text = [item.contentDesc stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (text.length == 0) return;
+    objc_setAssociatedObject(vc, &kDDMForwardTextKey, text, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 #pragma mark 路由调用
 
 // 生成发布上报会话（优先宿主 VC 方法，回退默认构造）。
@@ -1100,14 +1112,6 @@ static UIColor *ddm_track_bg(void) {
     } else {
         [vc setBShowLocation:NO];
     }
-}
-
-// 把原帖文案贴到发布器 VC 实例（关联对象），供文本框初始化时回填；绑定到具体 VC 避免文案泄漏到无关发布。
-- (void)ddmAttachCaptionOf:(WCDataItem *)item toCommitVC:(WCNewCommitViewController *)vc {
-    if (!vc || !item) return;
-    NSString *text = [item.contentDesc stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (text.length == 0) return;
-    objc_setAssociatedObject(vc, &kDDMForwardTextKey, text, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // 视频发布：构造 WCNewCommitViewController(sightDraft) 并推入。
@@ -1311,22 +1315,24 @@ static char kDDMLineKey;
 
 %hook WCNewCommitViewController
 
-// 加载后若是本地资源带入，显示 + 号（图片选择器）。
+// 加载后若是本地资源带入，显示 + 号（图片选择器）；并回填原帖文案。
 - (void)viewDidLoad {
     %orig;
     if (self.m_isUseMMAsset) self.bHideAddView = NO;
-}
-
-// 文本框初始化后回填绑定到本 VC 的原帖文案。
-- (void)initTextViewContent {
-    %orig;
+    // 回填原帖文案：关联对象已由引擎在推入前写入，viewDidLoad 时序稳定且早于 sight 草稿重新合成；
+    // 视频(sight)草稿跳过 textViewTextDidChange，避免该通知触发 sight 草稿重新合成而破坏转发。
     NSString *text = objc_getAssociatedObject(self, &kDDMForwardTextKey);
     if (text.length == 0) return;
     UITextView *tv = self.textView.textView;
     if (![tv isKindOfClass:UITextView.class]) return;
     if (tv.text.length > 0) return;
     tv.text = text;
-    [self textViewTextDidChange];
+    if (!self.sightDraft) [self textViewTextDidChange];
+}
+
+// 文案回填已移至 viewDidLoad，这里不再操作，避免对 sight 草稿重复通知引发重新合成。
+- (void)initTextViewContent {
+    %orig;
 }
 
 %end
@@ -1572,7 +1578,7 @@ static void ddmInjectMarkIntoComment(id c) {
 
 #pragma mark - 注册入口
 
-// 将设置页注册到微信“我”页插件管理（依赖第三方 WCPluginsMgr，做存在性守卫避免启动崩溃）。
+// 将设置页注册到插件管理（依赖第三方 WCPluginsMgr，做存在性守卫避免启动崩溃）。
 %ctor {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
