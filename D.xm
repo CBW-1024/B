@@ -1287,7 +1287,7 @@ static char kDDMLineKey;
         if (!CGRectEqualToRect(line.frame, lf)) line.frame = lf;
     }
 
-    // 第三列：加宽外层 self 到三列宽度并居中（承载容器 / 圆角背景若设 autoresizing 会跟随拉伸）。
+    // 第三列：仅加宽外层 self（承载容器 / 圆角背景若设 autoresizing 会跟随拉伸）；不动 center，避免打断微信入场动画。
     CGFloat needW = CGRectGetMaxX(target) + likeBtn.frame.origin.x;
     if (fabs(self.bounds.size.width - needW) > 0.5) {
         CGPoint center = self.center;
@@ -1295,9 +1295,6 @@ static char kDDMLineKey;
         f.size.width = needW;
         self.frame = f;
         self.center = CGPointMake(center.x, center.y);
-        if (self.superview) {
-            self.center = CGPointMake(self.superview.bounds.size.width / 2.0, self.center.y);
-        }
     }
 }
 
