@@ -1185,7 +1185,6 @@ static UIImage *DDMShareIcon(void) {
 
 static char kDDMShareBtnKey;
 static char kDDMLineKey;
-static char kDDMSizedKey;
 
 @interface WCOperateFloatView (DDMoments)
 - (void)ddm_onForwardTapped:(UIButton *)sender;
@@ -1201,10 +1200,19 @@ static char kDDMSizedKey;
     [self initForwardButton];
 }
 
-// 浮窗展示时补充转发按钮与分隔线；三列加宽 / 居中由 layoutSubviews 首帧定型一次。
+// 浮窗展示时补充转发按钮与分隔线；三列加宽 / 居中由 layoutSubviews 按宽度差自动处理。
 - (void)showWithItemData:(id)itemData tipPoint:(struct CGPoint)tipPoint {
     %orig;
     [self initForwardLineView];
+}
+
+// 浮窗退出时同步隐藏注入的转发列，避免克隆分隔线滞留于原生退出动画之外。
+- (void)hide {
+    UIButton *shareBtn = objc_getAssociatedObject(self, &kDDMShareBtnKey);
+    UIImageView *line = objc_getAssociatedObject(self, &kDDMLineKey);
+    if (shareBtn) shareBtn.hidden = YES;
+    if (line) line.hidden = YES;
+    %orig;
 }
 
 %new
@@ -1288,20 +1296,17 @@ static char kDDMSizedKey;
         if (!CGRectEqualToRect(line.frame, lf)) line.frame = lf;
     }
 
-    // 第三列：仅在尚未定型时把外层 self 加宽并居中一次，避免动画过程中反复改 frame 导致转发列出现不流畅。
-    if (![objc_getAssociatedObject(self, &kDDMSizedKey) boolValue]) {
-        CGFloat needW = CGRectGetMaxX(target) + likeBtn.frame.origin.x;
-        if (fabs(self.bounds.size.width - needW) > 0.5) {
-            CGPoint center = self.center;
-            CGRect f = self.frame;
-            f.size.width = needW;
-            self.frame = f;
-            self.center = CGPointMake(center.x, center.y);
-            if (self.superview) {
-                self.center = CGPointMake(self.superview.bounds.size.width / 2.0, self.center.y);
-            }
+    // 第三列：宽度不一致时才把外层 self 加宽并居中（稳定后不再改，避免与入场动画抢 frame）。
+    CGFloat needW = CGRectGetMaxX(target) + likeBtn.frame.origin.x;
+    if (fabs(self.bounds.size.width - needW) > 0.5) {
+        CGPoint center = self.center;
+        CGRect f = self.frame;
+        f.size.width = needW;
+        self.frame = f;
+        self.center = CGPointMake(center.x, center.y);
+        if (self.superview) {
+            self.center = CGPointMake(self.superview.bounds.size.width / 2.0, self.center.y);
         }
-        objc_setAssociatedObject(self, &kDDMSizedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
