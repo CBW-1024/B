@@ -23,6 +23,58 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
+#include <stdarg.h>
+
+#pragma mark - 调试日志子系统
+
+// 调试日志：落盘到 App 沙盒 Library/DDWCMoments/debug.log。
+// 随微信进程加载即可写，不依赖越狱 / PreferenceLoader / Cephei。
+// 手机无法接 console 时，用设置页「导出日志」经系统分享面板存到
+// 文件 / 隔空投送 / 拷贝，即可离线调试实况保留等问题。
+static NSString *DDMLogPath(void) {
+    NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *dir = [lib stringByAppendingPathComponent:@"DDWCMoments"];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:@"debug.log"];
+}
+static dispatch_queue_t DDMLogQueue(void) {
+    static dispatch_queue_t q; static dispatch_once_t t;
+    dispatch_once(&t, ^{ q = dispatch_queue_create("com.ddwcmoments.log", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+static void DDMLogWrite(NSString *line) {
+    NSString *p = DDMLogPath();
+    dispatch_async(DDMLogQueue(), ^{
+        FILE *f = fopen([p UTF8String], "a");
+        if (f) { fputs([line UTF8String], f); fputs("\n", f); fclose(f); }
+    });
+}
+static void DDMLog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"MM-dd HH:mm:ss.SSS";
+    NSString *line = [NSString stringWithFormat:@"[%@] %@", [df stringFromDate:[NSDate date]], msg];
+    DDMLogWrite(line);
+}
+static void DDMLogClear(void) {
+    NSString *p = DDMLogPath();
+    dispatch_async(DDMLogQueue(), ^{
+        [@"" writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    });
+}
+static NSString *DDMLogContent(void) {
+    NSString *p = DDMLogPath();
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"";
+}
+static void DDMLogAlert(UIViewController *from, NSString *title, NSString *msg) {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [from presentViewController:a animated:YES completion:nil];
+}
+
 #pragma mark - 微信私有接口声明
 
 // 微信插件管理入口，用于注册本插件设置页。
@@ -507,7 +559,9 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     // 现在只认微信自己的转码产物。拿不到就返回 nil，调用方降级成普通图片：
     // 丢实况动效，但保住图。
     NSString *p = [live getFormatVideoPath];
-    return DDMFileUsable(p) ? p : nil;
+    NSString *r = DDMFileUsable(p) ? p : nil;
+    DDMLog(@"[LiveVideo] getFormatVideoPath=%@ -> %@", p, r ? @"valid" : @"nil(降级普通图)");
+    return r;
 }
 
 #pragma mark - 转发引擎
@@ -1073,7 +1127,11 @@ static UIColor *ddm_track_bg(void) {
         } else {
             movLocal = nil;
         }
-
+        DDMLog(@"[Forward] media ui=%@ live=%@ movLocal=%@ asset=%@",
+               ui ? @"Y" : @"N",
+               m.livePhotoMediaItem ? @"Y" : @"N",
+               movLocal ? @"Y" : @"N",
+               asset ? @"Y" : @"N");
         MMImage *mm = [self ddmMakeMMImage:ui asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
     }
@@ -1129,6 +1187,14 @@ static UIColor *ddm_track_bg(void) {
     // 说明它不会清掉 m_asset；放在所有字段设完之后统一调一次即可覆盖两种情况。
     [mmImg commonInit];
 
+    if (movLocal && asset) {
+        DDMLog(@"[MMImage] live built video=%@ size=%lld dur=%.2f",
+               movLocal,
+               (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize],
+               DDMVideoDuration(movLocal));
+    } else {
+        DDMLog(@"[MMImage] plain image (no live)");
+    }
     return mmImg;
 }
 
@@ -1171,9 +1237,11 @@ static UIColor *ddm_track_bg(void) {
         SEL pushSel = NSSelectorFromString(@"PushViewController:animated:completion:");
         if (nav && [nav respondsToSelector:pushSel]) {
             void (*fn)(id, SEL, id, BOOL, id) = (void (*)(id, SEL, id, BOOL, id))objc_msgSend;
+            DDMLog(@"[Present] using WeChat private PushViewController:animated:completion:");
             void (^noop)(void) = ^{};
             fn(nav, pushSel, vc, YES, noop);
         } else {
+            DDMLog(@"[Present] fallback system pushViewController: (no viewDidBePushOrPresent:)");
             [nav pushViewController:vc animated:YES];
             // 回退：系统 push 不会触发 viewDidBePushOrPresent:，手动补一次，
             // 确保草稿保存控制器被初始化（仅兜底，正常情况下私有封装已调用）。
@@ -1627,9 +1695,15 @@ static void ddmInjectMarkIntoComment(id c) {
                                    target:self
                                     title:@"启用视频进度"
                                        on:cfg.enableVideoProgress]];
-    [_tableViewManager addSection:aux];
+        [_tableViewManager addSection:aux];
 
-    [_tableViewManager reloadTableView];
+        WCTableViewSectionManager *logSec = [secMgr sectionWithHeader:@"调试日志"];
+        [logSec addCell:[cellMgr normalCellForSel:@selector(onExportLog) target:self title:@"导出日志（分享/隔空投送/存文件）"]];
+        [logSec addCell:[cellMgr normalCellForSel:@selector(onViewLog)   target:self title:@"查看日志"]];
+        [logSec addCell:[cellMgr normalCellForSel:@selector(onClearLog)  target:self title:@"清空日志"]];
+        [_tableViewManager addSection:logSec];
+
+        [_tableViewManager reloadTableView];
 }
 // 将微信表格 delegate 事件转发给原 delegate，本类只做外观代理。
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1655,6 +1729,55 @@ static void ddmInjectMarkIntoComment(id c) {
 - (void)onDisableVideoAutoPlaySwitch:(UISwitch *)s { DDMConfig.shared.disableVideoAutoPlay = s.isOn; }
 - (void)onDisableVideoTapCloseSwitch:(UISwitch *)s { DDMConfig.shared.disableVideoTapClose = s.isOn; }
 - (void)onEnableVideoProgressSwitch:(UISwitch *)s  { DDMConfig.shared.enableVideoProgress = s.isOn; }
+
+#pragma mark 调试日志操作
+- (void)onExportLog {
+    NSString *p = DDMLogPath();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:p] ||
+        [[NSData dataWithContentsOfFile:p] length] == 0) {
+        DDMLogAlert(self, @"日志为空", @"还没有任何调试日志可供导出。");
+        return;
+    }
+    NSURL *url = [NSURL fileURLWithPath:p];
+    UIActivityViewController *avc =
+        [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    if ([avc respondsToSelector:@selector(popoverPresentationController)]) {
+        avc.popoverPresentationController.sourceView = self.view;
+        avc.popoverPresentationController.sourceRect =
+            CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height - 40, 1, 1);
+        avc.popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionDown;
+    }
+    [self presentViewController:avc animated:YES completion:nil];
+}
+- (void)onViewLog {
+    UIViewController *v = [[UIViewController alloc] init];
+    v.title = @"调试日志";
+    v.view.backgroundColor = [UIColor whiteColor];
+    UITextView *tv = [[UITextView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    tv.editable = NO;
+    tv.font = [UIFont fontWithName:@"Menlo" size:11];
+    tv.text = DDMLogContent();
+    [v.view addSubview:tv];
+    UIBarButtonItem *close = [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                                            style:UIBarButtonItemStyleDone
+                                                           target:self
+                                                           action:@selector(ddmDismissLog:)];
+    UIBarButtonItem *share = [[UIBarButtonItem alloc] initWithTitle:@"导出"
+                                                            style:UIBarButtonItemStylePlain
+                                                           target:self
+                                                           action:@selector(onExportLog)];
+    v.navigationItem.leftBarButtonItem = close;
+    v.navigationItem.rightBarButtonItem = share;
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:v];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+- (void)ddmDismissLog:(id)sender {
+    [self.presentedViewController dismissViewControllerAnimated:YES completion:nil];
+}
+- (void)onClearLog {
+    DDMLogClear();
+    DDMLogAlert(self, @"已清空", @"调试日志已清空。");
+}
 @end
 
 #pragma mark - 注册入口
