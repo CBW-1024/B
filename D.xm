@@ -1679,3 +1679,14 @@ static void ddmInjectMarkIntoComment(id c) {
 - (void)onDisableVideoTapCloseSwitch:(UISwitch *)s { DDMConfig.shared.disableVideoTapClose = s.isOn; }
 - (void)onEnableVideoProgressSwitch:(UISwitch *)s  { DDMConfig.shared.enableVideoProgress = s.isOn; }
 @end
+
+#pragma mark - 注册入口
+
+// 将本插件设置页注册到微信“我”页。
+%ctor {
+    @autoreleasepool {
+        [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD朋友圈助手"
+                                                                          version:@"1.0.0"
+                                                                       controller:@"DDMSettingsViewController"];
+    }
+}
