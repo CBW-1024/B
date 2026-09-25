@@ -485,15 +485,16 @@ static NSString *DDMTranscodeWxamToMov(NSString *src) {
 static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     if (!live) return nil;
 
+    // ① 微信自己的转码产物（CDN 缓存目录，微信会自己维护生命周期）。
+    //    对齐 PKC：原样直接引用，绝不复制一份到 tmp —— tmp 被回收后草稿里的路径就失效了。
     NSString *decoded = DDMFirstUsablePath(@[
         ([live getFormatVideoPath] ?: @""),
         ([live getTempVideoPath]  ?: @""),
     ]);
-    if (decoded) {
-        NSString *cp = DDMCopyToTemp(decoded, @"mov");
-        if (cp) return cp;
-    }
+    if (decoded) return decoded;
 
+    // ② 兜底：短视频原始封装（wxam 无法直接播放），必须转码成 mov。
+    //    转码产物只能落 tmp，这是唯一还会丢的场景，仅在微信尚未转码时才会走到。
     NSString *wxam = DDMPersistentSightPath(live);
     if (!wxam) return nil;
     return DDMTranscodeWxamToMov(wxam);
@@ -1005,22 +1006,29 @@ static UIColor *ddm_track_bg(void) {
 
 // 图片 / Live Photo 转发：组装 MMImage（含 Live Photo 保真）→ 唤起发布器。
 //
-// 对齐 PKC（反汇编取证 PA/PB 两条转发链结论一致）：
-//   · 普通图片不构造任何资产，MMImage 只承载 UIImage，微信会自行持有并写进自己的草稿目录。
-//     一旦挂上资产，微信就认为"已有文件可引用"，草稿只记路径 —— 我们的文件在 tmp，
-//     被回收后重开草稿就只剩文案。
-//   · 只有 Live Photo 才构造资产，且用 MMAsset 基类 + URLWithString:（PKC 原样）。
-//     URLWithString: 不带 file:// scheme，微信解析不出可引用的本地路径，被迫自行复制。
+// 对齐 PKC（反汇编取证：block@0x1166fc 三处 imageOfSize: 参数恒为 2）：
+//   · 图片一律取 [mediaItem imageOfSize:2] —— 那是微信自己缓存里已解码的 UIImage，
+//     不依赖任何我们创建的文件。此前用 imageWithContentsOfFile:(tmp 副本) 是惰性解码、
+//     只记路径，要等归档草稿那一刻才真正读盘，tmp 一被回收就是空图/整条草稿不落库。
+//   · 普通图片不构造任何资产，MMImage 只承载 UIImage。
+//   · 只有 Live Photo 才构造资产，用 MMAsset 基类 + URLWithString:（PKC 原样），
+//     且 URL 指向微信自己的转码产物，不是我们的 tmp。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
     Class assetCls = objc_getClass("MMAsset");
 
     NSMutableArray *assets = [NSMutableArray array];
 
     for (WCMediaItem *m in item.contentObj.mediaList) {
-        NSString *imgSrc = DDMImagePath(m);
-        if (!imgSrc) continue;
-        NSString *imgLocal = DDMCopyToTemp(imgSrc, @"jpg");
-        if (!imgLocal) continue;
+        UIImage *ui = (UIImage *)[m imageOfSize:2];
+
+        // 兜底：imageOfSize: 取不到时直接读源文件。用 imageWithData: 而非
+        // imageWithContentsOfFile: —— 后者惰性解码仍持有文件路径，前者读完即完全驻留内存。
+        if (!ui) {
+            NSString *imgSrc = DDMImagePath(m);
+            NSData *data = imgSrc ? [NSData dataWithContentsOfFile:imgSrc] : nil;
+            ui = data ? [UIImage imageWithData:data] : nil;
+        }
+        if (!ui) continue;
 
         NSString *movLocal = (m.livePhotoMediaItem ? DDMLivePhotoVideoPath(m.livePhotoMediaItem) : nil);
 
@@ -1033,7 +1041,7 @@ static UIColor *ddm_track_bg(void) {
             if (!asset) movLocal = nil;
         }
 
-        MMImage *mm = [self ddmMakeMMImage:imgLocal asset:asset liveVideoPath:movLocal];
+        MMImage *mm = [self ddmMakeMMImage:ui asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
     }
 
@@ -1045,11 +1053,10 @@ static UIColor *ddm_track_bg(void) {
 
 // 构建 MMImage；若为 Live Photo，保真运动视频信息。
 // asset 为 nil 表示普通图片 —— 此时不挂 m_asset，微信自行持有图片数据。
-- (MMImage *)ddmMakeMMImage:(NSString *)imgLocal
+- (MMImage *)ddmMakeMMImage:(UIImage *)ui
                       asset:(MMAsset *)asset
               liveVideoPath:(NSString *)movLocal {
     Class mmImgCls = objc_getClass("MMImage");
-    UIImage *ui = [UIImage imageWithContentsOfFile:imgLocal];
     MMImage *mmImg = ui ? (MMImage *)[(MMImage *)[mmImgCls alloc] initWithImage:ui] : [[mmImgCls alloc] init];
     if (!mmImg) return nil;
 
