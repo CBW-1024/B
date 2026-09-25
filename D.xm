@@ -1695,12 +1695,16 @@ static void ddmInjectMarkIntoComment(id c) {
 
 #pragma mark - 注册入口
 
-// 将本插件设置页注册到微信“我”页。
+// 将本插件设置页注册到微信“我”页。注册入口依赖懒猫的插件管理框架（WCPluginsMgr），
+// 该框架为第三方依赖，设备上未必安装；%ctor 跑在加载期，故对其做存在性守卫，
+// 避免缺该框架时 unrecognized selector 拖崩 App 启动。
 %ctor {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
-        [[mgr sharedInstance] registerControllerWithTitle:@"DD朋友圈助手"
-                                                 version:@"1.0.0"
-                                              controller:@"DDMSettingsViewController"];
+        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD朋友圈助手"
+                                                     version:@"1.0.0"
+                                                  controller:@"DDMSettingsViewController"];
+        }
     }
 }
