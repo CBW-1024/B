@@ -1200,10 +1200,25 @@ static char kDDMLineKey;
     [self initForwardButton];
 }
 
-// 浮窗展示时补充转发按钮与分隔线；三列加宽 / 居中由 layoutSubviews 按宽度差自动处理。
+// 浮窗展示时补充转发按钮与分隔线，并在动画前把浮窗定型为三列并居中，使转发列随弹窗一起入场（不依赖标记）。
 - (void)showWithItemData:(id)itemData tipPoint:(struct CGPoint)tipPoint {
     %orig;
     [self initForwardLineView];
+    UIButton *cmt = self.m_commentBtn;
+    UIButton *like = self.m_likeBtn;
+    if (cmt && like && cmt.frame.size.width > 0 && like.frame.size.width > 0) {
+        CGFloat gap = cmt.frame.origin.x - (like.frame.origin.x + like.frame.size.width);
+        if (gap <= 0 || gap > 60) gap = 8.0;
+        CGFloat needW = CGRectGetMaxX(cmt.frame) + gap + cmt.frame.size.width;
+        if (fabs(self.bounds.size.width - needW) > 0.5) {
+            CGPoint c = self.center;
+            CGRect fr = self.frame;
+            fr.size.width = needW;
+            self.frame = fr;
+            self.center = CGPointMake(c.x, c.y);
+            if (self.superview) self.center = CGPointMake(self.superview.bounds.size.width / 2.0, self.center.y);
+        }
+    }
 }
 
 // 浮窗退出时同步隐藏注入的转发列，避免克隆分隔线滞留于原生退出动画之外。
@@ -1265,7 +1280,7 @@ static char kDDMLineKey;
     }
 }
 
-// 转发按钮与分隔线随浮窗布局：仅当转发开关打开时显示；第三列加宽时同步拉伸承载容器与圆角背景，避免按钮被裁剪 / 背景盖不住。
+// 转发按钮与分隔线随浮窗布局：仅当转发开关打开时显示并定位（三列加宽 / 居中已在动画前的 showWithItemData 完成）。
 - (void)layoutSubviews {
     %orig;
 
@@ -1294,19 +1309,6 @@ static char kDDMLineKey;
                                cmtBtn.frame.origin.y + (cmtBtn.frame.size.height - ls.height) / 2,
                                ls.width, ls.height);
         if (!CGRectEqualToRect(line.frame, lf)) line.frame = lf;
-    }
-
-    // 第三列：宽度不一致时才把外层 self 加宽并居中（稳定后不再改，避免与入场动画抢 frame）。
-    CGFloat needW = CGRectGetMaxX(target) + likeBtn.frame.origin.x;
-    if (fabs(self.bounds.size.width - needW) > 0.5) {
-        CGPoint center = self.center;
-        CGRect f = self.frame;
-        f.size.width = needW;
-        self.frame = f;
-        self.center = CGPointMake(center.x, center.y);
-        if (self.superview) {
-            self.center = CGPointMake(self.superview.bounds.size.width / 2.0, self.center.y);
-        }
     }
 }
 
