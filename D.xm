@@ -1223,10 +1223,6 @@ static char kDDMLineKey;
     [shareBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     shareBtn.titleLabel.font = cmtBtn.titleLabel.font ?: [UIFont systemFontOfSize:15.0];
 
-    shareBtn.frame = CGRectMake(cmtBtn.frame.origin.x + cmtBtn.frame.size.width,
-                                cmtBtn.frame.origin.y,
-                                cmtBtn.frame.size.width,
-                                cmtBtn.frame.size.height);
     [shareBtn addTarget:self action:@selector(ddm_onForwardTapped:) forControlEvents:UIControlEventTouchUpInside];
     shareBtn.hidden = YES;
     // 注入到原生按钮所在容器（多为 m_clipView），与赞 / 评论同层、同裁剪 / 圆角背景。
@@ -1249,9 +1245,8 @@ static char kDDMLineKey;
 }
 
 %new
-// 转发按钮点击：优先走时间线 VC 原生事件流，否则直接拉起引擎。
+// 转发按钮点击：走时间线 VC 原生事件流（浮窗必在时间线 VC 之下，无需直拉引擎兜底）。
 - (void)ddm_onForwardTapped:(UIButton *)sender {
-
     UIResponder *r = self;
     while ((r = r.nextResponder)) {
         if ([r isKindOfClass:NSClassFromString(@"WCTimeLineViewController")]) {
@@ -1259,9 +1254,6 @@ static char kDDMLineKey;
             return;
         }
     }
-    WCDataItem *item = self.m_item;
-    if (!item) return;
-    [[DDMEngine shared] forwardDataItem:item hostView:self];
 }
 
 // 转发按钮与分隔线随浮窗布局：仅当转发开关打开时显示；第三列加宽时同步拉伸承载容器与圆角背景，避免按钮被裁剪 / 背景盖不住。
@@ -1295,21 +1287,8 @@ static char kDDMLineKey;
         if (!CGRectEqualToRect(line.frame, lf)) line.frame = lf;
     }
 
-    // 第三列：把承载原生按钮的容器（m_clipView）与圆角背景（m_bkgImageView）一起加宽到三列宽度。
+    // 第三列：加宽外层 self 到三列宽度并居中（承载容器 / 圆角背景若设 autoresizing 会跟随拉伸）。
     CGFloat needW = CGRectGetMaxX(target) + likeBtn.frame.origin.x;
-    UIView *container = shareBtn.superview ?: self;
-    if (fabs(container.bounds.size.width - needW) > 0.5) {
-        CGRect cf = container.frame;
-        cf.size.width = needW;
-        container.frame = cf;
-    }
-    Ivar bkgIvar = class_getInstanceVariable([self class], "m_bkgImageView");
-    UIImageView *bkg = bkgIvar ? object_getIvar(self, bkgIvar) : nil;
-    if ([bkg isKindOfClass:UIImageView.class]) {
-        CGRect bf = bkg.frame;
-        if (fabs(bf.size.width - needW) > 0.5) { bf.size.width = needW; bkg.frame = bf; }
-    }
-    // 外层 self 同步加宽并居中（保持原有定位行为）。
     if (fabs(self.bounds.size.width - needW) > 0.5) {
         CGPoint center = self.center;
         CGRect f = self.frame;
