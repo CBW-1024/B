@@ -1,15 +1,21 @@
 // DDWCMoments.xm
-// 微信朋友圈增强插件（Theos / Logos，arm64 / arm64e）
+// 微信朋友圈助手（Theos / Logos，arm64 / arm64e）
 //
 // 功能：
-//   1. 启用一键转发 —— 在朋友圈操作浮窗注入“转发”按钮，支持图片、视频、Live Photo 与纯文字转发；
-//      可选择保留 / 移除原作者位置。
-//   2. 辅助设置 —— 7 项独立开关：查看已删评论、禁用隐私图标、禁用微商折叠、
-//      禁用文字折叠、禁用自动播放、禁用点击关闭、启用视频进度条。
+//   1. 一键转发 —— 在朋友圈「赞 / 评论」操作浮窗中注入「转发」按钮，支持图片、视频、
+//      Live Photo 与纯文字；自动带回原帖文案，可选保留 / 移除原作者位置。
+//   2. 辅助设置 —— 7 项独立开关：查看已删评论、禁用隐私图标、禁用微商折叠、禁用文字折叠、
+//      禁用自动播放、禁用点击关闭、启用视频进度条。
+//
+// 转发链路：
+//   抓文案 → 备媒体（缺失则走 CDN 下载）→ 深拷贝隔离原帖 → 按类型分流
+//   → 构建微信草稿 / 资产 → 唤起发布器并回填文案与位置。
 //
 // 设计说明：
-//   - 所有微信私有类均运行时获取（objc_getClass），不链接私有符号。
-//   - 私有接口基于微信 8.0.79 头文件 dump，仅声明本插件实际调用的方法。
+//   - 所有微信私有类均运行时获取（objc_getClass / NSClassFromString），不链接私有符号。
+//   - 私有接口基于微信 8.0.79 头文件 dump，仅声明本插件实际会调用的方法。
+//   - 文案回填落在发布器 init 期的 initTextViewContent：写完随 textViewTextDidChange
+//     同步进微信内部模型，因此发布器后续重建文本框也不会丢文案。
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -130,12 +136,10 @@ static inline id DDMGetFrameFacade(void) {
 
 // 本地资源基类。
 @interface MMAsset : NSObject
-@property (nonatomic) BOOL m_isNeedOriginImage;
 @property (nonatomic) BOOL m_isUseLivePhoto;
 @property (retain, nonatomic) NSString *m_livePhotoVideoPath;
 @property (nonatomic) double livePhotoDuration;
 @property (nonatomic) long long livePhotoVideoSize;
-@property (nonatomic) BOOL isLivePhoto;
 @end
 
 // 本地图片 / Live Photo 资源。
@@ -160,7 +164,6 @@ static inline id DDMGetFrameFacade(void) {
 @interface SightDraft : NSObject
 + (id)draftWithVideoURL:(NSURL *)url thumbImage:(UIImage *)thumbImage;
 + (id)draftWithVideoURL:(NSURL *)url;
-@property (copy, nonatomic) NSString *draftItemVideoPath;
 @end
 
 // 朋友圈路由：转发到微信原生转发界面（纯文字 / 兜底）。
@@ -214,7 +217,6 @@ static inline id DDMGetFrameFacade(void) {
 
 @interface WCSNSMessage : NSObject
 - (id)comment;
-- (unsigned int)delStatus;
 - (void)setDelStatus:(unsigned int)arg1;
 @end
 
@@ -301,8 +303,7 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 
 #pragma mark - 运行时工具
 
-static BOOL DDMFileUsable(NSString *path);
-static NSString *DDMLivePhotoVideoPath(WCMediaItem *live);
+static BOOL DDMFileUsable(NSString *path);   // 前置声明：DDMVideoDuration 在其定义前使用
 
 // 视频时长（Live Photo 运动视频登记用）。
 static double DDMVideoDuration(NSString *path) {
@@ -758,14 +759,14 @@ static UIColor *ddm_track_bg(void) {
 
 #pragma mark 入口
 
-// 转发主入口：清理临时目录 → 展示 HUD → 下载媒体 → 处理位置 → 分流发布器。
+// 转发主入口：抓文案 → 清临时目录 → 展示进度 → 备媒体 → 在副本上处理位置 → 按类型分流。
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView {
     if (!item) return;
     if (self.busy) { return; }
     self.busy = YES;
 
-    // 文案在入口就从原始 item 抓取：此刻正是用户正在看的这条帖，contentDesc 最可靠。
-    // 存进槽供发布器 init 期取出（取出即清，天然只回填一次，无需 8s 时效也不串文案）。
+    // 文案在入口就从原始 item 抓取：此刻它正是用户正在看的那条帖，内容最可靠。
+    // 存进槽供发布器 init 期取出（取出即清，无需时效判断，也不会串到下一条转发）。
     NSString *cap = [item.contentDesc stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     self.pendingText = cap.length > 0 ? cap : nil;
 
@@ -779,7 +780,7 @@ static UIColor *ddm_track_bg(void) {
     __weak typeof(self) weakSelf = self;
 
     [self downloadAllMediaOf:item completion:^{
-        // 深拷贝失败（如清理缓存后）时回退原件，避免 work 为 nil 触发原生转发崩溃。
+        // 深拷贝失败时回退原件，保证分流拿到的数据项非空。
         WCDataItem *work = [weakSelf deepCopyDataItem:item] ?: item;
         if (work != item) {  // 仅在独立副本上改位置，不污染原帖
             if ([DDMConfig shared].removeOriginalLocation) {
@@ -883,7 +884,7 @@ static UIColor *ddm_track_bg(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         BOOL ready = YES;
         if (isVideo) {
-            // 视频无安全兜底，超时未就绪则静默中止，避免以空路径构建草稿崩溃。
+            // 视频必须等到真正就绪；超时则静默中止，不以空路径构建草稿。
             ready = [self ddmWaitVideo:pending videoMgr:videoMgr];
         } else {
             [self ddmWaitMedia:pending liveSubs:liveSubs];
@@ -1076,8 +1077,8 @@ static UIColor *ddm_track_bg(void) {
 
 #pragma mark 文案暂存
 
-// 取出原帖文案（取出即清）。一次性消费保证 initTextViewContent 被微信二次调用时读到空、不再通知，
-// 从而避免 sight 草稿就绪后被重复通知触发重新合成；同时天然杜绝连转两条串文案。
+// 取出原帖文案（取出即清）。一次性消费保证发布器只会回填并通知一次：
+// 既不会在 sight 草稿就绪后被重复通知，也不会把文案串到下一条转发。
 - (NSString *)consumePendingText {
     NSString *t = self.pendingText;
     self.pendingText = nil;
@@ -1182,7 +1183,7 @@ static char kDDMLineKey;
     [self initForwardButton];
 }
 
-// 浮窗展示时补充转发按钮与分隔线，并在动画前把浮窗定型为三列并居中，使转发列随弹窗一起入场（不依赖标记）。
+// 浮窗展示时补齐分隔线，并在动画前把浮窗定型为三列并居中，使转发列随弹窗一起入场。
 - (void)showWithItemData:(id)itemData tipPoint:(struct CGPoint)tipPoint {
     %orig;
     [self initForwardLineView];
@@ -1251,7 +1252,7 @@ static char kDDMLineKey;
 }
 
 %new
-// 转发按钮点击：走时间线 VC 原生事件流（浮窗必在时间线 VC 之下，无需直拉引擎兜底）。
+// 转发按钮点击：沿响应链找到时间线 VC，触发其转发事件。
 - (void)ddm_onForwardTapped:(UIButton *)sender {
     UIResponder *r = self;
     while ((r = r.nextResponder)) {
@@ -1301,7 +1302,7 @@ static char kDDMLineKey;
 %hook WCTimeLineViewController
 
 %new
-// 浮窗点击转发时由 WCOperateFloatView 响应的事件：直接拉起引擎。
+// 时间线 VC 上的转发事件入口：取出浮窗当前数据项，交给转发引擎。
 - (void)onClickForwardBtnOnFloatView {
     WCOperateFloatView *fv = self.floatOperateView;
     if (!fv) return;
@@ -1322,9 +1323,9 @@ static char kDDMLineKey;
     if (self.m_isUseMMAsset) self.bHideAddView = NO;
 }
 
-// 文本框初始化后回填原帖文案。这里（init 期，微信自建的内容入口）是最早、最稳的写入点：
-// 槽在 init 前已就绪，取出即清故只回填一次；随后调用 textViewTextDidChange 把文案同步进微信内部模型，
-// 视频 / 图片都同步（不跳过），清理缓存后微信重建文本框时会从模型回填，文案不会丢。
+// 回填原帖文案。写在 init 期这个微信自建的内容入口上：槽此时已就绪，取出即清故只回填一次；
+// 随后 textViewTextDidChange 把文案同步进微信内部模型（视频 / 图片都同步），
+// 之后发布器即便重建文本框也会从模型回填，文案不会丢。
 - (void)initTextViewContent {
     %orig;
     NSString *text = [[DDMEngine shared] consumePendingText];
