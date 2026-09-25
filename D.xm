@@ -303,7 +303,9 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 
 static BOOL DDMFileUsable(NSString *path);   // 前置声明：DDMVideoDuration 在其定义前使用
 
-// 视频时长（Live Photo 运动视频登记用）。
+// 视频时长（原为 Live Photo 资产的 livePhotoDuration 登记用）。
+// 实况链路已不再构造 MMAsset，暂无人调用；保留供需要时启用。
+__attribute__((unused))
 static double DDMVideoDuration(NSString *path) {
     if (!DDMFileUsable(path)) return 0;
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
