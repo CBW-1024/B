@@ -155,6 +155,7 @@ static inline id DDMGetFrameFacade(void) {
 @property (retain, nonatomic) MMAsset *m_asset;
 @property (nonatomic) BOOL isLivePhoto;
 @property (retain, nonatomic) NSString *livePhotoVideoPath;
+@property (retain, nonatomic) NSString *m_assetClassNameStr;   // 草稿 PB 反序列化时据此挑类重建 m_asset
 @property (nonatomic) long long imageFrom;
 @end
 
@@ -1083,7 +1084,14 @@ static UIColor *ddm_track_bg(void) {
     MMImage *mmImg = ui ? (MMImage *)[(MMImage *)[mmImgCls alloc] initWithImage:ui] : [[mmImgCls alloc] init];
     if (!mmImg) return nil;
 
-    if (asset) mmImg.m_asset = asset;
+    if (asset) {
+        mmImg.m_asset = asset;
+        // MMImage 走 PB 序列化（草稿归档），反序列化时微信靠 m_assetClassNameStr
+        // 决定实例化哪个资产类来重建 m_asset。PKC 从不保留草稿、从不在磁盘上重建资产，
+        // 所以从不设它；我们"保留→重开"必须重建 —— 不设则资产解码失败、
+        // 整张 MMImage 重建失败，重开草稿图不显示（即"丢图"）。值必须等于实际资产类名。
+        mmImg.m_assetClassNameStr = @"MMAsset";
+    }
 
     if (movLocal && asset) {
         // 实况照片保真：MMImage 侧标记 + 资产侧登记。
