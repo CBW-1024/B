@@ -1,21 +1,15 @@
 // DDWCMoments.xm
-// 微信朋友圈增强插件（Theos / Logos，arm64 / arm64e，iOS 18+）
+// 微信朋友圈增强插件（Theos / Logos，arm64 / arm64e）
 //
 // 功能：
-//   1. 启用朋友圈转发 —— 在朋友圈操作浮窗（点赞 / 评论条）注入“转发”按钮，支持图片、
-//      视频、Live Photo 与纯文字转发。下载完成后唤起微信发布器，并可选择保留 / 移除原作者位置。
+//   1. 启用一键转发 —— 在朋友圈操作浮窗注入“转发”按钮，支持图片、视频、Live Photo 与纯文字转发；
+//      可选择保留 / 移除原作者位置。
 //   2. 辅助设置 —— 7 项独立开关：查看已删评论、禁用隐私图标、禁用微商折叠、
 //      禁用文字折叠、禁用自动播放、禁用点击关闭、启用视频进度条。
 //
-// 设计要点：
-//   - 所有对微信私有类的引用均走运行时获取（objc_getClass / class_getInstanceVariable），
-//     不在编译期登记私有类符号，避免链接失败（tweak 无私有类实现）。
-//   - 私有接口声明锚定微信 8.0.79 头文件 dump，仅保留本插件实际调用的方法。
-//   - 转发位置处理：默认保留原作者位置；开启“移除原始位置”后清空副本的 locationInfo，
-//     再由发布器 setPoiInfo: / setBShowLocation: 落到新帖，保证开 / 关两种语义都生效。
-//   - 进度浮卡挂载于触发浮窗所在主窗口，支持深色模式与窗口尺寸自适应。
-//   - 设置页重建遵循“基础双重建 + 展开型开关即时重建”：viewDidLoad / viewWillAppear
-//     始终重建；“启用朋友圈转发”开关展开“移除原始位置”子项，故其回调内即时重建。
+// 设计说明：
+//   - 所有微信私有类均运行时获取（objc_getClass），不链接私有符号。
+//   - 私有接口基于微信 8.0.79 头文件 dump，仅声明本插件实际调用的方法。
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -25,13 +19,13 @@
 
 #pragma mark - 微信私有接口声明
 
-// 微信“我”页设置入口：将本插件设置页注册为一个功能项。
+// 微信“我”页设置入口，用于注册本插件设置页。
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-// 微信内置设置表格组件（用于构建本插件设置页）。
+// 微信内置设置表格组件。
 @interface WCTableViewManager : NSObject
 - (instancetype)initWithFrame:(struct CGRect)arg1 style:(long long)arg2;
 - (void)clearAllSection;
@@ -54,24 +48,24 @@
 @interface WCContentItem : NSObject
 @property (retain, nonatomic) NSMutableArray *mediaList;   // 媒体列表（图片 / 视频 / Live Photo）
 @property (nonatomic) int type;                            // 内容类型
-+ (BOOL)isVideoType:(long long)type;                        // 类型是否为视频
++ (BOOL)isVideoType:(long long)type;                        // 是否为视频类型
 @end
 
-// 朋友圈数据项（一条朋友圈的完整数据模型）。
+// 朋友圈数据项（一条朋友圈完整模型）。
 @interface WCDataItem : NSObject
 @property (retain, nonatomic) WCContentItem *contentObj;    // 内容项
 @property (retain, nonatomic) NSString *contentDesc;        // 文案
-+ (id)fromNSCodingBuffer:(NSData *)buffer;                  // 反序列化（用于深拷贝）
-- (NSData *)toNSCodingBuffer;                               // 序列化（用于深拷贝）
++ (id)fromNSCodingBuffer:(NSData *)buffer;                  // 反序列化（深拷贝用）
+- (NSData *)toNSCodingBuffer;                               // 序列化（深拷贝用）
 - (BOOL)isVideo;                                            // 是否为视频
-- (NSArray *)getNeedBatchDownloadMedias;                    // 需要批量下载的媒体
+- (NSArray *)getNeedBatchDownloadMedias;                    // 需批量下载的媒体
 - (BOOL)isWeiShang;                                         // 是否微商
-- (void)setExtFlag:(unsigned int)arg1;                      // 设置扩展标记（含微商标记）
-- (id)locationInfo;                                          // 位置 / POI 信息（锚定 WCDataItem.h:250）
-- (void)setLocationInfo:(id)arg1;                            // 设置位置 / POI 信息（锚定 WCDataItem.h:436）
+- (void)setExtFlag:(unsigned int)arg1;                      // 扩展标记（含微商标记）
+- (id)locationInfo;                                          // 位置信息
+- (void)setLocationInfo:(id)arg1;                            // 设置位置信息
 @end
 
-// 朋友圈单条媒体（图片 / 视频 / Live Photo）。
+// 单条媒体（图片 / 视频 / Live Photo）。
 @interface WCMediaItem : NSObject
 @property (retain, nonatomic) WCMediaItem *livePhotoMediaItem;  // 关联的运动视频
 @property (readonly, nonatomic) BOOL isLivePhoto;               // 是否为 Live Photo
@@ -89,20 +83,20 @@
 - (id)imageOfSize:(long long)arg1;                             // 内存图（按尺寸取）
 @end
 
-// 微信视频下载管理器（经 WCFacade 取得，StartDownloadVideo: 被实际调用）。
+// 视频下载管理器。
 @interface WCDownloadVideoCDNMgr : NSObject
 - (unsigned long long)StartDownloadVideo:(id)arg1;
 - (void)CheckQueue;
 @end
 
-// 微信业务门面：经它获取下载管理器，触发 CDN 下载。
+// 业务门面：获取下载管理器、触发 CDN 下载。
 @interface WCFacade : NSObject
 - (id)videoDownloadCdnMgrForCategory:(long long)arg1;
 - (id)imageDownloadCdnMgrForCategory:(long long)arg1;
 - (void)StartDownloadImage:(id)arg1 DownloadType:(long long)arg2;
 @end
 
-// 微信服务定位：经 MMContext → serviceCenter → getService: 取 WCFacade 单例。
+// 服务定位链：MMContext → serviceCenter → getService: 取 WCFacade 单例。
 @interface MMServiceCenter : NSObject
 - (id)getService:(Class)arg1;
 @end
@@ -112,7 +106,7 @@
 @property (readonly, nonatomic) MMServiceCenter *serviceCenter;
 @end
 
-// 经微信服务链取 WCFacade 单例。currentContext / serviceCenter / getService: 均已声明，直接调用。
+// 经服务链取 WCFacade。
 static inline id DDMGetFrameFacade(void) {
     MMContext *ctx = [objc_getClass("MMContext") currentContext];
     MMServiceCenter *center = ctx.serviceCenter;
@@ -125,7 +119,6 @@ static inline id DDMGetFrameFacade(void) {
 @property (readonly, nonatomic) UIButton *m_commentBtn;
 @property (readonly, nonatomic) WCDataItem *m_item;
 @property (nonatomic, weak) UINavigationController *navigationController;
-- (double)buttonWidth:(id)button;
 - (void)hide;
 - (void)showWithItemData:(id)itemData tipPoint:(struct CGPoint)tipPoint;
 @end
@@ -135,7 +128,7 @@ static inline id DDMGetFrameFacade(void) {
 @property (retain, nonatomic) WCOperateFloatView *floatOperateView;
 @end
 
-// 本地资源基类（MMAssetForLocalImage 的父类）。
+// 本地资源基类。
 @interface MMAsset : NSObject
 @property (nonatomic) BOOL m_isNeedOriginImage;
 @property (nonatomic) BOOL m_isUseLivePhoto;
@@ -167,11 +160,10 @@ static inline id DDMGetFrameFacade(void) {
 @interface SightDraft : NSObject
 + (id)draftWithVideoURL:(NSURL *)url thumbImage:(UIImage *)thumbImage;
 + (id)draftWithVideoURL:(NSURL *)url;
-- (BOOL)isSightResourceValid;
 @property (copy, nonatomic) NSString *draftItemVideoPath;
 @end
 
-// 朋友圈路由：转发到微信原生转发界面（纯文字 / 兜底场景）。
+// 朋友圈路由：转发到微信原生转发界面（纯文字 / 兜底）。
 @interface WCTimelineRouterHelper : NSObject
 + (BOOL)presentForwardViewController:(id)dataItem
                    postReportSession:(id)session
@@ -184,7 +176,7 @@ static inline id DDMGetFrameFacade(void) {
 @property (retain, nonatomic) UITextView *textView;
 @end
 
-// 微信发布器 VC：转发媒体 / 文案注入到这里。
+// 微信发布器 VC：媒体 / 文案注入到这里。
 @interface WCNewCommitViewController : UIViewController
 @property (retain, nonatomic) MMGrowTextView *textView;
 @property (nonatomic) BOOL m_isUseMMAsset;
@@ -193,28 +185,28 @@ static inline id DDMGetFrameFacade(void) {
 - (void)textViewTextDidChange;
 - (instancetype)initWithImages:(id)arg1 contacts:(id)arg2;
 - (instancetype)initWithSightDraft:(id)arg1;
-- (void)setPoiInfo:(id)arg1;            // 写入 POI / 位置信息（锚定 WCNewCommitViewController.h:315）
-- (void)setBShowLocation:(BOOL)arg1;    // 是否展示位置（锚定 WCNewCommitViewController.h:276）
-- (void)setDelegate:(id)arg1;           // 设置代理（锚定 WCNewCommitViewController.h:280）
+- (void)setPoiInfo:(id)arg1;            // 写入位置信息
+- (void)setBShowLocation:(BOOL)arg1;    // 是否展示位置
+- (void)setDelegate:(id)arg1;
 @end
 
-// 朋友圈视频模板视图：禁用自动播放。
+// 朋友圈视频模板视图（禁用自动播放）。
 @interface WCContentItemViewTemplateVideo : UIView
 - (void)autoPlayWithoutSound;
 @end
 
-// 朋友圈 cell 视图：禁用隐私图标 + 禁用文字折叠。
+// 朋友圈 cell 视图（禁用隐私图标 + 文字折叠）。
 @interface WCTimeLineCellView : UIView
 - (void)initPrivacyButton:(id)arg1;
 - (void)layoutSubviews;
 + (BOOL)shouldShowFullTextButtonWithDataItem:(id)arg1;
 @end
 
-// 微信按钮基类（隐私 / 删除按钮）。
+// 微信按钮基类。
 @interface MMUIButton : UIButton
 @end
 
-// 朋友圈评论 / 消息（锚定 8.0.79 WCSNSMessage.h / WCUserComment.h，仅保留实际调用的方法）。
+// 评论 / 消息模型。
 @interface WCUserComment : NSObject
 - (id)content;
 - (void)setContent:(id)arg1;
@@ -226,7 +218,7 @@ static inline id DDMGetFrameFacade(void) {
 - (void)setDelStatus:(unsigned int)arg1;
 @end
 
-// 全屏视频播放器：禁用点击关闭 + 启用进度条。
+// 全屏视频播放器（禁用点击关闭 + 进度条）。
 @interface WCPlayerConfigFullScreenViewController : UIViewController
 - (void)onFullScreenSingleTap;
 - (BOOL)shouldShowProgressBar;
@@ -235,10 +227,10 @@ static inline id DDMGetFrameFacade(void) {
 
 #pragma mark - 配置
 
-// 转发开关：存储键独立为新键，不再读取旧插件 DDForward_Enabled 的残留偏好。
+// 转发总开关。
 static NSString * const kDDMForwardEnabled       = @"DDMoments_forwardEnabled";
 
-// 辅助设置：存储键统一为 DDMoments_<属性名>，属性名与界面标题一一对应。
+// 辅助开关（键名与界面标题一一对应）。
 static NSString * const kDDMViewDeletedComment   = @"DDMoments_viewDeletedComment";    // 查看已删评论
 static NSString * const kDDMDisablePrivacyIcon   = @"DDMoments_disablePrivacyIcon";    // 禁用隐私图标
 static NSString * const kDDMDisableWeiShangFold  = @"DDMoments_disableWeiShangFold";   // 禁用微商折叠
@@ -246,22 +238,22 @@ static NSString * const kDDMDisableTextFold      = @"DDMoments_disableTextFold";
 static NSString * const kDDMDisableVideoAutoPlay = @"DDMoments_disableVideoAutoPlay";  // 禁用自动播放
 static NSString * const kDDMDisableVideoTapClose = @"DDMoments_disableVideoTapClose";  // 禁用点击关闭
 static NSString * const kDDMEnableVideoProgress  = @"DDMoments_enableVideoProgress";   // 启用视频进度
-static NSString * const kDDMRemoveOriginalLoc    = @"DDMoments_removeOriginalLocation"; // 移除原始位置：开=去位置，关=保留位置（转发子项）
+static NSString * const kDDMRemoveOriginalLoc    = @"DDMoments_removeOriginalLocation"; // 移除原始位置
 
-// 已删评论标记前缀（默认文案，预留可定制）。
+// 已删评论标记。
 static NSString * const kDDMDeletedCommentMark   = @"DDMoments_deletedCommentMark";
 static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 
 @interface DDMConfig : NSObject
-@property (assign, nonatomic) BOOL forwardEnabled;       // 启用朋友圈转发（独立开关，控制转发按钮注入；开启时展开“移除原始位置”子项）
-@property (assign, nonatomic) BOOL viewDeletedComment;   // 查看已删评论
-@property (assign, nonatomic) BOOL disablePrivacyIcon;   // 禁用隐私图标
-@property (assign, nonatomic) BOOL disableWeiShangFold;  // 禁用微商折叠
-@property (assign, nonatomic) BOOL disableTextFold;      // 禁用文字折叠
-@property (assign, nonatomic) BOOL disableVideoAutoPlay; // 禁用自动播放
-@property (assign, nonatomic) BOOL disableVideoTapClose; // 禁用点击关闭
-@property (assign, nonatomic) BOOL enableVideoProgress;  // 启用视频进度
-@property (assign, nonatomic) BOOL removeOriginalLocation; // 移除原始位置：开=清空副本位置，关=保留原作者位置（转发子项，仅转发开启时展开）
+@property (assign, nonatomic) BOOL forwardEnabled;          // 启用一键转发（总开关；开启时展开“移除原始位置”）
+@property (assign, nonatomic) BOOL viewDeletedComment;      // 查看已删评论
+@property (assign, nonatomic) BOOL disablePrivacyIcon;      // 禁用隐私图标
+@property (assign, nonatomic) BOOL disableWeiShangFold;     // 禁用微商折叠
+@property (assign, nonatomic) BOOL disableTextFold;         // 禁用文字折叠
+@property (assign, nonatomic) BOOL disableVideoAutoPlay;    // 禁用自动播放
+@property (assign, nonatomic) BOOL disableVideoTapClose;    // 禁用点击关闭
+@property (assign, nonatomic) BOOL enableVideoProgress;     // 启用视频进度
+@property (assign, nonatomic) BOOL removeOriginalLocation;  // 移除原始位置（仅转发开启时展开）
 + (instancetype)shared;
 @end
 
@@ -312,7 +304,7 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 static BOOL DDMFileUsable(NSString *path);
 static NSString *DDMLivePhotoVideoPath(WCMediaItem *live);
 
-// 视频时长（用于 Live Photo 运动视频时长登记）。
+// 视频时长（Live Photo 运动视频登记用）。
 static double DDMVideoDuration(NSString *path) {
     if (!DDMFileUsable(path)) return 0;
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
@@ -320,7 +312,7 @@ static double DDMVideoDuration(NSString *path) {
     return CMTIME_IS_NUMERIC(d) ? CMTimeGetSeconds(d) : 0;
 }
 
-// 取当前 keyWindow（用于无触发窗口时回退定位顶层 VC）。
+// 取当前 keyWindow。
 static UIWindow *DDMKeyWindow(void) {
     UIWindow *found = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -333,7 +325,7 @@ static UIWindow *DDMKeyWindow(void) {
     return found;
 }
 
-// 从给定根 VC 递归找到最上层可见 VC（穿透导航 / 标签 / present）。
+// 从根 VC 递归找到最上层可见 VC。
 static UIViewController *DDMTopViewController(UIViewController *root) {
     UIViewController *vc = root ?: DDMKeyWindow().rootViewController;
     while (vc) {
@@ -353,7 +345,7 @@ static UIViewController *DDMTopViewController(UIViewController *root) {
     return vc;
 }
 
-// 本插件临时目录（下载 / 转码产物统一落这里，便于转发后清理）。
+// 本插件临时目录（下载 / 转码产物统一落这里）。
 static NSString *DDMTempDir(void) {
     static NSString *dir = nil;
     static dispatch_once_t once;
@@ -373,7 +365,7 @@ static void DDMCleanTempDir(void) {
     }
 }
 
-// 判断文件是否可用（存在、常规文件、大小 > 0）。
+// 文件是否可用（存在、常规文件、大小 > 0）。
 static BOOL DDMFileUsable(NSString *path) {
     if (path.length == 0) return NO;
     NSDictionary *attr = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
@@ -383,13 +375,13 @@ static BOOL DDMFileUsable(NSString *path) {
     return [attr fileSize] > 0;
 }
 
-// 从候选路径中取出第一个可用文件。
+// 从候选路径取第一个可用文件。
 static NSString *DDMFirstUsablePath(NSArray<NSString *> *candidates) {
     for (NSString *p in candidates) if (DDMFileUsable(p)) return p;
     return nil;
 }
 
-// 将源文件拷贝到临时目录，解析软链并补齐扩展名。
+// 拷贝源文件到临时目录，解析软链并补齐扩展名。
 static NSString *DDMCopyToTemp(NSString *srcPath, NSString *ext) {
     if (!DDMFileUsable(srcPath)) return nil;
 
@@ -425,7 +417,7 @@ static UIImage *DDMVideoFirstFrame(NSString *path) {
 
 #pragma mark - 媒体路径解析
 
-// 图片优先路径。pathForData / pathForExistData 均已声明，直接调用。
+// 图片优先路径。
 static NSString *DDMImagePath(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
     [cands addObject:[item pathForData] ?: @""];
@@ -433,7 +425,7 @@ static NSString *DDMImagePath(WCMediaItem *item) {
     return DDMFirstUsablePath(cands);
 }
 
-// 视频优先路径（短视频 / 转码 / 临时路径）。
+// 视频优先路径（短视频 / 转码 / 临时）。
 static NSString *DDMVideoPath(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
     [cands addObject:[item pathForSightData] ?: @""];
@@ -443,7 +435,7 @@ static NSString *DDMVideoPath(WCMediaItem *item) {
     return DDMFirstUsablePath(cands);
 }
 
-// Live Photo 运动视频的持久化路径（短视频 / 临时路径）。
+// Live Photo 运动视频的持久化路径。
 static NSString *DDMLiveVideoPath(WCMediaItem *live) {
     if (!live) return nil;
     NSMutableArray *cands = [NSMutableArray array];
@@ -454,7 +446,7 @@ static NSString *DDMLiveVideoPath(WCMediaItem *live) {
     return DDMFirstUsablePath(cands);
 }
 
-// 短视频持久化路径（Live Photo 运动视频的兜底来源）。
+// 短视频持久化路径（Live Photo 运动视频兜底来源）。
 static NSString *DDMPersistentSightPath(WCMediaItem *item) {
     if (!item) return nil;
     NSMutableArray *cands = [NSMutableArray array];
@@ -463,7 +455,7 @@ static NSString *DDMPersistentSightPath(WCMediaItem *item) {
     return DDMFirstUsablePath(cands);
 }
 
-// 图片缩略图路径（缩略图 / 预览图）。
+// 图片缩略图路径。
 static UIImage *DDMThumbImage(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
     [cands addObject:[item getThumbImagePath] ?: @""];
@@ -472,9 +464,9 @@ static UIImage *DDMThumbImage(WCMediaItem *item) {
     return p ? [UIImage imageWithContentsOfFile:p] : nil;
 }
 
-#pragma mark - 实况照片运动视频：转码为真实可播放视频
+#pragma mark - 实况照片运动视频：转码为可播放视频
 
-// 将 wxam（微信实况封装）转码为 .mov，得到可被系统播放器识别的真实视频。
+// 将 wxam（微信实况封装）转码为 .mov。
 static NSString *DDMTranscodeWxamToMov(NSString *src) {
     if (!DDMFileUsable(src)) return nil;
     NSURL *inURL = [NSURL fileURLWithPath:src];
@@ -503,7 +495,7 @@ static NSString *DDMTranscodeWxamToMov(NSString *src) {
     return nil;
 }
 
-// Live Photo 运动视频路径：优先已转码路径，否则从持久化短视频转码。
+// Live Photo 运动视频路径：优先已转码，否则从持久化短视频转码。
 static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     if (!live) return nil;
 
@@ -528,14 +520,13 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
 @property (nonatomic, assign) NSTimeInterval pendingTextStamp;
 @property (nonatomic, assign) BOOL busy;
 @property (nonatomic, strong) id retainedCommentDetailVC;
-@property (nonatomic, weak) UIWindow *ddmWindow;   // 进度卡挂载的窗口，由触发浮窗直接给出，不遍历窗口列表
+@property (nonatomic, weak) UIWindow *ddmWindow;   // 进度卡挂载的窗口，由触发浮窗直接给出
 + (instancetype)shared;
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView;
 - (NSString *)consumePendingText;
 @end
 
-// 进度浮卡子类：宽度随窗口变化（autoresizingMask 左右各留 16 边距）后，
-// 在 layoutSubviews 内按当前宽度重排子视图，从而适配横竖屏与窗口尺寸变化。
+// 进度浮卡：窗口宽度变化时按当前宽度重排子视图。
 @interface DDMProgressCardView : UIView
 @end
 @implementation DDMProgressCardView
@@ -564,7 +555,7 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     return e;
 }
 
-#pragma mark HUD（下载进度条：圆角浮卡 + 类型化标题 + 计数/百分比 + 深色模式 + 尺寸跟随窗口）
+#pragma mark HUD（下载进度浮卡）
 
 static const NSInteger kDDMProgressHUDTag = 0x44444602;
 
@@ -574,7 +565,7 @@ typedef NS_ENUM(NSInteger, DDMMediaKind) {
     DDMMediaKindLive    = 2,
 };
 
-// 深色模式配色：直接走动态色，浅色 / 深色自动切换。
+// 深色模式动态配色。
 static UIColor *ddm_card_bg(void) {
     return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
         return tc.userInterfaceStyle == UIUserInterfaceStyleDark
@@ -604,10 +595,9 @@ static UIColor *ddm_track_bg(void) {
     }];
 }
 
-// 进度浮卡（DDMProgressCardView）的布局在 layoutSubviews 内按当前宽度重排，窗口变化时自适应。
-
+// 构建进度浮卡（圆角 + 类型化标题 + 计数/百分比 + 尺寸跟随窗口）。
 - (UIView *)ddmProgressCard {
-    UIWindow *win = self.ddmWindow;   // 直接挂触发浮窗所在的主窗口，不遍历窗口列表
+    UIWindow *win = self.ddmWindow;
     if (!win) return nil;
     CGFloat cardW = win.bounds.size.width - 32.0;
     CGFloat cardH = 56.0;
@@ -626,7 +616,6 @@ static UIColor *ddm_track_bg(void) {
     card.layer.shadowOffset = CGSizeMake(0, 2);
     card.layer.shadowOpacity = 0.08;
     card.layer.shadowRadius = 6;
-    // 宽度跟随窗口变化：左右各留 16 边距（autoresizing 仅宽度弹性）。
     card.autoresizingMask = UIViewAutoresizingFlexibleWidth;
 
     CGFloat padX = 14.0;
@@ -665,7 +654,6 @@ static UIColor *ddm_track_bg(void) {
     objc_setAssociatedObject(card, "ddmBar", bar, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(card, "ddmPct", pct, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-
     objc_setAssociatedObject(card, "ddmMediaKind", @(DDMMediaKindImages), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(card, "ddmTotalCount", @1, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
@@ -679,7 +667,7 @@ static UIColor *ddm_track_bg(void) {
     return win ? [win viewWithTag:kDDMProgressHUDTag] : nil;
 }
 
-// 按内容类型展示初始 HUD（视频 / 多图 / Live Photo 标题与计数不同）。
+// 按内容类型展示初始 HUD。
 - (void)showHUDForItem:(WCDataItem *)item {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIView *card = [self ddmProgressHUD] ?: [self ddmProgressCard];
@@ -731,7 +719,7 @@ static UIColor *ddm_track_bg(void) {
     });
 }
 
-// 更新进度（0~1），并按媒体类型刷新副标题（百分比 / 计数）。
+// 更新进度（0~1），按媒体类型刷新副标题。
 - (void)ddmSetProgress:(float)p {
     p = MAX(0.0, MIN(1.0, p));
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -756,15 +744,12 @@ static UIColor *ddm_track_bg(void) {
 
         switch (kind) {
             case DDMMediaKindLive:
-
                 sub.text = [NSString stringWithFormat:@"%ld/%ld", (long)done, (long)total];
                 break;
             case DDMMediaKindVideo:
-
                 sub.text = [NSString stringWithFormat:@"%d%%", pctVal];
                 break;
             default:
-
                 if (total > 1)
                     title.text = [NSString stringWithFormat:@"获取图 %ld/%ld", (long)done, (long)total];
                 sub.text = @"";
@@ -785,13 +770,12 @@ static UIColor *ddm_track_bg(void) {
 
 #pragma mark 入口
 
-// 转发主入口：清理临时目录 → 展示进度 HUD → 下载媒体 → 处理位置 → 分流到发布器。
+// 转发主入口：清理临时目录 → 展示 HUD → 下载媒体 → 处理位置 → 分流发布器。
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView {
     if (!item) return;
     if (self.busy) { return; }
     self.busy = YES;
 
-    // 进度卡直接挂在触发浮窗所在的主窗口上，不遍历窗口列表（避免被 iConsole 之类浮层换类名干扰）。
     self.ddmWindow = floatView.window;
     UIViewController *host = DDMTopViewController(floatView.navigationController);
     [floatView hide];
@@ -802,22 +786,20 @@ static UIColor *ddm_track_bg(void) {
     __weak typeof(self) weakSelf = self;
 
     [self downloadAllMediaOf:item completion:^{
-        // 深拷贝失败（如清理缓存后 toNSCodingBuffer 序列化失败）时回退到原件，避免 work 为 nil
-        // 传入 routeForwardForItem: 触发原生转发在 nil 上生成分享链接而崩溃。此为原始 DD 朋友圈转发的“处理”。
+        // 深拷贝失败（如清理缓存后）时回退原件，避免 work 为 nil 触发原生转发崩溃。
         WCDataItem *work = [weakSelf deepCopyDataItem:item] ?: item;
-        if (work != item) {  // 仅对独立副本操作，避免清理缓存回退到原件时误改时间线原始对象
+        if (work != item) {  // 仅在独立副本上改位置，不污染原帖
             if ([DDMConfig shared].removeOriginalLocation) {
-                [work setLocationInfo:nil];                   // 去位置：WCDataItem.setLocationInfo:（WCDataItem.h:436）
+                [work setLocationInfo:nil];
             } else if ([item locationInfo]) {
-                [work setLocationInfo:[item locationInfo]];   // 保位置：深拷贝不一定序列化 locationInfo，从原件补回
+                [work setLocationInfo:[item locationInfo]];
             }
         }
         [weakSelf routeForwardForItem:work host:host];
     }];
 }
 
-// 深拷贝数据项（序列化再反序列化），隔离原始对象。toNSCodingBuffer / fromNSCodingBuffer: 已在
-// WCDataItem 声明（锚定微信头文件 8.0.79），直接调用；拷贝失败返回 nil，由调用方决定中止。
+// 深拷贝数据项（序列化再反序列化），隔离原始对象。
 - (WCDataItem *)deepCopyDataItem:(WCDataItem *)item {
     NSData *buf = [item toNSCodingBuffer];
     return [objc_getClass("WCDataItem") fromNSCodingBuffer:buf];
@@ -906,11 +888,14 @@ static UIColor *ddm_track_bg(void) {
     BOOL isVideo = item.isVideo;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        BOOL ready = YES;
         if (isVideo) {
-            [self ddmWaitVideo:pending videoMgr:videoMgr];
+            // 视频无安全兜底，超时未就绪则静默中止，避免以空路径构建草稿崩溃。
+            ready = [self ddmWaitVideo:pending videoMgr:videoMgr];
         } else {
             [self ddmWaitMedia:pending liveSubs:liveSubs];
         }
+        if (!ready) { [self ddmAbortOnTimeout]; return; }
         [self ddmSetProgress:1.0];
         dispatch_async(dispatch_get_main_queue(), completion);
     });
@@ -925,7 +910,7 @@ static UIColor *ddm_track_bg(void) {
     return [self ddmImageReady:m];
 }
 
-// 判断单个图片媒体是否就绪（尝试 imageOfSize: 内存图或落盘路径）。imageOfSize: 已于 WCMediaItem 声明，直接调用。
+// 判断单个图片媒体是否就绪。
 - (BOOL)ddmImageReady:(WCMediaItem *)m {
     id img = [m imageOfSize:2LL];
     if (img) return YES;
@@ -933,20 +918,29 @@ static UIColor *ddm_track_bg(void) {
     return (p && DDMFileUsable(p));
 }
 
-// 视频进度：时间驱动，已等待秒 / 60（封顶 60s）。
-- (void)ddmWaitVideo:(NSArray *)pending videoMgr:(id)videoMgr {
-    const NSInteger cap = 60;
+// 下载超时（视频未就绪）时静默中止：收起进度卡并解除占用，不弹提示、不进发布器。
+- (void)ddmAbortOnTimeout {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self dismissHUD];
+        self.busy = NO;
+    });
+}
+
+// 视频进度：已等待秒 / 120（封顶 120s）。返回是否全部就绪。
+- (BOOL)ddmWaitVideo:(NSArray *)pending videoMgr:(id)videoMgr {
+    const NSInteger cap = 120;
     for (NSInteger s = 0; s <= cap; s++) {
         BOOL allReady = YES;
         for (WCMediaItem *m in pending) {
             if (![self ddmVideoReady:m]) { allReady = NO; break; }
         }
-        if (allReady) { [self ddmSetProgress:1.0]; return; }
+        if (allReady) { [self ddmSetProgress:1.0]; return YES; }
         [self ddmSetProgress:(float)s / (float)cap];
         if (s >= cap) break;
         [videoMgr CheckQueue];
         [NSThread sleepForTimeInterval:1.0];
     }
+    return NO;
 }
 
 // 图片 / 实况进度：已就绪数 / 总数（封顶 60s）。
@@ -983,7 +977,7 @@ static UIColor *ddm_track_bg(void) {
 
 #pragma mark 视频链路
 
-// 视频转发：取视频本地路径 → 构建 SightDraft → 唤起发布器。
+// 视频转发：取本地路径 → 构建 SightDraft → 唤起发布器。
 - (void)forwardVideoItem:(WCDataItem *)item host:(UIViewController *)host {
     WCContentItem *content = item.contentObj;
     WCMediaItem *videoItem = nil;
@@ -1000,10 +994,10 @@ static UIColor *ddm_track_bg(void) {
     [self presentVideoWithLocalPath:local thumb:DDMThumbImage(videoItem) item:item host:host];
 }
 
-// 用本地视频 + 缩略图构建 SightDraft 并唤起视频发布器。
-// SightDraft 为微信私有类，经 objc_getClass 取类（变量发消息，避免链接私有类符号），
-// 其 draftWithVideoURL: / isSightResourceValid 已在头文件声明，直接调用。
+// 构建 SightDraft 并唤起视频发布器。SightDraft 为微信私有类，运行时取类。
 - (void)presentVideoWithLocalPath:(NSString *)path thumb:(UIImage *)thumb item:(WCDataItem *)item host:(UIViewController *)host {
+    // 路径不可用（超时未取到 / 解析失败）时静默退出，不构建空草稿。
+    if (!path || !DDMFileUsable(path)) { [self dismissHUD]; self.busy = NO; return; }
     if (!thumb) thumb = DDMVideoFirstFrame(path);
 
     NSURL *url = [NSURL fileURLWithPath:path];
@@ -1021,8 +1015,6 @@ static UIColor *ddm_track_bg(void) {
 #pragma mark 图片 / LivePhoto 链路
 
 // 图片 / Live Photo 转发：构建本地资源 → 组装 MMImage（含 Live Photo 保真）→ 唤起发布器。
-// MMAssetForLocalImage 为私有类，经 objc_getClass 取类（链接必需），其 initWithUrl:IsNeedOrigin: 已声明，直接调用；
-// MMImage 由 ddmMakeMMImage: 内部按同样方式取类。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
     Class localImgCls = objc_getClass("MMAssetForLocalImage");
 
@@ -1059,9 +1051,9 @@ static UIColor *ddm_track_bg(void) {
     self.busy = NO;
 }
 
-// 用本地图片 + 资源构建 MMImage；若为 Live Photo，保真运动视频信息。
+// 构建 MMImage；若为 Live Photo，保真运动视频信息。
 - (MMImage *)ddmMakeMMImage:(NSString *)imgLocal asset:(id)asset liveVideoPath:(NSString *)movLocal {
-    Class mmImgCls = objc_getClass("MMImage");   // 私有类，变量发消息（链接必需），initWithImage: / init 已声明
+    Class mmImgCls = objc_getClass("MMImage");
     NSData *raw = [NSData dataWithContentsOfFile:imgLocal options:NSDataReadingMappedIfSafe error:nil];
     if (raw.length > 0) {
         long long t = (long long)[asset _getImageTypeFromData:raw];
@@ -1073,7 +1065,7 @@ static UIColor *ddm_track_bg(void) {
     mmImg.m_asset = asset;
 
     if (movLocal) {
-        // 实况照片保真：标记 isLivePhoto + imageFrom + tempExtraInfo，保证发布为动态实况。
+        // 实况照片保真：标记 isLivePhoto + imageFrom + 运动视频路径与尺寸。
         mmImg.isLivePhoto = YES;
         mmImg.livePhotoVideoPath = movLocal;
         [mmImg setImageFrom:3];
@@ -1101,7 +1093,7 @@ static UIColor *ddm_track_bg(void) {
     self.pendingTextStamp = NSDate.date.timeIntervalSince1970;
 }
 
-// 取出暂存文案（8s 内有效，超时视为过期）。
+// 取出暂存文案（8s 内有效）。
 - (NSString *)consumePendingText {
     NSString *t = self.pendingText;
     self.pendingText = nil;
@@ -1112,7 +1104,7 @@ static UIColor *ddm_track_bg(void) {
 
 #pragma mark 路由调用
 
-// 生成发布上报会话（优先宿主 VC 的方法，回退到默认构造）。
+// 生成发布上报会话（优先宿主 VC 方法，回退默认构造）。
 - (id)reportSessionFromHost:(UIViewController *)host {
     SEL gen = NSSelectorFromString(@"generatePostReportSessionForEntrance:");
     if ([host respondsToSelector:gen]) {
@@ -1132,8 +1124,7 @@ static UIColor *ddm_track_bg(void) {
     });
 }
 
-// 把来源位置信息写到发布器：setPoiInfo: 写入 POI（WCNewCommitViewController.h:315），
-// setBShowLocation: 控制是否展示（WCNewCommitViewController.h:276）。loc 为 nil 时关闭位置展示。
+// 把来源位置写进发布器：loc 为 nil 时关闭位置展示。
 - (void)ddmApplyLocation:(id)loc toCommitVC:(WCNewCommitViewController *)vc {
     if (!vc) return;
     if (loc) {
@@ -1144,8 +1135,7 @@ static UIColor *ddm_track_bg(void) {
     }
 }
 
-// 视频发布：构造 WCNewCommitViewController(sightDraft) 并推入，附带来源位置。
-// WCNewCommitViewController 为私有类，经 objc_getClass 取类（链接必需）；其 initWithSightDraft: 已声明，直接调用。
+// 视频发布：构造 WCNewCommitViewController(sightDraft) 并推入。
 - (void)ddmPushSightCommit:(id)draft item:(WCDataItem *)item host:(UIViewController *)host {
     Class cls = objc_getClass("WCNewCommitViewController");
     WCNewCommitViewController *vc = [(WCNewCommitViewController *)[cls alloc] initWithSightDraft:draft];
@@ -1159,8 +1149,7 @@ static UIColor *ddm_track_bg(void) {
     [self ddmPresentCommitVC:vc host:host];
 }
 
-// 图片发布：构造 WCNewCommitViewController(images) 并推入，附带来源位置。
-// WCNewCommitViewController 为私有类，经 objc_getClass 取类（链接必需）；其 initWithImages:contacts: 已声明，直接调用。
+// 图片发布：构造 WCNewCommitViewController(images) 并推入。
 - (void)ddmPushImageCommit:(NSArray *)assets item:(WCDataItem *)item host:(UIViewController *)host {
     Class cls = objc_getClass("WCNewCommitViewController");
     WCNewCommitViewController *vc = [(WCNewCommitViewController *)[cls alloc] initWithImages:[assets mutableCopy] contacts:nil];
@@ -1182,7 +1171,7 @@ static UIColor *ddm_track_bg(void) {
 
 #pragma mark - Hook：朋友圈操作浮窗（点赞 / 评论条）
 
-// 转发图标为微信主题 SVG 资源，须经 WCSDKAdapter 渲染，UIImage imageNamed: 取不到。
+// 转发图标为微信主题 SVG 资源，须经 WCSDKAdapter 渲染。
 static UIImage *DDMShareIcon(void) {
     UIImage *img = nil;
     Class adapter = NSClassFromString(@"WCSDKAdapter");
@@ -1211,7 +1200,7 @@ static char kDDMLineKey;
     [self initForwardButton];
 }
 
-// 浮窗展示时补充转发按钮与分隔线（关联对象避免重复注入）。
+// 浮窗展示时补充转发按钮与分隔线。
 - (void)showWithItemData:(id)itemData tipPoint:(struct CGPoint)tipPoint {
     %orig;
     [self initForwardLineView];
@@ -1320,7 +1309,7 @@ static char kDDMLineKey;
 
 %end
 
-#pragma mark - Hook：宿主时间线 VC，转发按钮对齐原生事件流
+#pragma mark - Hook：宿主时间线 VC
 
 %hook WCTimeLineViewController
 
@@ -1336,11 +1325,11 @@ static char kDDMLineKey;
 
 %end
 
-#pragma mark - Hook：发布器，注入原文案 + 启用图片选择器（+号）
+#pragma mark - Hook：发布器（注入原文案 + 启用图片选择器）
 
 %hook WCNewCommitViewController
 
-// 发布器加载后，若是本插件带入的本地资源，显示 + 号（图片选择器）。
+// 加载后若是本地资源带入，显示 + 号（图片选择器）。
 - (void)viewDidLoad {
     %orig;
     if (self.m_isUseMMAsset) self.bHideAddView = NO;
@@ -1404,7 +1393,7 @@ static void ddmInjectMarkIntoComment(id c) {
 }
 %end
 
-// 禁用朋友圈“谁可以看”隐私图标 + 长文字折叠。
+// 禁用“谁可以看”隐私图标 + 长文字折叠。
 %hook WCTimeLineCellView
 - (void)initPrivacyButton:(id)arg1 {
     %orig;
@@ -1497,7 +1486,7 @@ static void ddmInjectMarkIntoComment(id c) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"朋友圈助手设置";
-    // 导航栏三态外观（标准 / 滚动边缘 / 紧凑），统一浅色背景。
+    // 导航栏三态外观统一浅色背景。
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithDefaultBackground];
     appearance.shadowColor = nil;
@@ -1514,12 +1503,12 @@ static void ddmInjectMarkIntoComment(id c) {
     _originalDelegate = self.tableViewManager.delegate;
     self.tableViewManager.delegate = self;
 }
-// 每次进入重建表格（基础重建）。
+// 每次进入重建表格。
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self buildTable];
 }
-// 重建表格：清空后按分组重新添加开关 cell。
+// 清空后按分组重新添加开关 cell。
 - (void)buildTable {
     [_tableViewManager clearAllSection];
     Class cellMgr = objc_getClass("WCTableViewCellManager");
@@ -1529,9 +1518,9 @@ static void ddmInjectMarkIntoComment(id c) {
     WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"转发设置"];
     [sec addCell:[cellMgr switchCellForSel:@selector(onForwardEnabledSwitch:)
                                     target:self
-                                     title:@"启用朋友圈转发"
+                                     title:@"启用一键转发"
                                         on:cfg.forwardEnabled]];
-    // 转发开关打开时展开子项：移除原始位置。
+    // 转发开启时展开子项：移除原始位置。
     if (cfg.forwardEnabled) {
         [sec addCell:[cellMgr switchCellForSel:@selector(onRemoveOriginalLocationSwitch:)
                                         target:self
@@ -1573,7 +1562,7 @@ static void ddmInjectMarkIntoComment(id c) {
 
     [_tableViewManager reloadTableView];
 }
-// 将微信表格的 delegate 事件转发给原 delegate，本类只做外观代理。
+// 将微信表格 delegate 事件转发给原 delegate，本类只做外观代理。
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
     if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)])
         [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
@@ -1587,7 +1576,7 @@ static void ddmInjectMarkIntoComment(id c) {
         return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
     return UITableViewAutomaticDimension;
 }
-// “启用朋友圈转发”开关展开“移除原始位置”子项，故其回调内即时重建表格。
+// 转发开关展开“移除原始位置”子项，故其回调内即时重建表格。
 - (void)onForwardEnabledSwitch:(UISwitch *)s        { DDMConfig.shared.forwardEnabled = s.isOn; [self buildTable]; }
 - (void)onRemoveOriginalLocationSwitch:(UISwitch *)s { DDMConfig.shared.removeOriginalLocation = s.isOn; }
 - (void)onViewDeletedCommentSwitch:(UISwitch *)s   { DDMConfig.shared.viewDeletedComment = s.isOn; }
@@ -1601,9 +1590,7 @@ static void ddmInjectMarkIntoComment(id c) {
 
 #pragma mark - 注册入口
 
-// 将本插件设置页注册到微信“我”页。注册入口依赖懒猫的插件管理框架（WCPluginsMgr），
-// 该框架为第三方依赖，设备上未必安装；%ctor 跑在加载期，故对其做存在性守卫，
-// 避免缺该框架时 unrecognized selector 拖崩 App 启动。
+// 将设置页注册到微信“我”页（依赖第三方 WCPluginsMgr，做存在性守卫避免启动崩溃）。
 %ctor {
     @autoreleasepool {
         id mgr = objc_getClass("WCPluginsMgr");
