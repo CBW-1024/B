@@ -198,32 +198,6 @@ static inline id DDMGetFrameFacade(void) {
 - (void)setDelegate:(id)arg1;           // 设置代理（锚定 WCNewCommitViewController.h:280）
 @end
 
-// 时间线位置（WCDataItem.locationInfo 返回的对象，protobuf 存储态）。
-// 仅声明本插件转换时用到的 getter（锚定 WCLocationInfo.h）。
-@interface WCLocationInfo : NSObject
-- (CLLocationCoordinate2D)location;
-- (id)poiName;
-- (id)poiAddress;
-- (id)city;
-- (id)country;
-- (id)buildingID;
-- (id)floorName;
-- (id)poiInfoUrl;
-@end
-
-// 发布器位置（setPoiInfo: 期望的对象）。与 WCLocationInfo 是不同类、不同接口，
-// 故不能把后者直接喂给 setPoiInfo:，需显式转换（锚定 POIInfo.h）。
-@interface POIInfo : NSObject
-- (void)setCoordinate:(CLLocationCoordinate2D)arg1;
-- (void)setPoiName:(id)arg1;
-- (void)setAddress:(id)arg1;
-- (void)setCity:(id)arg1;
-- (void)setCountry:(id)arg1;
-- (void)setBuildingId:(id)arg1;
-- (void)setFloorName:(id)arg1;
-- (void)setInfoUrl:(id)arg1;
-@end
-
 // 朋友圈视频模板视图：禁用自动播放。
 @interface WCContentItemViewTemplateVideo : UIView
 - (void)autoPlayWithoutSound;
@@ -1163,33 +1137,11 @@ static UIColor *ddm_track_bg(void) {
 - (void)ddmApplyLocation:(id)loc toCommitVC:(WCNewCommitViewController *)vc {
     if (!vc) return;
     if (loc) {
-        id poi = [self ddmMakePoiInfoFromLocation:loc];
-        if (poi) {
-            [vc setPoiInfo:poi];
-            [vc setBShowLocation:YES];
-            return;
-        }
+        [vc setPoiInfo:loc];
+        [vc setBShowLocation:YES];
+    } else {
+        [vc setBShowLocation:NO];
     }
-    [vc setBShowLocation:NO];
-}
-
-// 由时间线位置（WCLocationInfo）构造发布器可用的 POIInfo。
-// 直接把 WCLocationInfo 喂给 setPoiInfo: 会因类型不匹配（发布器按 POIInfo 读取坐标 / 名称）崩溃，故显式转换。
-// WCLocationInfo / POIInfo 均为私有类：POIInfo 经 objc_getClass 取类（链接必需），二者方法已声明可直接调用。
-- (id)ddmMakePoiInfoFromLocation:(id)loc {
-    if (!loc) return nil;
-    WCLocationInfo *l = (WCLocationInfo *)loc;
-    POIInfo *poi = [[objc_getClass("POIInfo") alloc] init];
-    if (!poi) return nil;
-    poi.coordinate = l.location;
-    poi.poiName    = l.poiName;
-    poi.address    = l.poiAddress;
-    poi.city       = l.city;
-    poi.country    = l.country;
-    poi.buildingId = l.buildingID;
-    poi.floorName  = l.floorName;
-    poi.infoUrl    = l.poiInfoUrl;
-    return poi;
 }
 
 // 视频发布：构造 WCNewCommitViewController(sightDraft) 并推入，附带来源位置。
