@@ -1020,16 +1020,20 @@ static UIColor *ddm_track_bg(void) {
 //     不依赖任何我们创建的文件。此前用 imageWithContentsOfFile:(tmp 副本) 是惰性解码、
 //     只记路径，要等归档草稿那一刻才真正读盘，tmp 一被回收就是空图/整条草稿不落库。
 //   · 普通图片不构造任何资产，MMImage 只承载 UIImage。
-//   · 实况也不挂 m_asset。挂上资产后微信会把这张图当成"已有文件可引用"，
-//     保存草稿时走 copyImageAtAlbumToFile: 去复制我们的资产 —— 而我们用
-//     MMAsset 基类 + URLWithString: 造出来的资产解析不出可引用的本地路径，
-//     复制失败 → setDraftImages:needCopyImageToFile: 返回 NO → 整条草稿不落库。
-//     这正是"普通图好了、实况还丢"的根因（普通图不挂 asset 才修好）。
-//     实况信息改由 isLivePhoto + livePhotoVideoPath + tempExtraInfo 三个字段承载，
-//     它们只是标记，不会把发布器切到"引用文件"模式。
+//   · 实况挂 MMAsset 基类（m_isUseLivePhoto / m_livePhotoVideoPath 只在这个类上，
+//     MMAssetForLocalImage 继承 NSObject、没有这两个字段，且不遵 NSCoding）。
+//   · 但 URL 必须用 fileURLWithPath:，不能用 PKC 的 URLWithString:。
+//     URLWithString: 造出来的是无 scheme 的 URL，微信解析不出可引用的本地路径，
+//     保存草稿时 copyImageAtAlbumToFile: 复制失败 → setDraftImages: 返回 NO
+//     → 整条草稿不落库（这正是上一版"实况丢图"的原因）。
+//     fileURLWithPath: 带 file:// scheme，微信能解析出路径，复制源又是微信自己的
+//     持久转码产物，复制成功且目标落在微信草稿目录 —— 落库与实况同时保住。
+//     PKC 用 URLWithString: 是因为它不做"保留草稿"，那条路径它根本不走。
 //   · 运动视频只认 [livePhotoMediaItem getFormatVideoPath]，无任何回退（PKC 原样）。
 //     拿不到就降级成普通图片 —— 丢实况动效，但图一定在。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
+    Class assetCls = objc_getClass("MMAsset");
+
     NSMutableArray *assets = [NSMutableArray array];
 
     for (WCMediaItem *m in item.contentObj.mediaList) {
@@ -1046,7 +1050,19 @@ static UIColor *ddm_track_bg(void) {
 
         NSString *movLocal = (m.livePhotoMediaItem ? DDMLivePhotoVideoPath(m.livePhotoMediaItem) : nil);
 
-        MMImage *mm = [self ddmMakeMMImage:ui liveVideoPath:movLocal];
+        // 普通图片 asset 传 nil；只有实况才建资产。
+        // 资产构造失败时退化成普通图片（丢实况动效，但保住图）。
+        MMAsset *asset = nil;
+        if (movLocal && assetCls &&
+            [assetCls instancesRespondToSelector:@selector(initWithUrl:IsNeedOrigin:)]) {
+            asset = [(MMAsset *)[assetCls alloc] initWithUrl:[NSURL fileURLWithPath:movLocal]
+                                               IsNeedOrigin:YES];
+            if (!asset) movLocal = nil;
+        } else {
+            movLocal = nil;
+        }
+
+        MMImage *mm = [self ddmMakeMMImage:ui asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
     }
 
@@ -1056,21 +1072,21 @@ static UIColor *ddm_track_bg(void) {
     self.busy = NO;
 }
 
-// 构建 MMImage；若为 Live Photo，写入实况标记（不挂 m_asset）。
+// 构建 MMImage；若为 Live Photo，挂资产并写入实况信息。
 //
-// 关键点：整条链路都不挂 m_asset。挂上之后微信会把图当"已有文件可引用"，
-// 保存草稿时改走 copyImageAtAlbumToFile:；我们造不出它能解析的本地路径，
-// 复制失败就是 setDraftImages: 返回 NO、整条草稿不落库。
-// 不挂 asset 时微信直接从 MMImage 已解码的像素数据写进自己的草稿目录，最稳。
+// asset 为 nil 表示普通图片 —— 此时不挂 m_asset，微信直接从已解码的像素数据
+// 写进自己的草稿目录（实测稳定，不丢图）。
 - (MMImage *)ddmMakeMMImage:(UIImage *)ui
+                      asset:(MMAsset *)asset
               liveVideoPath:(NSString *)movLocal {
     Class mmImgCls = objc_getClass("MMImage");
     MMImage *mmImg = ui ? (MMImage *)[(MMImage *)[mmImgCls alloc] initWithImage:ui] : [[mmImgCls alloc] init];
     if (!mmImg) return nil;
 
-    if (movLocal.length > 0) {
-        // 实况标记：这三个字段只是"说明这张图带运动视频"，
-        // 不会把发布器切到引用文件模式，因此不会破坏草稿落库。
+    if (asset) mmImg.m_asset = asset;
+
+    if (movLocal && asset) {
+        // 实况照片保真：MMImage 侧标记 + 资产侧登记。
         mmImg.isLivePhoto = YES;
         mmImg.livePhotoVideoPath = movLocal;
         [mmImg setImageFrom:3];
@@ -1078,10 +1094,16 @@ static UIColor *ddm_track_bg(void) {
         NSMutableDictionary *extra = [NSMutableDictionary dictionary];
         [extra setValue:movLocal forKey:@"ExportedLivePhotoPath"];
         [mmImg setValue:extra forKey:@"tempExtraInfo"];
+
+        asset.m_isUseLivePhoto = YES;
+        asset.m_livePhotoVideoPath = movLocal;
+        long long sz = (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize];
+        asset.livePhotoVideoSize = sz;
+        asset.livePhotoDuration = DDMVideoDuration(movLocal);
     }
 
-    // 对齐 PKC：initWithImage: 之后必调一次 commonInit。
-    // 放在所有字段设完之后统一调，覆盖普通图与实况两种情况。
+    // 对齐 PKC：必调。PKC 在 initWithImage: 之后必调一次，实况则在 setM_asset: 之后再调一次，
+    // 说明它不会清掉 m_asset；放在所有字段设完之后统一调一次即可覆盖两种情况。
     [mmImg commonInit];
 
     return mmImg;
