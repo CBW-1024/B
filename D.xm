@@ -1685,8 +1685,11 @@ static void ddmInjectMarkIntoComment(id c) {
 // 将本插件设置页注册到微信“我”页。
 %ctor {
     @autoreleasepool {
-        [[%c(WCPluginsMgr) sharedInstance] registerControllerWithTitle:@"DD朋友圈助手"
-                                                                          version:@"1.0.0"
-                                                                       controller:@"DDMSettingsViewController"];
+        id mgr = objc_getClass("WCPluginsMgr");
+        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD朋友圈助手"
+                                                     version:@"1.0.0"
+                                                  controller:@"DDMSettingsViewController"];
+        }
     }
 }
