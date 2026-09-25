@@ -1229,7 +1229,8 @@ static char kDDMLineKey;
                                 cmtBtn.frame.size.height);
     [shareBtn addTarget:self action:@selector(ddm_onForwardTapped:) forControlEvents:UIControlEventTouchUpInside];
     shareBtn.hidden = YES;
-    [self addSubview:shareBtn];
+    // 注入到原生按钮所在容器（多为 m_clipView），与赞 / 评论同层、同裁剪 / 圆角背景。
+    [cmtBtn.superview ?: self addSubview:shareBtn];
     objc_setAssociatedObject(self, &kDDMShareBtnKey, shareBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
@@ -1242,7 +1243,7 @@ static char kDDMLineKey;
     if ([origLine isKindOfClass:UIImageView.class]) {
         UIImageView *clone = [[UIImageView alloc] initWithImage:origLine.image];
         clone.hidden = YES;
-        [self addSubview:clone];
+        [origLine.superview ?: self addSubview:clone];
         objc_setAssociatedObject(self, &kDDMLineKey, clone, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
@@ -1263,7 +1264,7 @@ static char kDDMLineKey;
     [[DDMEngine shared] forwardDataItem:item hostView:self];
 }
 
-// 转发按钮与分隔线随浮窗布局：仅当转发开关打开时显示，并右移删除按钮让位。
+// 转发按钮与分隔线随浮窗布局：仅当转发开关打开时显示；第三列加宽时同步拉伸承载容器与圆角背景，避免按钮被裁剪 / 背景盖不住。
 - (void)layoutSubviews {
     %orig;
 
@@ -1272,7 +1273,7 @@ static char kDDMLineKey;
     UIButton *likeBtn = self.m_likeBtn;
     UIButton *cmtBtn  = self.m_commentBtn;
 
-    BOOL show = DDMConfig.shared.forwardEnabled && shareBtn && likeBtn && cmtBtn && shareBtn.superview == self;
+    BOOL show = DDMConfig.shared.forwardEnabled && shareBtn && likeBtn && cmtBtn && shareBtn.superview;
     shareBtn.hidden = !show;
     line.hidden = !show;
     if (!show) return;
@@ -1286,7 +1287,7 @@ static char kDDMLineKey;
                                cmtBtn.frame.size.height);
     if (!CGRectEqualToRect(shareBtn.frame, target)) shareBtn.frame = target;
 
-    if (line && line.superview == self && line.image) {
+    if (line && line.superview && line.image) {
         CGSize ls = line.image.size;
         CGRect lf = CGRectMake(CGRectGetMaxX(cmtBtn.frame) + gap / 2 - ls.width / 2,
                                cmtBtn.frame.origin.y + (cmtBtn.frame.size.height - ls.height) / 2,
@@ -1294,7 +1295,21 @@ static char kDDMLineKey;
         if (!CGRectEqualToRect(line.frame, lf)) line.frame = lf;
     }
 
+    // 第三列：把承载原生按钮的容器（m_clipView）与圆角背景（m_bkgImageView）一起加宽到三列宽度。
     CGFloat needW = CGRectGetMaxX(target) + likeBtn.frame.origin.x;
+    UIView *container = shareBtn.superview ?: self;
+    if (fabs(container.bounds.size.width - needW) > 0.5) {
+        CGRect cf = container.frame;
+        cf.size.width = needW;
+        container.frame = cf;
+    }
+    Ivar bkgIvar = class_getInstanceVariable([self class], "m_bkgImageView");
+    UIImageView *bkg = bkgIvar ? object_getIvar(self, bkgIvar) : nil;
+    if ([bkg isKindOfClass:UIImageView.class]) {
+        CGRect bf = bkg.frame;
+        if (fabs(bf.size.width - needW) > 0.5) { bf.size.width = needW; bkg.frame = bf; }
+    }
+    // 外层 self 同步加宽并居中（保持原有定位行为）。
     if (fabs(self.bounds.size.width - needW) > 0.5) {
         CGPoint center = self.center;
         CGRect f = self.frame;
