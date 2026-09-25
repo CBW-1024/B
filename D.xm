@@ -198,6 +198,32 @@ static inline id DDMGetFrameFacade(void) {
 - (void)setDelegate:(id)arg1;           // 设置代理（锚定 WCNewCommitViewController.h:280）
 @end
 
+// 时间线位置（WCDataItem.locationInfo 返回的对象，protobuf 存储态）。
+// 仅声明本插件转换时用到的 getter（锚定 WCLocationInfo.h）。
+@interface WCLocationInfo : NSObject
+- (CLLocationCoordinate2D)location;
+- (id)poiName;
+- (id)poiAddress;
+- (id)city;
+- (id)country;
+- (id)buildingID;
+- (id)floorName;
+- (id)poiInfoUrl;
+@end
+
+// 发布器位置（setPoiInfo: 期望的对象）。与 WCLocationInfo 是不同类、不同接口，
+// 故不能把后者直接喂给 setPoiInfo:，需显式转换（锚定 POIInfo.h）。
+@interface POIInfo : NSObject
+- (void)setCoordinate:(CLLocationCoordinate2D)arg1;
+- (void)setPoiName:(id)arg1;
+- (void)setAddress:(id)arg1;
+- (void)setCity:(id)arg1;
+- (void)setCountry:(id)arg1;
+- (void)setBuildingId:(id)arg1;
+- (void)setFloorName:(id)arg1;
+- (void)setInfoUrl:(id)arg1;
+@end
+
 // 朋友圈视频模板视图：禁用自动播放。
 @interface WCContentItemViewTemplateVideo : UIView
 - (void)autoPlayWithoutSound;
@@ -802,11 +828,15 @@ static UIColor *ddm_track_bg(void) {
     __weak typeof(self) weakSelf = self;
 
     [self downloadAllMediaOf:item completion:^{
-        WCDataItem *work = [weakSelf deepCopyDataItem:item];
-        if ([DDMConfig shared].removeOriginalLocation) {
-            [work setLocationInfo:nil];                       // 去位置：WCDataItem.setLocationInfo:（WCDataItem.h:436）
-        } else if ([item locationInfo]) {
-            [work setLocationInfo:[item locationInfo]];       // 保位置：深拷贝不一定序列化 locationInfo，从原件补回
+        // 深拷贝失败（如清理缓存后 toNSCodingBuffer 序列化失败）时回退到原件，避免 work 为 nil
+        // 传入 routeForwardForItem: 触发原生转发在 nil 上生成分享链接而崩溃。此为原始 DD 朋友圈转发的“处理”。
+        WCDataItem *work = [weakSelf deepCopyDataItem:item] ?: item;
+        if (work != item) {  // 仅对独立副本操作，避免清理缓存回退到原件时误改时间线原始对象
+            if ([DDMConfig shared].removeOriginalLocation) {
+                [work setLocationInfo:nil];                   // 去位置：WCDataItem.setLocationInfo:（WCDataItem.h:436）
+            } else if ([item locationInfo]) {
+                [work setLocationInfo:[item locationInfo]];   // 保位置：深拷贝不一定序列化 locationInfo，从原件补回
+            }
         }
         [weakSelf routeForwardForItem:work host:host];
     }];
@@ -1133,11 +1163,33 @@ static UIColor *ddm_track_bg(void) {
 - (void)ddmApplyLocation:(id)loc toCommitVC:(WCNewCommitViewController *)vc {
     if (!vc) return;
     if (loc) {
-        [vc setPoiInfo:loc];
-        [vc setBShowLocation:YES];
-    } else {
-        [vc setBShowLocation:NO];
+        id poi = [self ddmMakePoiInfoFromLocation:loc];
+        if (poi) {
+            [vc setPoiInfo:poi];
+            [vc setBShowLocation:YES];
+            return;
+        }
     }
+    [vc setBShowLocation:NO];
+}
+
+// 由时间线位置（WCLocationInfo）构造发布器可用的 POIInfo。
+// 直接把 WCLocationInfo 喂给 setPoiInfo: 会因类型不匹配（发布器按 POIInfo 读取坐标 / 名称）崩溃，故显式转换。
+// WCLocationInfo / POIInfo 均为私有类：POIInfo 经 objc_getClass 取类（链接必需），二者方法已声明可直接调用。
+- (id)ddmMakePoiInfoFromLocation:(id)loc {
+    if (!loc) return nil;
+    WCLocationInfo *l = (WCLocationInfo *)loc;
+    POIInfo *poi = [[objc_getClass("POIInfo") alloc] init];
+    if (!poi) return nil;
+    poi.coordinate = l.location;
+    poi.poiName    = l.poiName;
+    poi.address    = l.poiAddress;
+    poi.city       = l.city;
+    poi.country    = l.country;
+    poi.buildingId = l.buildingID;
+    poi.floorName  = l.floorName;
+    poi.infoUrl    = l.poiInfoUrl;
+    return poi;
 }
 
 // 视频发布：构造 WCNewCommitViewController(sightDraft) 并推入，附带来源位置。
