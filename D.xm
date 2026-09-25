@@ -1212,7 +1212,7 @@ static char kDDMLineKey;
     UIButton *cmtBtn = self.m_commentBtn;
     if (!cmtBtn || objc_getAssociatedObject(self, &kDDMShareBtnKey)) return;
 
-    UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     shareBtn.tintColor = [UIColor whiteColor];
 
     UIImage *icon = DDMShareIcon();
