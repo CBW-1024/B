@@ -408,6 +408,30 @@ static NSString *DDMCopyToTemp(NSString *srcPath, NSString *ext) {
     return dst;
 }
 
+// 转发媒体的持久备份目录（Caches，跨启动保留，不进 iCloud）。
+// tmp 会被系统回收，而发布器「保留」的草稿只存本地文件引用，文件没了草稿重开就只剩文案。
+// 这里另存一份作为兜底来源，主流程仍走 tmp，不改动原有工作流。
+static NSString *DDMKeepDir(void) {
+    static NSString *dir = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *base = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+        dir = [base stringByAppendingPathComponent:@"DDMomentsKeep"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+    });
+    return dir;
+}
+
+// 把转发产物备份进持久目录（与源文件同名，补回时无需任何映射表）。
+static void DDMKeepBackup(NSString *path) {
+    if (!DDMFileUsable(path)) return;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *dst = [DDMKeepDir() stringByAppendingPathComponent:path.lastPathComponent];
+    if ([fm fileExistsAtPath:dst]) return;
+    [fm copyItemAtPath:path toPath:dst error:nil];
+}
+
 // 取视频首帧作为转发缩略图。
 static UIImage *DDMVideoFirstFrame(NSString *path) {
     if (!DDMFileUsable(path)) return nil;
@@ -500,12 +524,16 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     ]);
     if (decoded) {
         NSString *cp = DDMCopyToTemp(decoded, @"mov");
-        if (cp) return cp;
+        if (cp) { DDMKeepBackup(cp); return cp; }
     }
 
     NSString *wxam = DDMPersistentSightPath(live);
     if (!wxam) return nil;
-    return DDMTranscodeWxamToMov(wxam);
+    // 转码产物直接落 tmp，不经过 DDMCopyToTemp，必须在这里单独备份，
+    // 否则这条路径下的实况运动视频没有兜底来源。
+    NSString *mov = DDMTranscodeWxamToMov(wxam);
+    if (mov) DDMKeepBackup(mov);
+    return mov;
 }
 
 #pragma mark - 转发引擎
@@ -1023,6 +1051,7 @@ static UIColor *ddm_track_bg(void) {
         if (!imgSrc) continue;
         NSString *imgLocal = DDMCopyToTemp(imgSrc, @"jpg");
         if (!imgLocal) continue;
+        DDMKeepBackup(imgLocal);
 
         WCMediaItem *live = m.livePhotoMediaItem;
         NSString *movLocal = (live ? DDMLivePhotoVideoPath(live) : nil);
@@ -1374,6 +1403,34 @@ static char kDDMLineKey;
     }
     if (!ok) ok = %orig(images, needCopy);
     return ok;
+}
+
+%end
+
+#pragma mark - Hook：转发媒体持久兜底（数据供给层补回）
+
+%hook MMAssetForLocalImage
+
+// 发布器「保留」的草稿只存本地文件引用，指向 tmp，系统回收后草稿重开就只剩文案。
+// 这里在微信读取文件路径的入口兜底：原文件不在就从持久备份拷回原位，路径照原样返回。
+// 不改写返回值、不要求微信配合任何事，微信全程无感——与 PKC 在 pathForSightData 上的做法一致。
+- (NSString *)localFilePath {
+    NSString *p = %orig;
+    // 头文件声明为 id，实际未必是字符串；非字符串直接放行，避免后续消息发送踩空。
+    if (![p isKindOfClass:NSString.class] || p.length == 0) return p;
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if ([fm fileExistsAtPath:p]) return p;
+
+    NSString *bak = [DDMKeepDir() stringByAppendingPathComponent:p.lastPathComponent];
+    if (![fm fileExistsAtPath:bak]) return p;
+
+    NSString *dir = [p stringByDeletingLastPathComponent];
+    if (![fm fileExistsAtPath:dir]) {
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    [fm copyItemAtPath:bak toPath:p error:nil];
+    return p;
 }
 
 %end
