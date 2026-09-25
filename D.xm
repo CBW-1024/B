@@ -435,17 +435,6 @@ static NSString *DDMVideoPath(WCMediaItem *item) {
     return DDMFirstUsablePath(cands);
 }
 
-// Live Photo 运动视频的持久化路径。
-static NSString *DDMLiveVideoPath(WCMediaItem *live) {
-    if (!live) return nil;
-    NSMutableArray *cands = [NSMutableArray array];
-    [cands addObject:[live pathForSightData] ?: @""];
-    [cands addObject:[live tempPathForSightData] ?: @""];
-    [cands addObject:[live getFormatVideoPath] ?: @""];
-    [cands addObject:[live getTempVideoPath] ?: @""];
-    return DDMFirstUsablePath(cands);
-}
-
 // 短视频持久化路径（Live Photo 运动视频兜底来源）。
 static NSString *DDMPersistentSightPath(WCMediaItem *item) {
     if (!item) return nil;
@@ -905,7 +894,7 @@ static UIColor *ddm_track_bg(void) {
 - (BOOL)ddmVideoReady:(WCMediaItem *)m {
     NSString *p = [m getFormatVideoPath];
     if (p && [[NSFileManager defaultManager] fileExistsAtPath:p]) return YES;
-    NSString *alt = DDMVideoPath(m) ?: DDMLiveVideoPath(m);
+    NSString *alt = DDMVideoPath(m);
     if (alt && DDMFileUsable(alt)) return YES;
     return [self ddmImageReady:m];
 }
