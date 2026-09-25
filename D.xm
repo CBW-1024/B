@@ -820,7 +820,12 @@ static UIColor *ddm_track_bg(void) {
     };
 
     BOOL (^isLiveLocal)(WCMediaItem *) = ^BOOL(WCMediaItem *m) {
-        return DDMPersistentSightPath(m) != nil;
+        // 不能用 DDMPersistentSightPath（它认 pathForSightData / tempPathForSightData，
+        // 即 wxam 原始封装，下载后立刻存在）。实况资产要的是 getFormatVideoPath
+        // （转码后的可播放文件），它往往比 wxam 晚生成；误判"已本地"会让
+        // StartDownloadVideo 被跳过，导致转发时 getFormatVideoPath 仍为空 → 实况退化成普通图。
+        NSString *p = [m getFormatVideoPath];
+        return p && [[NSFileManager defaultManager] fileExistsAtPath:p];
     };
 
     void (^add)(WCMediaItem *, BOOL) = ^(WCMediaItem *m, BOOL isLive) {
@@ -911,6 +916,14 @@ static UIColor *ddm_track_bg(void) {
     return [self ddmImageReady:m];
 }
 
+// 实况运动视频就绪：严格要求转码后的播放文件（getFormatVideoPath）已存在，
+// 不能退回到 wxam 原始封装。否则资产会指向一个尚未转码的路径，
+// 点「保留」后草稿里记录的实况视频路径失效 → 重开退化成普通图。
+- (BOOL)ddmLiveVideoReady:(WCMediaItem *)m {
+    NSString *p = [m getFormatVideoPath];
+    return p && [[NSFileManager defaultManager] fileExistsAtPath:p];
+}
+
 // 判断单个图片媒体是否就绪。
 - (BOOL)ddmImageReady:(WCMediaItem *)m {
     id img = [m imageOfSize:2LL];
@@ -951,7 +964,7 @@ static UIColor *ddm_track_bg(void) {
     for (NSInteger s = 0; s <= cap; s++) {
         NSInteger ready = 0;
         for (WCMediaItem *m in pending) {
-            BOOL ok = [liveSubs containsObject:m] ? [self ddmVideoReady:m] : [self ddmImageReady:m];
+            BOOL ok = [liveSubs containsObject:m] ? [self ddmLiveVideoReady:m] : [self ddmImageReady:m];
             if (ok) ready++;
         }
         [self ddmSetProgress:(float)ready / (float)total];
@@ -1143,11 +1156,33 @@ static UIColor *ddm_track_bg(void) {
 }
 
 // 将发布器 VC 推入宿主导航栈。
+//
+// 关键：必须用微信私有封装 PushViewController:animated:completion:，不能用系统
+// pushViewController:animated:。微信的 WCNewCommitViewController 依赖 viewDidBePushOrPresent:
+// 做入栈后的初始化（含 setupEnhanceDraftSaveController，见 WCNewCommitViewController.h:361/336），
+// 而该方法只在微信私有导航封装里被触发，UIKit 的 push 不会调它。
+// 一旦 enhanceDraftSaveController 为 nil，实况照片的草稿保存（需要它）会失败，
+// 普通照片走更宽松的路径所以不受影响 —— 这正是"普通图能存、实况丢"的根因。
+// PKC 反汇编（block@0x117848 → 0x117a5c）用的就是 PushViewController:animated:completion:。
 - (void)ddmPresentCommitVC:(UIViewController *)vc host:(UIViewController *)host {
     dispatch_async(dispatch_get_main_queue(), ^{
         UINavigationController *nav = host.navigationController;
         if (!nav) nav = DDMTopViewController(nil).navigationController;
-        [nav pushViewController:vc animated:YES];
+        SEL pushSel = NSSelectorFromString(@"PushViewController:animated:completion:");
+        if (nav && [nav respondsToSelector:pushSel]) {
+            void (*fn)(id, SEL, id, BOOL, id) = (void (*)(id, SEL, id, BOOL, id))objc_msgSend;
+            void (^noop)(void) = ^{};
+            fn(nav, pushSel, vc, YES, noop);
+        } else {
+            [nav pushViewController:vc animated:YES];
+            // 回退：系统 push 不会触发 viewDidBePushOrPresent:，手动补一次，
+            // 确保草稿保存控制器被初始化（仅兜底，正常情况下私有封装已调用）。
+            SEL vSel = NSSelectorFromString(@"viewDidBePushOrPresent:");
+            if ([vc respondsToSelector:vSel]) {
+                void (*fn2)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))objc_msgSend;
+                fn2(vc, vSel, YES);
+            }
+        }
     });
 }
 
