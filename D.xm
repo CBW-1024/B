@@ -166,11 +166,6 @@ static inline id DDMGetFrameFacade(void) {
 + (id)draftWithVideoURL:(NSURL *)url;
 @end
 
-// 朋友圈草稿箱：保存 / 恢复未发布的草稿（图片默认只存引用，可指定拷进微信自己的存储）。
-@interface WCTimelineEnhanceDraftController : NSObject
-- (BOOL)setDraftImages:(id)images needCopyImageToFile:(BOOL)needCopy;
-@end
-
 // 朋友圈路由：转发到微信原生转发界面（纯文字 / 兜底）。
 @interface WCTimelineRouterHelper : NSObject
 + (BOOL)presentForwardViewController:(id)dataItem
@@ -408,30 +403,6 @@ static NSString *DDMCopyToTemp(NSString *srcPath, NSString *ext) {
     return dst;
 }
 
-// 转发媒体的持久备份目录（Caches，跨启动保留，不进 iCloud）。
-// tmp 会被系统回收，而发布器「保留」的草稿只存本地文件引用，文件没了草稿重开就只剩文案。
-// 这里另存一份作为兜底来源，主流程仍走 tmp，不改动原有工作流。
-static NSString *DDMKeepDir(void) {
-    static NSString *dir = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *base = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
-        dir = [base stringByAppendingPathComponent:@"DDMomentsKeep"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                  withIntermediateDirectories:YES attributes:nil error:nil];
-    });
-    return dir;
-}
-
-// 把转发产物备份进持久目录（与源文件同名，补回时无需任何映射表）。
-static void DDMKeepBackup(NSString *path) {
-    if (!DDMFileUsable(path)) return;
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *dst = [DDMKeepDir() stringByAppendingPathComponent:path.lastPathComponent];
-    if ([fm fileExistsAtPath:dst]) return;
-    [fm copyItemAtPath:path toPath:dst error:nil];
-}
-
 // 取视频首帧作为转发缩略图。
 static UIImage *DDMVideoFirstFrame(NSString *path) {
     if (!DDMFileUsable(path)) return nil;
@@ -524,16 +495,12 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     ]);
     if (decoded) {
         NSString *cp = DDMCopyToTemp(decoded, @"mov");
-        if (cp) { DDMKeepBackup(cp); return cp; }
+        if (cp) return cp;
     }
 
     NSString *wxam = DDMPersistentSightPath(live);
     if (!wxam) return nil;
-    // 转码产物直接落 tmp，不经过 DDMCopyToTemp，必须在这里单独备份，
-    // 否则这条路径下的实况运动视频没有兜底来源。
-    NSString *mov = DDMTranscodeWxamToMov(wxam);
-    if (mov) DDMKeepBackup(mov);
-    return mov;
+    return DDMTranscodeWxamToMov(wxam);
 }
 
 #pragma mark - 转发引擎
@@ -1051,21 +1018,22 @@ static UIColor *ddm_track_bg(void) {
         if (!imgSrc) continue;
         NSString *imgLocal = DDMCopyToTemp(imgSrc, @"jpg");
         if (!imgLocal) continue;
-        DDMKeepBackup(imgLocal);
 
         WCMediaItem *live = m.livePhotoMediaItem;
         NSString *movLocal = (live ? DDMLivePhotoVideoPath(live) : nil);
 
         NSString *assetPath = movLocal ?: imgLocal;
-        MMAssetForLocalImage *asset = [[localImgCls alloc] initWithUrl:[NSURL fileURLWithPath:assetPath]
+        // 用 URLWithString: 而非 fileURLWithPath:，与 PKC 实况资产构造逐字一致。
+        // 且绝不手动写 localFilePath / localAssetId：那会把 tmp 路径钉进资产，
+        // 发布器「保留」时草稿记下的就是这个路径，tmp 被回收后草稿重开只剩文案。
+        // 路径交给 initWithUrl: 内部自行处置（PKC 全程不碰这两个字段，实况转发实测不丢）。
+        MMAssetForLocalImage *asset = [[localImgCls alloc] initWithUrl:[NSURL URLWithString:assetPath]
                                                               IsNeedOrigin:YES];
         if (!asset && movLocal) {
             assetPath = imgLocal;
-            asset = [[localImgCls alloc] initWithUrl:[NSURL fileURLWithPath:assetPath] IsNeedOrigin:YES];
+            asset = [[localImgCls alloc] initWithUrl:[NSURL URLWithString:assetPath] IsNeedOrigin:YES];
         }
         if (!asset) continue;
-        asset.localFilePath = assetPath;
-        asset.localAssetId  = assetPath;
 
         MMImage *mm = [self ddmMakeMMImage:imgLocal asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
@@ -1369,68 +1337,6 @@ static char kDDMLineKey;
     if (tv.text.length > 0) return;
     tv.text = text;
     [self textViewTextDidChange];
-}
-
-%end
-
-#pragma mark - Hook：朋友圈草稿箱（让微信接管转发图本体）
-
-%hook WCTimelineEnhanceDraftController
-
-// 转发带入的是本地文件资产（MMAssetForLocalImage），图片本体在我们自己的临时文件里，
-// 微信默认只存引用，文件一旦被清，草稿重开就只剩文案。
-// 对这类资产强制 needCopyImageToFile:YES，让微信把图拷进自己的草稿存储，
-// 与视频（SightDraft 由微信持有）和相册（本体在系统相册）一致。
-- (BOOL)setDraftImages:(id)images needCopyImageToFile:(BOOL)needCopy {
-    BOOL force = needCopy;
-    if (!force && [images isKindOfClass:NSArray.class]) {
-        Class localCls = NSClassFromString(@"MMAssetForLocalImage");
-        for (id obj in (NSArray *)images) {
-            // 入参可能是 MMImage（外层封装）也可能是裸 MMAsset，两种都取到底层资产再判类型。
-            id asset = [obj respondsToSelector:@selector(m_asset)] ? [obj m_asset] : obj;
-            if (localCls && asset && [asset isKindOfClass:localCls]) { force = YES; break; }
-        }
-    }
-    if (force == needCopy) return %orig(images, needCopy);
-
-    // 强制拷图是替微信改了默认路径，其内部 copyImageAtAlbumToFile: 面向相册资产实现，
-    // 喂本地文件资产有抛异常的可能，这里兜住：异常时退回微信默认行为，宁可草稿丢图也不崩发布流程。
-    BOOL ok = NO;
-    @try {
-        ok = %orig(images, force);
-    } @catch (NSException *e) {
-        ok = NO;
-    }
-    if (!ok) ok = %orig(images, needCopy);
-    return ok;
-}
-
-%end
-
-#pragma mark - Hook：转发媒体持久兜底（数据供给层补回）
-
-%hook MMAssetForLocalImage
-
-// 发布器「保留」的草稿只存本地文件引用，指向 tmp，系统回收后草稿重开就只剩文案。
-// 这里在微信读取文件路径的入口兜底：原文件不在就从持久备份拷回原位，路径照原样返回。
-// 不改写返回值、不要求微信配合任何事，微信全程无感——与 PKC 在 pathForSightData 上的做法一致。
-- (NSString *)localFilePath {
-    NSString *p = %orig;
-    // 头文件声明为 id，实际未必是字符串；非字符串直接放行，避免后续消息发送踩空。
-    if (![p isKindOfClass:NSString.class] || p.length == 0) return p;
-
-    NSFileManager *fm = NSFileManager.defaultManager;
-    if ([fm fileExistsAtPath:p]) return p;
-
-    NSString *bak = [DDMKeepDir() stringByAppendingPathComponent:p.lastPathComponent];
-    if (![fm fileExistsAtPath:bak]) return p;
-
-    NSString *dir = [p stringByDeletingLastPathComponent];
-    if (![fm fileExistsAtPath:dir]) {
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-    [fm copyItemAtPath:bak toPath:p error:nil];
-    return p;
 }
 
 %end
