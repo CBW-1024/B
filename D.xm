@@ -25,7 +25,7 @@
 
 #include <stdarg.h>
 
-#pragma mark - 调试日志子系统
+// 调试日志子系统
 
 // 调试日志：落盘到 App 沙盒 Library/DDWCMoments/debug.log。
 // 随微信进程加载即可写，不依赖越狱 / PreferenceLoader / Cephei。
@@ -100,6 +100,15 @@ static void DDMLogAlert(UIViewController *from, NSString *title, NSString *msg) 
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
+@end
+
+// 必须放在主 @interface 之后：clang 对“前置 category”会报
+// “cannot find interface declaration” 并丢弃其中的方法，导致 Class 接收者调用
+// normalCellForSel 时回退为 “no known class method for selector”。
+// 见 wechat_8079/WCTableViewCellManager.h:17 与 wechat_headers/WCTableViewCellManager.h:17：
+// +(id) normalCellForSel:(SEL) target:(id) title:(id);
+@interface WCTableViewCellManager (DDMLogSupport)
++ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3;
 @end
 
 // 朋友圈内容项（一条朋友圈的元数据）。
