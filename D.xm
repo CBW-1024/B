@@ -453,6 +453,9 @@ static UIImage *DDMThumbImage(WCMediaItem *item) {
 #pragma mark - 实况照片运动视频：转码为可播放视频
 
 // 将 wxam（微信实况封装）转码为 .mov。
+// 产物落在 tmp（DDMTempDir）。实况链路已改为只认微信自己的 getFormatVideoPath，
+// 不再走这里 —— 保留供后续需要时启用。
+__attribute__((unused))
 static NSString *DDMTranscodeWxamToMov(NSString *src) {
     if (!DDMFileUsable(src)) return nil;
     NSURL *inURL = [NSURL fileURLWithPath:src];
@@ -481,23 +484,25 @@ static NSString *DDMTranscodeWxamToMov(NSString *src) {
     return nil;
 }
 
-// Live Photo 运动视频路径：优先已转码，否则从持久化短视频转码。
+// Live Photo 运动视频路径（只认微信自己的转码产物，无回退）。
 static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     if (!live) return nil;
 
-    // ① 微信自己的转码产物（CDN 缓存目录，微信会自己维护生命周期）。
-    //    对齐 PKC：原样直接引用，绝不复制一份到 tmp —— tmp 被回收后草稿里的路径就失效了。
-    NSString *decoded = DDMFirstUsablePath(@[
-        ([live getFormatVideoPath] ?: @""),
-        ([live getTempVideoPath]  ?: @""),
-    ]);
-    if (decoded) return decoded;
-
-    // ② 兜底：短视频原始封装（wxam 无法直接播放），必须转码成 mov。
-    //    转码产物只能落 tmp，这是唯一还会丢的场景，仅在微信尚未转码时才会走到。
-    NSString *wxam = DDMPersistentSightPath(live);
-    if (!wxam) return nil;
-    return DDMTranscodeWxamToMov(wxam);
+    // 严格对齐 PKC（block@0x1166fc 逐条取证）：
+    //   0x116e58  x21 = [mediaItem livePhotoMediaItem]
+    //   0x116e68  x28 = [x21 getFormatVideoPath]        ← 唯一来源
+    //   0x116e9c  fileExistsAtPath:x28 → 失败即报错退出（code 4），不做任何回退
+    //   0x116fac / 0x117050 / 0x1170b0  三处都写 x28（原路径）
+    //   0x117010  [NSURL URLWithString:x28]  ← asset URL 同样是原路径
+    //
+    // 我们此前额外加的 getTempVideoPath 与「wxam→mov 转码」两个兜底，产物都在
+    // 可被系统回收的临时目录；一旦挂上资产，微信草稿只记路径，回收即空 ——
+    // 这就是实况丢图而普通图不丢的原因。
+    //
+    // 现在只认微信自己的转码产物。拿不到就返回 nil，调用方降级成普通图片：
+    // 丢实况动效，但保住图。
+    NSString *p = [live getFormatVideoPath];
+    return DDMFileUsable(p) ? p : nil;
 }
 
 #pragma mark - 转发引擎
@@ -1013,6 +1018,8 @@ static UIColor *ddm_track_bg(void) {
 //   · 普通图片不构造任何资产，MMImage 只承载 UIImage。
 //   · 只有 Live Photo 才构造资产，用 MMAsset 基类 + URLWithString:（PKC 原样），
 //     且 URL 指向微信自己的转码产物，不是我们的 tmp。
+//   · 运动视频只认 [livePhotoMediaItem getFormatVideoPath]，无任何回退（PKC 原样）。
+//     拿不到就降级成普通图片 —— 丢实况动效，但图一定在。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
     Class assetCls = objc_getClass("MMAsset");
 
@@ -1033,12 +1040,15 @@ static UIColor *ddm_track_bg(void) {
         NSString *movLocal = (m.livePhotoMediaItem ? DDMLivePhotoVideoPath(m.livePhotoMediaItem) : nil);
 
         // 普通图片 asset 传 nil；只有实况才建资产。
-        // 资产构造失败时退化成普通图片（丢实况，但不丢图）。
+        // 资产构造失败（或拿不到运动视频）时退化成普通图片：丢实况动效，但保住图。
         MMAsset *asset = nil;
-        if (movLocal) {
+        if (movLocal && assetCls &&
+            [assetCls instancesRespondToSelector:@selector(initWithUrl:IsNeedOrigin:)]) {
             asset = [(MMAsset *)[assetCls alloc] initWithUrl:[NSURL URLWithString:movLocal]
                                                IsNeedOrigin:YES];
             if (!asset) movLocal = nil;
+        } else {
+            movLocal = nil;
         }
 
         MMImage *mm = [self ddmMakeMMImage:ui asset:asset liveVideoPath:movLocal];
