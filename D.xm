@@ -181,7 +181,6 @@ static inline id DDMGetFrameFacade(void) {
 @property (retain, nonatomic) MMGrowTextView *textView;
 @property (nonatomic) BOOL m_isUseMMAsset;
 @property (nonatomic) BOOL bHideAddView;
-@property (nonatomic, retain) id sightDraft;   // 视频(sight)草稿，用于判定当前是否为视频发布器
 - (void)initTextViewContent;
 - (void)textViewTextDidChange;
 - (instancetype)initWithImages:(id)arg1 contacts:(id)arg2;
@@ -244,12 +243,6 @@ static NSString * const kDDMRemoveOriginalLoc    = @"DDMoments_removeOriginalLoc
 // 已删评论标记。
 static NSString * const kDDMDeletedCommentMark   = @"DDMoments_deletedCommentMark";
 static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
-
-// 转发文案关联对象键：将原文案绑定到发布器 VC，供 viewDidLoad 回填（替代原 8s 全局槽）。
-static char kDDMForwardTextKey;
-// 转发文案在原始数据项上的暂存键：深拷贝 / 清理缓存后的序列化可能丢失 contentDesc，
-// 故文案在 forwardDataItem 入口从原始 item 提取，绑到 work 随链路传递。
-static char kDDMWorkCaptionKey;
 
 @interface DDMConfig : NSObject
 @property (assign, nonatomic) BOOL forwardEnabled;          // 启用一键转发（总开关；开启时展开“移除原始位置”）
@@ -512,11 +505,13 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
 #pragma mark - 转发引擎
 
 @interface DDMEngine : NSObject
+@property (nonatomic, strong) NSString *pendingText;   // 原帖文案槽：入口写入，发布器 init 期取出即清
 @property (nonatomic, assign) BOOL busy;
 @property (nonatomic, strong) id retainedCommentDetailVC;
 @property (nonatomic, weak) UIWindow *ddmWindow;   // 进度卡挂载的窗口，由触发浮窗直接给出
 + (instancetype)shared;
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView;
+- (NSString *)consumePendingText;
 @end
 
 // 进度浮卡：窗口宽度变化时按当前宽度重排子视图。
@@ -769,6 +764,11 @@ static UIColor *ddm_track_bg(void) {
     if (self.busy) { return; }
     self.busy = YES;
 
+    // 文案在入口就从原始 item 抓取：此刻正是用户正在看的这条帖，contentDesc 最可靠。
+    // 存进槽供发布器 init 期取出（取出即清，天然只回填一次，无需 8s 时效也不串文案）。
+    NSString *cap = [item.contentDesc stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    self.pendingText = cap.length > 0 ? cap : nil;
+
     self.ddmWindow = floatView.window;
     UIViewController *host = DDMTopViewController(floatView.navigationController);
     [floatView hide];
@@ -781,10 +781,6 @@ static UIColor *ddm_track_bg(void) {
     [self downloadAllMediaOf:item completion:^{
         // 深拷贝失败（如清理缓存后）时回退原件，避免 work 为 nil 触发原生转发崩溃。
         WCDataItem *work = [weakSelf deepCopyDataItem:item] ?: item;
-        // 文案从原始 item 提取：深拷贝（NSCoding 序列化）在清理缓存后可能丢失 contentDesc，
-        // 故在入口就抓取原文案，绑到 work 随链路传递，发布器再用它回填。
-        NSString *cap = [item.contentDesc stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (cap.length > 0) objc_setAssociatedObject(work, &kDDMWorkCaptionKey, cap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (work != item) {  // 仅在独立副本上改位置，不污染原帖
             if ([DDMConfig shared].removeOriginalLocation) {
                 [work setLocationInfo:nil];
@@ -1080,13 +1076,12 @@ static UIColor *ddm_track_bg(void) {
 
 #pragma mark 文案暂存
 
-// 将原帖文案绑定到发布器 VC（关联对象），供 viewDidLoad 回填。绑定 VC 实例可避免连转两条串文案，
-// 且无需 8s 时效（只要 VC 还活着，文案就在）。
-// 文案取自 work 上绑定的原文案（forwardDataItem 入口抓取），绕开深拷贝可能丢失的 contentDesc。
-- (void)ddmAttachCaptionOf:(WCDataItem *)item toCommitVC:(UIViewController *)vc {
-    NSString *text = objc_getAssociatedObject(item, &kDDMWorkCaptionKey);
-    if (text.length == 0) return;
-    objc_setAssociatedObject(vc, &kDDMForwardTextKey, text, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+// 取出原帖文案（取出即清）。一次性消费保证 initTextViewContent 被微信二次调用时读到空、不再通知，
+// 从而避免 sight 草稿就绪后被重复通知触发重新合成；同时天然杜绝连转两条串文案。
+- (NSString *)consumePendingText {
+    NSString *t = self.pendingText;
+    self.pendingText = nil;
+    return t;
 }
 
 #pragma mark 路由调用
@@ -1133,7 +1128,6 @@ static UIColor *ddm_track_bg(void) {
         self.retainedCommentDetailVC = detail;
     }
     [self ddmApplyLocation:[item locationInfo] toCommitVC:vc];
-    [self ddmAttachCaptionOf:item toCommitVC:vc];
     [self ddmPresentCommitVC:vc host:host];
 }
 
@@ -1142,7 +1136,6 @@ static UIColor *ddm_track_bg(void) {
     Class cls = objc_getClass("WCNewCommitViewController");
     WCNewCommitViewController *vc = [(WCNewCommitViewController *)[cls alloc] initWithImages:[assets mutableCopy] contacts:nil];
     [self ddmApplyLocation:[item locationInfo] toCommitVC:vc];
-    [self ddmAttachCaptionOf:item toCommitVC:vc];
     [self ddmPresentCommitVC:vc host:host];
 }
 
@@ -1323,24 +1316,24 @@ static char kDDMLineKey;
 
 %hook WCNewCommitViewController
 
-// 加载后若是本地资源带入，显示 + 号（图片选择器）；并回填原帖文案。
+// 加载后若是本地资源带入，显示 + 号（图片选择器）。
 - (void)viewDidLoad {
     %orig;
     if (self.m_isUseMMAsset) self.bHideAddView = NO;
-    // 回填原帖文案：关联对象已由引擎在推入前写入，viewDidLoad 时序稳定且早于 sight 草稿重新合成；
-    // 视频(sight)草稿跳过 textViewTextDidChange，避免该通知触发 sight 草稿重新合成而破坏转发。
-    NSString *text = objc_getAssociatedObject(self, &kDDMForwardTextKey);
+}
+
+// 文本框初始化后回填原帖文案。这里（init 期，微信自建的内容入口）是最早、最稳的写入点：
+// 槽在 init 前已就绪，取出即清故只回填一次；随后调用 textViewTextDidChange 把文案同步进微信内部模型，
+// 视频 / 图片都同步（不跳过），清理缓存后微信重建文本框时会从模型回填，文案不会丢。
+- (void)initTextViewContent {
+    %orig;
+    NSString *text = [[DDMEngine shared] consumePendingText];
     if (text.length == 0) return;
     UITextView *tv = self.textView.textView;
     if (![tv isKindOfClass:UITextView.class]) return;
     if (tv.text.length > 0) return;
     tv.text = text;
-    if (!self.sightDraft) [self textViewTextDidChange];
-}
-
-// 文案回填已移至 viewDidLoad，这里不再操作，避免对 sight 草稿重复通知引发重新合成。
-- (void)initTextViewContent {
-    %orig;
+    [self textViewTextDidChange];
 }
 
 %end
