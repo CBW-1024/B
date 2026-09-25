@@ -166,6 +166,11 @@ static inline id DDMGetFrameFacade(void) {
 + (id)draftWithVideoURL:(NSURL *)url;
 @end
 
+// 朋友圈草稿箱：保存 / 恢复未发布的草稿（图片默认只存引用，可指定拷进微信自己的存储）。
+@interface WCTimelineEnhanceDraftController : NSObject
+- (BOOL)setDraftImages:(id)images needCopyImageToFile:(BOOL)needCopy;
+@end
+
 // 朋友圈路由：转发到微信原生转发界面（纯文字 / 兜底）。
 @interface WCTimelineRouterHelper : NSObject
 + (BOOL)presentForwardViewController:(id)dataItem
@@ -1335,6 +1340,40 @@ static char kDDMLineKey;
     if (tv.text.length > 0) return;
     tv.text = text;
     [self textViewTextDidChange];
+}
+
+%end
+
+#pragma mark - Hook：朋友圈草稿箱（让微信接管转发图本体）
+
+%hook WCTimelineEnhanceDraftController
+
+// 转发带入的是本地文件资产（MMAssetForLocalImage），图片本体在我们自己的临时文件里，
+// 微信默认只存引用，文件一旦被清，草稿重开就只剩文案。
+// 对这类资产强制 needCopyImageToFile:YES，让微信把图拷进自己的草稿存储，
+// 与视频（SightDraft 由微信持有）和相册（本体在系统相册）一致。
+- (BOOL)setDraftImages:(id)images needCopyImageToFile:(BOOL)needCopy {
+    BOOL force = needCopy;
+    if (!force && [images isKindOfClass:NSArray.class]) {
+        Class localCls = NSClassFromString(@"MMAssetForLocalImage");
+        for (id obj in (NSArray *)images) {
+            // 入参可能是 MMImage（外层封装）也可能是裸 MMAsset，两种都取到底层资产再判类型。
+            id asset = [obj respondsToSelector:@selector(m_asset)] ? [obj m_asset] : obj;
+            if (localCls && asset && [asset isKindOfClass:localCls]) { force = YES; break; }
+        }
+    }
+    if (force == needCopy) return %orig(images, needCopy);
+
+    // 强制拷图是替微信改了默认路径，其内部 copyImageAtAlbumToFile: 面向相册资产实现，
+    // 喂本地文件资产有抛异常的可能，这里兜住：异常时退回微信默认行为，宁可草稿丢图也不崩发布流程。
+    BOOL ok = NO;
+    @try {
+        ok = %orig(images, force);
+    } @catch (NSException *e) {
+        ok = NO;
+    }
+    if (!ok) ok = %orig(images, needCopy);
+    return ok;
 }
 
 %end
