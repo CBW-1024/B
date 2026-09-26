@@ -2,27 +2,42 @@
 // 微信集赞助手（Theos / Logos，arm64 / arm64e）
 //
 // 功能：
-//   自己点赞某条朋友圈后，自动伪造指定数量的「点赞」与「评论」，
-//   数据落在本地 WCDataItem 上，不改服务端。
+//   长按朋友圈「赞 / 评论」浮窗里的点赞按钮（1 秒），按配置伪造指定数量的
+//   「点赞」与「评论」，数据落在本地 WCDataItem 上，不改服务端。
+//   普通单击点赞完全不受影响 —— 挂 likeFlag 被动伪造会连正常点赞一起改掉。
+//
+// 触发链路：
+//   长按 m_likeBtn → 开一个 8 秒的触发窗口并记住目标 item
+//   → 未赞则走原生 onLikeItem:（内部会调 WCTimelineMgr.modifyDataItem:notify:）
+//     已赞则经 WCFacade.getTimelineMgr 手动 notify 一次
+//   → %hook WCTimelineMgr 命中窗口时把伪造数据写回 item，再放行原生实现。
+//   借原生链路刷新，可顺带绕过 WCDataItemUICache 布局缓存不失效的问题。
 //
 // 说明：
 //   - 设置界面与配置层按 DD朋友圈助手（DDWCMoments.xm）的模式改写，
 //     便于后续整体并入 DD朋友圈助手：配置类为单例 + NSUserDefaults 直写，
 //     键名统一 DDMoments_ 前缀，设置页结构（ensureTableViewMgr / 三态导航栏 /
 //     viewWillAppear 重建 / delegate 三方法转发）与 DDMSettingsViewController 一致。
+//   - 三项自定义输入（点赞数量 / 评论数量 / 评论内容）采用 DD收款助手
+//     （DDTransfer.xm）的行内「输入框 + 确认按钮」样式，尺寸与配色逐项对齐：
+//     容器 220×34、输入框 160×34、按钮 52×34，systemGray5Color 圆角背景。
 //   - 微信私有类一律运行时获取（objc_getClass / NSClassFromString），不链接私有符号。
 //   - 私有接口取自微信 8.0.79 头文件，只声明本插件真正会调用的方法。
 //
 // 并入 DD朋友圈助手 的步骤（本文件已按此设计）：
 //   1. DDLikeConfig 的属性与 key 直接搬进 DDMConfig（key 前缀已统一，用户旧设置不丢）。
 //   2. addLikeSections 的方法体直接搬进 DDMSettingsViewController 的 buildTable。
-//   3. DDLikeHelper 与 %hook WCTimelineMgr 整段搬过去。
+//   3. DDLikeHelper 与两个 %hook 整段搬过去。
 //   4. 注意声明去重：DDWCMoments.xm 已声明 WCDataItem 与 WCUserComment，
 //      合并时取并集，不要写两份 @interface。
 //        - WCUserComment：DDWCMoments 已有 content / setContent:，本文件补
 //          nickname / username / commentID / type / createTime 及各 setter。
 //        - WCDataItem：两边都用到 createtime（unsigned int，类型一致），
 //          本文件补 likeUsers / likeCount / commentUsers / commentCount / likeFlag。
+//   5. WCOperateFloatView 冲突：DDWCMoments.xm 已 %hook 了该类（initCommentButton /
+//      showWithItemData: / hide / layoutSubviews）。合并时不要写第二个 %hook 块，
+//      把 [self ddl_attachLongPress]; 加进它已有的 layoutSubviews 即可，
+//      再把两个 %new 方法并入同一个 %hook 块。WCFacade 同理取并集。
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -56,6 +71,7 @@
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
++ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;  // WCTableViewCellManager.h:30
 @end
 
 // 联系人基类：m_nsUsrName / m_uiSex / m_nsHeadImgUrl / m_nsRemark 都在这里，
@@ -84,11 +100,35 @@
 @property (readonly, nonatomic) MMServiceCenter *serviceCenter;
 @end
 
-static inline id DDLContactMgr(void) {
+// 取服务：MMContext → serviceCenter → getService:
+static inline id DDLService(Class cls) {
     MMContext *ctx = [objc_getClass("MMContext") currentContext];
     MMServiceCenter *center = ctx.serviceCenter;
-    return [center getService:objc_getClass("CContactMgr")];
+    return [center getService:cls];
 }
+
+static inline id DDLContactMgr(void) {
+    return DDLService(objc_getClass("CContactMgr"));
+}
+
+// WCTimelineMgr 在头文件里没有任何引用者，说明它不被别的类以属性方式持有；
+// 正路是经 WCFacade 取（WCFacade.h:198 getTimelineMgr / :240 timelineMgr）。
+@interface WCFacade : NSObject
+- (id)getTimelineMgr;                                    // WCFacade.h:198
+@end
+
+static inline id DDLTimelineMgr(void) {
+    return [(WCFacade *)DDLService(objc_getClass("WCFacade")) getTimelineMgr];
+}
+
+// 朋友圈「赞 / 评论」浮窗。dump 里写的是 : NSObject，实际是 UIView 子类
+// （DDWCMoments.xm 亦按 UIView 声明并 hook 了 layoutSubviews）。
+@interface WCOperateFloatView : UIView
+- (id)m_item;                                            // WCOperateFloatView.h:9
+- (id)m_likeBtn;                                         // WCOperateFloatView.h:10
+- (void)onLikeItem:(id)arg1;                             // WCOperateFloatView.h:20
+- (void)hide;                                            // WCOperateFloatView.h:16
+@end
 
 // 评论 / 点赞项模型。朋友圈的 likeUsers 与 commentUsers 装的都是这个类
 // （头文件里没有独立的点赞模型类，likeUserDetail 只是空 PB 壳）。
@@ -123,9 +163,6 @@ static NSString * const kDDMLikeCount      = @"DDMoments_likeCount";
 static NSString * const kDDMCommentCount   = @"DDMoments_commentCount";
 static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
 
-// 评论内容默认值（多条用 "-" 分隔，随机取一条）。
-static NSString * const kDDMDefaultComments = @"赞-👍";
-
 @interface DDLikeConfig : NSObject
 @property (assign, nonatomic) BOOL likeEnabled;      // 启用集赞（总开关；开启时展开三个子项）
 @property (assign, nonatomic) NSInteger likeCount;   // 伪造点赞数（0 = 未设置，不生效）
@@ -149,8 +186,7 @@ static NSString * const kDDMDefaultComments = @"赞-👍";
         _likeEnabled   = [ud boolForKey:kDDMLikeEnabled];
         _likeCount     = [ud integerForKey:kDDMLikeCount];
         _commentCount  = [ud integerForKey:kDDMCommentCount];
-        NSString *c    = [ud stringForKey:kDDMLikeComments];
-        _comments      = (c.length > 0) ? c : kDDMDefaultComments;
+        _comments      = [ud stringForKey:kDDMLikeComments] ?: @"";   // 无默认内容，未填即为空
     }
     return self;
 }
@@ -163,16 +199,17 @@ static NSString * const kDDMDefaultComments = @"赞-👍";
 - (void)setLikeEnabled:(BOOL)v   { _likeEnabled = v;   [self persist:@(v) key:kDDMLikeEnabled]; }
 - (void)setLikeCount:(NSInteger)v  { _likeCount = v;     [self persist:@(v) key:kDDMLikeCount]; }
 - (void)setCommentCount:(NSInteger)v { _commentCount = v; [self persist:@(v) key:kDDMCommentCount]; }
+// 允许清空：清空后 commentPool 为空，fakeCommentsFor: 会跳过伪造评论。
 - (void)setComments:(NSString *)v {
-    NSString *val = (v.length > 0) ? v : kDDMDefaultComments;
+    NSString *val = v ?: @"";
     _comments = [val copy];
     [self persist:val key:kDDMLikeComments];
 }
 
-// 评论内容池（按 "-" 切分，空则回退默认）。
+// 评论内容池（按 "-" 切分）。未填写时返回空数组。
 - (NSArray<NSString *> *)commentPool {
-    NSArray *arr = [self.comments componentsSeparatedByString:@"-"];
-    return arr.count ? arr : @[kDDMDefaultComments];
+    if (self.comments.length == 0) return @[];
+    return [self.comments componentsSeparatedByString:@"-"];
 }
 
 @end
@@ -227,11 +264,14 @@ static NSString * const kDDMDefaultComments = @"赞-👍";
 + (NSMutableArray<WCUserComment *> *)fakeCommentsFor:(WCDataItem *)origItem {
     NSInteger target = DDLikeConfig.shared.commentCount;
     NSMutableArray *orig = origItem.commentUsers ?: [NSMutableArray array];
-    if (target <= 0) return orig;                       // 未设置：原样返回
+    if (target <= 0) return orig;                       // 未设置数量：原样返回
     if ((NSInteger)orig.count >= target) return orig;   // 已够：原样返回
 
-    NSMutableArray *list = [orig mutableCopy];
+    // 未填写评论内容：不做伪造，避免产生空文本评论。
     NSArray<NSString *> *pool = DDLikeConfig.shared.commentPool;
+    if (pool.count == 0) return orig;
+
+    NSMutableArray *list = [orig mutableCopy];
 
     unsigned int now = (unsigned int)[NSDate date].timeIntervalSince1970;
     // createtime 可能为 0（本地刚发 / 未同步）或晚于当前时间，
@@ -260,26 +300,147 @@ static NSString * const kDDMDefaultComments = @"赞-👍";
 
 @end
 
-#pragma mark - Hook：伪造点赞 / 评论
+#pragma mark - Hook：长按点赞 → 集赞
+
+// 触发窗口：长按点赞按钮时记下目标 item 与过期时间。
+// 用「目标 + 时间窗」而非 BOOL，是因为 onLikeItem: 内部的落库可能是异步的，
+// 立即清标记会漏掉回调；伪造本身幂等，窗口内重复命中无害。
+static __unsafe_unretained WCDataItem *gDDLTargetItem = nil;
+static NSTimeInterval gDDLTriggerUntil = 0;
+static const NSTimeInterval kDDLWindow = 8.0;
+
+static inline BOOL DDLInWindow(WCDataItem *item) {
+    return item != nil
+        && item == gDDLTargetItem
+        && CFAbsoluteTimeGetCurrent() < gDDLTriggerUntil;
+}
+
+// 长按手势的挂载去重键。
+static const void *kDDLLongPressKey = &kDDLLongPressKey;
+
+// 把伪造数据写回 item。幂等：窗口内重复调用结果一致（仅评论时间随机）。
+static inline void DDLFakeInto(WCDataItem *item) {
+    if (!item) return;
+
+    NSMutableArray *comments = [DDLikeHelper fakeCommentsFor:item];
+    if (comments.count) {
+        item.commentUsers = comments;
+        item.commentCount = (int)comments.count;
+    }
+    NSMutableArray *likes = [DDLikeHelper fakeLikeUsers];
+    if (likes.count) {
+        item.likeUsers = likes;
+        item.likeCount = (int)likes.count;
+    }
+}
+
+// 底部短提示，1.4s 后淡出（长按唯一的反馈，不用震动）。
+static void DDLShowToast(NSString *text) {
+    UIWindow *win = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (!w.hidden && w.windowLevel == UIWindowLevelNormal) { win = w; break; }
+    }
+    if (!win) win = UIApplication.sharedApplication.keyWindow;
+    if (!win) return;
+
+    UILabel *lab = [[UILabel alloc] init];
+    lab.text = text;
+    lab.font = [UIFont systemFontOfSize:14];
+    lab.textColor = [UIColor whiteColor];
+    lab.textAlignment = NSTextAlignmentCenter;
+    lab.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.78];
+    lab.layer.cornerRadius = 8;
+    lab.layer.masksToBounds = YES;
+    [lab sizeToFit];
+
+    CGFloat w = CGRectGetWidth(lab.bounds) + 32.0;
+    CGFloat h = CGRectGetHeight(lab.bounds) + 20.0;
+    lab.frame = CGRectMake((CGRectGetWidth(win.bounds) - w) / 2.0,
+                           CGRectGetHeight(win.bounds) - 140.0, w, h);
+    lab.alpha = 0;
+    [win addSubview:lab];
+
+    [UIView animateWithDuration:0.18 animations:^{ lab.alpha = 1.0; } completion:^(BOOL f) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [UIView animateWithDuration:0.25 animations:^{ lab.alpha = 0; }
+                             completion:^(BOOL f2){ [lab removeFromSuperview]; }];
+        });
+    }];
+}
+
+static void DDLToastLikeResult(WCDataItem *item) {
+    NSMutableString *s = [NSMutableString stringWithString:@"已集赞"];
+    if (item.likeCount > 0)    [s appendFormat:@" %d 赞", item.likeCount];
+    if (item.commentCount > 0) [s appendFormat:@" %d 评论", item.commentCount];
+    DDLShowToast(s);
+}
+
+// %new 方法的编译期声明（Logos 运行时注入，编译器需先见到签名）。
+@interface WCOperateFloatView (DDLike)
+- (void)ddl_attachLongPress;
+- (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g;
+@end
+
+%hook WCOperateFloatView
+
+// 浮窗每次布局都会跑，借它把手势挂上去（内部去重，开销可忽略）。
+// 合并进 DDWCMoments.xm 时，直接把这一行加进它已有的 layoutSubviews 即可。
+- (void)layoutSubviews {
+    %orig;
+    [self ddl_attachLongPress];
+}
+
+%new
+- (void)ddl_attachLongPress {
+    if (!DDLikeConfig.shared.likeEnabled) return;
+    UIButton *btn = self.m_likeBtn;
+    if (!btn) return;
+    if (objc_getAssociatedObject(btn, kDDLLongPressKey)) return;   // 已挂过
+
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                      action:@selector(ddl_onLikeLongPress:)];
+    lp.minimumPressDuration = 1.0;                                 // 长按 1 秒触发
+    [btn addGestureRecognizer:lp];
+    objc_setAssociatedObject(btn, kDDLLongPressKey, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+%new
+// 长按点赞按钮：开窗口 → 触发一次原生落库 → 收起浮窗并提示。
+- (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    if (!DDLikeConfig.shared.likeEnabled) return;
+
+    WCDataItem *item = self.m_item;
+    if (!item) return;
+
+    gDDLTargetItem   = item;
+    gDDLTriggerUntil = CFAbsoluteTimeGetCurrent() + kDDLWindow;
+
+    if (!item.likeFlag) {
+        // 未赞：走原生点赞，其内部会调 modifyDataItem:notify: 命中窗口。
+        [self onLikeItem:self.m_likeBtn];
+    } else {
+        // 已赞：onLikeItem: 会把赞取消，故不调它，改为手动 notify 一次刷新。
+        item.likeFlag = YES;
+        id mgr = DDLTimelineMgr();
+        if (mgr) [mgr modifyDataItem:item notify:YES];
+        else DDLFakeInto(item);               // 拿不到 mgr 兜底：改完就算，等下次刷新生效
+    }
+
+    [self hide];
+    DDLToastLikeResult(item);
+}
+
+%end
 
 %hook WCTimelineMgr
 
 // modifyDataItem:notify: 是数据项落库 / 刷新的统一出口（WCTimelineMgr.h:71）。
-// 只在自己点过赞（likeFlag）的帖子上做假，避免污染别人 / 未互动的帖子。
+// 命中长按窗口才伪造；普通单击点赞与后台刷新一律放行原生实现。
 - (void)modifyDataItem:(WCDataItem *)arg1 notify:(BOOL)arg2 {
-    if (DDLikeConfig.shared.likeEnabled && arg1 && arg1.likeFlag) {
-        NSMutableArray *comments = [DDLikeHelper fakeCommentsFor:arg1];
-        if (comments.count) {
-            arg1.commentUsers = comments;
-            arg1.commentCount = (int)comments.count;
-        }
-
-        NSMutableArray *likes = [DDLikeHelper fakeLikeUsers];
-        if (likes.count) {
-            arg1.likeUsers = likes;
-            arg1.likeCount = (int)likes.count;
-        }
-    }
+    if (DDLInWindow(arg1)) DDLFakeInto(arg1);
     %orig(arg1, arg2);
 }
 
@@ -289,6 +450,9 @@ static NSString * const kDDMDefaultComments = @"赞-👍";
 
 @interface DDLikeSettingsViewController : UIViewController <UITableViewDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
+@property (nonatomic, strong) UITextField *likeCountField;    // 点赞数量输入框
+@property (nonatomic, strong) UITextField *commentCountField; // 评论数量输入框
+@property (nonatomic, strong) UITextField *commentsField;     // 评论内容输入框
 @end
 
 @implementation DDLikeSettingsViewController {
@@ -322,6 +486,7 @@ static NSString * const kDDMDefaultComments = @"赞-👍";
     [self buildTable];
 
     UITableView *tableView = [self.tableViewManager getTableView];
+    tableView.frame = self.view.bounds;
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     [self.view addSubview:tableView];
@@ -356,24 +521,36 @@ static NSString * const kDDMDefaultComments = @"赞-👍";
                                         on:cfg.likeEnabled]];
 
     if (cfg.likeEnabled) {
-        NSString *likeVal = cfg.likeCount > 0
-                          ? [NSString stringWithFormat:@"%ld 个", (long)cfg.likeCount] : @"未设置";
-        [sec addCell:[cellMgr normalCellForSel:@selector(onLikeCountTapped)
-                                        target:self
-                                         title:@"↳点赞数量"
-                                    rightValue:likeVal]];
+        // 三项均为「输入框 + 确认按钮」行内编辑（样式与 DD收款助手 一致）：
+        // 输入框 160×34、按钮 52×34、容器 220×34，灰色圆角背景、系统默认文字颜色。
+        self.likeCountField = [self makeFieldPlaceholder:@"点赞个数"
+                                                  number:YES
+                                                   value:cfg.likeCount > 0
+                                                         ? [NSString stringWithFormat:@"%ld", (long)cfg.likeCount] : @""];
+        [sec addCell:[cellMgr normalCellForSel:nil
+                                        target:nil
+                                         title:@"   ↳点赞数量"
+                                    rightView:[self inputRowWithField:self.likeCountField
+                                                               action:@selector(likeCountConfirmed:)]]];
 
-        NSString *cmtVal = cfg.commentCount > 0
-                         ? [NSString stringWithFormat:@"%ld 条", (long)cfg.commentCount] : @"未设置";
-        [sec addCell:[cellMgr normalCellForSel:@selector(onCommentCountTapped)
-                                        target:self
-                                         title:@"↳评论数量"
-                                    rightValue:cmtVal]];
+        self.commentCountField = [self makeFieldPlaceholder:@"评论条数"
+                                                     number:YES
+                                                      value:cfg.commentCount > 0
+                                                            ? [NSString stringWithFormat:@"%ld", (long)cfg.commentCount] : @""];
+        [sec addCell:[cellMgr normalCellForSel:nil
+                                        target:nil
+                                         title:@"   ↳评论数量"
+                                    rightView:[self inputRowWithField:self.commentCountField
+                                                               action:@selector(commentCountConfirmed:)]]];
 
-        [sec addCell:[cellMgr normalCellForSel:@selector(onCommentsTapped)
-                                        target:self
-                                         title:@"↳评论内容"
-                                    rightValue:cfg.comments]];
+        self.commentsField = [self makeFieldPlaceholder:@"多个内容用-分隔"
+                                                number:NO
+                                                 value:cfg.comments];
+        [sec addCell:[cellMgr normalCellForSel:nil
+                                        target:nil
+                                         title:@"   ↳评论内容"
+                                    rightView:[self inputRowWithField:self.commentsField
+                                                               action:@selector(commentsConfirmed:)]]];
     }
     [_tableViewManager addSection:sec];
 }
@@ -401,61 +578,67 @@ static NSString * const kDDMDefaultComments = @"赞-👍";
     [self buildTable];
 }
 
-// 数值 / 文本输入统一走弹窗。
-- (void)onLikeCountTapped {
-    [self presentNumberInputTitle:@"点赞数量"
-                          message:@"输入期望的点赞个数"
-                      placeholder:@"数量"
-                     currentValue:DDLikeConfig.shared.likeCount > 0
-                                  ? [NSString stringWithFormat:@"%ld", (long)DDLikeConfig.shared.likeCount] : @""
-                          commit:^(NSInteger v){ DDLikeConfig.shared.likeCount = v; }];
-}
-- (void)onCommentCountTapped {
-    [self presentNumberInputTitle:@"评论数量"
-                          message:@"输入期望的评论条数"
-                      placeholder:@"条数"
-                     currentValue:DDLikeConfig.shared.commentCount > 0
-                                  ? [NSString stringWithFormat:@"%ld", (long)DDLikeConfig.shared.commentCount] : @""
-                          commit:^(NSInteger v){ DDLikeConfig.shared.commentCount = v; }];
-}
-- (void)onCommentsTapped {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"评论内容"
-                                                                  message:@"多个随机内容用“-”分隔，如“赞-👍-666”"
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"内容";
-        tf.text = DDLikeConfig.shared.comments;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSString *text = alert.textFields.firstObject.text;
-        DDLikeConfig.shared.comments = (text.length > 0) ? text : kDDMDefaultComments;
-        [self buildTable];
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
+// 输入框工厂：文本右对齐，数字项走数字键盘。
+- (UITextField *)makeFieldPlaceholder:(NSString *)placeholder
+                               number:(BOOL)number
+                                value:(NSString *)value {
+    UITextField *field = [[UITextField alloc] init];
+    field.placeholder = placeholder;
+    field.text = value;
+    field.textAlignment = NSTextAlignmentRight;
+    if (number) field.keyboardType = UIKeyboardTypeNumberPad;
+    return field;
 }
 
-// 数字输入弹窗：只接受正整数，非法 / 空一律归零（= 未设置，不生效）。
-- (void)presentNumberInputTitle:(NSString *)title
-                        message:(NSString *)message
-                    placeholder:(NSString *)placeholder
-                   currentValue:(NSString *)current
-                         commit:(void (^)(NSInteger))commit {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
-                                                                  message:message
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = placeholder;
-        tf.keyboardType = UIKeyboardTypeNumberPad;
-        tf.text = current;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSInteger v = [alert.textFields.firstObject.text integerValue];
-        if (commit) commit(v > 0 ? v : 0);
-        [self buildTable];
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
+// 右侧容器：输入框 + 确认按钮。
+// 尺寸与配色照搬 DD收款助手 inputRowWithField:action:——
+// 容器 220×34、输入框 160×34、按钮 52×34（x=168），
+// systemGray5Color 背景、6pt 圆角、无边框、labelColor 文字、15pt 常规字重。
+- (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action {
+    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 220, 34)];
+    container.backgroundColor = [UIColor clearColor];
+
+    field.frame = CGRectMake(0, 0, 160, 34);
+    field.borderStyle = UITextBorderStyleNone;
+    field.backgroundColor = [UIColor systemGray5Color];
+    field.layer.cornerRadius = 6.0;
+    field.layer.masksToBounds = YES;
+    field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
+    field.leftViewMode = UITextFieldViewModeAlways;
+    field.rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
+    field.rightViewMode = UITextFieldViewModeAlways;
+    [container addSubview:field];
+
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = CGRectMake(168, 0, 52, 34);
+    [btn setTitle:@"确认" forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor systemGray5Color];
+    btn.layer.cornerRadius = 6.0;
+    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [container addSubview:btn];
+
+    return container;
+}
+
+// 确认回调：写回配置 + 收键盘。
+// 不调用 buildTable —— 重建会销毁输入框并打断编辑，值已直接显示在输入框里。
+- (void)likeCountConfirmed:(id)sender {
+    NSInteger v = [self.likeCountField.text integerValue];
+    DDLikeConfig.shared.likeCount = v > 0 ? v : 0;   // 非法 / 0 归零 = 未设置，不生效
+    [self.likeCountField resignFirstResponder];
+}
+
+- (void)commentCountConfirmed:(id)sender {
+    NSInteger v = [self.commentCountField.text integerValue];
+    DDLikeConfig.shared.commentCount = v > 0 ? v : 0;
+    [self.commentCountField resignFirstResponder];
+}
+
+- (void)commentsConfirmed:(id)sender {
+    DDLikeConfig.shared.comments = self.commentsField.text ?: @"";   // 清空即停用伪造评论
+    [self.commentsField resignFirstResponder];
 }
 
 @end
