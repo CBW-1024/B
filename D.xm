@@ -53,7 +53,6 @@
 @interface WCContentItem : NSObject
 @property (retain, nonatomic) NSMutableArray *mediaList;   // 媒体列表（图片 / 视频 / Live Photo）
 @property (nonatomic) int type;                            // 内容类型
-@property (nonatomic) unsigned int createtime;             // 发布时间（Unix 秒）
 + (BOOL)isVideoType:(long long)type;                        // 是否为视频类型
 @end
 
@@ -61,6 +60,7 @@
 @interface WCDataItem : NSObject
 @property (retain, nonatomic) WCContentItem *contentObj;    // 内容项
 @property (retain, nonatomic) NSString *contentDesc;        // 文案
+@property (nonatomic) unsigned int createtime;             // 发布时间（Unix 秒）
 + (id)fromNSCodingBuffer:(NSData *)buffer;                  // 反序列化（深拷贝用）
 - (NSData *)toNSCodingBuffer;                               // 序列化（深拷贝用）
 - (BOOL)isVideo;                                            // 是否为视频
