@@ -583,7 +583,98 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
 + (instancetype)shared;
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView;
 - (NSString *)consumePendingText;
+// 构建 MMImage（实况分支会挂 MMAsset + 视频路径）。重开草稿时复用此工厂重建实况图。
+- (MMImage *)ddmMakeMMImage:(UIImage *)ui asset:(MMAsset *)asset liveVideoPath:(NSString *)movLocal;
 @end
+
+#pragma mark - 实况草稿保留（自带缓存 + 重开重注入）
+
+// 微信草稿序列化吃不进我们的合成 MMAsset（无 assetId / assetUrl），保存即丢；
+// 连 PKC 也保不住（合成资产不走微信标准资产落库）。故改为：
+//   转发实况时把“视频 + 静帧”拷进本插件自己的缓存目录（Library/DDWCMoments/livecache/，
+//   绝不碰微信草稿目录与 7 天清理策略），并“武装”一条 stash；
+//   用户重开被保留的草稿（commit VC enteredWithDraft=YES 且当前图片数为 0）时，
+//   从缓存重建实况 MMImage 补回，立即解除武装（只补一次）。
+static NSString *gDDMLiveVideoCache = nil;   // 本插件缓存的 .mov 绝对路径
+static NSString *gDDMLiveStillCache = nil;   // 本插件缓存的静帧绝对路径
+static BOOL     gDDMLiveArmed     = NO;      // 是否武装（有待重注入的实况）
+static id       gDDMLiveInjectedImage = nil; // 本次重开已重建的实况 MMImage（整个重开 VC 生命周期保留）
+static __weak id gDDMCurrentCommitVC = nil;  // 当前发布器（用于判断 enteredWithDraft）
+static BOOL     gDDMKeptDraft     = NO;      // 本次转发是否被“保留/手动存”为草稿
+
+static NSString *DDMLiveCacheDir(void) {
+    NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *dir = [lib stringByAppendingPathComponent:@"DDWCMoments/livecache"];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+static NSString *DDMLiveStashPlist(void) {
+    return [DDMLiveCacheDir() stringByAppendingPathComponent:@"stash.plist"];
+}
+static void DDMLoadLiveStash(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:DDMLiveStashPlist()];
+        if (d) {
+            gDDMLiveVideoCache = [d[@"video"] copy];
+            gDDMLiveStillCache = [d[@"still"] copy];
+            gDDMLiveArmed = [d[@"armed"] boolValue];
+            if (gDDMLiveArmed && (!gDDMLiveVideoCache || !DDMFileUsable(gDDMLiveVideoCache)))
+                gDDMLiveArmed = NO;
+            DDMLog(@"[LiveStash] loaded video=%@ still=%@ armed=%@",
+                   gDDMLiveVideoCache ? @"Y" : @"N",
+                   gDDMLiveStillCache ? @"Y" : @"N",
+                   gDDMLiveArmed ? @"Y" : @"N");
+        }
+    });
+}
+static void DDMSaveLiveStash(void) {
+    NSDictionary *d = @{@"video": gDDMLiveVideoCache ?: @"",
+                        @"still": gDDMLiveStillCache ?: @"",
+                        @"armed": @(gDDMLiveArmed)};
+    [d writeToFile:DDMLiveStashPlist() atomically:YES];
+}
+// 转发实况时调用：把视频 + 静帧拷进本插件缓存并武装。
+static void DDMArmLiveStash(NSString *srcVideo, NSString *srcStill) {
+    DDMLoadLiveStash();
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *dir = DDMLiveCacheDir();
+    NSString *vDst = [dir stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"live_%@.mov", [NSUUID.UUID UUIDString]]];
+    NSString *sDst = [dir stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"live_%@.jpg", [NSUUID.UUID UUIDString]]];
+    if (srcVideo && DDMFileUsable(srcVideo)) [fm copyItemAtPath:srcVideo toPath:vDst error:nil];
+    if (srcStill && DDMFileUsable(srcStill)) [fm copyItemAtPath:srcStill toPath:sDst error:nil];
+    gDDMLiveVideoCache = DDMFileUsable(vDst) ? [vDst copy] : nil;
+    gDDMLiveStillCache = DDMFileUsable(sDst) ? [sDst copy] : nil;
+    gDDMLiveArmed = (gDDMLiveVideoCache != nil);
+    gDDMLiveInjectedImage = nil;   // 新转发武装，清掉上一次重开注入的图
+    DDMSaveLiveStash();
+    DDMLog(@"[LiveStash] armed video=%@ still=%@",
+           gDDMLiveVideoCache ? @"Y" : @"N", gDDMLiveStillCache ? @"Y" : @"N");
+}
+// 解除武装（注入成功 / 转发被丢弃时调用）。
+static void DDMDisarmLiveStash(void) {
+    if (!gDDMLiveArmed) return;
+    gDDMLiveArmed = NO;
+    DDMSaveLiveStash();
+    DDMLog(@"[LiveStash] disarmed");
+}
+// 重开草稿时调用：若已武装，从缓存重建实况 MMImage。
+static id DDMRebuildLiveMMImage(void) {
+    DDMLoadLiveStash();
+    if (!gDDMLiveArmed || !gDDMLiveVideoCache || !DDMFileUsable(gDDMLiveVideoCache)) return nil;
+    UIImage *ui = gDDMLiveStillCache ? [UIImage imageWithContentsOfFile:gDDMLiveStillCache] : nil;
+    if (!ui) return nil;
+    Class assetCls = objc_getClass("MMAsset");
+    MMAsset *asset = nil;
+    if (assetCls && [assetCls instancesRespondToSelector:@selector(initWithUrl:IsNeedOrigin:)]) {
+        asset = [(MMAsset *)[assetCls alloc] initWithUrl:[NSURL URLWithString:gDDMLiveVideoCache]
+                                             IsNeedOrigin:YES];
+    }
+    MMImage *mm = [[DDMEngine shared] ddmMakeMMImage:ui asset:asset liveVideoPath:gDDMLiveVideoCache];
+    return mm;
+}
 
 // 进度浮卡：窗口宽度变化时按当前宽度重排子视图。
 @interface DDMProgressCardView : UIView
@@ -1110,6 +1201,8 @@ static UIColor *ddm_track_bg(void) {
     Class assetCls = objc_getClass("MMAsset");
 
     NSMutableArray *assets = [NSMutableArray array];
+    // 实况草稿保留：记录最后一张实况的“视频 + 静帧”，循环后武装缓存。
+    NSString *liveVideoToStash = nil, *liveStillToStash = nil;
 
     for (WCMediaItem *m in item.contentObj.mediaList) {
         UIImage *ui = (UIImage *)[m imageOfSize:2];
@@ -1143,6 +1236,16 @@ static UIColor *ddm_track_bg(void) {
                asset ? @"Y" : @"N");
         MMImage *mm = [self ddmMakeMMImage:ui asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
+        // 记住实况源（视频 + 静帧），用于武装草稿重开重注入缓存。
+        if (mm && asset && movLocal) {
+            liveVideoToStash = movLocal;
+            liveStillToStash = DDMImagePath(m);
+        }
+    }
+
+    // 武装实况草稿缓存：转发含实况时，把视频 + 静帧拷进本插件目录，待重开草稿时补回。
+    if (liveVideoToStash) {
+        DDMArmLiveStash(liveVideoToStash, liveStillToStash);
     }
 
     if (assets.count == 0) { [self presentLegacyForward:item host:host]; return; }
@@ -1476,6 +1579,7 @@ static char kDDMLineKey;
 // 加载后若是本地资源带入，显示 + 号（图片选择器）。
 - (void)viewDidLoad {
     %orig;
+    gDDMCurrentCommitVC = self;   // 兜底：确保重开草稿时指针先于 draftImages 读取就绪
     if (self.m_isUseMMAsset) self.bHideAddView = NO;
 }
 
@@ -1503,6 +1607,7 @@ static char kDDMLineKey;
 // 点「保留」（取消发布但存草稿）：记录落盘前增强控制器里还几张图，%orig 之后再核对。
 - (void)onCancelSaveBtnClickedWithTag:(long long)arg1 {
     DDMLog(@"[SaveFlow] onCancelSaveBtnClicked(保留) tag=%lld", arg1);
+    gDDMKeptDraft = YES;   // 标记本次转发被“保留”为草稿，重开时需重注入实况
     // 这些微信私有方法仅 @class 前向声明，直接 [self/edc xxx] 会让 clang 报
     // “no visible @interface”。改用 objc_msgSend 动态派发规避选择子可见性检查。
     SEL edcSel = @selector(enhanceDraftSaveController);
@@ -1529,7 +1634,33 @@ static char kDDMLineKey;
 // 手动点「存草稿」按钮。
 - (void)onSaveBtnClickedWithTag:(long long)arg1 {
     DDMLog(@"[SaveFlow] onSaveBtnClicked(手动存) tag=%lld", arg1);
+    gDDMKeptDraft = YES;   // 标记本次转发被“手动存”为草稿，重开时需重注入实况
     %orig;
+}
+
+// 记录当前发布器，供草稿重载时判断 enteredWithDraft（draftImages 重注入用）。
+- (void)setEnhanceDraftSaveController:(id)arg1 {
+    %orig;
+    gDDMCurrentCommitVC = self;
+}
+
+// 真正退出发布器：
+//   · 重开草稿的 VC（enteredWithDraft=YES）退出 → 清掉本次重开注入的图，stash 已解除武装。
+//   · 未保留的转发 VC 退出 → 解除实况缓存武装，避免残留缓存被后续无关草稿误注入。
+//   保留/手动存已先置 gDDMKeptDraft（重开注入成功路径也会清它）。
+- (void)doExit {
+    BOOL enteredDraft = NO;
+    SEL ed = @selector(enteredWithDraft);
+    if ([(id)self respondsToSelector:ed]) {
+        enteredDraft = ((BOOL (*)(id, SEL))objc_msgSend)(self, ed);
+    }
+    if (enteredDraft) {
+        gDDMLiveInjectedImage = nil;   // 重开 VC 退出，清掉本次注入的实况图
+    } else if (!gDDMKeptDraft) {
+        DDMDisarmLiveStash();
+    }
+    %orig;
+    gDDMKeptDraft = NO;
 }
 
 %end
@@ -1884,8 +2015,9 @@ static void ddmInjectMarkIntoComment(id c) {
 // 草稿读出：重开时微信取回图片数组，记录每张实况是否还在、视频文件是否仍可访问。
 - (id)draftImages {
     id images = %orig;
+    NSUInteger cnt = ([images isKindOfClass:[NSArray class]] ? [images count] : 0);
     DDMLog(@"[DraftLoad] draftImages count=%lu",
-           (unsigned long)([images isKindOfClass:[NSArray class]] ? [images count] : 0));
+           (unsigned long)cnt);
     if ([images isKindOfClass:[NSArray class]]) {
         for (id img in images) {
             if ([img isKindOfClass:objc_getClass("MMImage")]) {
@@ -1899,6 +2031,41 @@ static void ddmInjectMarkIntoComment(id c) {
                        mm.m_asset ? @"Y" : @"N",
                        mm.m_assetClassNameStr ? mm.m_assetClassNameStr : @"(unset)");
             }
+        }
+    }
+    // 实况草稿保留：重开被微信丢掉的实况图。
+    // 微信草稿序列化吃不进我们的合成 MMAsset，保存即丢；故在“重开草稿”
+    // （当前发布器 enteredWithDraft=YES）且读回图片数为 0 时，从本插件缓存
+    // 重建实况 MMImage 补回。重建一次后缓存到 gDDMLiveInjectedImage，整个重开
+    // VC 生命周期内所有 draftImages 读取都带这张图（防止微信多次读取覆盖），
+    // 直到该 VC 退出（doExit）才清；解除武装只补一次，避免误注入无关草稿。
+    DDMLoadLiveStash();
+    if ((gDDMLiveArmed || gDDMLiveInjectedImage) && cnt == 0 && gDDMCurrentCommitVC) {
+        BOOL enteredDraft = NO;
+        SEL edSel = @selector(enteredWithDraft);
+        if ([(id)gDDMCurrentCommitVC respondsToSelector:edSel]) {
+            enteredDraft = ((BOOL (*)(id, SEL))objc_msgSend)(gDDMCurrentCommitVC, edSel);
+        }
+        if (enteredDraft) {
+            if (!gDDMLiveInjectedImage && gDDMLiveArmed) {
+                gDDMLiveInjectedImage = DDMRebuildLiveMMImage();
+                if (gDDMLiveInjectedImage) {
+                    DDMDisarmLiveStash();   // 只从缓存武装一次，之后靠 gDDMLiveInjectedImage
+                    gDDMKeptDraft = NO;     // 重注入成功即清保留标记，避免影响后续丢弃判断
+                    DDMLog(@"[DraftLoad] re-inject live into reloaded draft (video=%@)",
+                           gDDMLiveVideoCache ? @"Y" : @"N");
+                } else {
+                    DDMLog(@"[DraftLoad] re-inject FAILED to rebuild live");
+                }
+            }
+            if (gDDMLiveInjectedImage) {
+                NSMutableArray *arr = [NSMutableArray arrayWithCapacity:cnt + 1];
+                if ([images isKindOfClass:[NSArray class]]) [arr addObjectsFromArray:images];
+                [arr addObject:gDDMLiveInjectedImage];
+                return arr;
+            }
+        } else {
+            DDMLog(@"[DraftLoad] skip re-inject: not enteredWithDraft");
         }
     }
     return images;
