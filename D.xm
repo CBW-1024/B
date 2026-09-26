@@ -587,20 +587,29 @@ static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
 - (MMImage *)ddmMakeMMImage:(UIImage *)ui asset:(MMAsset *)asset liveVideoPath:(NSString *)movLocal;
 @end
 
-#pragma mark - 实况草稿保留（自带缓存 + 重开重注入）
+#pragma mark - 实况草稿保留
 
-// 微信草稿序列化吃不进我们的合成 MMAsset（无 assetId / assetUrl），保存即丢；
-// 连 PKC 也保不住（合成资产不走微信标准资产落库）。故改为：
-//   转发实况时把“视频 + 静帧”拷进本插件自己的缓存目录（Library/DDWCMoments/livecache/，
-//   绝不碰微信草稿目录与 7 天清理策略），并“武装”一条 stash；
-//   用户重开被保留的草稿（commit VC enteredWithDraft=YES 且当前图片数为 0）时，
-//   从缓存重建实况 MMImage 补回，立即解除武装（只补一次）。
+// 根因（debug 日志实锤）：微信草稿存储只收纳 MMAssetForPHAssetFramework，
+// 基类 MMAsset（无 PHAsset、无 assetId/assetUrl）写入即被丢。手动从相册选的实况
+// （clsName=MMAssetForPHAssetFramework）能正常保留，转发合成实况却不能。
+//
+// 修复（B-lite）：转发实况改用 MMAssetForPHAssetFramework，并把实况视频拷进本插件
+// 持久缓存（Library/DDWCMoments/livecache/，绝不碰微信草稿目录与 7 天清理策略），
+// 资产 URL 指向该持久副本，使重开草稿能读回。下方 stash + 重开重注入仅作 B-lite
+// 失效时的兜底（若资产仍被丢，enteredWithDraft=YES 且图片数为 0 时从缓存补回）。
 static NSString *gDDMLiveVideoCache = nil;   // 本插件缓存的 .mov 绝对路径
 static NSString *gDDMLiveStillCache = nil;   // 本插件缓存的静帧绝对路径
 static BOOL     gDDMLiveArmed     = NO;      // 是否武装（有待重注入的实况）
 static id       gDDMLiveInjectedImage = nil; // 本次重开已重建的实况 MMImage（整个重开 VC 生命周期保留）
 static __weak id gDDMCurrentCommitVC = nil;  // 当前发布器（用于判断 enteredWithDraft）
 static BOOL     gDDMKeptDraft     = NO;      // 本次转发是否被“保留/手动存”为草稿
+
+// 安全设属性：目标类（如 MMAssetForPHAssetFramework）可能未声明某 setter，
+// 用 respondsToSelector: 守卫 + objc_msgSend，避免未识别 selector 崩溃。
+#define DDM_SAFE_SET_BOOL(o,s,v) do { if ([(id)(o) respondsToSelector:(s)]) ((void(*)(id,SEL,BOOL))objc_msgSend)((id)(o),(s),(v)); } while(0)
+#define DDM_SAFE_SET_ID(o,s,v)   do { if ([(id)(o) respondsToSelector:(s)]) ((void(*)(id,SEL,id))objc_msgSend)((id)(o),(s),(v)); } while(0)
+#define DDM_SAFE_SET_LL(o,s,v)   do { if ([(id)(o) respondsToSelector:(s)]) ((void(*)(id,SEL,long long))objc_msgSend)((id)(o),(s),(v)); } while(0)
+#define DDM_SAFE_SET_DBL(o,s,v)  do { if ([(id)(o) respondsToSelector:(s)]) ((void(*)(id,SEL,double))objc_msgSend)((id)(o),(s),(v)); } while(0)
 
 static NSString *DDMLiveCacheDir(void) {
     NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
@@ -610,6 +619,18 @@ static NSString *DDMLiveCacheDir(void) {
 }
 static NSString *DDMLiveStashPlist(void) {
     return [DDMLiveCacheDir() stringByAppendingPathComponent:@"stash.plist"];
+}
+// 把实况视频拷进本插件持久缓存目录（Library/DDWCMoments/livecache/），返回副本绝对路径。
+// 微信自己的媒体缓存（wc/media/...）可能被清理，重开草稿时取不到；统一存到我们可控的
+// 持久目录，资产 URL 指向这里，保证重开能读回（B-lite：资产类是 MMAssetForPHAssetFramework）。
+static NSString *DDMPersistLiveMov(NSString *srcMov) {
+    if (!srcMov || !DDMFileUsable(srcMov)) return nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *dir = DDMLiveCacheDir();
+    NSString *dst = [dir stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"live_%@.mov", [NSUUID.UUID UUIDString]]];
+    if ([fm copyItemAtPath:srcMov toPath:dst error:nil] && DDMFileUsable(dst)) return [dst copy];
+    return nil;
 }
 static void DDMLoadLiveStash(void) {
     static dispatch_once_t once;
@@ -634,17 +655,31 @@ static void DDMSaveLiveStash(void) {
                         @"armed": @(gDDMLiveArmed)};
     [d writeToFile:DDMLiveStashPlist() atomically:YES];
 }
-// 转发实况时调用：把视频 + 静帧拷进本插件缓存并武装。
+// 转发实况时调用：武装 stash（B-lite 失效时的兜底重注入用）。
+// 若源已在 livecache 目录（B-lite 走 DDMPersistLiveMov 已落盘），直接记录、不重复拷贝。
 static void DDMArmLiveStash(NSString *srcVideo, NSString *srcStill) {
     DDMLoadLiveStash();
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *dir = DDMLiveCacheDir();
-    NSString *vDst = [dir stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"live_%@.mov", [NSUUID.UUID UUIDString]]];
-    NSString *sDst = [dir stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"live_%@.jpg", [NSUUID.UUID UUIDString]]];
-    if (srcVideo && DDMFileUsable(srcVideo)) [fm copyItemAtPath:srcVideo toPath:vDst error:nil];
-    if (srcStill && DDMFileUsable(srcStill)) [fm copyItemAtPath:srcStill toPath:sDst error:nil];
+    NSString *vDst = nil, *sDst = nil;
+    if (srcVideo && DDMFileUsable(srcVideo)) {
+        if ([srcVideo hasPrefix:dir]) {
+            vDst = [srcVideo copy];   // 已是本插件持久副本，不再重复拷贝
+        } else {
+            vDst = [dir stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"live_%@.mov", [NSUUID.UUID UUIDString]]];
+            [fm copyItemAtPath:srcVideo toPath:vDst error:nil];
+        }
+    }
+    if (srcStill && DDMFileUsable(srcStill)) {
+        if ([srcStill hasPrefix:dir]) {
+            sDst = [srcStill copy];
+        } else {
+            sDst = [dir stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"live_%@.jpg", [NSUUID.UUID UUIDString]]];
+            [fm copyItemAtPath:srcStill toPath:sDst error:nil];
+        }
+    }
     gDDMLiveVideoCache = DDMFileUsable(vDst) ? [vDst copy] : nil;
     gDDMLiveStillCache = DDMFileUsable(sDst) ? [sDst copy] : nil;
     gDDMLiveArmed = (gDDMLiveVideoCache != nil);
@@ -666,7 +701,7 @@ static id DDMRebuildLiveMMImage(void) {
     if (!gDDMLiveArmed || !gDDMLiveVideoCache || !DDMFileUsable(gDDMLiveVideoCache)) return nil;
     UIImage *ui = gDDMLiveStillCache ? [UIImage imageWithContentsOfFile:gDDMLiveStillCache] : nil;
     if (!ui) return nil;
-    Class assetCls = objc_getClass("MMAsset");
+    Class assetCls = objc_getClass("MMAssetForPHAssetFramework");
     MMAsset *asset = nil;
     if (assetCls && [assetCls instancesRespondToSelector:@selector(initWithUrl:IsNeedOrigin:)]) {
         asset = [(MMAsset *)[assetCls alloc] initWithUrl:[NSURL URLWithString:gDDMLiveVideoCache]
@@ -1188,8 +1223,8 @@ static UIColor *ddm_track_bg(void) {
 //     不依赖任何我们创建的文件。此前用 imageWithContentsOfFile:(tmp 副本) 是惰性解码、
 //     只记路径，要等归档草稿那一刻才真正读盘，tmp 一被回收就是空图/整条草稿不落库。
 //   · 普通图片不构造任何资产，MMImage 只承载 UIImage。
-//   · 实况挂 MMAsset 基类（m_isUseLivePhoto / m_livePhotoVideoPath 只在这个类上，
-//     MMAssetForLocalImage 继承 NSObject、没有这两个字段，且不遵 NSCoding）。
+//   · 实况挂 MMAssetForPHAssetFramework（m_isUseLivePhoto / m_livePhotoVideoPath 在这个类上；
+//     微信草稿存储只收纳该类，基类 MMAsset 写入即被丢 —— B-lite 据此换类）。
 //   · URL 必须用 URLWithString:（PKC 原样，0x117010 URLWithString:x28），不能改成
 //     fileURLWithPath:。PKC 的实况资产就是这么造的，用户实机验证正常。
 //     （此前我改成 fileURLWithPath: 又额外设 m_assetClassNameStr=@"MMAsset"，
@@ -1198,7 +1233,9 @@ static UIColor *ddm_track_bg(void) {
 //   · 运动视频只认 [livePhotoMediaItem getFormatVideoPath]，无任何回退（PKC 原样）。
 //     拿不到就降级成普通图片 —— 丢实况动效，但图一定在。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
-    Class assetCls = objc_getClass("MMAsset");
+    // B-lite：资产类必须是 MMAssetForPHAssetFramework —— 微信草稿存储只收纳该类，
+    // 基类 MMAsset 写入即被丢（debug 日志：setDraftImages count=1 → getter 读回 0）。
+    Class assetCls = objc_getClass("MMAssetForPHAssetFramework");
 
     NSMutableArray *assets = [NSMutableArray array];
     // 实况草稿保留：记录最后一张实况的“视频 + 静帧”，循环后武装缓存。
@@ -1216,7 +1253,10 @@ static UIColor *ddm_track_bg(void) {
         }
         if (!ui) continue;
 
-        NSString *movLocal = (m.livePhotoMediaItem ? DDMLivePhotoVideoPath(m.livePhotoMediaItem) : nil);
+        // 实况视频：先拷进本插件持久缓存（livecache），避免微信媒体缓存被清理后重开取不到；
+        // 资产 URL 直接指向该持久副本。资产类已换成 MMAssetForPHAssetFramework。
+        NSString *movSrc = (m.livePhotoMediaItem ? DDMLivePhotoVideoPath(m.livePhotoMediaItem) : nil);
+        NSString *movLocal = (movSrc && DDMFileUsable(movSrc)) ? DDMPersistLiveMov(movSrc) : nil;
 
         // 普通图片 asset 传 nil；只有实况才建资产。
         // 资产构造失败时退化成普通图片（丢实况动效，但保住图）。
@@ -1288,11 +1328,13 @@ static UIColor *ddm_track_bg(void) {
         [extra setValue:movLocal forKey:@"ExportedLivePhotoPath"];
         [mmImg setValue:extra forKey:@"tempExtraInfo"];
 
-        asset.m_isUseLivePhoto = YES;
-        asset.m_livePhotoVideoPath = movLocal;
+        // 资产侧登记：用 guarded objc_msgSend（MMAssetForPHAssetFramework 可能未声明部分 setter，
+        // 缺失则跳过，不崩溃；缺 m_isUseLivePhoto 时微信可能不识为实况，届时再走 B-full 真相册）。
+        DDM_SAFE_SET_BOOL(asset, @selector(setM_isUseLivePhoto:), YES);
+        DDM_SAFE_SET_ID(asset, @selector(setMLivePhotoVideoPath:), movLocal);
         long long sz = (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize];
-        asset.livePhotoVideoSize = sz;
-        asset.livePhotoDuration = DDMVideoDuration(movLocal);
+        DDM_SAFE_SET_LL(asset, @selector(setLivePhotoVideoSize:), sz);
+        DDM_SAFE_SET_DBL(asset, @selector(setLivePhotoDuration:), DDMVideoDuration(movLocal));
     }
 
     // 对齐 PKC：必调。PKC 在 initWithImage: 之后必调一次，实况则在 setM_asset: 之后再调一次，
@@ -1656,6 +1698,7 @@ static char kDDMLineKey;
     }
     if (enteredDraft) {
         gDDMLiveInjectedImage = nil;   // 重开 VC 退出，清掉本次注入的实况图
+        DDMDisarmLiveStash();          // 并解除武装，避免残留缓存误注入无关草稿
     } else if (!gDDMKeptDraft) {
         DDMDisarmLiveStash();
     }
@@ -2024,21 +2067,21 @@ static void ddmInjectMarkIntoComment(id c) {
                 MMImage *mm = (MMImage *)img;
                 NSString *vp = mm.livePhotoVideoPath;
                 BOOL vpOk = (vp && [[NSFileManager defaultManager] fileExistsAtPath:vp]);
-                DDMLog(@"[DraftLoad]   live=%@ vp=%@ vpExists=%@ asset=%@ clsName=%@",
+                DDMLog(@"[DraftLoad]   live=%@ vp=%@ vpExists=%@ asset=%@ aClass=%@ clsName=%@",
                        mm.isLivePhoto ? @"Y" : @"N",
                        vp ? vp : @"(null)",
                        vpOk ? @"Y" : @"N",
                        mm.m_asset ? @"Y" : @"N",
+                       mm.m_asset ? NSStringFromClass([mm.m_asset class]) : @"(nil)",
                        mm.m_assetClassNameStr ? mm.m_assetClassNameStr : @"(unset)");
             }
         }
     }
-    // 实况草稿保留：重开被微信丢掉的实况图。
-    // 微信草稿序列化吃不进我们的合成 MMAsset，保存即丢；故在“重开草稿”
-    // （当前发布器 enteredWithDraft=YES）且读回图片数为 0 时，从本插件缓存
-    // 重建实况 MMImage 补回。重建一次后缓存到 gDDMLiveInjectedImage，整个重开
-    // VC 生命周期内所有 draftImages 读取都带这张图（防止微信多次读取覆盖），
-    // 直到该 VC 退出（doExit）才清；解除武装只补一次，避免误注入无关草稿。
+    // 实况草稿保留（兜底）：B-lite 已把资产换成 MMAssetForPHAssetFramework，正常会被微信
+    // 原生收纳；若仍被丢（enteredWithDraft=YES 且读回图片数为 0），从本插件缓存重建实况
+    // MMImage 补回。重建一次后缓存到 gDDMLiveInjectedImage，整个重开 VC 生命周期内所有
+    // draftImages 读取都带这张图（防微信多次读取覆盖），直到 VC 退出（doExit）才清；
+    // 解除武装只补一次，避免误注入无关草稿。
     DDMLoadLiveStash();
     if ((gDDMLiveArmed || gDDMLiveInjectedImage) && cnt == 0 && gDDMCurrentCommitVC) {
         BOOL enteredDraft = NO;
