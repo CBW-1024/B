@@ -1503,19 +1503,26 @@ static char kDDMLineKey;
 // 点「保留」（取消发布但存草稿）：记录落盘前增强控制器里还几张图，%orig 之后再核对。
 - (void)onCancelSaveBtnClickedWithTag:(long long)arg1 {
     DDMLog(@"[SaveFlow] onCancelSaveBtnClicked(保留) tag=%lld", arg1);
-    id edc = [self enhanceDraftSaveController];
+    // 这些微信私有方法仅 @class 前向声明，直接 [self/edc xxx] 会让 clang 报
+    // “no visible @interface”。改用 objc_msgSend 动态派发规避选择子可见性检查。
+    SEL edcSel = @selector(enhanceDraftSaveController);
+    id edc = (id)objc_msgSend(self, edcSel);
+    SEL diSel = @selector(draftImages);
+    SEL hdSel = @selector(hasDraft);
     if (edc) {
-        id pre = [edc draftImages];
+        id pre = (id)objc_msgSend(edc, diSel);
+        BOOL hpre = (BOOL)objc_msgSend(edc, hdSel);
         DDMLog(@"[SaveFlow]   before-save inMemoryImages=%lu hasDraft=%@",
                (unsigned long)([pre isKindOfClass:[NSArray class]] ? [pre count] : 0),
-               [edc hasDraft] ? @"Y" : @"N");
+               hpre ? @"Y" : @"N");
     }
     %orig;
     if (edc) {
-        id post = [edc draftImages];
+        id post = (id)objc_msgSend(edc, diSel);
+        BOOL hpost = (BOOL)objc_msgSend(edc, hdSel);
         DDMLog(@"[SaveFlow]   after-save inMemoryImages=%lu hasDraft=%@",
                (unsigned long)([post isKindOfClass:[NSArray class]] ? [post count] : 0),
-               [edc hasDraft] ? @"Y" : @"N");
+               hpost ? @"Y" : @"N");
     }
 }
 
@@ -1893,12 +1900,14 @@ static void ddmInjectMarkIntoComment(id c) {
 
 // 真正落盘：createDraft 被调用时记“此刻内存里还几张图”，返回后记是否成功 + 落盘后能否读回。
 - (BOOL)createDraft {
-    id pre = [self draftImages];
+    // 经 objc_msgSend 调 draftImages 规避 @class 前向声明导致的“no visible @interface”。
+    SEL diSel = @selector(draftImages);
+    id pre = (id)objc_msgSend(self, diSel);
     DDMLog(@"[DraftCreate] createDraft enter; inMemoryImages=%lu",
            (unsigned long)([pre isKindOfClass:[NSArray class]] ? [pre count] : 0));
     BOOL r = %orig;
     DDMLog(@"[DraftCreate] -> %@", r ? @"YES" : @"NO");
-    id post = [self draftImages];
+    id post = (id)objc_msgSend(self, diSel);
     DDMLog(@"[DraftCreate] after inMemoryImages=%lu",
            (unsigned long)([post isKindOfClass:[NSArray class]] ? [post count] : 0));
     return r;
