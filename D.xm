@@ -892,13 +892,11 @@ static UIColor *ddm_track_bg(void) {
 }
 
 // 判断单个图片媒体是否就绪。
+// imageOfSize:2 稳定命中（实测 fromMem 命中率 100%，文件兜底从未触发），无需文件级判断。
 - (BOOL)ddmImageReady:(WCMediaItem *)m {
-    id img = [m imageOfSize:2LL];
-    if (img) { DDMLog(@"[Ready] image fromMem=Y"); return YES; }
-    NSString *p = DDMImagePath(m);
-    BOOL fileReady = (p && DDMFileUsable(p));
-    DDMLog(@"[Ready] image fromMem=N fileReady=%@", fileReady ? @"Y" : @"N");
-    return fileReady;
+    BOOL ready = ([m imageOfSize:2LL] != nil);
+    DDMLog(@"[Ready] image fromMem=%@", ready ? @"Y" : @"N");
+    return ready;
 }
 
 // 下载超时（视频未就绪）时静默中止：收起进度卡并解除占用，不弹提示、不进发布器。
@@ -1061,13 +1059,21 @@ static UIColor *ddm_track_bg(void) {
 
         NSMutableDictionary *extra = [NSMutableDictionary dictionary];
         [extra setValue:movLocal forKey:@"ExportedLivePhotoPath"];
-        [mmImg setValue:extra forKey:@"tempExtraInfo"];
+        [mmImg setValue:extra forKey:@"tempExtraInfo"];   // MMImage.h 无 setter，KVC 直写 ivar
 
-        ((MMAssetForLocalImage *)asset).m_isUseLivePhoto = YES;
-        ((MMAssetForLocalImage *)asset).m_livePhotoVideoPath = movLocal;
+        // 资产侧保真字段（MMAsset 基类，MMAssetForLocalImage 继承之）。
+        // 这四条对「转发」是否必需存疑：转发动效主靠上面 MMImage 侧承载，
+        // 它们是给真 PHAsset 资产附加的保真，暂留作观察。统一用 [(MMAsset *)asset ...] 写，
+        // 不靠强转 MMAssetForLocalImage* 访问基类字段。
+        [(MMAsset *)asset setM_isUseLivePhoto:YES];
+        [(MMAsset *)asset setM_livePhotoVideoPath:movLocal];
         long long sz = (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize];
-        ((MMAssetForLocalImage *)asset).livePhotoVideoSize = sz;
-        ((MMAssetForLocalImage *)asset).livePhotoDuration = DDMVideoDuration(movLocal);
+        double dur = DDMVideoDuration(movLocal);
+        [(MMAsset *)asset setLivePhotoVideoSize:sz];
+        [(MMAsset *)asset setLivePhotoDuration:dur];
+
+        DDMLog(@"[Live] fidelity mm.isLivePhoto=Y path=%@ extra=%@ | asset.useLive=Y path=%@ sz=%lld dur=%.2f",
+               movLocal, extra ? @"Y" : @"N", movLocal, sz, dur);
     }
     return mmImg;
 }
