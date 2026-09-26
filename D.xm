@@ -7,11 +7,10 @@
 //   普通单击点赞完全不受影响 —— 挂 likeFlag 被动伪造会连正常点赞一起改掉。
 //
 // 触发链路：
-//   长按 m_likeBtn → 开一个 8 秒的触发窗口并记住目标 item
-//   → 未赞则走原生 onLikeItem:（内部会调 WCTimelineMgr.modifyDataItem:notify:）
-//     已赞则经 WCFacade.getTimelineMgr 手动 notify 一次
-//   → %hook WCTimelineMgr 命中窗口时把伪造数据写回 item，再放行原生实现。
-//   借原生链路刷新，可顺带绕过 WCDataItemUICache 布局缓存不失效的问题。
+//   长按 m_likeBtn（1 秒）→ 直接把伪造数据写进 item、把 likeFlag 置为已赞
+//   → 调 WCTimelineMgr.modifyDataItem:notify: 通知一次刷新 → 收起浮窗。
+//   全程同步，不拦原生回调、不等服务器返回（本地伪装用不上）。
+//   走 WCTimelineMgr 的统一出口刷新，可顺带绕过 WCDataItemUICache 布局缓存不失效的问题。
 //
 // 说明：
 //   - 设置界面与配置层按 DD朋友圈助手（DDWCMoments.xm）的模式改写，
@@ -27,7 +26,7 @@
 // 并入 DD朋友圈助手 的步骤（本文件已按此设计）：
 //   1. DDLikeConfig 的属性与 key 直接搬进 DDMConfig（key 前缀已统一，用户旧设置不丢）。
 //   2. addLikeSections 的方法体直接搬进 DDMSettingsViewController 的 buildTable。
-//   3. DDLikeHelper 与两个 %hook 整段搬过去。
+//   3. DDLikeHelper 与 %hook WCOperateFloatView 整段搬过去。
 //   4. 注意声明去重：DDWCMoments.xm 已声明 WCDataItem 与 WCUserComment，
 //      合并时取并集，不要写两份 @interface。
 //        - WCUserComment：DDWCMoments 已有 content / setContent:，本文件补
@@ -126,7 +125,6 @@ static inline id DDLTimelineMgr(void) {
 @interface WCOperateFloatView : UIView
 - (id)m_item;                                            // WCOperateFloatView.h:9
 - (id)m_likeBtn;                                         // WCOperateFloatView.h:10
-- (void)onLikeItem:(id)arg1;                             // WCOperateFloatView.h:20
 - (void)hide;                                            // WCOperateFloatView.h:16
 @end
 
@@ -302,23 +300,10 @@ static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
 
 #pragma mark - Hook：长按点赞 → 集赞
 
-// 触发窗口：长按点赞按钮时记下目标 item 与过期时间。
-// 用「目标 + 时间窗」而非 BOOL，是因为 onLikeItem: 内部的落库可能是异步的，
-// 立即清标记会漏掉回调；伪造本身幂等，窗口内重复命中无害。
-static __unsafe_unretained WCDataItem *gDDLTargetItem = nil;
-static NSTimeInterval gDDLTriggerUntil = 0;
-static const NSTimeInterval kDDLWindow = 8.0;
-
-static inline BOOL DDLInWindow(WCDataItem *item) {
-    return item != nil
-        && item == gDDLTargetItem
-        && CFAbsoluteTimeGetCurrent() < gDDLTriggerUntil;
-}
-
 // 长按手势的挂载去重键。
 static const void *kDDLLongPressKey = &kDDLLongPressKey;
 
-// 把伪造数据写回 item。幂等：窗口内重复调用结果一致（仅评论时间随机）。
+// 把伪造数据写回 item。
 static inline void DDLFakeInto(WCDataItem *item) {
     if (!item) return;
 
@@ -365,7 +350,7 @@ static inline void DDLFakeInto(WCDataItem *item) {
 }
 
 %new
-// 长按点赞按钮：开窗口 → 触发一次原生落库 → 收起浮窗。
+// 长按点赞按钮：改数据 → 触发一次刷新 → 收起浮窗。全程同步，不等任何回调。
 - (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
     if (!DDLikeConfig.shared.likeEnabled) return;
@@ -373,32 +358,16 @@ static inline void DDLFakeInto(WCDataItem *item) {
     WCDataItem *item = self.m_item;
     if (!item) return;
 
-    gDDLTargetItem   = item;
-    gDDLTriggerUntil = CFAbsoluteTimeGetCurrent() + kDDLWindow;
+    // 不调原生 onLikeItem:——它是点赞 / 取消赞的开关，已赞时调会反而取消。
+    // 伪造是本地行为，直接把 likeFlag 置为已赞即可。
+    item.likeFlag = YES;
+    DDLFakeInto(item);
 
-    if (!item.likeFlag) {
-        // 未赞：走原生点赞，其内部会调 modifyDataItem:notify: 命中窗口。
-        [self onLikeItem:self.m_likeBtn];
-    } else {
-        // 已赞：onLikeItem: 会把赞取消，故不调它，改为手动 notify 一次刷新。
-        item.likeFlag = YES;
-        id mgr = DDLTimelineMgr();
-        if (mgr) [mgr modifyDataItem:item notify:YES];
-        else DDLFakeInto(item);               // 拿不到 mgr 兜底：改完就算，等下次刷新生效
-    }
+    // 借 WCTimelineMgr 的统一出口通知一次刷新（WCTimelineMgr.h:71）。
+    id mgr = DDLTimelineMgr();
+    if (mgr) [mgr modifyDataItem:item notify:YES];
 
     [self hide];
-}
-
-%end
-
-%hook WCTimelineMgr
-
-// modifyDataItem:notify: 是数据项落库 / 刷新的统一出口（WCTimelineMgr.h:71）。
-// 命中长按窗口才伪造；普通单击点赞与后台刷新一律放行原生实现。
-- (void)modifyDataItem:(WCDataItem *)arg1 notify:(BOOL)arg2 {
-    if (DDLInWindow(arg1)) DDLFakeInto(arg1);
-    %orig(arg1, arg2);
 }
 
 %end
