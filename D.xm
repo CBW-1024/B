@@ -1506,20 +1506,20 @@ static char kDDMLineKey;
     // 这些微信私有方法仅 @class 前向声明，直接 [self/edc xxx] 会让 clang 报
     // “no visible @interface”。改用 objc_msgSend 动态派发规避选择子可见性检查。
     SEL edcSel = @selector(enhanceDraftSaveController);
-    id edc = (id)objc_msgSend(self, edcSel);
+    id edc = ((id (*)(id, SEL))objc_msgSend)(self, edcSel);
     SEL diSel = @selector(draftImages);
     SEL hdSel = @selector(hasDraft);
     if (edc) {
-        id pre = (id)objc_msgSend(edc, diSel);
-        BOOL hpre = (BOOL)objc_msgSend(edc, hdSel);
+        id pre = ((id (*)(id, SEL))objc_msgSend)(edc, diSel);
+        BOOL hpre = ((BOOL (*)(id, SEL))objc_msgSend)(edc, hdSel);
         DDMLog(@"[SaveFlow]   before-save inMemoryImages=%lu hasDraft=%@",
                (unsigned long)([pre isKindOfClass:[NSArray class]] ? [pre count] : 0),
                hpre ? @"Y" : @"N");
     }
     %orig;
     if (edc) {
-        id post = (id)objc_msgSend(edc, diSel);
-        BOOL hpost = (BOOL)objc_msgSend(edc, hdSel);
+        id post = ((id (*)(id, SEL))objc_msgSend)(edc, diSel);
+        BOOL hpost = ((BOOL (*)(id, SEL))objc_msgSend)(edc, hdSel);
         DDMLog(@"[SaveFlow]   after-save inMemoryImages=%lu hasDraft=%@",
                (unsigned long)([post isKindOfClass:[NSArray class]] ? [post count] : 0),
                hpost ? @"Y" : @"N");
@@ -1902,12 +1902,12 @@ static void ddmInjectMarkIntoComment(id c) {
 - (BOOL)createDraft {
     // 经 objc_msgSend 调 draftImages 规避 @class 前向声明导致的“no visible @interface”。
     SEL diSel = @selector(draftImages);
-    id pre = (id)objc_msgSend(self, diSel);
+    id pre = ((id (*)(id, SEL))objc_msgSend)(self, diSel);
     DDMLog(@"[DraftCreate] createDraft enter; inMemoryImages=%lu",
            (unsigned long)([pre isKindOfClass:[NSArray class]] ? [pre count] : 0));
     BOOL r = %orig;
     DDMLog(@"[DraftCreate] -> %@", r ? @"YES" : @"NO");
-    id post = (id)objc_msgSend(self, diSel);
+    id post = ((id (*)(id, SEL))objc_msgSend)(self, diSel);
     DDMLog(@"[DraftCreate] after inMemoryImages=%lu",
            (unsigned long)([post isKindOfClass:[NSArray class]] ? [post count] : 0));
     return r;
