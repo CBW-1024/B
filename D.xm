@@ -7,10 +7,17 @@
 //   普通单击点赞完全不受影响 —— 挂 likeFlag 被动伪造会连正常点赞一起改掉。
 //
 // 触发链路：
-//   长按 m_likeBtn（1 秒）→ 直接把伪造数据写进 item、把 likeFlag 置为已赞
+//   长按 m_likeBtn（1 秒）→ 备份原始值 → 写伪造数据、置 likeFlag、清 cpKeyForLikeUsers
 //   → 调 WCTimelineMgr.modifyDataItem:notify: 通知一次刷新 → 收起浮窗。
+//   再次长按同一条 → 按快照恢复原样（取消集赞）并同样刷新。
 //   全程同步，不拦原生回调、不等服务器返回（本地伪装用不上）。
-//   走 WCTimelineMgr 的统一出口刷新，可顺带绕过 WCDataItemUICache 布局缓存不失效的问题。
+//
+// 两个坑（都是真机踩出来的）：
+//   - cpKeyForLikeUsers 是点赞区的布局缓存键，改 likeUsers 必须一并清掉，
+//     否则微信认为点赞区没变、不重绘 —— 表现为「评论出来了、赞没出来」。
+//   - 下拉刷新 / 翻页会重建 WCDataItem 对象，内存改动全丢，
+//     故把伪造状态按 tid 记在 gDDLFaked 里，再于
+//     WCTimelineMgr.commonProcessDataAfterUpdate: 里按 tid 重新伪造。
 //
 // 说明：
 //   - 设置界面与配置层按 DD朋友圈助手（DDWCMoments.xm）的模式改写，
@@ -147,10 +154,13 @@ static inline id DDLTimelineMgr(void) {
 @property (nonatomic) int commentCount;                       // WCDataItem.h:296
 @property (nonatomic) BOOL likeFlag;                          // WCDataItem.h:190
 @property (nonatomic) unsigned int createtime;                // WCDataItem.h:335
+@property (retain, nonatomic) NSString *tid;                  // WCDataItem.h:279 帖子唯一标识
+@property (retain, nonatomic) id cpKeyForLikeUsers;           // WCDataItem.h:217 点赞区布局缓存键
 @end
 
 @interface WCTimelineMgr : NSObject
 - (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;       // WCTimelineMgr.h:71
+- (void)commonProcessDataAfterUpdate:(id)datas newAdItems:(id)adItems changedTime:(unsigned int)t; // :59
 @end
 
 #pragma mark - 配置
@@ -212,6 +222,78 @@ static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
 
 @end
 
+#pragma mark - 调试日志
+
+// 非越狱（证书注入）没有 ssh / 系统控制台，日志只能从 App 内取：
+// 内存环形缓冲 → 设置页查看 / UIActivityViewController 导出成 txt。
+static const NSUInteger kDDLogMaxLines = 500;   // 超出丢弃最旧的，防止长时间运行吃内存
+
+static NSMutableArray<NSString *> *DDLogStore(void) {
+    static NSMutableArray *lines = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lines = [NSMutableArray array]; });
+    return lines;
+}
+
+static NSDateFormatter *DDLogFormatter(void) {
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSDateFormatter new];
+        fmt.dateFormat = @"HH:mm:ss.SSS";
+    });
+    return fmt;
+}
+
+// 刷新回调可能不在主线程，故加锁。
+// 不走 NSLog：非越狱（证书注入）看不到系统控制台，写了也白写。
+static void DDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static void DDLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+
+    NSString *line = [NSString stringWithFormat:@"%@ %@",
+                      [DDLogFormatter() stringFromDate:[NSDate date]], msg];
+
+    NSMutableArray *store = DDLogStore();
+    @synchronized (store) {
+        [store addObject:line];
+        if (store.count > kDDLogMaxLines) {
+            [store removeObjectsInRange:NSMakeRange(0, store.count - kDDLogMaxLines)];
+        }
+    }
+}
+
+static NSUInteger DDLogCount(void) {
+    NSMutableArray *store = DDLogStore();
+    @synchronized (store) { return store.count; }
+}
+
+static NSString *DDLogText(void) {
+    NSMutableArray *store = DDLogStore();
+    @synchronized (store) {
+        if (store.count == 0) return @"（暂无日志）";
+        return [store componentsJoinedByString:@"\n"];
+    }
+}
+
+static void DDLogClear(void) {
+    NSMutableArray *store = DDLogStore();
+    @synchronized (store) { [store removeAllObjects]; }
+}
+
+// 当前配置一览，导出时前置到日志头部，便于对照现象看参数。
+static NSString *DDLogConfigSummary(void) {
+    DDLikeConfig *c = DDLikeConfig.shared;
+    return [NSString stringWithFormat:
+            @"[配置] 启用=%d 点赞数=%ld 评论数=%ld 评论内容=「%@」\n"
+            @"[环境] 系统=%@ 微信头文件基线=8.0.79",
+            c.likeEnabled, (long)c.likeCount, (long)c.commentCount, c.comments,
+            [UIDevice currentDevice].systemVersion];
+}
+
 #pragma mark - 核心功能
 
 @interface DDLikeHelper : NSObject
@@ -230,10 +312,13 @@ static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
     dispatch_once(&once, ^{
         NSMutableArray *friends = [NSMutableArray array];
         CContactMgr *mgr = DDLContactMgr();
-        for (CContact *c in [mgr getContactList:1 contactType:0]) {
+        NSArray *raw = [mgr getContactList:1 contactType:0];
+        for (CContact *c in raw) {
             if (![c isBrandContact] && c.m_uiSex != 0) [friends addObject:c];
         }
         cached = [friends copy];
+        DDLog(@"[好友] contactMgr=%@ 原始=%lu 过滤后=%lu",
+              mgr ? @"OK" : @"nil", (unsigned long)raw.count, (unsigned long)cached.count);
     });
     return cached ?: @[];
 }
@@ -242,7 +327,10 @@ static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
 + (NSMutableArray<WCUserComment *> *)fakeLikeUsers {
     NSInteger target = DDLikeConfig.shared.likeCount;
     NSMutableArray *list = [NSMutableArray array];
-    if (target <= 0) return list;
+    if (target <= 0) {
+        DDLog(@"[点赞] target=%ld ≤0，未设置点赞数，跳过", (long)target);
+        return list;
+    }
 
     unsigned int now = (unsigned int)[NSDate date].timeIntervalSince1970;
     [[self allFriends] enumerateObjectsUsingBlock:^(CContact *c, NSUInteger idx, BOOL *stop) {
@@ -255,6 +343,8 @@ static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
         u.createTime = now;
         [list addObject:u];
     }];
+    DDLog(@"[点赞] target=%ld 好友池=%lu → 生成=%lu",
+          (long)target, (unsigned long)[self allFriends].count, (unsigned long)list.count);
     return list;
 }
 
@@ -262,12 +352,21 @@ static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
 + (NSMutableArray<WCUserComment *> *)fakeCommentsFor:(WCDataItem *)origItem {
     NSInteger target = DDLikeConfig.shared.commentCount;
     NSMutableArray *orig = origItem.commentUsers ?: [NSMutableArray array];
-    if (target <= 0) return orig;                       // 未设置数量：原样返回
-    if ((NSInteger)orig.count >= target) return orig;   // 已够：原样返回
+    if (target <= 0) {
+        DDLog(@"[评论] target=%ld ≤0，未设置评论数，跳过", (long)target);
+        return orig;                                    // 未设置数量：原样返回
+    }
+    if ((NSInteger)orig.count >= target) {
+        DDLog(@"[评论] 已有 %lu 条 ≥ target=%ld，跳过", (unsigned long)orig.count, (long)target);
+        return orig;                                    // 已够：原样返回
+    }
 
     // 未填写评论内容：不做伪造，避免产生空文本评论。
     NSArray<NSString *> *pool = DDLikeConfig.shared.commentPool;
-    if (pool.count == 0) return orig;
+    if (pool.count == 0) {
+        DDLog(@"[评论] 内容池为空（未填写评论内容），跳过");
+        return orig;
+    }
 
     NSMutableArray *list = [orig mutableCopy];
 
@@ -293,6 +392,8 @@ static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
     [list sortUsingComparator:^NSComparisonResult(WCUserComment *a, WCUserComment *b) {
         return a.createTime < b.createTime ? NSOrderedAscending : NSOrderedDescending;
     }];
+    DDLog(@"[评论] target=%ld 原有=%lu 内容池=%lu → 生成后=%lu",
+          (long)target, (unsigned long)orig.count, (unsigned long)pool.count, (unsigned long)list.count);
     return list;
 }
 
@@ -302,6 +403,36 @@ static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
 
 // 长按手势的挂载去重键。
 static const void *kDDLLongPressKey = &kDDLLongPressKey;
+
+// 已集赞的帖子：tid → 原始数据快照。
+// 两个用途：刷新后按 tid 重新伪造（刷新会重建 item、冲掉内存改动）；
+// 再次长按则据此恢复原样（取消集赞）。
+static NSMutableDictionary *gDDLFaked(void) {
+    static NSMutableDictionary *d = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary new]; });
+    return d;
+}
+
+// 备份 / 恢复原始数据。
+static NSDictionary *DDLSnapshotOf(WCDataItem *item) {
+    return @{
+        @"likeUsers":    item.likeUsers    ?: @[],
+        @"likeCount":    @(item.likeCount),
+        @"commentUsers": item.commentUsers ?: @[],
+        @"commentCount": @(item.commentCount),
+        @"likeFlag":     @(item.likeFlag),
+    };
+}
+
+static void DDLRestore(WCDataItem *item, NSDictionary *s) {
+    item.likeUsers    = [s[@"likeUsers"] mutableCopy];
+    item.likeCount    = [s[@"likeCount"] intValue];
+    item.commentUsers = [s[@"commentUsers"] mutableCopy];
+    item.commentCount = [s[@"commentCount"] intValue];
+    item.likeFlag     = [s[@"likeFlag"] boolValue];
+    item.cpKeyForLikeUsers = nil;               // 同下，取消时也要让点赞区重绘
+}
 
 // 把伪造数据写回 item。
 static inline void DDLFakeInto(WCDataItem *item) {
@@ -317,6 +448,14 @@ static inline void DDLFakeInto(WCDataItem *item) {
         item.likeUsers = likes;
         item.likeCount = (int)likes.count;
     }
+    // 关键：cpKey 是微信的布局缓存键（同类还有 cpKeyForMessage / cpKeyForNickname）。
+    // 只改 likeUsers 而 cpKeyForLikeUsers 不变，微信认为点赞区内容没变就不重绘，
+    // 表现为「评论出来了、赞没出来」。置 nil 强制重算。
+    id oldKey = item.cpKeyForLikeUsers;
+    item.cpKeyForLikeUsers = nil;
+    DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu cpKey旧=%@ → nil",
+          item.tid, (unsigned long)likes.count, (unsigned long)comments.count,
+          oldKey ? @"有值" : @"nil");
 }
 
 // %new 方法的编译期声明（Logos 运行时注入，编译器需先见到签名）。
@@ -347,30 +486,108 @@ static inline void DDLFakeInto(WCDataItem *item) {
     lp.minimumPressDuration = 1.0;                                 // 长按 1 秒触发
     [btn addGestureRecognizer:lp];
     objc_setAssociatedObject(btn, kDDLLongPressKey, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    DDLog(@"[手势] 已挂长按 likeBtn=%@", btn);
 }
 
 %new
-// 长按点赞按钮：改数据 → 触发一次刷新 → 收起浮窗。全程同步，不等任何回调。
+// 长按点赞按钮：开则备份 + 伪造，关则恢复原样，然后统一刷新、收起浮窗。
+// 全程同步，不等任何回调；伪造状态按 tid 记住，供刷新后重建。
 - (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
     if (!DDLikeConfig.shared.likeEnabled) return;
 
     WCDataItem *item = self.m_item;
-    if (!item) return;
+    if (!item) { DDLog(@"[长按] m_item 为 nil，中止"); return; }
 
-    // 不调原生 onLikeItem:——它是点赞 / 取消赞的开关，已赞时调会反而取消。
-    // 伪造是本地行为，直接把 likeFlag 置为已赞即可。
-    item.likeFlag = YES;
-    DDLFakeInto(item);
+    NSString *tid = item.tid;
+    NSMutableDictionary *faked = gDDLFaked();
+    DDLog(@"[长按] 触发 tid=%@ likeFlag=%d 已集赞=%d", tid, item.likeFlag, tid ? (faked[tid] != nil) : -1);
+
+    if (tid && faked[tid]) {
+        // 已集赞 → 取消：恢复原始数据并遗忘这条。
+        DDLRestore(item, faked[tid]);
+        [faked removeObjectForKey:tid];
+        DDLog(@"[长按] 取消集赞 tid=%@（已恢复原始值，记忆剩 %lu 条）", tid, (unsigned long)faked.count);
+    } else {
+        // 未集赞 → 先备份原始值，再伪造并记住 tid。
+        // 不调原生 onLikeItem:——它是点赞 / 取消赞的开关，已赞时调会反而取消。
+        if (!tid) DDLog(@"[长按] 警告：tid 为 nil，刷新后无法重建");
+        if (tid) faked[tid] = DDLSnapshotOf(item);
+        item.likeFlag = YES;
+        DDLFakeInto(item);
+        DDLog(@"[长按] 开启集赞 tid=%@（记忆 %lu 条）", tid, (unsigned long)faked.count);
+    }
 
     // 借 WCTimelineMgr 的统一出口通知一次刷新（WCTimelineMgr.h:71）。
     id mgr = DDLTimelineMgr();
-    if (mgr) [mgr modifyDataItem:item notify:YES];
+    if (mgr) {
+        [mgr modifyDataItem:item notify:YES];
+        DDLog(@"[刷新] modifyDataItem:notify: 已调用");
+    } else {
+        DDLog(@"[刷新] 警告：WCTimelineMgr 取不到（WCFacade/ServiceCenter 链断了），本次不会自动刷新");
+    }
 
     [self hide];
 }
 
 %end
+
+%hook WCTimelineMgr
+
+// 数据更新后的统一出口（WCTimelineMgr.h:59）。下拉刷新 / 翻页会重建 item 对象，
+// 内存里的伪造数据被冲掉，故在这里对「已集赞」的帖子按 tid 重新伪造。
+// 在 %orig 之前改，让微信后续流程拿到的就是伪造后的数据。
+- (void)commonProcessDataAfterUpdate:(id)datas newAdItems:(id)adItems changedTime:(unsigned int)t {
+    NSMutableDictionary *faked = gDDLFaked();
+    BOOL isArray = [datas isKindOfClass:NSArray.class];
+    NSUInteger hit = 0;
+
+    if (faked.count && isArray) {
+        for (id obj in (NSArray *)datas) {
+            if (![obj isKindOfClass:objc_getClass("WCDataItem")]) continue;
+            WCDataItem *item = (WCDataItem *)obj;
+            NSString *tid = item.tid;
+            if (tid && faked[tid]) {
+                item.likeFlag = YES;
+                DDLFakeInto(item);
+                hit++;
+            }
+        }
+    }
+
+    DDLog(@"[刷新回调] commonProcessDataAfterUpdate datas=%@ 条数=%lu 记忆=%lu 命中重建=%lu",
+          isArray ? @"NSArray" : NSStringFromClass([datas class]),
+          isArray ? (unsigned long)[(NSArray *)datas count] : 0,
+          (unsigned long)faked.count, (unsigned long)hit);
+
+    %orig(datas, adItems, t);
+}
+
+%end
+
+#pragma mark - 日志查看 / 导出
+
+// 把「配置概览 + 日志正文」写成 txt，调起系统分享面板：
+// 可存到文件 App、发微信给自己、隔空投送——非越狱下最省事的取出方式。
+static void DDLogExportFrom(UIViewController *vc, id sender) {
+    NSString *text = [NSString stringWithFormat:@"%@\n\n%@", DDLogConfigSummary(), DDLogText()];
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDLikeHelper.log.txt"];
+    [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    UIActivityViewController *av =
+        [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+                                          applicationActivities:nil];
+    // iPad 上必须给锚点，否则直接崩。
+    if (av.popoverPresentationController) {
+        av.popoverPresentationController.sourceView = vc.view;
+        av.popoverPresentationController.sourceRect =
+            CGRectMake(CGRectGetMidX(vc.view.bounds), CGRectGetMidY(vc.view.bounds), 1, 1);
+        if ([sender isKindOfClass:UIBarButtonItem.class]) {
+            av.popoverPresentationController.barButtonItem = (UIBarButtonItem *)sender;
+        }
+    }
+    [vc presentViewController:av animated:YES completion:nil];
+}
 
 #pragma mark - 设置界面
 
@@ -479,6 +696,25 @@ static inline void DDLFakeInto(WCDataItem *item) {
                                                                action:@selector(commentsConfirmed:)]]];
     }
     [_tableViewManager addSection:sec];
+
+    [self addDebugSection];
+}
+
+// 调试分组：只有导出和清空。调通后整段删掉即可。
+- (void)addDebugSection {
+    Class cellMgr = objc_getClass("WCTableViewCellManager");
+    Class secMgr  = objc_getClass("WCTableViewSectionManager");
+
+    WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"调试"];
+    [sec addCell:[cellMgr normalCellForSel:@selector(onExportLogTapped)
+                                    target:self
+                                     title:@"导出日志"
+                                rightValue:[NSString stringWithFormat:@"%lu 条", (unsigned long)DDLogCount()]]];
+    [sec addCell:[cellMgr normalCellForSel:@selector(onClearLogTapped)
+                                    target:self
+                                     title:@"清空日志"
+                                rightValue:nil]];
+    [_tableViewManager addSection:sec];
 }
 
 // 将微信表格 delegate 事件转发给原 delegate，本类只做外观代理。
@@ -501,6 +737,17 @@ static inline void DDLFakeInto(WCDataItem *item) {
 // 总开关：展开 / 收起子项，故回调内即时重建表格。
 - (void)onLikeEnabledSwitch:(UISwitch *)s {
     DDLikeConfig.shared.likeEnabled = s.isOn;
+    DDLog(@"[设置] 集赞开关 → %d", s.isOn);
+    [self buildTable];
+}
+
+- (void)onExportLogTapped {
+    DDLogExportFrom(self, nil);
+}
+
+- (void)onClearLogTapped {
+    DDLogClear();
+    DDLog(@"[设置] 日志已清空");
     [self buildTable];
 }
 
