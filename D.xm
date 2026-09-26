@@ -22,6 +22,8 @@
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <Photos/Photos.h>
+#import <dispatch/dispatch.h>
 
 #include <stdarg.h>
 
@@ -1223,8 +1225,10 @@ static UIColor *ddm_track_bg(void) {
 //     不依赖任何我们创建的文件。此前用 imageWithContentsOfFile:(tmp 副本) 是惰性解码、
 //     只记路径，要等归档草稿那一刻才真正读盘，tmp 一被回收就是空图/整条草稿不落库。
 //   · 普通图片不构造任何资产，MMImage 只承载 UIImage。
-//   · 实况挂 MMAssetForPHAssetFramework（m_isUseLivePhoto / m_livePhotoVideoPath 在这个类上；
-//     微信草稿存储只收纳该类，基类 MMAsset 写入即被丢 —— B-lite 据此换类）。
+//   · 实况挂 MMAsset 基类（m_isUseLivePhoto / m_livePhotoVideoPath 在基类上，本地文件资产
+//     转发稳定）；但基类写入草稿会被微信丢弃（保留即丢），最终保留需 B-full 走真 PHAsset。
+//     曾试 B-lite 换 MMAssetForPHAssetFramework + initWithUrl: 本地路径，因该类继承 NSObject、
+//     无实况 setter、且 initWithUrl: 期望 PHAsset URL 而闪退，已回退。
 //   · URL 必须用 URLWithString:（PKC 原样，0x117010 URLWithString:x28），不能改成
 //     fileURLWithPath:。PKC 的实况资产就是这么造的，用户实机验证正常。
 //     （此前我改成 fileURLWithPath: 又额外设 m_assetClassNameStr=@"MMAsset"，
@@ -1233,13 +1237,12 @@ static UIColor *ddm_track_bg(void) {
 //   · 运动视频只认 [livePhotoMediaItem getFormatVideoPath]，无任何回退（PKC 原样）。
 //     拿不到就降级成普通图片 —— 丢实况动效，但图一定在。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
-    // B-lite：资产类必须是 MMAssetForPHAssetFramework —— 微信草稿存储只收纳该类，
-    // 基类 MMAsset 写入即被丢（debug 日志：setDraftImages count=1 → getter 读回 0）。
-    Class assetCls = objc_getClass("MMAssetForPHAssetFramework");
-
+    // 探针阶段：临时回退到基类 MMAsset 同步转发，复现“实况被 setDraftImages 丢弃”，
+    // 以便 DDMDeepDescribe 抓到“被丢弃资产”的字段，与手动相册 PHAsset 资产对照，
+    // 定位微信 setDraftImages 的采纳判断依据。B-full 辅助方法（ddmImportLiveAndCommit 等）
+    // 暂未调用，待定位后决定 X(伪装类)/Y(hook 判断) 落地。
+    Class assetCls = objc_getClass("MMAsset");
     NSMutableArray *assets = [NSMutableArray array];
-    // 实况草稿保留：记录最后一张实况的“视频 + 静帧”，循环后武装缓存。
-    NSString *liveVideoToStash = nil, *liveStillToStash = nil;
 
     for (WCMediaItem *m in item.contentObj.mediaList) {
         UIImage *ui = (UIImage *)[m imageOfSize:2];
@@ -1253,12 +1256,11 @@ static UIColor *ddm_track_bg(void) {
         }
         if (!ui) continue;
 
-        // 实况视频：先拷进本插件持久缓存（livecache），避免微信媒体缓存被清理后重开取不到；
-        // 资产 URL 直接指向该持久副本。资产类已换成 MMAssetForPHAssetFramework。
+        // 实况视频：取微信媒体目录下已解码的视频文件绝对路径（本地文件资产，转发稳定）。
         NSString *movSrc = (m.livePhotoMediaItem ? DDMLivePhotoVideoPath(m.livePhotoMediaItem) : nil);
-        NSString *movLocal = (movSrc && DDMFileUsable(movSrc)) ? DDMPersistLiveMov(movSrc) : nil;
+        NSString *movLocal = (movSrc && DDMFileUsable(movSrc)) ? movSrc : nil;
 
-        // 普通图片 asset 传 nil；只有实况才建资产。
+        // 普通图片 asset 传 nil；只有实况才建基类 MMAsset（initWithUrl: 本地路径）。
         // 资产构造失败时退化成普通图片（丢实况动效，但保住图）。
         MMAsset *asset = nil;
         if (movLocal && assetCls &&
@@ -1269,28 +1271,114 @@ static UIColor *ddm_track_bg(void) {
         } else {
             movLocal = nil;
         }
-        DDMLog(@"[Forward] media ui=%@ live=%@ movLocal=%@ asset=%@",
-               ui ? @"Y" : @"N",
-               m.livePhotoMediaItem ? @"Y" : @"N",
-               movLocal ? @"Y" : @"N",
-               asset ? @"Y" : @"N");
+        DDMLog(@"[Forward] media ui=%@ live=%@ movLocal=%@ asset=%@ clsName=%@",
+               ui ? @"Y" : @"N", m.livePhotoMediaItem ? @"Y" : @"N",
+               movLocal ? @"Y" : @"N", asset ? @"Y" : @"N",
+               asset ? NSStringFromClass([asset class]) : @"(nil)");
         MMImage *mm = [self ddmMakeMMImage:ui asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
-        // 记住实况源（视频 + 静帧），用于武装草稿重开重注入缓存。
-        if (mm && asset && movLocal) {
-            liveVideoToStash = movLocal;
-            liveStillToStash = DDMImagePath(m);
-        }
-    }
-
-    // 武装实况草稿缓存：转发含实况时，把视频 + 静帧拷进本插件目录，待重开草稿时补回。
-    if (liveVideoToStash) {
-        DDMArmLiveStash(liveVideoToStash, liveStillToStash);
     }
 
     if (assets.count == 0) { [self presentLegacyForward:item host:host]; return; }
     [self dismissHUD];
     [self ddmPushImageCommit:assets item:item host:host];
+    self.busy = NO;
+}
+
+#pragma mark B-full：实况导入相册成真 Live Photo → PHAsset 资产
+
+// 权限分流：未决定则弹授权；已授权走导入；受限 / 拒绝则退化为“仅普通图片”。
+- (void)ddmImportLiveAndCommit:(NSArray *)liveItems
+                   plainAssets:(NSArray *)plainAssets
+                          item:(WCDataItem *)item
+                          host:(UIViewController *)host {
+    PHAuthorizationStatus st = [PHPhotoLibrary authorizationStatus];
+    void (^go)(BOOL) = ^(BOOL authorized) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (authorized) [self ddmDoImportLive:liveItems plainAssets:plainAssets item:item host:host];
+            else { DDMLog(@"[BFull] photo auth denied/limited → fallback (no live)"); [self ddmCommitPlain:plainAssets item:item host:host]; }
+        });
+    };
+    if (st == PHAuthorizationStatusNotDetermined) {
+        [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus s) { go(s == PHAuthorizationStatusAuthorized); }];
+    } else {
+        go(st == PHAuthorizationStatusAuthorized);
+    }
+}
+
+// 静帧(JPEG) + 配对视频(NSData) 经 PHAssetCreationRequest 导入相册成真 Live Photo，
+// 取回 PHAsset 后用 MMAssetForPHAssetFramework 构造资产，再与普通图一起推送。
+- (void)ddmDoImportLive:(NSArray *)liveItems
+            plainAssets:(NSArray *)plainAssets
+                   item:(WCDataItem *)item
+                   host:(UIViewController *)host {
+    NSMutableArray *stillDatas = [NSMutableArray array];
+    NSMutableArray *movDatas   = [NSMutableArray array];
+    for (NSDictionary *d in liveItems) {
+        UIImage *ui = d[@"ui"];
+        NSData *jpeg = UIImageJPEGRepresentation(ui, 0.95);
+        if (!jpeg) jpeg = UIImagePNGRepresentation(ui);
+        [stillDatas addObject:jpeg ?: [NSData data]];
+        [movDatas addObject:d[@"movData"]];
+    }
+
+    __block NSMutableArray *localIds = [NSMutableArray array];
+    [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+        for (NSUInteger i = 0; i < liveItems.count; i++) {
+            @autoreleasepool {
+                NSData *still = stillDatas[i];
+                NSData *mov   = movDatas[i];
+                PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAsset];
+                [req addResourceWithType:PHAssetResourceTypePhoto data:still options:nil];
+                PHAssetResourceCreationOptions *vo = [[PHAssetResourceCreationOptions alloc] init];
+                [req addResourceWithType:PHAssetResourceTypePairedVideo data:mov options:vo];
+                NSString *lid = req.placeholderForCreatedAsset.localIdentifier;
+                if (lid) [localIds addObject:lid];
+            }
+        }
+    } completionHandler:^(BOOL success, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!success) { DDMLog(@"[BFull] import failed: %@", error); [self ddmCommitPlain:plainAssets item:item host:host]; return; }
+            PHFetchResult *fr = [PHAsset fetchAssetsWithLocalIdentifiers:localIds options:nil];
+            NSMutableArray *all = [NSMutableArray arrayWithArray:plainAssets];
+            Class mmCls = objc_getClass("MMImage");
+            Class phCls = objc_getClass("MMAssetForPHAssetFramework");
+            NSUInteger idx = 0;
+            for (PHAsset *ph in fr) {
+                NSDictionary *d = liveItems[idx++];
+                UIImage *ui = d[@"ui"];
+                MMImage *mm = ui ? (MMImage *)[(MMImage *)[mmCls alloc] initWithImage:ui] : [[mmCls alloc] init];
+                if (!mm) continue;
+                if (phCls && [phCls instancesRespondToSelector:@selector(initWithPHAsset:IsNeedOrigin:)]) {
+                    id asset = [(id)[phCls alloc] initWithPHAsset:ph IsNeedOrigin:YES];
+                    if (asset) {
+                        // 真 PHAsset 资产：微信取实况视频走 PHAsset（相册里刚导入的 Live Photo），
+                        // 不依赖微信沙盒本地路径（导入后可能清理），故不设 MMImage.livePhotoVideoPath /
+                        // tempExtraInfo，与 debug-2 手动相册行为一致。
+                        mm.m_asset = (MMAsset *)asset;
+                        mm.isLivePhoto = YES;
+                        [mm setImageFrom:3];
+                        DDMLog(@"[BFull] live MMImage built phAsset=%@ isLive=%d assetCls=%@",
+                               ph.localIdentifier, mm.isLivePhoto,
+                               mm.m_asset ? NSStringFromClass([mm.m_asset class]) : @"(nil)");
+                    }
+                }
+                [all addObject:mm];
+            }
+            [self dismissHUD];
+            [self ddmPushImageCommit:all item:item host:host];
+            self.busy = NO;
+        });
+    }];
+}
+
+// 退化：无实况（无权限 / 导入失败）。保留普通图，丢弃实况动效但保住图。
+- (void)ddmCommitPlain:(NSArray *)plainAssets
+                  item:(WCDataItem *)item
+                  host:(UIViewController *)host {
+    [self dismissHUD];
+    if (plainAssets.count == 0) { [self presentLegacyForward:item host:host]; self.busy = NO; return; }
+    [self ddmPushImageCommit:plainAssets item:item host:host];
     self.busy = NO;
 }
 
@@ -2011,13 +2099,50 @@ static void ddmInjectMarkIntoComment(id c) {
 // 仅打印日志，不改任何逻辑；Logos 在运行时按 selector 挂钩，方法不存在也不会崩溃。
 // 关键：draftImages getter 在重开草稿时被微信调用以重建发布器，抓它即可看到“保留后”
 // 读回来的实况视频路径是否还在、是否退化成普通图。
+
+// 探针：反射打印对象的类 + 直接 property 值（不递归，安全吞异常）。用于对比
+// “被微信收纳的资产”与“被丢弃的资产”的字段差异，定位 setDraftImages 的采纳依据。
+static NSString *DDMDeepDescribe(id obj) {
+    if (!obj) return @"(nil)";
+    Class cls = object_getClass(obj);
+    NSMutableString *s = [NSMutableString stringWithFormat:@"%@ ", NSStringFromClass(cls)];
+    unsigned int n = 0;
+    objc_property_t *props = class_copyPropertyList(cls, &n);
+    for (unsigned int i = 0; i < n; i++) {
+        const char *pn = property_getName(props[i]);
+        NSString *name = [NSString stringWithUTF8String:pn];
+        @try {
+            id v = [obj valueForKey:name];
+            if (v) {
+                NSString *d = [v description];
+                if ([d length] > 160) d = [d substringToIndex:160];
+                [s appendFormat:@"|%@=%@", name, d];
+            }
+        } @catch (NSException *e) {}
+    }
+    free(props);
+    [s appendFormat:@" (super=%@)", NSStringFromClass(class_getSuperclass(cls))];
+    return s;
+}
+
+// 探针：setDraftImages 调用栈（前 10 帧），看微信从哪个流程进来。
+static NSString *DDMCallStack(void) {
+    NSArray *cs = [NSThread callStackSymbols];
+    NSMutableString *s = [NSMutableString string];
+    for (NSUInteger i = 1; i < cs.count && i < 11; i++) {
+        [s appendFormat:@"\n    %@", cs[i]];
+    }
+    return s;
+}
+
 %hook WCTimelineEnhanceDraftController
 
 // 草稿落库：写入图片数组时记录每张实况状态 + 返回值。
 - (BOOL)setDraftImages:(id)images needCopyImageToFile:(BOOL)needCopy {
-    DDMLog(@"[DraftSave] setDraftImages count=%lu needCopy=%@",
+    DDMLog(@"[DraftSave] setDraftImages count=%lu needCopy=%@ stack=%@",
            (unsigned long)([images isKindOfClass:[NSArray class]] ? [images count] : 0),
-           needCopy ? @"Y" : @"N");
+           needCopy ? @"Y" : @"N",
+           DDMCallStack());
     if ([images isKindOfClass:[NSArray class]]) {
         for (id img in images) {
             if ([img isKindOfClass:objc_getClass("MMImage")]) {
@@ -2025,13 +2150,13 @@ static void ddmInjectMarkIntoComment(id c) {
                 NSString *vp = mm.livePhotoVideoPath;
                 MMAsset *a = mm.m_asset;
                 BOOL vpOk = (vp && [[NSFileManager defaultManager] fileExistsAtPath:vp]);
-                DDMLog(@"[DraftSave]   live=%@ vp=%@ vpExists=%@ asset=%@ assetVp=%@ clsName=%@",
+                DDMLog(@"[DraftSave]   live=%@ vp=%@ vpExists=%@ asset=%@ clsName=%@",
                        mm.isLivePhoto ? @"Y" : @"N",
                        vp ? vp : @"(null)",
                        vpOk ? @"Y" : @"N",
                        a ? @"Y" : @"N",
-                       (a && a.m_livePhotoVideoPath) ? a.m_livePhotoVideoPath : @"-",
                        mm.m_assetClassNameStr ? mm.m_assetClassNameStr : @"(unset)");
+                DDMLog(@"[DraftSave]   assetDetail=%@", DDMDeepDescribe(a));
             }
         }
     }
@@ -2074,6 +2199,7 @@ static void ddmInjectMarkIntoComment(id c) {
                        mm.m_asset ? @"Y" : @"N",
                        mm.m_asset ? NSStringFromClass([mm.m_asset class]) : @"(nil)",
                        mm.m_assetClassNameStr ? mm.m_assetClassNameStr : @"(unset)");
+                DDMLog(@"[DraftLoad]   assetDetail=%@", DDMDeepDescribe(mm.m_asset));
             }
         }
     }
