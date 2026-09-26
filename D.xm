@@ -1807,7 +1807,7 @@ static void ddmInjectMarkIntoComment(id c) {
            needCopy ? @"Y" : @"N");
     if ([images isKindOfClass:[NSArray class]]) {
         for (id img in images) {
-            if ([img isKindOfClass:[MMImage class]]) {
+            if ([img isKindOfClass:objc_getClass("MMImage")]) {
                 MMImage *mm = (MMImage *)img;
                 NSString *vp = mm.livePhotoVideoPath;
                 MMAsset *a = mm.m_asset;
@@ -1834,7 +1834,7 @@ static void ddmInjectMarkIntoComment(id c) {
            (unsigned long)([images isKindOfClass:[NSArray class]] ? [images count] : 0));
     if ([images isKindOfClass:[NSArray class]]) {
         for (id img in images) {
-            if ([img isKindOfClass:[MMImage class]]) {
+            if ([img isKindOfClass:objc_getClass("MMImage")]) {
                 MMImage *mm = (MMImage *)img;
                 NSString *vp = mm.livePhotoVideoPath;
                 BOOL vpOk = (vp && [[NSFileManager defaultManager] fileExistsAtPath:vp]);
