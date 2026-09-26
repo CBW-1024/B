@@ -1871,7 +1871,7 @@ static void ddmInjectMarkIntoComment(id c) {
     static BOOL sPersisting = NO;
     if (r && !sPersisting && [images isKindOfClass:[NSArray class]] && [images count] > 0) {
         SEL cd = @selector(createDraft);
-        if ([self respondsToSelector:cd]) {
+        if ([(id)self respondsToSelector:cd]) {
             sPersisting = YES;
             BOOL saved = ((BOOL (*)(id, SEL))objc_msgSend)(self, cd);
             sPersisting = NO;
