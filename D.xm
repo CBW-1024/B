@@ -2,9 +2,9 @@
 // 微信朋友圈助手（Theos / Logos，arm64 / arm64e）
 //
 // 功能：
-//   1. 一键转发 —— 在朋友圈「赞 / 评论」浮窗注入「转发」按钮，支持图片、视频、文案
+//   1. 一键转发 —— 在朋友圈「赞 / 评论」浮窗注入「转发」按钮，支持图片、视频、
 //      Live Photo 与纯文字；自动带回原帖文案，可选保留 / 移除原作者位置。
-//   2. 辅助开关 —— 查看已删评论、禁用隐私图标、禁用微商折叠、禁用文字折叠、文案
+//   2. 辅助开关 —— 显示精确日期、查看已删评论、禁用隐私图标、禁用微商折叠、禁用文字折叠、
 //      禁用自动播放、禁用点击关闭、启用视频进度条。
 //
 // 转发链路：
@@ -53,6 +53,7 @@
 @interface WCContentItem : NSObject
 @property (retain, nonatomic) NSMutableArray *mediaList;   // 媒体列表（图片 / 视频 / Live Photo）
 @property (nonatomic) int type;                            // 内容类型
+@property (nonatomic) unsigned int createtime;             // 发布时间（Unix 秒）
 + (BOOL)isVideoType:(long long)type;                        // 是否为视频类型
 @end
 
@@ -191,11 +192,14 @@ static inline id DDMGetFrameFacade(void) {
 - (void)autoPlayWithoutSound;
 @end
 
-// 朋友圈 cell 视图（禁用隐私图标 + 文字折叠）。
+// 朋友圈 cell 视图（禁用隐私图标 + 文字折叠 + 精确日期）。
 @interface WCTimeLineCellView : UIView
 - (void)initPrivacyButton:(id)arg1;
 - (void)layoutSubviews;
 + (BOOL)shouldShowFullTextButtonWithDataItem:(id)arg1;
+@property (readonly, nonatomic) WCDataItem *m_dataItem;
+@property (readonly, nonatomic) UILabel *m_timeLabel;
+- (void)updateWithDataItem:(id)dataItem actionAreaVM:(id)actionAreaVM;
 @end
 
 // 微信按钮基类。
@@ -227,6 +231,7 @@ static NSString * const kDDMForwardEnabled       = @"DDMoments_forwardEnabled";
 
 // 辅助开关（键名与界面标题一一对应）。
 static NSString * const kDDMViewDeletedComment   = @"DDMoments_viewDeletedComment";    // 查看已删评论
+static NSString * const kDDMShowPreciseDate      = @"DDMoments_showPreciseDate";       // 显示精确日期
 static NSString * const kDDMDisablePrivacyIcon   = @"DDMoments_disablePrivacyIcon";    // 禁用隐私图标
 static NSString * const kDDMDisableWeiShangFold  = @"DDMoments_disableWeiShangFold";   // 禁用微商折叠
 static NSString * const kDDMDisableTextFold      = @"DDMoments_disableTextFold";       // 禁用文字折叠
@@ -242,6 +247,7 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 @interface DDMConfig : NSObject
 @property (assign, nonatomic) BOOL forwardEnabled;          // 启用一键转发（总开关；开启时展开“移除原始位置”）
 @property (assign, nonatomic) BOOL viewDeletedComment;      // 查看已删评论
+@property (assign, nonatomic) BOOL showPreciseDate;         // 显示精确日期（替换朋友圈相对时间为绝对时间）
 @property (assign, nonatomic) BOOL disablePrivacyIcon;      // 禁用隐私图标
 @property (assign, nonatomic) BOOL disableWeiShangFold;     // 禁用微商折叠
 @property (assign, nonatomic) BOOL disableTextFold;         // 禁用文字折叠
@@ -266,6 +272,7 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         _forwardEnabled           = [ud boolForKey:kDDMForwardEnabled];
         _viewDeletedComment       = [ud boolForKey:kDDMViewDeletedComment];
+        _showPreciseDate          = [ud boolForKey:kDDMShowPreciseDate];
         _disablePrivacyIcon       = [ud boolForKey:kDDMDisablePrivacyIcon];
         _disableWeiShangFold      = [ud boolForKey:kDDMDisableWeiShangFold];
         _disableTextFold          = [ud boolForKey:kDDMDisableTextFold];
@@ -284,6 +291,7 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 
 - (void)setForwardEnabled:(BOOL)v            { _forwardEnabled = v;            [self persist:@(v) key:kDDMForwardEnabled]; }
 - (void)setViewDeletedComment:(BOOL)v       { _viewDeletedComment = v;       [self persist:@(v) key:kDDMViewDeletedComment]; }
+- (void)setShowPreciseDate:(BOOL)v          { _showPreciseDate = v;          [self persist:@(v) key:kDDMShowPreciseDate]; }
 - (void)setDisablePrivacyIcon:(BOOL)v       { _disablePrivacyIcon = v;       [self persist:@(v) key:kDDMDisablePrivacyIcon]; }
 - (void)setDisableWeiShangFold:(BOOL)v      { _disableWeiShangFold = v;      [self persist:@(v) key:kDDMDisableWeiShangFold]; }
 - (void)setDisableTextFold:(BOOL)v          { _disableTextFold = v;          [self persist:@(v) key:kDDMDisableTextFold]; }
@@ -1241,6 +1249,19 @@ static char kDDMLineKey;
 
 #pragma mark - 朋友圈辅助功能
 
+// 把 Unix 秒格式化为绝对时间（精确到秒）；时间戳为 0（取不到发布时间）时返回 nil，保持原生文案。
+static NSString *DDMPreciseDateText(unsigned int ts) {
+    if (ts == 0) return nil;
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        fmt.locale = [NSLocale currentLocale];
+    });
+    return [fmt stringFromDate:[NSDate dateWithTimeIntervalSince1970:ts]];
+}
+
 // 查看已删除评论：评论被删（delStatus=1）时保留内容并加标记前缀。
 static NSString *ddmDeletedMarkText(void) {
     NSString *t = [[NSUserDefaults standardUserDefaults] stringForKey:kDDMDeletedCommentMark];
@@ -1283,7 +1304,7 @@ static void ddmInjectMarkIntoComment(id c) {
 }
 %end
 
-// 禁用“谁可以看”隐私图标 + 长文字折叠。
+// 禁用“谁可以看”隐私图标 + 长文字折叠 + 显示精确日期。
 %hook WCTimeLineCellView
 - (void)initPrivacyButton:(id)arg1 {
     %orig;
@@ -1318,6 +1339,15 @@ static void ddmInjectMarkIntoComment(id c) {
 + (BOOL)shouldShowFullTextButtonWithDataItem:(id)arg1 {
     if ([DDMConfig shared].disableTextFold) return NO;
     return %orig;
+}
+// 显示精确日期：cell 每次复用都会走这里，%orig 之后覆盖时间标签，
+// 把“x 小时前”换成绝对时间。只挂这一个点即可 —— initTimeLabel 里 m_dataItem 尚未赋值，
+// 且随后一定会被本方法覆盖。
+- (void)updateWithDataItem:(id)dataItem actionAreaVM:(id)actionAreaVM {
+    %orig;
+    if (![DDMConfig shared].showPreciseDate) return;
+    NSString *text = DDMPreciseDateText([(WCDataItem *)dataItem createtime]);
+    if (text) self.m_timeLabel.text = text;
 }
 %end
 
@@ -1424,6 +1454,10 @@ static void ddmInjectMarkIntoComment(id c) {
                                    target:self
                                     title:@"查看已删评论"
                                        on:cfg.viewDeletedComment]];
+    [aux addCell:[cellMgr switchCellForSel:@selector(onShowPreciseDateSwitch:)
+                                   target:self
+                                    title:@"显示精确日期"
+                                       on:cfg.showPreciseDate]];
     [aux addCell:[cellMgr switchCellForSel:@selector(onDisablePrivacyIconSwitch:)
                                    target:self
                                     title:@"禁用隐私图标"
@@ -1470,6 +1504,7 @@ static void ddmInjectMarkIntoComment(id c) {
 - (void)onForwardEnabledSwitch:(UISwitch *)s        { DDMConfig.shared.forwardEnabled = s.isOn; [self buildTable]; }
 - (void)onRemoveOriginalLocationSwitch:(UISwitch *)s { DDMConfig.shared.removeOriginalLocation = s.isOn; }
 - (void)onViewDeletedCommentSwitch:(UISwitch *)s   { DDMConfig.shared.viewDeletedComment = s.isOn; }
+- (void)onShowPreciseDateSwitch:(UISwitch *)s      { DDMConfig.shared.showPreciseDate = s.isOn; }
 - (void)onDisablePrivacyIconSwitch:(UISwitch *)s   { DDMConfig.shared.disablePrivacyIcon = s.isOn; }
 - (void)onDisableWeiShangFoldSwitch:(UISwitch *)s  { DDMConfig.shared.disableWeiShangFold = s.isOn; }
 - (void)onDisableTextFoldSwitch:(UISwitch *)s      { DDMConfig.shared.disableTextFold = s.isOn; }
