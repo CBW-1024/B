@@ -1863,6 +1863,21 @@ static void ddmInjectMarkIntoComment(id c) {
     }
     BOOL r = %orig;
     DDMLog(@"[DraftSave] -> %@", r ? @"YES" : @"NO");
+    // 修复“保留后丢实况”：
+    // 微信初始化增强草稿控制器时，createDraft 先于 setDraftImages 运行，把“空”写进磁盘；
+    // 我们的实况图随后只进内存、从不落盘，导致重开/保留时从空磁盘重建而丢失（连 PKC 也保不住，
+    // 因为合成资产不走微信标准资产落库）。这里 %orig 成功且数组非空时补一次 createDraft 真正落盘；
+    // count=0 不落，避免手动存/清除时把磁盘也清成空。静态标志防止 createDraft 反向调用本方法递归。
+    static BOOL sPersisting = NO;
+    if (r && !sPersisting && [images isKindOfClass:[NSArray class]] && [images count] > 0) {
+        SEL cd = @selector(createDraft);
+        if ([self respondsToSelector:cd]) {
+            sPersisting = YES;
+            BOOL saved = ((BOOL (*)(id, SEL))objc_msgSend)(self, cd);
+            sPersisting = NO;
+            DDMLog(@"[DraftSave] persist createDraft -> %@", saved ? @"YES" : @"NO");
+        }
+    }
     return r;
 }
 
