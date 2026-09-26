@@ -1061,19 +1061,20 @@ static UIColor *ddm_track_bg(void) {
         [extra setValue:movLocal forKey:@"ExportedLivePhotoPath"];
         [mmImg setValue:extra forKey:@"tempExtraInfo"];   // MMImage.h 无 setter，KVC 直写 ivar
 
-        // 资产侧保真字段（MMAsset 基类，MMAssetForLocalImage 继承之）。
-        // 这四条对「转发」是否必需存疑：转发动效主靠上面 MMImage 侧承载，
-        // 它们是给真 PHAsset 资产附加的保真，暂留作观察。统一用 [(MMAsset *)asset ...] 写，
-        // 不靠强转 MMAssetForLocalImage* 访问基类字段。
-        [(MMAsset *)asset setM_isUseLivePhoto:YES];
-        [(MMAsset *)asset setM_livePhotoVideoPath:movLocal];
-        long long sz = (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize];
-        double dur = DDMVideoDuration(movLocal);
-        [(MMAsset *)asset setLivePhotoVideoSize:sz];
-        [(MMAsset *)asset setLivePhotoDuration:dur];
+        // 资产侧保真字段（A/B 测试：本轮禁用，验证是否冗余）。
+        // 转发动效主靠上面 MMImage 侧承载（isLivePhoto + livePhotoVideoPath +
+        // tempExtraInfo.ExportedLivePhotoPath + setImageFrom:3）。这组 MMAsset 基类字段
+        // 是微信给真 PHAsset 资产留的保真位，非真 PHAsset 的 MMAssetForLocalImage 可能不生效。
+        // 要恢复直接取消下面四行注释（sz/dur 仅用于日志核对，一并恢复）。
+        // [(MMAsset *)asset setM_isUseLivePhoto:YES];
+        // [(MMAsset *)asset setM_livePhotoVideoPath:movLocal];
+        // long long sz = (long long)[[NSFileManager.defaultManager attributesOfItemAtPath:movLocal error:nil] fileSize];
+        // double dur = DDMVideoDuration(movLocal);
+        // [(MMAsset *)asset setLivePhotoVideoSize:sz];
+        // [(MMAsset *)asset setLivePhotoDuration:dur];
 
-        DDMLog(@"[Live] fidelity mm.isLivePhoto=Y path=%@ extra=%@ | asset.useLive=Y path=%@ sz=%lld dur=%.2f",
-               movLocal, extra ? @"Y" : @"N", movLocal, sz, dur);
+        DDMLog(@"[Live] fidelity=SKIP(asset-side off) mm.isLivePhoto=Y path=%@ extra=%@",
+               movLocal, extra ? @"Y" : @"N");
     }
     return mmImg;
 }
