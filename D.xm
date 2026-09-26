@@ -1080,10 +1080,11 @@ static char kDDMLineKey;
 }
 
 // 浮窗展示时补齐分隔线，并在动画前把浮窗定型为三列并居中，使转发列随弹窗一起入场。
+// showWithItemData 每次弹出都执行，故加宽可按开关实时决定；分隔线则只创建一次（内部去重）。
 - (void)showWithItemData:(id)itemData tipPoint:(struct CGPoint)tipPoint {
     %orig;
-    if (!DDMConfig.shared.forwardEnabled) return;   // 转发关闭时保持原生两列，不加宽留白
     [self initForwardLineView];
+    if (!DDMConfig.shared.forwardEnabled) return;   // 转发关闭时保持原生两列，不加宽留白
     UIButton *cmt = self.m_commentBtn;
     UIButton *like = self.m_likeBtn;
     if (cmt && like && cmt.frame.size.width > 0 && like.frame.size.width > 0) {
@@ -1111,9 +1112,10 @@ static char kDDMLineKey;
 }
 
 %new
-// 在评论按钮右侧注入“转发”按钮。浮窗每次弹出都是新实例，故关闭时直接不创建。
+// 在评论按钮右侧注入“转发”按钮。
+// 浮窗在 VC 内被复用（initCommentButton 只跑一次），故这里始终创建，
+// 显隐交给每次布局都会执行的 layoutSubviews 按开关决定，开关切换后即时生效。
 - (void)initForwardButton {
-    if (!DDMConfig.shared.forwardEnabled) return;
     UIButton *cmtBtn = self.m_commentBtn;
     if (!cmtBtn || objc_getAssociatedObject(self, &kDDMShareBtnKey)) return;
 
@@ -1170,8 +1172,7 @@ static char kDDMLineKey;
     UIButton *likeBtn = self.m_likeBtn;
     UIButton *cmtBtn  = self.m_commentBtn;
 
-    // 按钮只在转发开启时创建，故 shareBtn 存在即代表开关是开的。
-    BOOL show = shareBtn && likeBtn && cmtBtn && shareBtn.superview;
+    BOOL show = DDMConfig.shared.forwardEnabled && shareBtn && likeBtn && cmtBtn && shareBtn.superview;
     shareBtn.hidden = !show;
     line.hidden = !show;
     if (!show) return;
