@@ -1051,8 +1051,12 @@ static UIColor *ddm_track_bg(void) {
         [extra setValue:movLocal forKey:@"ExportedLivePhotoPath"];
         [mmImg setValue:extra forKey:@"tempExtraInfo"];   // MMImage.h 无 setter，KVC 直写 ivar
 
-        DDMLog(@"[Live] fidelity mm.isLivePhoto=Y path=%@ extra=%@",
-               movLocal, extra ? @"Y" : @"N");
+        // 回读验证 KVC 是否真的写进了 ivar（写入失败会抛 NSUnknownKeyException 直接崩，
+        // 因此能走到这里即命中；hit 用于确认值未被中途重置）。
+        id extraBack = [mmImg tempExtraInfo];
+        BOOL hit = [[extraBack objectForKey:@"ExportedLivePhotoPath"] isEqualToString:movLocal];
+        DDMLog(@"[Live] fidelity mm.isLivePhoto=Y path=%@ extra=%@ hit=%@",
+               movLocal, extra ? @"Y" : @"N", hit ? @"Y" : @"N");
     }
     return mmImg;
 }
