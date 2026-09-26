@@ -334,48 +334,6 @@ static inline void DDLFakeInto(WCDataItem *item) {
     }
 }
 
-// 底部短提示，1.4s 后淡出（长按唯一的反馈，不用震动）。
-static void DDLShowToast(NSString *text) {
-    UIWindow *win = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (!w.hidden && w.windowLevel == UIWindowLevelNormal) { win = w; break; }
-    }
-    if (!win) win = UIApplication.sharedApplication.keyWindow;
-    if (!win) return;
-
-    UILabel *lab = [[UILabel alloc] init];
-    lab.text = text;
-    lab.font = [UIFont systemFontOfSize:14];
-    lab.textColor = [UIColor whiteColor];
-    lab.textAlignment = NSTextAlignmentCenter;
-    lab.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.78];
-    lab.layer.cornerRadius = 8;
-    lab.layer.masksToBounds = YES;
-    [lab sizeToFit];
-
-    CGFloat w = CGRectGetWidth(lab.bounds) + 32.0;
-    CGFloat h = CGRectGetHeight(lab.bounds) + 20.0;
-    lab.frame = CGRectMake((CGRectGetWidth(win.bounds) - w) / 2.0,
-                           CGRectGetHeight(win.bounds) - 140.0, w, h);
-    lab.alpha = 0;
-    [win addSubview:lab];
-
-    [UIView animateWithDuration:0.18 animations:^{ lab.alpha = 1.0; } completion:^(BOOL f) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:0.25 animations:^{ lab.alpha = 0; }
-                             completion:^(BOOL f2){ [lab removeFromSuperview]; }];
-        });
-    }];
-}
-
-static void DDLToastLikeResult(WCDataItem *item) {
-    NSMutableString *s = [NSMutableString stringWithString:@"已集赞"];
-    if (item.likeCount > 0)    [s appendFormat:@" %d 赞", item.likeCount];
-    if (item.commentCount > 0) [s appendFormat:@" %d 评论", item.commentCount];
-    DDLShowToast(s);
-}
-
 // %new 方法的编译期声明（Logos 运行时注入，编译器需先见到签名）。
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
@@ -407,7 +365,7 @@ static void DDLToastLikeResult(WCDataItem *item) {
 }
 
 %new
-// 长按点赞按钮：开窗口 → 触发一次原生落库 → 收起浮窗并提示。
+// 长按点赞按钮：开窗口 → 触发一次原生落库 → 收起浮窗。
 - (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
     if (!DDLikeConfig.shared.likeEnabled) return;
@@ -430,7 +388,6 @@ static void DDLToastLikeResult(WCDataItem *item) {
     }
 
     [self hide];
-    DDLToastLikeResult(item);
 }
 
 %end
