@@ -345,16 +345,6 @@ static NSString * const kDDMDefaultDeletedMark   = @"[对方已删除] ";
 
 #pragma mark - 运行时工具
 
-static BOOL DDMFileUsable(NSString *path);   // 前置声明：DDMVideoDuration 在其定义前使用
-
-// 视频时长（Live Photo 运动视频登记用）。
-static double DDMVideoDuration(NSString *path) {
-    if (!DDMFileUsable(path)) return 0;
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-    CMTime d = asset.duration;
-    return CMTIME_IS_NUMERIC(d) ? CMTimeGetSeconds(d) : 0;
-}
-
 // 取当前 keyWindow。
 static UIWindow *DDMKeyWindow(void) {
     UIWindow *found = nil;
