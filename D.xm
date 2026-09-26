@@ -1493,6 +1493,38 @@ static char kDDMLineKey;
     [self textViewTextDidChange];
 }
 
+// —— 草稿保存路径埋点 ——
+// 保留/不保留 弹框出现时记一笔，方便把“取消发布”动作对齐到日志时间线。
+- (void)showSaveOrNotAlert:(long long)arg1 {
+    DDMLog(@"[SaveFlow] showSaveOrNotAlert tag=%lld", arg1);
+    %orig;
+}
+
+// 点「保留」（取消发布但存草稿）：记录落盘前增强控制器里还几张图，%orig 之后再核对。
+- (void)onCancelSaveBtnClickedWithTag:(long long)arg1 {
+    DDMLog(@"[SaveFlow] onCancelSaveBtnClicked(保留) tag=%lld", arg1);
+    id edc = [self enhanceDraftSaveController];
+    if (edc) {
+        id pre = [edc draftImages];
+        DDMLog(@"[SaveFlow]   before-save inMemoryImages=%lu hasDraft=%@",
+               (unsigned long)([pre isKindOfClass:[NSArray class]] ? [pre count] : 0),
+               [edc hasDraft] ? @"Y" : @"N");
+    }
+    %orig;
+    if (edc) {
+        id post = [edc draftImages];
+        DDMLog(@"[SaveFlow]   after-save inMemoryImages=%lu hasDraft=%@",
+               (unsigned long)([post isKindOfClass:[NSArray class]] ? [post count] : 0),
+               [edc hasDraft] ? @"Y" : @"N");
+    }
+}
+
+// 手动点「存草稿」按钮。
+- (void)onSaveBtnClickedWithTag:(long long)arg1 {
+    DDMLog(@"[SaveFlow] onSaveBtnClicked(手动存) tag=%lld", arg1);
+    %orig;
+}
+
 %end
 
 #pragma mark - 朋友圈辅助功能
@@ -1856,6 +1888,26 @@ static void ddmInjectMarkIntoComment(id c) {
            arg ? NSStringFromClass([arg class]) : @"(null)");
     BOOL r = %orig;
     DDMLog(@"[DraftCopy] -> %@", r ? @"YES" : @"NO");
+    return r;
+}
+
+// 真正落盘：createDraft 被调用时记“此刻内存里还几张图”，返回后记是否成功 + 落盘后能否读回。
+- (BOOL)createDraft {
+    id pre = [self draftImages];
+    DDMLog(@"[DraftCreate] createDraft enter; inMemoryImages=%lu",
+           (unsigned long)([pre isKindOfClass:[NSArray class]] ? [pre count] : 0));
+    BOOL r = %orig;
+    DDMLog(@"[DraftCreate] -> %@", r ? @"YES" : @"NO");
+    id post = [self draftImages];
+    DDMLog(@"[DraftCreate] after inMemoryImages=%lu",
+           (unsigned long)([post isKindOfClass:[NSArray class]] ? [post count] : 0));
+    return r;
+}
+
+// hasDraft 频繁被问，记录当前是否有草稿。
+- (BOOL)hasDraft {
+    BOOL r = %orig;
+    DDMLog(@"[DraftCreate] hasDraft -> %@", r ? @"Y" : @"N");
     return r;
 }
 
