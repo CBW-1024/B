@@ -894,9 +894,11 @@ static UIColor *ddm_track_bg(void) {
 // 判断单个图片媒体是否就绪。
 - (BOOL)ddmImageReady:(WCMediaItem *)m {
     id img = [m imageOfSize:2LL];
-    if (img) return YES;
+    if (img) { DDMLog(@"[Ready] image fromMem=Y"); return YES; }
     NSString *p = DDMImagePath(m);
-    return (p && DDMFileUsable(p));
+    BOOL fileReady = (p && DDMFileUsable(p));
+    DDMLog(@"[Ready] image fromMem=N fileReady=%@", fileReady ? @"Y" : @"N");
+    return fileReady;
 }
 
 // 下载超时（视频未就绪）时静默中止：收起进度卡并解除占用，不弹提示、不进发布器。
