@@ -2,67 +2,25 @@
 // 微信朋友圈助手（Theos / Logos，arm64 / arm64e）
 //
 // 功能：
-//   1. 一键转发 —— 在朋友圈「赞 / 评论」操作浮窗中注入「转发」按钮，支持图片、视频、
+//   1. 一键转发 —— 在朋友圈「赞 / 评论」浮窗注入「转发」按钮，支持图片、视频、
 //      Live Photo 与纯文字；自动带回原帖文案，可选保留 / 移除原作者位置。
-//   2. 辅助设置 —— 7 项独立开关：查看已删评论、禁用隐私图标、禁用微商折叠、禁用文字折叠、
+//   2. 辅助开关 —— 查看已删评论、禁用隐私图标、禁用微商折叠、禁用文字折叠、
 //      禁用自动播放、禁用点击关闭、启用视频进度条。
 //
 // 转发链路：
-//   抓文案 → 备媒体（缺失则走 CDN 下载）→ 深拷贝隔离原帖 → 按类型分流
-//   → 构建微信草稿 / 资产 → 唤起发布器并回填文案与位置。
+//   抓文案 → 备媒体（缺失走 CDN 下载）→ 深拷贝隔离原帖 → 按类型分流
+//   → 构建草稿 / 资产 → 唤起发布器并回填文案与位置。
 //
-// 设计说明：
-//   - 所有微信私有类均运行时获取（objc_getClass / NSClassFromString），不链接私有符号。
-//   - 私有接口基于微信 8.0.79 头文件 dump，仅声明本插件实际会调用的方法。
-//   - 文案回填落在发布器 init 期的 initTextViewContent：写完随 textViewTextDidChange
-//     同步进微信内部模型，因此发布器后续重建文本框也不会丢文案。
+// 说明：
+//   - 微信私有类一律运行时获取（objc_getClass / NSClassFromString），不链接私有符号。
+//   - 私有接口取自微信 8.0.79 头文件，只声明本插件真正会调用的方法。
+//   - 文案在发布器 init 期（initTextViewContent）回填，并随 textViewTextDidChange
+//     同步进微信内部模型，之后发布器重建文本框也不会丢。
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#include <stdarg.h>
-
-#pragma mark - 调试日志
-
-// 调试日志：落盘到 App 沙盒 Library/DDWCMoments/debug.log。
-// 随微信进程加载即可写，不依赖越狱 / PreferenceLoader / Cephei。
-// 手机无法接 console 时，用设置页「导出日志」经系统分享面板存到
-// 文件 / 隔空投送 / 拷贝，即可离线调试转发链路。
-static NSString *DDMLogPath(void) {
-    NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *dir = [lib stringByAppendingPathComponent:@"DDWCMoments"];
-    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [dir stringByAppendingPathComponent:@"debug.log"];
-}
-static dispatch_queue_t DDMLogQueue(void) {
-    static dispatch_queue_t q; static dispatch_once_t t;
-    dispatch_once(&t, ^{ q = dispatch_queue_create("com.ddwcmoments.log", DISPATCH_QUEUE_SERIAL); });
-    return q;
-}
-static void DDMLogWrite(NSString *line) {
-    NSString *p = DDMLogPath();
-    dispatch_async(DDMLogQueue(), ^{
-        FILE *f = fopen([p UTF8String], "a");
-        if (f) { fputs([line UTF8String], f); fputs("\n", f); fclose(f); }
-    });
-}
-static void DDMLog(NSString *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    df.dateFormat = @"MM-dd HH:mm:ss.SSS";
-    NSString *line = [NSString stringWithFormat:@"[%@] %@", [df stringFromDate:[NSDate date]], msg];
-    DDMLogWrite(line);
-}
-static void DDMLogClear(void) {
-    NSString *p = DDMLogPath();
-    dispatch_async(DDMLogQueue(), ^{
-        [@"" writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:nil];
-    });
-}
 
 #pragma mark - 微信私有接口声明
 
@@ -89,7 +47,6 @@ static void DDMLogClear(void) {
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3;
 @end
 
 // 朋友圈内容项（一条朋友圈的元数据）。
@@ -176,33 +133,24 @@ static inline id DDMGetFrameFacade(void) {
 @property (retain, nonatomic) WCOperateFloatView *floatOperateView;
 @end
 
-// 本地资源基类。
+// 本地资源基类（实况运动视频由 MMAssetForLocalImage 携带）。
 @interface MMAsset : NSObject
-@property (nonatomic) BOOL m_isUseLivePhoto;
-@property (retain, nonatomic) NSString *m_livePhotoVideoPath;
-@property (nonatomic) double livePhotoDuration;
-@property (nonatomic) long long livePhotoVideoSize;
 @end
 
 // 本地图片 / Live Photo 资源。
 @interface MMAssetForLocalImage : MMAsset
 @property (retain, nonatomic) NSString *localAssetId;
 @property (retain, nonatomic) NSString *localFilePath;
-@property (nonatomic) long long imageDataType;
 - (id)initWithUrl:(NSURL *)url IsNeedOrigin:(BOOL)isNeedOrigin;
-- (long long)_getImageTypeFromData:(NSData *)arg1;
 @end
 
-// 微信图片封装：发布时承载本地图片与 Live Photo 信息。
+// 微信图片封装：承载像素与实况信息，提交给发布器。
 @interface MMImage : UIImage
 - (id)initWithImage:(id)arg1;
 @property (retain, nonatomic) MMAsset *m_asset;
 @property (nonatomic) BOOL isLivePhoto;
 @property (retain, nonatomic) NSString *livePhotoVideoPath;
 @property (nonatomic) long long imageFrom;
-// 头文件（8.0.79 MMImage.h:53）只有 getter、无 setTempExtraInfo:，故只声明读方法；
-// 写入走 KVC 直写 ivar。
-- (id)tempExtraInfo;
 @end
 
 // 短视频草稿：视频转发时构建。
@@ -431,20 +379,13 @@ static NSString *DDMCopyToTemp(NSString *srcPath, NSString *ext) {
     if (realExt.length == 0) realExt = @"jpg";
     NSString *name = [NSString stringWithFormat:@"%@.%@", NSUUID.UUID.UUIDString, realExt];
     NSString *dst = [DDMTempDir() stringByAppendingPathComponent:name];
-    NSError *err = nil;
-    if (![NSFileManager.defaultManager copyItemAtPath:realPath toPath:dst error:&err]) {
-        return nil;
-    }
+    if (![NSFileManager.defaultManager copyItemAtPath:realPath toPath:dst error:NULL]) return nil;
     return dst;
 }
 
-// 仅解析符号链接取真实可读路径，不做复制。
-// 转发静帧只需读一次像素内嵌进 MMImage，无需复制副本；
-// 复制动作（DDMCopyToTemp）留给真正需要持久文件引用的视频链路。
-
 #pragma mark - 媒体路径解析
 
-// 图片优先路径。
+// 图片本地路径（仅用于判断媒体是否已在本地）。
 static NSString *DDMImagePath(WCMediaItem *item) {
     NSMutableArray *cands = [NSMutableArray array];
     [cands addObject:[item pathForData] ?: @""];
@@ -471,8 +412,8 @@ static UIImage *DDMThumbImage(WCMediaItem *item) {
     return p ? [UIImage imageWithContentsOfFile:p] : nil;
 }
 
-// Live Photo 运动视频路径：仅认微信已转码的视频（getFormatVideoPath / getTempVideoPath）。
-// 对齐 PKC：微信原生只认 getFormatVideoPath，失败即丢实况，不做 wxam 转码兜底。
+// Live Photo 运动视频：只认微信已转码产物并拷进临时目录。
+// 微信原生取实况同样只认这两个转码路径，取不到就是没有实况，不做二次转码。
 static NSString *DDMLivePhotoVideoPath(WCMediaItem *live) {
     if (!live) return nil;
     NSString *decoded = DDMFirstUsablePath(@[
@@ -742,7 +683,7 @@ static UIColor *ddm_track_bg(void) {
 // 转发主入口：抓文案 → 清临时目录 → 展示进度 → 备媒体 → 在副本上处理位置 → 按类型分流。
 - (void)forwardDataItem:(WCDataItem *)item hostView:(WCOperateFloatView *)floatView {
     if (!item) return;
-    if (self.busy) { return; }
+    if (self.busy) return;
     self.busy = YES;
 
     // 文案在入口就从原始 item 抓取：此刻它正是用户正在看的那条帖，内容最可靠。
@@ -875,21 +816,17 @@ static UIColor *ddm_track_bg(void) {
     });
 }
 
-// 判断单个视频媒体是否就绪。
+// 视频是否就绪：只认真实存在的视频文件，不看封面图。
 - (BOOL)ddmVideoReady:(WCMediaItem *)m {
     NSString *p = [m getFormatVideoPath];
     if (p && [[NSFileManager defaultManager] fileExistsAtPath:p]) return YES;
     NSString *alt = DDMVideoPath(m);
-    if (alt && DDMFileUsable(alt)) return YES;
-    return [self ddmImageReady:m];
+    return (alt && DDMFileUsable(alt));
 }
 
-// 判断单个图片媒体是否就绪。
-// imageOfSize:2 稳定命中（实测 fromMem 命中率 100%，文件兜底从未触发），无需文件级判断。
+// 图片是否就绪：与取图同源，imageOfSize:2 能拿到内存图即就绪。
 - (BOOL)ddmImageReady:(WCMediaItem *)m {
-    BOOL ready = ([m imageOfSize:2LL] != nil);
-    DDMLog(@"[Ready] image fromMem=%@", ready ? @"Y" : @"N");
-    return ready;
+    return [m imageOfSize:2LL] != nil;
 }
 
 // 下载超时（视频未就绪）时静默中止：收起进度卡并解除占用，不弹提示、不进发布器。
@@ -936,18 +873,14 @@ static UIColor *ddm_track_bg(void) {
 
 #pragma mark 分流
 
-// 按内容类型分流：视频 / 多图 / 纯文字。
+// 按内容类型分流：视频 → 图片 → 纯文字。
 - (void)routeForwardForItem:(WCDataItem *)item host:(UIViewController *)host {
     WCContentItem *content = item.contentObj;
     NSArray *mediaList = content.mediaList;
 
-    BOOL isVideo = item.isVideo;
-    DDMLog(@"[Route] isVideo=%@ mediaCount=%lu", isVideo ? @"Y" : @"N", (unsigned long)mediaList.count);
+    if (item.isVideo) { [self forwardVideoItem:item host:host]; return; }
+    if (mediaList.count > 0) { [self forwardPhotoItem:item host:host]; return; }
 
-    if (isVideo) { DDMLog(@"[Route] -> forwardVideoItem"); [self forwardVideoItem:item host:host]; return; }
-    if (mediaList.count > 0) { DDMLog(@"[Route] -> forwardPhotoItem"); [self forwardPhotoItem:item host:host]; return; }
-
-    DDMLog(@"[Route] -> presentLegacyForward (text/unknown)");
     [self presentLegacyForward:item host:host];
 }
 
@@ -955,35 +888,27 @@ static UIColor *ddm_track_bg(void) {
 
 // 视频转发：取本地路径 → 构建 SightDraft → 唤起发布器。
 - (void)forwardVideoItem:(WCDataItem *)item host:(UIViewController *)host {
-    WCContentItem *content = item.contentObj;
+    // 等待阶段已确认视频已就绪，这里取路径并拷进临时目录。
     WCMediaItem *videoItem = nil;
-    for (WCMediaItem *m in content.mediaList) {
-        NSString *vp = DDMVideoPath(m);
-        if (vp) { videoItem = m; break; }
+    NSString *src = nil;
+    for (WCMediaItem *m in item.contentObj.mediaList) {
+        NSString *p = DDMVideoPath(m);
+        if (p) { videoItem = m; src = p; break; }
     }
-    DDMLog(@"[Video] candidate found=%@ mediaCount=%lu", videoItem?@"Y":@"N", (unsigned long)content.mediaList.count);
-    if (!videoItem) {   // mediaList 内无可解码视频：跳过循环，避免空转 ~2s
-        DDMLog(@"[Video] abort: no video candidate");
+    if (!src) {   // 没有可解码的视频，直接收手
         [self dismissHUD]; self.busy = NO;
         return;
     }
-    NSString *local = nil;
-    int used = 0;   // 实际取到路径时是第几轮（1 = 首轮命中，重试循环未起作用）
-    for (int attempt = 0; attempt < 5 && !local; attempt++) {
-        if (attempt > 0) [NSThread sleepForTimeInterval:0.4];
-        NSString *s = DDMVideoPath(videoItem);
-        if (s && DDMFileUsable(s)) { local = DDMCopyToTemp(s, @"mp4"); used = attempt + 1; }
-    }
-    DDMLog(@"[Video] local=%@ attempts=%d", local?@"Y":@"N", used);
-    [self presentVideoWithLocalPath:local thumb:DDMThumbImage(videoItem) item:item host:host];
+    [self presentVideoWithLocalPath:DDMCopyToTemp(src, @"mp4")
+                              thumb:DDMThumbImage(videoItem)
+                               item:item
+                               host:host];
 }
 
 // 构建 SightDraft 并唤起视频发布器。SightDraft 为微信私有类，运行时取类。
 - (void)presentVideoWithLocalPath:(NSString *)path thumb:(UIImage *)thumb item:(WCDataItem *)item host:(UIViewController *)host {
-    // 路径不可用（超时未取到 / 解析失败）时静默退出，不构建空草稿。
-    if (!path || !DDMFileUsable(path)) { DDMLog(@"[Video] abort: path unusable"); [self dismissHUD]; self.busy = NO; return; }
-    if (!thumb) { DDMLog(@"[Video] thumb missing (fallback to no-thumb draft)"); }
-    else { DDMLog(@"[Video] thumb from DDMThumbImage"); }
+    // 路径不可用（超时未取到）时静默退出，不构建空草稿。
+    if (!path || !DDMFileUsable(path)) { [self dismissHUD]; self.busy = NO; return; }
 
     NSURL *url = [NSURL fileURLWithPath:path];
     Class draftCls = objc_getClass("SightDraft");
@@ -991,76 +916,57 @@ static UIColor *ddm_track_bg(void) {
                               : [draftCls draftWithVideoURL:url];
 
     [self dismissHUD];
-    DDMLog(@"[Video] push SightDraft (hasThumb=%@)", thumb?@"Y":@"N");
-
     [self ddmPushSightCommit:draft item:item host:host];
     self.busy = NO;
 }
 
 #pragma mark 图片 / LivePhoto 链路
 
-// 图片 / Live Photo 转发：构建本地资源 → 组装 MMImage（含 Live Photo 保真）→ 唤起发布器。
+// 图片 / 实况转发：取内存图 → 组装 MMImage → 唤起发布器。
 - (void)forwardPhotoItem:(WCDataItem *)item host:(UIViewController *)host {
     Class localImgCls = objc_getClass("MMAssetForLocalImage");
-
     NSMutableArray *assets = [NSMutableArray array];
-    // 普通照片：不构造 / 不挂载 MMAsset（避免临时文件路径被草稿序列化后读不到 → 重开丢图）；
-    // 实况照片：仍用 MMAssetForLocalImage 携带 livePhotoVideoPath 等运动视频信息。
-    // 取图走微信原生内存图 imageOfSize:2（对齐 PKC block@0x1166fc 恒为 2），稳定命中。
-    // 像素经 ddmMakeMMImage 内嵌进 MMImage，保留草稿重开不丢图；无文件兜底（imageOfSize:2 确定命中）。
 
-    NSInteger idx = 0;
+    // 取图统一走 imageOfSize:2（微信原生取图规格），像素内嵌进 MMImage，
+    // 所以保留草稿再打开也不会丢图。普通照片不挂资源，只有实况才需要带运动视频。
     for (WCMediaItem *m in item.contentObj.mediaList) {
         UIImage *ui = [m imageOfSize:2LL];
-        BOOL fromMem = (ui != nil);
-
         WCMediaItem *live = m.livePhotoMediaItem;
-        NSString *movLocal = (live ? DDMLivePhotoVideoPath(live) : nil);
+        NSString *movLocal = live ? DDMLivePhotoVideoPath(live) : nil;
 
         MMAssetForLocalImage *asset = nil;
-        if (movLocal && localImgCls) {
+        if (movLocal) {
             asset = [[localImgCls alloc] initWithUrl:[NSURL fileURLWithPath:movLocal] IsNeedOrigin:YES];
-            if (!asset) { DDMLog(@"[Live] #%ld asset build FAIL -> degrade to photo", (long)idx); movLocal = nil; }
-            else { asset.localFilePath = movLocal; asset.localAssetId = movLocal; DDMLog(@"[Live] #%ld asset OK video=%@", (long)idx, movLocal); }
+            asset.localFilePath = movLocal;
+            asset.localAssetId  = movLocal;
         }
         MMImage *mm = [self ddmMakeMMImage:ui asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
-        DDMLog(@"[Photo] #%ld fromMem=%@ live=%@ asset=%@ -> MMImage=%@",
-               (long)idx, fromMem?@"Y":@"N", live?@"Y":@"N", asset?@"Y":@"N", mm?@"Y":@"N");
-        idx++;
     }
 
-    DDMLog(@"[Photo] built %lu MMImage(s)", (unsigned long)assets.count);
-    if (assets.count == 0) { DDMLog(@"[Photo] empty -> presentLegacyForward"); [self presentLegacyForward:item host:host]; return; }
+    if (assets.count == 0) { [self presentLegacyForward:item host:host]; return; }
     [self dismissHUD];
     [self ddmPushImageCommit:assets item:item host:host];
     self.busy = NO;
 }
 
-// 构建 MMImage；若为 Live Photo，保真运动视频信息。
+// 构建 MMImage；实况照片额外带上运动视频信息。
 - (MMImage *)ddmMakeMMImage:(UIImage *)ui asset:(id)asset liveVideoPath:(NSString *)movLocal {
-    Class mmImgCls = objc_getClass("MMImage");
     if (!ui) return nil;
-    MMImage *mmImg = (MMImage *)[(MMImage *)[mmImgCls alloc] initWithImage:ui];
+    MMImage *mmImg = (MMImage *)[[objc_getClass("MMImage") alloc] initWithImage:ui];
     if (!mmImg) return nil;
     mmImg.m_asset = asset;
 
     if (movLocal) {
-        // 实况照片保真：标记 isLivePhoto + imageFrom + 运动视频路径与尺寸。
         mmImg.isLivePhoto = YES;
         mmImg.livePhotoVideoPath = movLocal;
         [mmImg setImageFrom:3];
 
+        // ExportedLivePhotoPath 是微信读取实况导出路径的约定 key。
+        // MMImage 没有 setTempExtraInfo:，只能 KVC 写进同名 ivar。
         NSMutableDictionary *extra = [NSMutableDictionary dictionary];
-        [extra setValue:movLocal forKey:@"ExportedLivePhotoPath"];
-        [mmImg setValue:extra forKey:@"tempExtraInfo"];   // MMImage.h 无 setter，KVC 直写 ivar
-
-        // 回读验证 KVC 是否真的写进了 ivar（写入失败会抛 NSUnknownKeyException 直接崩，
-        // 因此能走到这里即命中；hit 用于确认值未被中途重置）。
-        id extraBack = [mmImg tempExtraInfo];
-        BOOL hit = [[extraBack objectForKey:@"ExportedLivePhotoPath"] isEqualToString:movLocal];
-        DDMLog(@"[Live] fidelity mm.isLivePhoto=Y path=%@ extra=%@ hit=%@",
-               movLocal, extra ? @"Y" : @"N", hit ? @"Y" : @"N");
+        extra[@"ExportedLivePhotoPath"] = movLocal;
+        [mmImg setValue:extra forKey:@"tempExtraInfo"];
     }
     return mmImg;
 }
@@ -1130,13 +1036,13 @@ static UIColor *ddm_track_bg(void) {
     [self ddmPresentCommitVC:vc host:host];
 }
 
-// 兜底转发：走微信原生转发界面（纯文字等无媒体场景）。
+// 兜底转发：无媒体（纯文字等）时走微信原生转发界面。
 - (void)presentLegacyForward:(WCDataItem *)item host:(UIViewController *)host {
     [self dismissHUD];
     Class router = objc_getClass("WCTimelineRouterHelper");
     BOOL (*fn)(id, SEL, id, id, id, id) = (BOOL (*)(id, SEL, id, id, id, id))objc_msgSend;
-    if (fn(router, @selector(presentForwardViewController:postReportSession:trashReportData:currentViewController:),
-            item, [self reportSessionFromHost:host], nil, host)) { self.busy = NO; return; }
+    fn(router, @selector(presentForwardViewController:postReportSession:trashReportData:currentViewController:),
+       item, [self reportSessionFromHost:host], nil, host);
     self.busy = NO;
 }
 
@@ -1540,11 +1446,6 @@ static void ddmInjectMarkIntoComment(id c) {
                                        on:cfg.enableVideoProgress]];
     [_tableViewManager addSection:aux];
 
-    WCTableViewSectionManager *logSec = [secMgr sectionWithHeader:@"调试日志"];
-    [logSec addCell:[cellMgr normalCellForSel:@selector(onExportLog) target:self title:@"导出日志（分享 / 隔空投送 / 存文件）"]];
-    [logSec addCell:[cellMgr normalCellForSel:@selector(onClearLog) target:self title:@"清空日志"]];
-    [_tableViewManager addSection:logSec];
-
     [_tableViewManager reloadTableView];
 }
 // 将微信表格 delegate 事件转发给原 delegate，本类只做外观代理。
@@ -1571,38 +1472,6 @@ static void ddmInjectMarkIntoComment(id c) {
 - (void)onDisableVideoAutoPlaySwitch:(UISwitch *)s { DDMConfig.shared.disableVideoAutoPlay = s.isOn; }
 - (void)onDisableVideoTapCloseSwitch:(UISwitch *)s { DDMConfig.shared.disableVideoTapClose = s.isOn; }
 - (void)onEnableVideoProgressSwitch:(UISwitch *)s  { DDMConfig.shared.enableVideoProgress = s.isOn; }
-
-#pragma mark 调试日志操作
-- (void)onExportLog {
-    NSString *p = DDMLogPath();
-    if (![[NSFileManager defaultManager] fileExistsAtPath:p] ||
-        [[NSData dataWithContentsOfFile:p] length] == 0) {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"日志为空"
-                                                                 message:@"还没有任何调试日志。"
-                                                          preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
-        return;
-    }
-    NSURL *url = [NSURL fileURLWithPath:p];
-    UIActivityViewController *avc =
-        [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
-    if ([avc respondsToSelector:@selector(popoverPresentationController)]) {
-        avc.popoverPresentationController.sourceView = self.view;
-        avc.popoverPresentationController.sourceRect =
-            CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height - 40, 1, 1);
-        avc.popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionDown;
-    }
-    [self presentViewController:avc animated:YES completion:nil];
-}
-- (void)onClearLog {
-    DDMLogClear();
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已清空"
-                                                             message:@"调试日志已清空。"
-                                                      preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:a animated:YES completion:nil];
-}
 @end
 
 #pragma mark - 注册入口
