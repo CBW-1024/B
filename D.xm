@@ -968,12 +968,13 @@ static UIColor *ddm_track_bg(void) {
         return;
     }
     NSString *local = nil;
+    int used = 0;   // 实际取到路径时是第几轮（1 = 首轮命中，重试循环未起作用）
     for (int attempt = 0; attempt < 5 && !local; attempt++) {
         if (attempt > 0) [NSThread sleepForTimeInterval:0.4];
         NSString *s = DDMVideoPath(videoItem);
-        if (s && DDMFileUsable(s)) local = DDMCopyToTemp(s, @"mp4");
+        if (s && DDMFileUsable(s)) { local = DDMCopyToTemp(s, @"mp4"); used = attempt + 1; }
     }
-    DDMLog(@"[Video] local after retries=%@", local?@"Y":@"N");
+    DDMLog(@"[Video] local=%@ attempts=%d", local?@"Y":@"N", used);
     [self presentVideoWithLocalPath:local thumb:DDMThumbImage(videoItem) item:item host:host];
 }
 
