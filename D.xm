@@ -1064,14 +1064,6 @@ static UIColor *ddm_track_bg(void) {
 - (MMImage *)ddmMakeMMImage:(UIImage *)ui asset:(id)asset liveVideoPath:(NSString *)movLocal {
     Class mmImgCls = objc_getClass("MMImage");
     if (!ui) return nil;
-    // 图像类型登记（实况资产保真用）：用 UIImage 编码 data 推断 magic number。
-    if (asset) {
-        NSData *raw = UIImageJPEGRepresentation(ui, 1.0);
-        if (raw.length > 0) {
-            long long t = (long long)[asset _getImageTypeFromData:raw];
-            if (t != 0) ((MMAssetForLocalImage *)asset).imageDataType = t;
-        }
-    }
     MMImage *mmImg = (MMImage *)[(MMImage *)[mmImgCls alloc] initWithImage:ui];
     if (!mmImg) return nil;
     mmImg.m_asset = asset;
