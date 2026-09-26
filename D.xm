@@ -200,6 +200,9 @@ static inline id DDMGetFrameFacade(void) {
 @property (nonatomic) BOOL isLivePhoto;
 @property (retain, nonatomic) NSString *livePhotoVideoPath;
 @property (nonatomic) long long imageFrom;
+// 头文件（8.0.79 MMImage.h:53）只有 getter、无 setTempExtraInfo:，故只声明读方法；
+// 写入走 KVC 直写 ivar。
+- (id)tempExtraInfo;
 @end
 
 // 短视频草稿：视频转发时构建。
