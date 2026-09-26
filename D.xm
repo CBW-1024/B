@@ -403,6 +403,16 @@ static NSString *DDMCopyToTemp(NSString *srcPath, NSString *ext) {
     return dst;
 }
 
+// 仅解析符号链接取真实可读路径，不做复制。
+// 转发静帧只需读一次像素内嵌进 MMImage，无需复制副本；
+// 复制动作（DDMCopyToTemp）留给真正需要持久文件引用的视频链路。
+static NSString *DDMResolvedPath(NSString *src) {
+    if (!DDMFileUsable(src)) return nil;
+    NSURL *r = [[NSURL fileURLWithPath:src] URLByResolvingSymlinksInPath];
+    NSString *p = r ? [r path] : src;
+    return (p && DDMFileUsable(p)) ? p : src;
+}
+
 // 取视频首帧作为转发缩略图。
 static UIImage *DDMVideoFirstFrame(NSString *path) {
     if (!DDMFileUsable(path)) return nil;
@@ -1014,26 +1024,33 @@ static UIColor *ddm_track_bg(void) {
     NSMutableArray *assets = [NSMutableArray array];
 
     for (WCMediaItem *m in item.contentObj.mediaList) {
-        NSString *imgSrc = DDMImagePath(m);
-        if (!imgSrc) continue;
-        NSString *imgLocal = DDMCopyToTemp(imgSrc, @"jpg");
-        if (!imgLocal) continue;
+        // 取图：优先微信原生内存图 imageOfSize:2（对齐 PKC block@0x1166fc 三处恒为 2），
+        // nil 再走文件路径读（DDMImagePath 候选 + symlink 解析兜底）。两路都内嵌像素，保留草稿不丢图。
+        UIImage *ui = [m imageOfSize:2LL];
+        if (!ui) {
+            NSString *imgPath = DDMResolvedPath(DDMImagePath(m));
+            if (!imgPath) continue;
+            ui = [UIImage imageWithContentsOfFile:imgPath];
+            if (!ui) continue;
+        }
 
         WCMediaItem *live = m.livePhotoMediaItem;
         NSString *movLocal = (live ? DDMLivePhotoVideoPath(live) : nil);
 
-        NSString *assetPath = movLocal ?: imgLocal;
-        MMAssetForLocalImage *asset = [[localImgCls alloc] initWithUrl:[NSURL fileURLWithPath:assetPath]
-                                                              IsNeedOrigin:YES];
-        if (!asset && movLocal) {
-            assetPath = imgLocal;
-            asset = [[localImgCls alloc] initWithUrl:[NSURL fileURLWithPath:assetPath] IsNeedOrigin:YES];
+        // 普通照片：不构造 / 不挂载 MMAsset。
+        // 原实现把 MMAssetForLocalImage 指向临时目录文件再挂到 MMImage.m_asset，
+        // 微信「保留草稿 → 重开」序列化 m_asset 后会按该路径读文件；临时文件在下次转发
+        // 被 DDMCleanTempDir 清掉、或重启后失效，导致重开丢图。
+        // 改为纯 initWithImage: 把像素直接内嵌进 MMImage，重开从内嵌像素重建，不再依赖外部文件。
+        // 实况照片：仍需 MMAssetForLocalImage 携带 livePhotoVideoPath 等运动视频信息。
+        MMAssetForLocalImage *asset = nil;
+        if (movLocal && localImgCls) {
+            asset = [[localImgCls alloc] initWithUrl:[NSURL fileURLWithPath:movLocal] IsNeedOrigin:YES];
+            if (!asset) { movLocal = nil; }   // 资产构造失败 → 退化普通图（丢实况动效，保住图）
+            else { asset.localFilePath = movLocal; asset.localAssetId = movLocal; }
         }
-        if (!asset) continue;
-        asset.localFilePath = assetPath;
-        asset.localAssetId  = assetPath;
 
-        MMImage *mm = [self ddmMakeMMImage:imgLocal asset:asset liveVideoPath:movLocal];
+        MMImage *mm = [self ddmMakeMMImage:ui asset:asset liveVideoPath:movLocal];
         if (mm) [assets addObject:mm];
     }
 
@@ -1044,15 +1061,18 @@ static UIColor *ddm_track_bg(void) {
 }
 
 // 构建 MMImage；若为 Live Photo，保真运动视频信息。
-- (MMImage *)ddmMakeMMImage:(NSString *)imgLocal asset:(id)asset liveVideoPath:(NSString *)movLocal {
+- (MMImage *)ddmMakeMMImage:(UIImage *)ui asset:(id)asset liveVideoPath:(NSString *)movLocal {
     Class mmImgCls = objc_getClass("MMImage");
-    NSData *raw = [NSData dataWithContentsOfFile:imgLocal options:NSDataReadingMappedIfSafe error:nil];
-    if (raw.length > 0) {
-        long long t = (long long)[asset _getImageTypeFromData:raw];
-        if (t != 0) ((MMAssetForLocalImage *)asset).imageDataType = t;
+    if (!ui) return nil;
+    // 图像类型登记（实况资产保真用）：用 UIImage 编码 data 推断 magic number。
+    if (asset) {
+        NSData *raw = UIImageJPEGRepresentation(ui, 1.0);
+        if (raw.length > 0) {
+            long long t = (long long)[asset _getImageTypeFromData:raw];
+            if (t != 0) ((MMAssetForLocalImage *)asset).imageDataType = t;
+        }
     }
-    UIImage *ui = [UIImage imageWithContentsOfFile:imgLocal];
-    MMImage *mmImg = ui ? (MMImage *)[(MMImage *)[mmImgCls alloc] initWithImage:ui] : [[mmImgCls alloc] init];
+    MMImage *mmImg = (MMImage *)[(MMImage *)[mmImgCls alloc] initWithImage:ui];
     if (!mmImg) return nil;
     mmImg.m_asset = asset;
 
