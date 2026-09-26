@@ -1789,6 +1789,78 @@ static void ddmInjectMarkIntoComment(id c) {
 }
 @end
 
+#pragma mark - 草稿存 / 取 埋点（定位“保留后丢实况”）
+
+// 锚定方法签名：wechat_8079/WCTimelineEnhanceDraftController.h
+//   -(BOOL) setDraftImages:(id) needCopyImageToFile:(BOOL);
+//   -(id)   draftImages;
+//   -(BOOL) copyImageAtAlbumToFile:(id);
+// 仅打印日志，不改任何逻辑；Logos 在运行时按 selector 挂钩，方法不存在也不会崩溃。
+// 关键：draftImages getter 在重开草稿时被微信调用以重建发布器，抓它即可看到“保留后”
+// 读回来的实况视频路径是否还在、是否退化成普通图。
+%hook WCTimelineEnhanceDraftController
+
+// 草稿落库：写入图片数组时记录每张实况状态 + 返回值。
+- (BOOL)setDraftImages:(id)images needCopyImageToFile:(BOOL)needCopy {
+    DDMLog(@"[DraftSave] setDraftImages count=%lu needCopy=%@",
+           (unsigned long)([images isKindOfClass:[NSArray class]] ? [images count] : 0),
+           needCopy ? @"Y" : @"N");
+    if ([images isKindOfClass:[NSArray class]]) {
+        for (id img in images) {
+            if ([img isKindOfClass:[MMImage class]]) {
+                MMImage *mm = (MMImage *)img;
+                NSString *vp = mm.livePhotoVideoPath;
+                MMAsset *a = mm.m_asset;
+                BOOL vpOk = (vp && [[NSFileManager defaultManager] fileExistsAtPath:vp]);
+                DDMLog(@"[DraftSave]   live=%@ vp=%@ vpExists=%@ asset=%@ assetVp=%@ clsName=%@",
+                       mm.isLivePhoto ? @"Y" : @"N",
+                       vp ? vp : @"(null)",
+                       vpOk ? @"Y" : @"N",
+                       a ? @"Y" : @"N",
+                       (a && a.m_livePhotoVideoPath) ? a.m_livePhotoVideoPath : @"-",
+                       mm.m_assetClassNameStr ? mm.m_assetClassNameStr : @"(unset)");
+            }
+        }
+    }
+    BOOL r = %orig;
+    DDMLog(@"[DraftSave] -> %@", r ? @"YES" : @"NO");
+    return r;
+}
+
+// 草稿读出：重开时微信取回图片数组，记录每张实况是否还在、视频文件是否仍可访问。
+- (id)draftImages {
+    id images = %orig;
+    DDMLog(@"[DraftLoad] draftImages count=%lu",
+           (unsigned long)([images isKindOfClass:[NSArray class]] ? [images count] : 0));
+    if ([images isKindOfClass:[NSArray class]]) {
+        for (id img in images) {
+            if ([img isKindOfClass:[MMImage class]]) {
+                MMImage *mm = (MMImage *)img;
+                NSString *vp = mm.livePhotoVideoPath;
+                BOOL vpOk = (vp && [[NSFileManager defaultManager] fileExistsAtPath:vp]);
+                DDMLog(@"[DraftLoad]   live=%@ vp=%@ vpExists=%@ asset=%@ clsName=%@",
+                       mm.isLivePhoto ? @"Y" : @"N",
+                       vp ? vp : @"(null)",
+                       vpOk ? @"Y" : @"N",
+                       mm.m_asset ? @"Y" : @"N",
+                       mm.m_assetClassNameStr ? mm.m_assetClassNameStr : @"(unset)");
+            }
+        }
+    }
+    return images;
+}
+
+// 逐资产拷进草稿目录：记录入口与结果（目标文件是否落盘由 setDraftImages 的 vpExists 侧证）。
+- (BOOL)copyImageAtAlbumToFile:(id)arg {
+    DDMLog(@"[DraftCopy] copyImageAtAlbumToFile enter argClass=%@",
+           arg ? NSStringFromClass([arg class]) : @"(null)");
+    BOOL r = %orig;
+    DDMLog(@"[DraftCopy] -> %@", r ? @"YES" : @"NO");
+    return r;
+}
+
+%end
+
 #pragma mark - 注册入口
 
 // 将设置页注册到插件管理（依赖第三方 WCPluginsMgr，做存在性守卫避免启动崩溃）。
