@@ -448,25 +448,6 @@ static NSString *DDMCopyToTemp(NSString *srcPath, NSString *ext) {
 // 仅解析符号链接取真实可读路径，不做复制。
 // 转发静帧只需读一次像素内嵌进 MMImage，无需复制副本；
 // 复制动作（DDMCopyToTemp）留给真正需要持久文件引用的视频链路。
-static NSString *DDMResolvedPath(NSString *src) {
-    if (!DDMFileUsable(src)) return nil;
-    NSURL *r = [[NSURL fileURLWithPath:src] URLByResolvingSymlinksInPath];
-    NSString *p = r ? [r path] : src;
-    return (p && DDMFileUsable(p)) ? p : src;
-}
-
-// 取视频首帧作为转发缩略图。
-static UIImage *DDMVideoFirstFrame(NSString *path) {
-    if (!DDMFileUsable(path)) return nil;
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-    AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
-    gen.appliesPreferredTrackTransform = YES;
-    CGImageRef ref = [gen copyCGImageAtTime:CMTimeMake(0, 600) actualTime:NULL error:NULL];
-    if (!ref) return nil;
-    UIImage *img = [UIImage imageWithCGImage:ref];
-    CGImageRelease(ref);
-    return img;
-}
 
 #pragma mark - 媒体路径解析
 
@@ -988,6 +969,11 @@ static UIColor *ddm_track_bg(void) {
         if (vp) { videoItem = m; break; }
     }
     DDMLog(@"[Video] candidate found=%@ mediaCount=%lu", videoItem?@"Y":@"N", (unsigned long)content.mediaList.count);
+    if (!videoItem) {   // mediaList 内无可解码视频：跳过循环，避免空转 ~2s
+        DDMLog(@"[Video] abort: no video candidate");
+        [self dismissHUD]; self.busy = NO;
+        return;
+    }
     NSString *local = nil;
     for (int attempt = 0; attempt < 5 && !local; attempt++) {
         if (attempt > 0) [NSThread sleepForTimeInterval:0.4];
@@ -1002,7 +988,7 @@ static UIColor *ddm_track_bg(void) {
 - (void)presentVideoWithLocalPath:(NSString *)path thumb:(UIImage *)thumb item:(WCDataItem *)item host:(UIViewController *)host {
     // 路径不可用（超时未取到 / 解析失败）时静默退出，不构建空草稿。
     if (!path || !DDMFileUsable(path)) { DDMLog(@"[Video] abort: path unusable"); [self dismissHUD]; self.busy = NO; return; }
-    if (!thumb) { thumb = DDMVideoFirstFrame(path); DDMLog(@"[Video] thumb from firstFrame"); }
+    if (!thumb) { DDMLog(@"[Video] thumb missing (fallback to no-thumb draft)"); }
     else { DDMLog(@"[Video] thumb from DDMThumbImage"); }
 
     NSURL *url = [NSURL fileURLWithPath:path];
@@ -1026,18 +1012,13 @@ static UIColor *ddm_track_bg(void) {
     NSMutableArray *assets = [NSMutableArray array];
     // 普通照片：不构造 / 不挂载 MMAsset（避免临时文件路径被草稿序列化后读不到 → 重开丢图）；
     // 实况照片：仍用 MMAssetForLocalImage 携带 livePhotoVideoPath 等运动视频信息。
-    // 取图优先微信原生内存图 imageOfSize:2（对齐 PKC block@0x1166fc 恒为 2），nil 再走文件路径读。
+    // 取图走微信原生内存图 imageOfSize:2（对齐 PKC block@0x1166fc 恒为 2），稳定命中。
+    // 像素经 ddmMakeMMImage 内嵌进 MMImage，保留草稿重开不丢图；无文件兜底（imageOfSize:2 确定命中）。
 
     NSInteger idx = 0;
     for (WCMediaItem *m in item.contentObj.mediaList) {
         UIImage *ui = [m imageOfSize:2LL];
         BOOL fromMem = (ui != nil);
-        if (!ui) {
-            NSString *imgPath = DDMResolvedPath(DDMImagePath(m));
-            if (!imgPath) { DDMLog(@"[Photo] #%ld skip: no image path", (long)idx); idx++; continue; }
-            ui = [UIImage imageWithContentsOfFile:imgPath];
-            if (!ui) { DDMLog(@"[Photo] #%ld skip: read fail", (long)idx); idx++; continue; }
-        }
 
         WCMediaItem *live = m.livePhotoMediaItem;
         NSString *movLocal = (live ? DDMLivePhotoVideoPath(live) : nil);
