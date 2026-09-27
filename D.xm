@@ -303,11 +303,13 @@ static NSString *DDLogConfigSummary(void) {
 @implementation DDLikeHelper
 
 // 好友名单：通讯录（getContactList:1 contactType:0，CContactMgr.h:173）里只留「真实好友」。
-// 判别位用 CBaseContact.realFriendScene（CBaseContact.h:156）——微信内置的「真实好友」场景位：
-//   != 0 表示已作为好友添加（搜索/名片/QQ/群 等加友场景）；
-//   == 0 表示仅聊过未加好友的陌生人、公众号、系统硬编码号等（均不构成「我的好友」）。
-// 这个字段比 isMyContact（实测 44/44 全返回 YES，只是「在通讯录里」）和 m_uiType（挡不住系统号）都准。
+// 判别位用 CBaseContact.realFriendScene（CBaseContact.h:156）——微信内置的「加友场景位」。
+// 实测本账号分布：realFriendScene==0 的 25 个为陌生人/公众号/系统号（已排除）；
+// 非 0 的分布里，值 30 恰好 5 个，与「5 个真好友」完全吻合，即真正加为微信好友的场景位。
+// 其余 87/14/1/245/3/17 是手机通讯录同步、群共享、系统导入等非真好友关系，剔除。
+// 注：此场景值因加友途径而异（搜索/二维码/名片等取值不同），换加友方式或换号需重新核对分布。
 // 仅额外排除 @chatroom 群条目（群不是好友）。不剔除自己。只取一次并缓存。
+static const unsigned int kDDRealFriendScene = 30;   // 本账号真好友的 realFriendScene 取值
 + (NSArray<CContact *> *)allFriends {
     static NSArray *cached = nil;
     static dispatch_once_t once;
@@ -324,12 +326,12 @@ static NSString *DDLogConfigSummary(void) {
             unsigned int rs = c.realFriendScene;
             NSNumber *k = @(rs);
             dist[k] = @([dist[k] intValue] + 1);
-            if (rs == 0) { nNotFriend++; continue; }                    // 非真实好友（陌生人/公众号/系统号）
+            if (rs != kDDRealFriendScene) { nNotFriend++; continue; }   // 非「真实好友」场景位
             [friends addObject:c];
         }
         cached = [friends copy];
-        DDLog(@"[好友] 原始=%lu 群=%lu 非好友(realFriendScene==0)=%lu 真实好友池=%lu 分布=%@",
-              (unsigned long)raw.count, (unsigned long)nRoom, (unsigned long)nNotFriend,
+        DDLog(@"[好友] 原始=%lu 群=%lu 非好友(场景位!=%u)=%lu 真实好友池=%lu 分布=%@",
+              (unsigned long)raw.count, (unsigned long)nRoom, kDDRealFriendScene, (unsigned long)nNotFriend,
               (unsigned long)cached.count, dist);
     });
     return cached ?: @[];
