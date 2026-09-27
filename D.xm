@@ -12,32 +12,38 @@
 //   再次长按同一条 → 按快照恢复原样（取消集赞）并同样重绘。
 //   全程同步，不拦原生回调、不等服务器返回（本地伪装用不上）。
 //
-// 刷新方式（实测修正过两版，下面是最终版与两次踩坑的证据）：
-//   改完 item → 定位时间线主表 → reloadData。
-//   优先级：① 主表 reloadData ② VC reloadTableView ③ VC reloadTableData。
+// 刷新方式（实测修正过三版，第四版按锤子 dylib 的反汇编结论重写）：
+//   改完 item → [WCTimelineMgr modifyDataItem:item notify:YES]（微信官方刷新通道）。
 //
-//   第一版：单行 reloadRowsAtIndexPaths —— 「本来就有赞」的帖子加了伪赞画面不变，
-//           要再手动刷一次。原因：单行重绘绕不开点赞区那层布局缓存。
-//   第二版：照抄成品把 reloadTableView 排第一 —— 实测同样无效：
+//   第一版：单行 reloadRowsAtIndexPaths —— 「本来就有赞」的帖子加了伪赞画面不变。
+//   第二版：reloadTableView 排第一 —— 实测无效：
 //           00:33:54.374 [刷新] 整表重绘 出口=reloadTableView（耗时 105ms，确实执行了）
 //           之后 11 秒没有任何 [单元格] 重建 → 8.0.79 上它并不触发
 //           tableView:cellForRowAtIndexPath:。
-//   真正让画面变的是同一份日志的第 16 行：11 秒后微信自己的 [刷新回调] 重写=1，
-//   它一过伪赞就出来了 —— 说明只要有一次真正的 reloadData，画面立刻正确。
+//   第三版：主表 reloadData 排第一 —— 仍未验证通过（用户反馈「还是一样的问题」）。
+//   第四版（本版）：整份 WeChatTweak.dylib（锤子）反汇编后的结论 ——
+//     锤子全文 0 处 reloadData / 0 处 reloadTableView / 0 处 reloadRows，
+//     它自己一行刷新代码都没写。它把所有「微信拿 item 的出口」都 hook 了一遍，
+//     在出口上按 tid 从记忆表补灌伪赞，刷新则一律交给微信的 modifyDataItem:notify:：
+//       WCTimelineMgr -[modifyDataItem:notify:]           hook IMP 0x7b5a08（%orig 前补灌）
+//       WCFacade      -[getTimelineDataInCacheByItemID:]  hook IMP 0x7b5574（%orig 后补灌）
+//       WCFacade      -[getTimelineDataItemOfIndex:]      hook IMP 0x7b56b4（%orig 后补灌）
+//     其长按流程末尾唯一的刷新调用：0x7b61b8（x0=WCTimelineMgr、x2=item、w3=1）。
+//     → 即时生效的关键不是「我们自己把画面刷出来」，而是「让微信自己的刷新管线
+//       拿到的就是伪造后的 item」—— 那条管线会连带失效点赞区的布局缓存，
+//       而自己 reloadData 只重走 cellForRow，绕不过那层缓存。这也解释了为什么
+//       手动下拉刷新（走完整管线）一过伪赞就出来。
 //
 // 三个坑（都是真机踩出来的）：
-//   - 刷新必须落到「主表 reloadData」，见上面三版对比。成品的
-//     _WCRefineReloadMomentsViewControllerAfterFakeEngagement（WCRefine.dylib IMP 0x55d5d4）
-//     与本插件结构一致：改完 item 只做一次重绘，VC 级出口是它的备选；
-//     锤子 WeChatTweak.dylib 的 reloadTableData（IMP 0x718294）也是
-//     → tableViewMgr → tableView → reloadData。两者都全程没有
-//     modifyDataItem:notify:，也没碰过 cpKeyForLikeUsers
-//     （WCRefine 的 25228 条 selrefs 里搜不到 cpKey 字样）。
+//   - 别自己 reloadData 当主通道（上面三版全栽在这）。主通道必须走
+//     modifyDataItem:notify:，并在其 hook 里 %orig 前补灌（锤子 0x7b5a08 同款）。
+//     注：此前「成品插件不用 modifyDataItem」的判断是错的 —— 那是只看了
+//     WCRefine.dylib 的结论；锤子（WeChatTweak.dylib）用的正是它。
 //   - 微信的后台轮询会重建 item、冲掉内存改动，
-//     所以 commonProcessDataAfterUpdate: 里回填完必须自己补一次重绘
+//     所以 commonProcessDataAfterUpdate: 里回填完还要再推一次刷新
 //     （否则就是「数据对了、画面不动」）。
 //   - cpKeyForLikeUsers 是点赞区的布局缓存键，置 nil 属于双保险；
-//     成品不碰它（它们靠重绘兜底），保留不影响正确性。
+//     锤子不碰它（它靠 modifyDataItem 让微信自己失效），保留不影响正确性。
 //   - 下拉刷新 / 翻页会重建 WCDataItem 对象，内存改动全丢，
 //     故把伪造状态按 tid 记在 gDDLFaked 里，再于
 //     WCTimelineMgr.commonProcessDataAfterUpdate: 里按 tid 重新伪造。
@@ -153,6 +159,8 @@ static inline id DDLContactMgr(void) {
 // 正路是经 WCFacade 取（WCFacade.h:198 getTimelineMgr / :240 timelineMgr）。
 @interface WCFacade : NSObject
 - (id)getTimelineMgr;                                    // WCFacade.h:198
+- (id)getTimelineDataInCacheByItemID:(id)itemID;         // WCFacade.h:195 按 tid 从缓存取 item
+- (id)getTimelineDataItemOfIndex:(long long)index;       // WCFacade.h:197 按行号取 item
 @end
 
 static inline id DDLTimelineMgr(void) {
@@ -512,14 +520,57 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
         item.likeCount = (int)likes.count;
     }
     // cpKey 是微信点赞区的布局缓存键。置 nil 让其下次重算 —— 这是双保险，
-    // 真正把画面刷出来的是随后的整表重绘（成品插件不碰 cpKey，只靠重绘，
-    // 见文件头注释里 WCRefine Apply 的消息序列：末尾四个 set 之后没有任何 cpKey 操作）。
+    // 真正把画面刷出来的是随后的 modifyDataItem:notify:（锤子全程不碰 cpKey，
+    // 只把刷新交给微信官方通道；其 ApplyFake 的末尾四个 set 之后没有任何 cpKey 操作）。
     item.cpKeyForLikeUsers = nil;
     // 幂等标记：同一 item 实例已伪装且一致时，刷新回调可跳过重写（省一次回填 + 日志）。
     objc_setAssociatedObject(item, kDDLFakedMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-// 刷新统一走 DDLReloadTimelineFrom()（定位主表 → reloadData）。
+// ============================================================================
+// 按 tid 把「已生成的固定伪造内容」补灌回任意一个 WCDataItem。
+//
+// 这一层是照锤子（WeChatTweak.dylib）抄的，反汇编证据如下（三处实现完全同构，
+// 都是「取 tid → 查记忆表 → setLikeUsers: → count → setLikeCount:」）：
+//   WCTimelineMgr  -[modifyDataItem:notify:]           hook IMP 0x7b5a08（%orig 前补灌）
+//   WCFacade       -[getTimelineDataInCacheByItemID:]  hook IMP 0x7b5574（%orig 后补灌）
+//   WCFacade       -[getTimelineDataItemOfIndex:]      hook IMP 0x7b56b4（%orig 后补灌）
+// 锤子 dylib 全文 0 处 reloadData / 0 处 reloadTableView / 0 处 reloadRows /
+// 0 处 cellForRow —— 它自己一行刷新代码都没写，刷新完全交给微信的
+// modifyDataItem:notify:（其长按流程末尾唯一的一条刷新调用，
+// WeChatTweak.dylib:0x7b61b8，x0=WCTimelineMgr、x2=item、w3=1）。
+//
+// 结论：即时生效的关键不是「我们自己把画面刷出来」，而是
+// 「让微信自己的刷新管线拿到的就是伪造后的 item」。微信那条管线会连带
+// invalidate 点赞区的布局缓存 —— 而我们自己 reloadData 只重走 cellForRow，
+// 绕不过那层缓存，所以怎么刷都不动，只有手动下拉（走完整管线）才出来。
+// ============================================================================
+static void DDLReapply(NSString *tag, id item) {
+    if (!item || ![item respondsToSelector:@selector(tid)]) return;
+    NSString *tid = [(WCDataItem *)item tid];
+    if (!tid) return;
+    NSDictionary *snap = gDDLFaked()[tid];
+    if (!snap) return;
+
+    WCDataItem *di = (WCDataItem *)item;
+    NSArray *likes = snap[@"likes"], *comments = snap[@"comments"];
+    if (likes.count)    { di.likeUsers    = [likes mutableCopy];    di.likeCount    = (int)likes.count; }
+    if (comments.count) { di.commentUsers = [comments mutableCopy]; di.commentCount = (int)comments.count; }
+    di.likeFlag = YES;
+    di.cpKeyForLikeUsers = nil;
+
+    // 这两个出口调用极频繁（滚动时每取一个 item 一次），日志按 tid 去重，只打首条。
+    static NSMutableSet *seen = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
+    if (![seen containsObject:tid]) {
+        [seen addObject:tid];
+        DDLog(@"[补灌] 出口=%@ tid=%@ 赞=%lu 评论=%lu", tag, tid,
+              (unsigned long)likes.count, (unsigned long)comments.count);
+    }
+}
+
+// 刷新走 DDLReloadTimelineFrom()（定位主表 → reloadData），仅作保底。
 // 上一版照抄成品的优先级链，把 reloadTableView 排在第一位，实测踩坑：
 //   00:33:54.374 [刷新] 整表重绘 出口=reloadTableView   ← 确实执行了（耗时 105ms）
 //   之后 11 秒都没有一条 [单元格] 重建
@@ -789,22 +840,22 @@ static NSString *DDLTidOfCell(id cell) {
         DDLog(@"[长按] 开启集赞 tid=%@（记忆 %lu 条）", tid, (unsigned long)faked.count);
     }
 
-    // 只刷一次：对时间线做整表重绘。
-    // 原来这里是「modifyDataItem:notify: + reloadRows 单行」两套叠加：
-    //   - modifyDataItem 会触发一条异步管线，几秒后拿服务端数据重建 WCDataItem
-    //     （日志里那条延迟 5.6 秒的 [刷新回调] 重写=1 就是它），既慢又能把我们刚写的
-    //     内存改动冲掉 —— 「要再手动刷一次才出伪赞」的元凶之一；
-    //   - reloadRows 只重绘该行单元格，绕不过点赞区那层带 cpKey 的布局缓存。
-    // 成品插件两条都不用：改完 item 直接找到时间线 VC 走一次重绘。
-    // 定位不到 VC 时才退回 modifyDataItem:notify:（旧的保底路径）。
-    BOOL didReload = [self ddl_reloadTimelineForItem:item];
-    if (!didReload) {
-        id mgr = DDLTimelineMgr();
-        if (mgr) {
-            [mgr modifyDataItem:item notify:YES];
-            DDLog(@"[刷新] 定位失败 → 退回 modifyDataItem:notify:（原生通知，需等其异步回调）");
-        } else {
-            DDLog(@"[刷新] ⚠时间线 VC 与 WCTimelineMgr 都没取到，本次不会自动刷新");
+    // 刷新主通道：微信官方的 modifyDataItem:notify:（WCTimelineMgr.h:71）。
+    // 锤子长按流程里唯一的刷新调用就是它（WeChatTweak.dylib:0x7b61b8，
+    // x0=WCTimelineMgr、x2=item、w3=1），自身 0 处 reloadData/reloadTableView。
+    // 它走的是微信完整管线 —— 会连带失效点赞区那层布局缓存，
+    // 这正是我们自己 reloadData（只重走 cellForRow）绕不过去的东西。
+    // 上面 %hook WCTimelineMgr 的 modifyDataItem:notify: 会在 %orig 前再补灌一次。
+    id mgr = DDLTimelineMgr();
+    if (mgr) {
+        [mgr modifyDataItem:item notify:YES];
+        DDLog(@"[刷新] modifyDataItem:notify:YES tid=%@（微信官方刷新通道，锤子同款）", tid);
+        DDLProbeOpen();                       // 开 3 秒探活，看这次刷新有没有到 cellForRow
+        DDLCheckVisible(tid);                 // 0.3 秒后体检：命中 cell 的赞/评论条数
+    } else {
+        // 取不到 WCTimelineMgr 才退回主表 reloadData —— 锤子没有这条，留着防万一。
+        if (![self ddl_reloadTimelineForItem:item]) {
+            DDLog(@"[刷新] ⚠WCTimelineMgr 与时间线主表都没取到，本次不会自动刷新");
         }
     }
 
@@ -812,11 +863,12 @@ static NSString *DDLTidOfCell(id cell) {
 }
 
 %new
-// 改完 item 之后的唯一刷新出口。实际工作都交给 DDLReloadTimelineFrom()，
+// 保底刷新出口：只在 WCTimelineMgr 取不到时才用（锤子没有这条）。
+// 实际工作都交给 DDLReloadTimelineFrom()（定位主表 → reloadData），
 // 本方法只负责定位（从浮窗出发）和刷新后的体检。
 //
-// 为什么不是单行 reloadRows：单行重绘绕不开点赞区那层布局缓存，
-// 「本来就有赞」的帖子加了伪赞也看不出来。
+// 为什么它当不了主通道：自己 reloadData 只重走 cellForRow，绕不开点赞区那层
+// 布局缓存 —— 前三版全栽在这里。主通道是 modifyDataItem:notify:。
 - (BOOL)ddl_reloadTimelineForItem:(id)item {
     NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
     DDLog(@"[刷新] 定位开始 tid=%@ 起点=%@ nav=%@", tid, NSStringFromClass([self class]),
@@ -853,7 +905,35 @@ static NSString *DDLTidOfCell(id cell) {
 }
 %end
 
+%hook WCFacade
+
+// 微信取朋友圈 item 的两个出口（WCFacade.h:195 / :197）。锤子两个都 hook 了
+// （IMP 0x7b5574 / 0x7b56b4），%orig 之后按 tid 补灌 —— 这样无论微信从哪里
+// 把 item 取出来（缓存、行号、翻页重建），拿到的都是带伪赞的版本。
+- (id)getTimelineDataInCacheByItemID:(id)itemID {
+    id item = %orig(itemID);
+    DDLReapply(@"cacheByItemID", item);
+    return item;
+}
+
+- (id)getTimelineDataItemOfIndex:(long long)index {
+    id item = %orig(index);
+    DDLReapply(@"itemOfIndex", item);
+    return item;
+}
+
+%end
+
 %hook WCTimelineMgr
+
+// 微信官方的「数据项已变更」出口（WCTimelineMgr.h:71）。锤子 hook 的正是这里
+// （WeChatTweak.dylib IMP 0x7b5a08）：在 %orig 之前按 tid 补灌伪赞，
+// 让微信后续那条刷新管线（含点赞区布局缓存的失效）拿到的就是伪造后的 item。
+// 我们长按改完数据后主动调它一次，等同于走了一条完整的「下拉刷新」。
+- (void)modifyDataItem:(id)item notify:(BOOL)notify {
+    DDLReapply(@"modifyDataItem", item);
+    %orig(item, notify);
+}
 
 // 数据更新后的统一出口（WCTimelineMgr.h:59）。下拉刷新 / 翻页会重建 item 对象，
 // 内存里的伪造数据被冲掉，故在这里对「已集赞」的帖子按 tid 重新伪造。
@@ -898,19 +978,21 @@ static NSString *DDLTidOfCell(id cell) {
     %orig(datas, adItems, t);
 
     // 微信的后台轮询会重建 item、冲掉内存改动（日志里 11 秒后那条 [刷新回调] 重写=1 就是）。
-    // 上面回填完必须自己再补一次重绘，否则数据对了画面也不动
-    // —— 这正是「要再手动刷一次才出伪赞」的成因：手动下拉刷新会走一次 reloadData。
+    // 回填完再走一次官方刷新通道把画面推出来。
+    // 注：锤子在这一步不做任何刷新（它靠上面那批「取 item 出口」hook 保证微信
+    // 取到的永远是伪数据）；我们多走一次，是为了兜住 8.0.79 上
+    // commonProcessDataAfterUpdate 自身不触发重绘的情况。
     if (hit > 0 && isArray) {
-        NSString *firstTid = nil;
+        id firstItem = nil;
         for (id obj in (NSArray *)datas) {
             if (![obj isKindOfClass:objc_getClass("WCDataItem")]) continue;
             if (![obj respondsToSelector:@selector(tid)]) continue;
             NSString *tid = [obj tid];
-            if (tid && faked[tid]) { firstTid = tid; break; }
+            if (tid && faked[tid]) { firstItem = obj; break; }
         }
-        if (firstTid) {
-            DDLReloadTimelineFrom(DDLKeyWindow(), firstTid);
-            DDLCheckVisible(firstTid);
+        if (firstItem) {
+            [self modifyDataItem:firstItem notify:YES];
+            DDLCheckVisible([(WCDataItem *)firstItem tid]);
         }
     }
 }
