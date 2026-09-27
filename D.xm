@@ -190,6 +190,8 @@ static inline id DDLTimelineMgr(void) {
 @interface WCDataItem : NSObject
 @property (retain, nonatomic) NSMutableArray *likeUsers;      // WCDataItem.h:248
 @property (nonatomic) int likeCount;                          // WCDataItem.h:303
+@property (nonatomic) int realLikeCount;                      // WCDataItem.h:305 ← 真·渲染用计数，见 DDLFakeInto 注释
+@property (nonatomic) int selfLikeCount;                      // WCDataItem.h:307 我自己点的赞（0/1）
 @property (retain, nonatomic) NSMutableArray *commentUsers;   // WCDataItem.h:212
 @property (nonatomic) int commentCount;                       // WCDataItem.h:296
 @property (nonatomic) BOOL likeFlag;                          // WCDataItem.h:190
@@ -208,7 +210,9 @@ static inline id DDLTimelineMgr(void) {
 @interface WCTimeLineViewController : NSObject
 - (id)getContentTableView;                 // WCTimeLineViewController.h:105 时间线主表（UITableView 子类）
 - (id)indexPathOfDataItem:(id)item;        // WCTimeLineViewController.h:116 给定 item → 其 indexPath
-- (void)reloadTableView;                   // WCTimeLineViewController.h:474 整表重绘（首选刷新出口）
+- (void)reloadTableView;                   // WCTimeLineViewController.h:474 整表重绘
+- (void)onActionClearCellCacheAndRefreshCellView:(id)arg1;  // :289 清 cell 缓存 + 刷新 cell 视图
+- (void)onUpdateDataItem:(id)item oldHeight:(double)oh newHeight:(double)nh;  // :424 改完 item 后的单行重排
 @end
 
 #pragma mark - 配置
@@ -487,8 +491,10 @@ static NSMutableDictionary *gDDLFaked(void) {
 // 备份 / 恢复原始数据。
 static NSDictionary *DDLSnapshotOf(WCDataItem *item) {
     return @{
-        @"likeUsers":    item.likeUsers    ?: @[],
-        @"likeCount":    @(item.likeCount),
+        @"likeUsers":     item.likeUsers    ?: @[],
+        @"likeCount":     @(item.likeCount),
+        @"realLikeCount": @(item.realLikeCount),   // 「只有原本带赞的才失效」的根因字段
+        @"selfLikeCount": @(item.selfLikeCount),
         @"commentUsers": item.commentUsers ?: @[],
         @"commentCount": @(item.commentCount),
         @"likeFlag":     @(item.likeFlag),
@@ -497,8 +503,10 @@ static NSDictionary *DDLSnapshotOf(WCDataItem *item) {
 
 static void DDLRestore(WCDataItem *item, NSDictionary *snap) {
     NSDictionary *o = snap[@"orig"];
-    item.likeUsers    = [o[@"likeUsers"] mutableCopy];
-    item.likeCount    = [o[@"likeCount"] intValue];
+    item.likeUsers     = [o[@"likeUsers"] mutableCopy];
+    item.likeCount     = [o[@"likeCount"] intValue];
+    item.realLikeCount = [o[@"realLikeCount"] intValue];
+    item.selfLikeCount = [o[@"selfLikeCount"] intValue];
     item.commentUsers = [o[@"commentUsers"] mutableCopy];
     item.commentCount = [o[@"commentCount"] intValue];
     item.likeFlag     = [o[@"likeFlag"] boolValue];
@@ -518,6 +526,14 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
     if (likes.count) {
         item.likeUsers = [likes mutableCopy];
         item.likeCount = (int)likes.count;
+        // ★ 关键修复：realLikeCount（WCDataItem.h:305）必须一起改。
+        //   8.0.79 的点赞区渲染取的是它，不是 likeCount：
+        //     - 原本没赞：realLikeCount 本来就是 0，改 likeCount 就够 → 一直正常；
+        //     - 原本带赞：realLikeCount 还是旧值（如 2），likeCount 已改成 6，
+        //       画面按 realLikeCount 渲染 → 看着「完全没变」，只有下拉刷新重建
+        //       item 后才对得上（那时微信会自己重新同步这两个计数）。
+        //   这就是「只有原本带赞的帖子才要手动刷一次」的根因。
+        item.realLikeCount = (int)likes.count;
     }
     // cpKey 是微信点赞区的布局缓存键。置 nil 让其下次重算 —— 这是双保险，
     // 真正把画面刷出来的是随后的 modifyDataItem:notify:（锤子全程不碰 cpKey，
@@ -552,12 +568,9 @@ static void DDLReapply(NSString *tag, id item) {
     NSDictionary *snap = gDDLFaked()[tid];
     if (!snap) return;
 
-    WCDataItem *di = (WCDataItem *)item;
-    NSArray *likes = snap[@"likes"], *comments = snap[@"comments"];
-    if (likes.count)    { di.likeUsers    = [likes mutableCopy];    di.likeCount    = (int)likes.count; }
-    if (comments.count) { di.commentUsers = [comments mutableCopy]; di.commentCount = (int)comments.count; }
-    di.likeFlag = YES;
-    di.cpKeyForLikeUsers = nil;
+    // 复用 DDLFakeInto，保证「长按首次写入」与「各出口补灌」用的是同一套字段，
+    // 不会再出现一边改了 realLikeCount、另一边漏改的漂移。
+    DDLFakeInto((WCDataItem *)item, snap[@"likes"], snap[@"comments"]);
 
     // 这两个出口调用极频繁（滚动时每取一个 item 一次），日志按 tid 去重，只打首条。
     static NSMutableSet *seen = nil;
@@ -691,18 +704,26 @@ static UIWindow *DDLKeyWindow(void) {
     return nil;
 }
 
-static void DDLCheckVisible(NSString *tid) {
+// start：定位起点。传浮窗/VC 比 keyWindow 靠谱 —— 04 版日志里
+// 「[体检] ⚠拿不到主表」就是从 keyWindow 出发找不到 VC 造成的（浮窗那条链能找到）。
+static void DDLCheckVisible(NSString *tid, id start) {
     if (!tid) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        DDLog(@"[体检] tid=%@ 开始", tid);
-        id tlvc = DDLFindTimelineVC(DDLKeyWindow());
+        id tlvc = DDLFindTimelineVC(start);
         id tv = DDLTimelineTableView(tlvc);
+        if (![tv isKindOfClass:UITableView.class]) {
+            // 起点找不到就退回 keyWindow（保留旧路径）
+            tlvc = DDLFindTimelineVC(DDLKeyWindow());
+            tv = DDLTimelineTableView(tlvc);
+        }
+        DDLog(@"[体检] tid=%@ 开始 起点=%@ VC=%@", tid,
+              NSStringFromClass([start class]) ?: @"(nil)",
+              NSStringFromClass([tlvc class]) ?: @"(nil)");
         if (![tv isKindOfClass:UITableView.class]) { DDLog(@"[体检] ⚠拿不到主表"); return; }
         NSUInteger n = 0, shown = 0;
         for (UIView *cell in ((UITableView *)tv).visibleCells) {
             NSString *ctid = DDLTidOfCell(cell);
-            id it = nil;
-            @try { it = [cell valueForKey:@"m_dataItem"]; } @catch (NSException *__) {}
+            id it = DDLDeepItem(cell, 0);          // 走 m_subContentView 递归，别再直接取
             NSUInteger lc = 0, cc = 0;
             if ([it respondsToSelector:@selector(likeUsers)])    lc = [[it valueForKey:@"likeUsers"] count];
             if ([it respondsToSelector:@selector(commentUsers)]) cc = [[it valueForKey:@"commentUsers"] count];
@@ -739,21 +760,38 @@ static NSString *DDLGap(NSString *key, NSString *tag) {
 
 // 尽量从 cell 取 tid：cell 可能直接持有 m_dataItem，或其一级子视图持有（WCTimeLineCellView.m_dataItem）。
 // 取不到返回 nil；全程 @try 包裹，绝不因诊断影响主流程。
+// 从单元格里挖出真正的 WCDataItem（递归，最多 3 层）。
+//
+// 8.0.79 实测（04 版日志）：tableView:cellForRowAtIndexPath: 返回的类名是
+// **MMTableViewCell**，不是 WCTimeLineCellView —— 真正的 cellView 装在
+// MMTableViewCell 的 m_subContentView 里（MMTableViewCell.h:11）。
+// 所以 [cell valueForKey:@"m_dataItem"] 拿到的是 nil，
+// 前几版日志里那句「[单元格] 重建 赞=0/应=6」是**诊断误报**，不是数据没写进去。
+// 这里改成递归挖：先试自己 → 再试 m_subContentView → 再遍历 subviews。
+static id DDLDeepItem(id v, int depth) {
+    if (!v || depth > 3 || ![v isKindOfClass:NSObject.class]) return nil;
+    @try {
+        id it = [v valueForKey:@"m_dataItem"];
+        if ([it respondsToSelector:@selector(tid)]) return it;
+    } @catch (NSException *__) {}
+    @try {
+        id sub = [v valueForKey:@"m_subContentView"];
+        if (sub && sub != v) { id r = DDLDeepItem(sub, depth + 1); if (r) return r; }
+    } @catch (NSException *__) {}
+    if ([v isKindOfClass:UIView.class]) {
+        for (UIView *sv in ((UIView *)v).subviews) {
+            id r = DDLDeepItem(sv, depth + 1);
+            if (r) return r;
+        }
+    }
+    return nil;
+}
+
 static NSString *DDLTidOfCell(id cell) {
     if (!cell) return nil;
     @try {
-        id item = [cell valueForKey:@"m_dataItem"];
+        id item = DDLDeepItem(cell, 0);
         if ([item respondsToSelector:@selector(tid)]) return [item tid];
-        // 往下挖两层：朋友圈单元格是 WCTimeLineCellView 套在容器里，
-        // m_dataItem 常常挂在一级子视图上（旧版只挖一层，会漏判成「取不到 tid」）。
-        for (UIView *v in ((UIView *)cell).subviews) {
-            id it = [v valueForKey:@"m_dataItem"];
-            if ([it respondsToSelector:@selector(tid)]) return [it tid];
-            for (UIView *w in v.subviews) {
-                id it2 = [w valueForKey:@"m_dataItem"];
-                if ([it2 respondsToSelector:@selector(tid)]) return [it2 tid];
-            }
-        }
     } @catch (NSException *__) {}
     return nil;
 }
@@ -810,7 +848,11 @@ static NSString *DDLTidOfCell(id cell) {
 
     NSString *tid = item.tid;
     NSMutableDictionary *faked = gDDLFaked();
-    DDLog(@"[长按] 触发 tid=%@ likeFlag=%d 已集赞=%d", tid, item.likeFlag, tid ? (faked[tid] != nil) : -1);
+    // 写入前的原始计数打出来：likeCount>0 即「原本带赞」，正是会出问题的那类帖子。
+    DDLog(@"[长按] 触发 tid=%@ likeFlag=%d 已集赞=%d 原始 likeCount=%d realLikeCount=%d selfLikeCount=%d likeUsers=%lu",
+          tid, item.likeFlag, tid ? (faked[tid] != nil) : -1,
+          item.likeCount, item.realLikeCount, item.selfLikeCount,
+          (unsigned long)item.likeUsers.count);
 
     if (tid && faked[tid]) {
         // 已集赞 → 取消：恢复原始数据并遗忘这条。
@@ -835,29 +877,76 @@ static NSString *DDLTidOfCell(id cell) {
         item.likeFlag = YES;
         NSDictionary *snap = (tid ? faked[tid] : nil);
         DDLFakeInto(item, snap[@"likes"], snap[@"comments"]);
-        DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu（固定内容，刷新不重随机）",
-              tid, (unsigned long)[snap[@"likes"] count], (unsigned long)[snap[@"comments"] count]);
+        DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu item=%p（固定内容，刷新不重随机）",
+              tid, (unsigned long)[snap[@"likes"] count],
+              (unsigned long)[snap[@"comments"] count], (__bridge void *)item);
+        // 三个计数必须一致，否则就是「原本带赞失效」那类问题。
+        DDLog(@"[写入] 计数 likeCount=%d realLikeCount=%d selfLikeCount=%d likeFlag=%d likeUsers=%lu",
+              item.likeCount, item.realLikeCount, item.selfLikeCount, item.likeFlag,
+              (unsigned long)item.likeUsers.count);
         DDLog(@"[长按] 开启集赞 tid=%@（记忆 %lu 条）", tid, (unsigned long)faked.count);
     }
 
-    // 刷新主通道：微信官方的 modifyDataItem:notify:（WCTimelineMgr.h:71）。
-    // 锤子长按流程里唯一的刷新调用就是它（WeChatTweak.dylib:0x7b61b8，
-    // x0=WCTimelineMgr、x2=item、w3=1），自身 0 处 reloadData/reloadTableView。
-    // 它走的是微信完整管线 —— 会连带失效点赞区那层布局缓存，
-    // 这正是我们自己 reloadData（只重走 cellForRow）绕不过去的东西。
-    // 上面 %hook WCTimelineMgr 的 modifyDataItem:notify: 会在 %orig 前再补灌一次。
+    // —— 刷新：多路齐发，每路打点 + 开探活，下次日志一眼看出哪条路真的触发了重绘 ——
+    // 04 版实测 modifyDataItem:notify: 单独用是哑弹：它执行后 2.4 秒内
+    // 没有任何目标行的 [单元格] 重建（探活窗口全开着的）。锤子靠它够用，
+    // 但 8.0.79 上已经不够。故本版补两条微信自己的「cell 缓存 / 单行重排」入口。
     id mgr = DDLTimelineMgr();
-    if (mgr) {
-        [mgr modifyDataItem:item notify:YES];
-        DDLog(@"[刷新] modifyDataItem:notify:YES tid=%@（微信官方刷新通道，锤子同款）", tid);
-        DDLProbeOpen();                       // 开 3 秒探活，看这次刷新有没有到 cellForRow
-        DDLCheckVisible(tid);                 // 0.3 秒后体检：命中 cell 的赞/评论条数
-    } else {
-        // 取不到 WCTimelineMgr 才退回主表 reloadData —— 锤子没有这条，留着防万一。
-        if (![self ddl_reloadTimelineForItem:item]) {
-            DDLog(@"[刷新] ⚠WCTimelineMgr 与时间线主表都没取到，本次不会自动刷新");
-        }
+    DDLog(@"[刷新] 起点 tid=%@ mgr=%@ item=%p", tid,
+          NSStringFromClass([mgr class]) ?: @"(nil)", (__bridge void *)item);
+    DDLProbeOpen();                    // 开 3 秒探活
+    DDLCheckVisible(tid, self);        // 0.3 秒后体检
+
+    int fired = 0;
+
+    // ⓪ 锤子同款：微信官方数据项变更出口（WCTimelineMgr.h:71）
+    if (mgr) { [mgr modifyDataItem:item notify:YES]; fired++; }
+
+    id tlvc = DDLFindTimelineVC(self);
+    id tv   = DDLTimelineTableView(tlvc);
+    if (!tlvc) DDLog(@"[刷新] ⚠定位不到时间线 VC，①②跳过");
+
+    // ① 清 cell 缓存 + 刷新 cell 视图（WCTimeLineViewController.h:289）
+    //    名字直指「点赞区布局缓存」那一层，是本版主攻方向。
+    if (tlvc) {
+        @try {
+            [tlvc onActionClearCellCacheAndRefreshCellView:item];
+            DDLog(@"[刷新] ①onActionClearCellCacheAndRefreshCellView 已调用");
+            fired++;
+        } @catch (NSException *e) { DDLog(@"[刷新] ①异常 %@", e.reason); }
     }
+
+    // ② 改完 item 后的单行重排（WCTimeLineViewController.h:424）
+    //    微信自己点赞 / 删评论成功后走的就是它（oldHeight/newHeight 用来稳住 contentOffset）。
+    if (tlvc) {
+        double h = 0;
+        @try {
+            id ip = [tlvc indexPathOfDataItem:item];
+            if ([ip isKindOfClass:NSIndexPath.class] && [tv isKindOfClass:UITableView.class]) {
+                h = [(UITableView *)tv rectForRowAtIndexPath:(NSIndexPath *)ip].size.height;
+            }
+        } @catch (NSException *__) {}
+        @try {
+            [tlvc onUpdateDataItem:item oldHeight:h newHeight:h];
+            DDLog(@"[刷新] ②onUpdateDataItem:oldHeight:newHeight: 已调用 h=%.1f", h);
+            fired++;
+        } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
+    }
+
+    // ③ 兜底：单行重绘（前三版的办法，单独用无效，这里配合上面的缓存清理再走一次）
+    if (tlvc && [tv isKindOfClass:UITableView.class]) {
+        @try {
+            id ip = [tlvc indexPathOfDataItem:item];
+            if ([ip isKindOfClass:NSIndexPath.class]) {
+                [(UITableView *)tv reloadRowsAtIndexPaths:@[ip]
+                                        withRowAnimation:UITableViewRowAnimationNone];
+                DDLog(@"[刷新] ③reloadRowsAtIndexPaths 已调用");
+                fired++;
+            }
+        } @catch (NSException *e) { DDLog(@"[刷新] ③异常 %@", e.reason); }
+    }
+
+    DDLog(@"[刷新] 本次共触发 %d 条通路", fired);
 
     [self hide];
 }
@@ -874,7 +963,7 @@ static NSString *DDLTidOfCell(id cell) {
     DDLog(@"[刷新] 定位开始 tid=%@ 起点=%@ nav=%@", tid, NSStringFromClass([self class]),
           NSStringFromClass([[self navigationController] class]));
     BOOL ok = DDLReloadTimelineFrom(self, tid);
-    if (ok) DDLCheckVisible(tid);
+    if (ok) DDLCheckVisible(tid, self);
     return ok;
 }
 
@@ -892,14 +981,16 @@ static NSString *DDLTidOfCell(id cell) {
     NSDictionary *snap = (tid ? gDDLFaked()[tid] : nil);
     if (snap || probe) {
         NSUInteger lc = 0, cc = 0;
-        id it = nil;
-        @try { it = [cell valueForKey:@"m_dataItem"]; } @catch (NSException *__) {}
+        // 必须走 DDLDeepItem：04 版日志里 cell 类名是 MMTableViewCell，
+        // 直接 [cell valueForKey:@"m_dataItem"] 永远是 nil → 「赞=0」是假警报。
+        id it = DDLDeepItem(cell, 0);
         if ([it respondsToSelector:@selector(likeUsers)])    lc = [[it valueForKey:@"likeUsers"] count];
         if ([it respondsToSelector:@selector(commentUsers)]) cc = [[it valueForKey:@"commentUsers"] count];
-        DDLog(@"[单元格] 重建 %@tid=%@ %@ 赞=%lu/应=%lu 评论=%lu cell=%@ 表=%@",
+        DDLog(@"[单元格] 重建 %@tid=%@ %@ 赞=%lu/应=%lu 评论=%lu/%lu item=%p cell=%@ 表=%@",
               (snap ? @"" : @"(探活) "), tid ?: @"(无)", DDLGap(tid ?: @"?", @"C:"),
-              (unsigned long)lc, (unsigned long)[snap[@"likes"] count], (unsigned long)cc,
-              NSStringFromClass([cell class]), NSStringFromClass([tv class]));
+              (unsigned long)lc, (unsigned long)[snap[@"likes"] count],
+              (unsigned long)cc, (unsigned long)[snap[@"comments"] count],
+              (__bridge void *)it, NSStringFromClass([cell class]), NSStringFromClass([tv class]));
     }
     return cell;
 }
@@ -910,14 +1001,27 @@ static NSString *DDLTidOfCell(id cell) {
 // 微信取朋友圈 item 的两个出口（WCFacade.h:195 / :197）。锤子两个都 hook 了
 // （IMP 0x7b5574 / 0x7b56b4），%orig 之后按 tid 补灌 —— 这样无论微信从哪里
 // 把 item 取出来（缓存、行号、翻页重建），拿到的都是带伪赞的版本。
+// 这两个出口调用极频繁，进门日志只打前 4 次，够判断 hook 有没有挂上就行。
+static int gDDLFacadeLog = 0;
+
 - (id)getTimelineDataInCacheByItemID:(id)itemID {
     id item = %orig(itemID);
+    if (gDDLFacadeLog < 4) {
+        gDDLFacadeLog++;
+        DDLog(@"[取项] cacheByItemID 进入 itemID=%@ 返回=%@", itemID,
+              NSStringFromClass([item class]) ?: @"(nil)");
+    }
     DDLReapply(@"cacheByItemID", item);
     return item;
 }
 
 - (id)getTimelineDataItemOfIndex:(long long)index {
     id item = %orig(index);
+    if (gDDLFacadeLog < 4) {
+        gDDLFacadeLog++;
+        DDLog(@"[取项] itemOfIndex 进入 index=%lld 返回=%@", index,
+              NSStringFromClass([item class]) ?: @"(nil)");
+    }
     DDLReapply(@"itemOfIndex", item);
     return item;
 }
@@ -931,6 +1035,13 @@ static NSString *DDLTidOfCell(id cell) {
 // 让微信后续那条刷新管线（含点赞区布局缓存的失效）拿到的就是伪造后的 item。
 // 我们长按改完数据后主动调它一次，等同于走了一条完整的「下拉刷新」。
 - (void)modifyDataItem:(id)item notify:(BOOL)notify {
+    // 无条件进门日志：这一行是判断「本 hook 到底有没有被走到」的唯一依据。
+    // 04 版日志里它一次都没出现，而同一个 %hook 里的 commonProcessDataAfterUpdate:
+    // 却正常打印 —— 说明要么这条消息没打到 WCTimelineMgr，要么 tid 查不到记忆。
+    NSString *t = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
+    DDLog(@"[改项] 进入 self=%@ tid=%@ notify=%d 记忆=%lu",
+          NSStringFromClass([self class]), t ?: @"(无)", (int)notify,
+          (unsigned long)gDDLFaked().count);
     DDLReapply(@"modifyDataItem", item);
     %orig(item, notify);
 }
@@ -992,7 +1103,8 @@ static NSString *DDLTidOfCell(id cell) {
         }
         if (firstItem) {
             [self modifyDataItem:firstItem notify:YES];
-            DDLCheckVisible([(WCDataItem *)firstItem tid]);
+            DDLog(@"[刷新] 回调后补刷 modifyDataItem tid=%@", [(WCDataItem *)firstItem tid]);
+            DDLCheckVisible([(WCDataItem *)firstItem tid], nil);
         }
     }
 }
