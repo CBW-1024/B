@@ -701,83 +701,33 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
     DDLog(@"[刷新] 起点 tid=%@ item=%p", tid, (__bridge void *)item);
     DDLProbeOpen();
 
-    int fired = 0;
+    // 反汇编锤子(WeChatTweak)结论：ApplyFake 仅做 setLikeUsers:/setLikeCount: + modifyDataItem:item notify:1，
+    // 刷新完全交给微信原生管线（并由其 dataItem/m_dataItem getter 钩子持续重灌）。
+    // 我们之前额外加的 DDLForceRebuildCell / onActionClearCellCacheAndRefreshCellView: / reloadData /
+    // onUpdateDataItem: / onReloadCommentView:ofDataItem: 都是锤子从不做的事，且拆 live cell 的
+    // subview、调私有评论行方法会在布局中途触发 EXC_BAD_ACCESS（信号，@try 抓不住）→ 长按闪退。
+    // 因此这里严格回到锤子的最小机制：写假数据 → modifyDataItem:notify:1。
+    // 持久化由现有钩子负责：%hook WCTimelineMgr modifyDataItem:（DDLReapply）+ %hook cellForRowAtIndexPath（DDLReapply）。
     @try {
 
     if (turningOn) {
         NSDictionary *snap = (tid ? faked[tid] : nil);
         item.likeFlag = YES;
         DDLFakeInto(item, snap[@"likes"], snap[@"comments"]);
-        DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu item=%p（延迟到浮窗收起后执行）",
+        DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu item=%p",
               tid, (unsigned long)[snap[@"likes"] count],
               (unsigned long)[snap[@"comments"] count], (__bridge void *)item);
-
         DDLog(@"[写入] 计数 likeCount=%d realLikeCount=%d selfLikeCount=%d likeFlag=%d likeUsers=%lu",
               item.likeCount, item.realLikeCount, item.selfLikeCount, item.likeFlag,
               (unsigned long)item.likeUsers.count);
     }
 
-    @try { fired += DDLForceRebuildCell(tv, tlvc, item); }
-    @catch (NSException *e) { DDLog(@"[强拆] 异常 %@", e.reason); }
-
-    if (tlvc) {
-        @try {
-            [tlvc onActionClearCellCacheAndRefreshCellView:item];
-            DDLog(@"[刷新] ⓪清 cell 缓存（早于 notify，避免复用旧子 view）");
-            fired++;
-        } @catch (NSException *e) { DDLog(@"[刷新] ⓪异常 %@", e.reason); }
-    }
-
     id mgr = DDLTimelineMgr();
-    if (mgr) {
-        @try {
-            [mgr modifyDataItem:item notify:YES];
-            DDLog(@"[刷新] ③modifyDataItem notify:1（走微信原生管线，同锤子：清评论行渲染缓存并重绘）");
-            fired++;
-        } @catch (NSException *e) { DDLog(@"[刷新] ③异常 %@", e.reason); }
-    }
-
-    if (tlvc) {
-        @try {
-            if ([tv isKindOfClass:UITableView.class]) {
-                [(UITableView *)tv reloadData];
-                DDLog(@"[刷新] ①整表重建（安全 reloadData；WCR 的 reloadTableData 是它自己设置页的方法，不能套到时间线 VC）");
-                fired++;
-            }
-        } @catch (NSException *e) { DDLog(@"[刷新] ①异常 %@", e.reason); }
-    }
-
-    if (tlvc) {
-        double h = 0;
-        @try {
-            id ip = [tlvc indexPathOfDataItem:item];
-            if ([ip isKindOfClass:NSIndexPath.class] && [tv isKindOfClass:UITableView.class]) {
-                h = [(UITableView *)tv rectForRowAtIndexPath:(NSIndexPath *)ip].size.height;
-            }
-        } @catch (NSException *__) {}
-        @try {
-            [tlvc onUpdateDataItem:item oldHeight:h newHeight:h];
-            DDLog(@"[刷新] ②onUpdateDataItem:oldHeight:newHeight: 已调用 h=%.1f", h);
-            fired++;
-        } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
-    }
-
-    if ([tv isKindOfClass:UITableView.class] && tlvc) {
-        @try {
-            int r = DDLReloadCommentViews(tlvc, tv, item);
-            DDLog(@"[刷新] ⑤评论行定向重载 命中 %d 个", r);
-            fired += r;
-        } @catch (NSException *e) { DDLog(@"[刷新] ⑤异常 %@", e.reason); }
-    }
-
-    DDLog(@"[刷新] 本次共触发 %d 条通路", fired);
-
-    if (fired == 0 && [tv isKindOfClass:UITableView.class]) {
-        DDLog(@"[刷新] ⚠全部通路哑火，兜底 reloadData");
-        @try {
-            [(UITableView *)tv reloadData];
-            DDLog(@"[刷新] 兜底 reloadData 已执行");
-        } @catch (NSException *e) { DDLog(@"[刷新] 兜底异常 %@", e.reason); }
+    if (mgr && [mgr respondsToSelector:@selector(modifyDataItem:notify:)]) {
+        [mgr modifyDataItem:item notify:YES];
+        DDLog(@"[刷新] modifyDataItem notify:1（同锤子：走微信原生管线刷新，由 WCTimelineMgr 钩子与 cellForRow 钩子持续补灌）");
+    } else {
+        DDLog(@"[刷新] ⚠未找到 modifyDataItem:notify: 的 mgr，刷新可能无效");
     }
 
     } @catch (NSException *e) {
