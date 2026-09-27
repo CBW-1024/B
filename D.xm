@@ -311,12 +311,17 @@ static NSString *DDLogConfigSummary(void) {
 
 @implementation DDLikeHelper
 
-// 真实好友 = 非公众号 且 有性别（参考 DKHelper / 集赞助手）。
+// 真实好友池 = 非公众号 + 有性别 + 用户名不含 @openim。
+// 最后一项来自 WCRefine.dylib 的 +allFriends（IMP 0x0fa0434）反汇编实证：
+// 它对每个联系人依次判 isBrandContact / m_uiSex / [m_nsUsrName containsString:@"@openim"]，
+// 三者皆过才入池。@openim 是微信客服 / 开放平台机器人账号前缀（虽带性别但非真人），
+// 不剔除会被当成「点赞人」塞进列表。
 + (NSArray<CContact *> *)allFriends {
     NSMutableArray *friends = [NSMutableArray array];
     CContactMgr *mgr = DDLContactMgr();
     for (CContact *c in [mgr getContactList:1 contactType:0]) {
-        if (![c isBrandContact] && [c m_uiSex] != 0) {
+        if (![c isBrandContact] && [c m_uiSex] != 0 &&
+            ![[c m_nsUsrName] containsString:@"@openim"]) {
             [friends addObject:c];
         }
     }
