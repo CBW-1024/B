@@ -435,32 +435,25 @@ static void DDLReapply(NSString *tag, id item) {
     }
 }
 
-static BOOL DDLForceRebuildCell(id tv, id tlvc, id item) {
-    if (![tv isKindOfClass:UITableView.class] || !tlvc || !item) return NO;
-    id ip = nil;
-    @try { ip = [tlvc indexPathOfDataItem:item]; } @catch (NSException *__) {}
-    if (![ip isKindOfClass:NSIndexPath.class]) { DDLog(@"[强拆] ⚠取不到 indexPath"); return NO; }
-
-    UITableViewCell *cell = [(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip];
-    if (!cell) { DDLog(@"[强拆] ⚠目标行不可见（cell 为 nil）"); return NO; }
-
-    @try {
-        id old = nil;
-        if ([cell respondsToSelector:@selector(m_subContentView)]) old = [(MMTableViewCell *)cell m_subContentView];
-        if ([cell respondsToSelector:@selector(setM_subContentView:)]) {
-            [(MMTableViewCell *)cell setM_subContentView:nil];
-            DDLog(@"[强拆] 目标行 cell=%@ 原 subContentView=%@ 已置空",
-                  NSStringFromClass([cell class]), NSStringFromClass([old class]) ?: @"(无)");
-            return YES;
-        }
-
-        if (old && [old isKindOfClass:UIView.class]) {
-            [(UIView *)old removeFromSuperview];
-            DDLog(@"[强拆] 退路：移除 subContentView=%@", NSStringFromClass([old class]));
-            return YES;
-        }
-    } @catch (NSException *e) { DDLog(@"[强拆] 异常 %@", e.reason); }
-    return NO;
+static int DDLForceRebuildCell(id tv, id tlvc, id item) {
+    if (![tv isKindOfClass:UITableView.class] || !item) return 0;
+    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [(WCDataItem *)item tid] : nil);
+    if (!tid) return 0;
+    int n = 0;
+    for (NSIndexPath *ip in [(UITableView *)tv indexPathsForVisibleRows]) {
+        UITableViewCell *cell = [(UITableView *)tv cellForRowAtIndexPath:ip];
+        if (!cell || ![cell respondsToSelector:@selector(m_subContentView)]) continue;
+        id sub = [(MMTableViewCell *)cell m_subContentView];
+        id it = DDLDeepItem(sub ? sub : cell, 0);
+        NSString *ctid = ([it respondsToSelector:@selector(tid)] ? [(WCDataItem *)it tid] : nil);
+        if (!ctid || ![ctid isEqualToString:tid]) continue;
+        [(MMTableViewCell *)cell setM_subContentView:nil];
+        DDLog(@"[强拆] 行%@ cell=%@ sub=%@ 已置空", ip, NSStringFromClass([cell class]),
+              NSStringFromClass([sub class]) ?: @"(无)");
+        n++;
+    }
+    if (n == 0) DDLog(@"[强拆] 可见行中无 tid=%@ 匹配（应≥1：主cell+点赞行）", tid);
+    return n;
 }
 
 static NSString *DDLGap(NSString *key, NSString *tag);
@@ -611,6 +604,10 @@ static NSString *DDLGap(NSString *key, NSString *tag) {
 static id DDLDeepItem(id v, int depth) {
     if (!v || depth > 3 || ![v isKindOfClass:NSObject.class]) return nil;
     @try {
+        id it = [v valueForKey:@"mainDataItem"];
+        if ([it respondsToSelector:@selector(tid)]) return it;
+    } @catch (NSException *__) {}
+    @try {
         id it = [v valueForKey:@"m_dataItem"];
         if ([it respondsToSelector:@selector(tid)]) return it;
     } @catch (NSException *__) {}
@@ -667,7 +664,7 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
 
     int fired = 0;
 
-    if (DDLForceRebuildCell(tv0, tlvc0, item)) fired++;
+    fired += DDLForceRebuildCell(tv0, tlvc0, item);
 
     if (mgr) { [mgr modifyDataItem:item notify:YES]; fired++; }
 
