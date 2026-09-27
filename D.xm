@@ -446,6 +446,21 @@ static NSMutableDictionary *gDDLSwap(void) {
     return d;
 }
 
+static size_t DDLSizeOfType(const char *t) {
+    if (!t) return 0;
+    switch (t[0]) {
+        case 'c': case 'C': case 'B': return sizeof(char);
+        case 'i': case 'I':          return sizeof(int);
+        case 's': case 'S':          return sizeof(short);
+        case 'l': case 'L':          return sizeof(long);
+        case 'q': case 'Q':          return sizeof(long long);
+        case 'f':                    return sizeof(float);
+        case 'd':                    return sizeof(double);
+        case '*': case '#': case ':': return sizeof(void *);
+        default: return 0;
+    }
+}
+
 static id DDLFreshCopy(id item) {
     if (!item) return nil;
     Class c = [item class];
@@ -462,23 +477,53 @@ static id DDLFreshCopy(id item) {
             const char *t = ivar_getTypeEncoding(iv);
             if (!nm) continue;
             NSString *key = [NSString stringWithUTF8String:nm];
+            size_t sz = (t && t[0] != '@') ? DDLSizeOfType(t) : 0;
+            ptrdiff_t off = ivar_getOffset(iv);
+            if (sz && off >= 0) {
+                @try {
+                    void *dst = (__bridge void *)copy;
+                    const void *src = (__bridge const void *)item;
+                    memcpy((char *)dst + off, (const char *)src + off, sz);
+                } @catch (NSException *__) {}
+                continue;
+            }
             @try {
                 id v = [item valueForKey:key];
                 if (v) [copy setValue:v forKey:key];
-            } @catch (NSException *__) {
-                @try {
-                    if (t && t[0] != '@') {
-                        NSUInteger sz = 0, al = 0;
-                        NSGetSizeAndAlignment(t, &sz, &al);
-                        ptrdiff_t off = ivar_getOffset(iv);
-                        if (sz && sz < 4096) memcpy((char *)copy + off, (const char *)item + off, sz);
-                    }
-                } @catch (NSException *__) {}
-            }
+            } @catch (NSException *__) {}
         }
         free(ivars);
     }
     return copy;
+}
+
+static int DDLPushAltToViews(id tv, id item, id alt) {
+    if (![tv isKindOfClass:UITableView.class] || !alt || !item) return 0;
+    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [(WCDataItem *)item tid] : nil);
+    if (!tid) return 0;
+    int n = 0;
+    for (NSIndexPath *ip in [(UITableView *)tv indexPathsForVisibleRows]) {
+        UITableViewCell *cell = [(UITableView *)tv cellForRowAtIndexPath:ip];
+        if (!cell) continue;
+        for (UIView *sv in cell.contentView.subviews) {
+            NSString *key = nil;
+            if ([sv respondsToSelector:NSSelectorFromString(@"mainDataItem")]) key = @"mainDataItem";
+            else if ([sv respondsToSelector:NSSelectorFromString(@"m_dataItem")]) key = @"m_dataItem";
+            if (!key) continue;
+            id curIt = nil;
+            @try { curIt = [sv valueForKey:key]; } @catch (NSException *__) {}
+            NSString *ctid = ([curIt respondsToSelector:@selector(tid)] ? [(WCDataItem *)curIt tid] : nil);
+            if (!ctid || ![ctid isEqualToString:tid] || curIt == alt) continue;
+            @try {
+                [sv setValue:alt forKey:key];
+                [(UIView *)sv setNeedsLayout];
+                DDLog(@"[替身] 注入 view=%@ %@ 原=%p → 替身=%p", NSStringFromClass([sv class]),
+                      key, (__bridge void *)curIt, (__bridge void *)alt);
+                n++;
+            } @catch (NSException *e) { DDLog(@"[替身] 注入异常 %@", e.reason); }
+        }
+    }
+    return n;
 }
 
 static NSString *DDLSubList(id cell) {
@@ -739,7 +784,14 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
               (unsigned long)((WCDataItem *)cur).likeUsers.count);
     }
 
-    fired += DDLForceRebuildCell(tv, tlvc, item);
+    int pushed = 0;
+    if (cur != item) pushed = DDLPushAltToViews(tv, item, cur);
+    if (pushed) {
+        fired += pushed;
+        DDLog(@"[替身] 已就地注入 %d 个 cell view（跳过强拆）", pushed);
+    } else {
+        fired += DDLForceRebuildCell(tv, tlvc, item);
+    }
 
     if (tlvc && [tv isKindOfClass:UITableView.class]) {
         id ip = nil;
