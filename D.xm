@@ -92,6 +92,8 @@
 @interface CContact : CBaseContact
 @property (retain, nonatomic) NSString *m_nsNickName;   // CContact.h:281
 - (BOOL)isBrandContact;                                  // CContact.h:101 gh_ 公众号 = 非好友
+- (BOOL)isHolderContact;                                // 持有者 / 特殊号（非真人）
+- (BOOL)isWeixinTeamContact;                            // 微信团队号（非真人）
 @end
 
 @interface CContactMgr : NSObject
@@ -314,15 +316,17 @@ static NSString *DDLogConfigSummary(void) {
 
 @implementation DDLikeHelper
 
-// 真实好友池 = 非公众号 + 用户名不含 @openim。
-// @openim 是微信客服 / 开放平台机器人账号前缀（非真人），不剔除会被当成「点赞人」塞进列表。
-// 注意：不卡 m_uiSex —— 没填性别（m_uiSex==0）的真实好友也要保留，
-// 之前的「有性别」条件会把一大批未设性别的用户误伤出池。
+// 真实好友池 = 非公众号 + 非持有者号 + 非微信团队号 + 用户名不含 @openim。
+// 过滤判据对齐锤子 WeChatTweak.startCheckFriends 反汇编实证：
+//   isBrandContact / isHolderContact / isWeixinTeamContact /
+//   IsOpenImContactUserName: / IsOpenImKeFuContactUserName:
+// 我们用 @openim 子串检查同时覆盖企业微信联系人与客服两类；
+// 不按性别筛（m_uiSex 不卡，避免误伤未设性别的真实好友）。
 + (NSArray<CContact *> *)allFriends {
     NSMutableArray *friends = [NSMutableArray array];
     CContactMgr *mgr = DDLContactMgr();
     for (CContact *c in [mgr getContactList:1 contactType:0]) {
-        if (![c isBrandContact] &&
+        if (![c isBrandContact] && ![c isHolderContact] && ![c isWeixinTeamContact] &&
             ![[c m_nsUsrName] containsString:@"@openim"]) {
             [friends addObject:c];
         }
