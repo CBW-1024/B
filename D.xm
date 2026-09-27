@@ -439,6 +439,57 @@ static NSString *DDLGap(NSString *key, NSString *tag);
 static NSString *DDLTidOfCell(id cell);
 static id DDLDeepItem(id v, int depth);
 
+static NSMutableDictionary *gDDLSwap(void) {
+    static NSMutableDictionary *d;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary dictionary]; });
+    return d;
+}
+
+static id DDLFreshCopy(id item) {
+    if (!item) return nil;
+    Class c = [item class];
+    id copy = nil;
+    @try { copy = [[c alloc] init]; } @catch (NSException *__) {}
+    if (!copy) return nil;
+    for (Class cls = c; cls && cls != NSObject.class; cls = class_getSuperclass(cls)) {
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(cls, &n);
+        if (!ivars) continue;
+        for (unsigned int i = 0; i < n; i++) {
+            Ivar iv = ivars[i];
+            const char *nm = ivar_getName(iv);
+            const char *t = ivar_getTypeEncoding(iv);
+            if (!nm) continue;
+            NSString *key = [NSString stringWithUTF8String:nm];
+            @try {
+                id v = [item valueForKey:key];
+                if (v) [copy setValue:v forKey:key];
+            } @catch (NSException *__) {
+                @try {
+                    if (t && t[0] != '@') {
+                        NSUInteger sz = 0, al = 0;
+                        NSGetSizeAndAlignment(t, &sz, &al);
+                        ptrdiff_t off = ivar_getOffset(iv);
+                        if (sz && sz < 4096) memcpy((char *)copy + off, (const char *)item + off, sz);
+                    }
+                } @catch (NSException *__) {}
+            }
+        }
+        free(ivars);
+    }
+    return copy;
+}
+
+static NSString *DDLSubList(id cell) {
+    if (![cell isKindOfClass:UITableViewCell.class]) return @"(非cell)";
+    NSArray *subs = ((UITableViewCell *)cell).contentView.subviews;
+    if (!subs.count) return @"(空)";
+    NSMutableArray *n = [NSMutableArray array];
+    for (UIView *sv in subs) [n addObject:NSStringFromClass([sv class])];
+    return [n componentsJoinedByString:@"+"];
+}
+
 static int DDLForceRebuildCell(id tv, id tlvc, id item) {
     if (![tv isKindOfClass:UITableView.class] || !item) return 0;
     NSString *tid = ([item respondsToSelector:@selector(tid)] ? [(WCDataItem *)item tid] : nil);
@@ -446,17 +497,20 @@ static int DDLForceRebuildCell(id tv, id tlvc, id item) {
     int n = 0;
     for (NSIndexPath *ip in [(UITableView *)tv indexPathsForVisibleRows]) {
         UITableViewCell *cell = [(UITableView *)tv cellForRowAtIndexPath:ip];
-        if (!cell || ![cell respondsToSelector:@selector(m_subContentView)]) continue;
-        id sub = [(MMTableViewCell *)cell m_subContentView];
-        id it = DDLDeepItem(sub ? sub : cell, 0);
+        if (!cell) continue;
+        id it = DDLDeepItem(cell, 0);
         NSString *ctid = ([it respondsToSelector:@selector(tid)] ? [(WCDataItem *)it tid] : nil);
         if (!ctid || ![ctid isEqualToString:tid]) continue;
-        [(MMTableViewCell *)cell setM_subContentView:nil];
-        DDLog(@"[强拆] 行%@ cell=%@ sub=%@ 已置空", ip, NSStringFromClass([cell class]),
-              NSStringFromClass([sub class]) ?: @"(无)");
+        NSString *before = DDLSubList(cell);
+        @try {
+            for (UIView *sv in [cell.contentView.subviews copy]) [sv removeFromSuperview];
+            if ([cell respondsToSelector:@selector(setM_subContentView:)])
+                [(MMTableViewCell *)cell setM_subContentView:nil];
+        } @catch (NSException *e) { DDLog(@"[强拆] 异常 %@", e.reason); }
+        DDLog(@"[强拆] 行%@ 拆前cv=%@ 拆后cv=%@", ip, before, DDLSubList(cell));
         n++;
     }
-    if (n == 0) DDLog(@"[强拆] 可见行中无 tid=%@ 匹配（应≥1：主cell+点赞行）", tid);
+    if (n == 0) DDLog(@"[强拆] ⚠可见行中无 tid=%@ 匹配", tid);
     return n;
 }
 
@@ -577,16 +631,11 @@ static void DDLCheckVisible(NSString *tid, id start) {
 
             if ([ctid isEqualToString:tid] || shown < 3) {
                 if (![ctid isEqualToString:tid]) shown++; else n++;
-                id sub = nil;
-                @try {
-                    if ([cell respondsToSelector:@selector(m_subContentView)])
-                        sub = [(MMTableViewCell *)cell m_subContentView];
-                } @catch (NSException *__) {}
-                DDLog(@"[体检] %@cell=%@ tid=%@ item=%p 赞=%lu 评论=%lu sub=%@ frame=%@",
+                DDLog(@"[体检] %@cell=%@ tid=%@ item=%p 赞=%lu 评论=%lu cv=%@ frame=%@",
                       ([ctid isEqualToString:tid] ? @"命中 " : @"样本 "),
                       NSStringFromClass([cell class]), ctid ?: @"(无)", (__bridge void *)it,
                       (unsigned long)lc, (unsigned long)cc,
-                      NSStringFromClass([sub class]) ?: @"(无)", NSStringFromCGRect(cell.frame));
+                      DDLSubList(cell), NSStringFromCGRect(cell.frame));
             }
         }
         if (!n) DDLog(@"[体检] ⚠可见单元格里没有 tid=%@（可能已滚出屏幕或取不到 tid）", tid);
@@ -663,6 +712,7 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
         } @catch (NSException *e) { DDLog(@"[刷新] ⓪异常 %@", e.reason); }
     }
 
+    id cur = item;
     if (turningOn) {
         NSDictionary *snap = (tid ? faked[tid] : nil);
         item.likeFlag = YES;
@@ -671,9 +721,22 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
               tid, (unsigned long)[snap[@"likes"] count],
               (unsigned long)[snap[@"comments"] count], (__bridge void *)item);
 
+        id alt = DDLFreshCopy(item);
+        if (alt && [alt respondsToSelector:@selector(tid)]) {
+            DDLFakeInto(alt, snap[@"likes"], snap[@"comments"]);
+            if (tid) gDDLSwap()[tid] = alt;
+            cur = alt;
+            DDLog(@"[替身] 已造 tid=%@ 原=%p 替身=%p 赞=%lu 评论=%lu",
+                  tid, (__bridge void *)item, (__bridge void *)alt,
+                  (unsigned long)[snap[@"likes"] count], (unsigned long)[snap[@"comments"] count]);
+        } else {
+            DDLog(@"[替身] ⚠造失败，退回原对象");
+        }
+
         DDLog(@"[写入] 计数 likeCount=%d realLikeCount=%d selfLikeCount=%d likeFlag=%d likeUsers=%lu",
-              item.likeCount, item.realLikeCount, item.selfLikeCount, item.likeFlag,
-              (unsigned long)item.likeUsers.count);
+              ((WCDataItem *)cur).likeCount, ((WCDataItem *)cur).realLikeCount,
+              ((WCDataItem *)cur).selfLikeCount, ((WCDataItem *)cur).likeFlag,
+              (unsigned long)((WCDataItem *)cur).likeUsers.count);
     }
 
     fired += DDLForceRebuildCell(tv, tlvc, item);
@@ -694,13 +757,13 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
     if (tlvc) {
         double h = 0;
         @try {
-            id ip = [tlvc indexPathOfDataItem:item];
+            id ip = [tlvc indexPathOfDataItem:cur];
             if ([ip isKindOfClass:NSIndexPath.class] && [tv isKindOfClass:UITableView.class]) {
                 h = [(UITableView *)tv rectForRowAtIndexPath:(NSIndexPath *)ip].size.height;
             }
         } @catch (NSException *__) {}
         @try {
-            [tlvc onUpdateDataItem:item oldHeight:h newHeight:h];
+            [tlvc onUpdateDataItem:cur oldHeight:h newHeight:h];
             DDLog(@"[刷新] ②onUpdateDataItem:oldHeight:newHeight: 已调用 h=%.1f", h);
             fired++;
         } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
@@ -708,9 +771,19 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
 
     id mgr = DDLTimelineMgr();
     if (mgr) {
-        [mgr modifyDataItem:item notify:NO];
-        DDLog(@"[刷新] ③modifyDataItem notify:NO（断掉微信内部抢跑重建）");
-        fired++;
+        @try {
+            [mgr modifyDataItem:cur notify:NO];
+            DDLog(@"[刷新] ③modifyDataItem 替身 notify:NO（数据落库）");
+            fired++;
+        } @catch (NSException *e) { DDLog(@"[刷新] ③异常 %@", e.reason); }
+    }
+
+    if (mgr && cur != item) {
+        @try {
+            [mgr modifyDataItem:cur notify:YES];
+            DDLog(@"[刷新] ④modifyDataItem 替身 notify:YES（走微信原生管线，同原版路径）");
+            fired++;
+        } @catch (NSException *e) { DDLog(@"[刷新] ④异常 %@", e.reason); }
     }
 
     DDLog(@"[刷新] 本次共触发 %d 条通路", fired);
@@ -772,8 +845,10 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
 
         DDLRestore(item, faked[tid]);
         [faked removeObjectForKey:tid];
+        [gDDLSwap() removeObjectForKey:tid];
         turningOn = NO;
-        DDLog(@"[长按] 取消集赞 tid=%@（已恢复原始值，记忆剩 %lu 条）", tid, (unsigned long)faked.count);
+        DDLog(@"[长按] 取消集赞 tid=%@（已恢复原始值，替身已撤，记忆剩 %lu 条）",
+              tid, (unsigned long)faked.count);
     } else {
 
         if (!tid) DDLog(@"[长按] 警告：tid 为 nil，刷新后无法重建");
@@ -842,6 +917,11 @@ static int gDDLFacadeLog = 0;
 %hook WCFacade
 
 - (id)getTimelineDataInCacheByItemID:(id)itemID {
+    id alt = (itemID ? gDDLSwap()[itemID] : nil);
+    if (alt) {
+        DDLog(@"[替身] 出口=cacheByItemID 换出 tid=%@ 替身=%p", itemID, (__bridge void *)alt);
+        return alt;
+    }
     id item = %orig(itemID);
     if (gDDLFacadeLog < 4) {
         gDDLFacadeLog++;
@@ -854,6 +934,12 @@ static int gDDLFacadeLog = 0;
 
 - (id)getTimelineDataItemOfIndex:(long long)index {
     id item = %orig(index);
+    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [(WCDataItem *)item tid] : nil);
+    id alt = (tid ? gDDLSwap()[tid] : nil);
+    if (alt) {
+        DDLog(@"[替身] 出口=itemOfIndex 换出 index=%lld tid=%@ 替身=%p", index, tid, (__bridge void *)alt);
+        return alt;
+    }
     if (gDDLFacadeLog < 4) {
         gDDLFacadeLog++;
         DDLog(@"[取项] itemOfIndex 进入 index=%lld 返回=%@", index,
