@@ -435,6 +435,10 @@ static void DDLReapply(NSString *tag, id item) {
     }
 }
 
+static NSString *DDLGap(NSString *key, NSString *tag);
+static NSString *DDLTidOfCell(id cell);
+static id DDLDeepItem(id v, int depth);
+
 static int DDLForceRebuildCell(id tv, id tlvc, id item) {
     if (![tv isKindOfClass:UITableView.class] || !item) return 0;
     NSString *tid = ([item respondsToSelector:@selector(tid)] ? [(WCDataItem *)item tid] : nil);
@@ -455,10 +459,6 @@ static int DDLForceRebuildCell(id tv, id tlvc, id item) {
     if (n == 0) DDLog(@"[强拆] 可见行中无 tid=%@ 匹配（应≥1：主cell+点赞行）", tid);
     return n;
 }
-
-static NSString *DDLGap(NSString *key, NSString *tag);
-static NSString *DDLTidOfCell(id cell);
-static id DDLDeepItem(id v, int depth);
 
 static NSTimeInterval gDDLProbeUntil = 0;
 static inline void DDLProbeOpen(void) {
