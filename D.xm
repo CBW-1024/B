@@ -305,16 +305,23 @@ static NSString *DDLogConfigSummary(void) {
 + (NSMutableArray<WCUserComment *> *)fakeCommentsFor:(WCDataItem *)origItem;
 @end
 
+// 你的 theos 头文件版本里 CContact 未前向声明 m_uiSex（8.0.79 dump 中它存在于 CBaseContact.h:154），
+// 补这个分类声明以免编译报 “property 'm_uiSex' not found”。运行时 CContact 确有此 getter
+// （参考实现 集赞助手.txt 直接用了 contact.m_uiSex != 0）。
+@interface CContact (DDFriendExt)
+- (unsigned int)m_uiSex;
+@end
+
 @implementation DDLikeHelper
 
-// 好友名单：从通讯录（getContactList:1 contactType:0，CContactMgr.h:173）筛「真实个人好友」。
+// 好友名单：从通讯录（getContactList:1 contactType:0）筛「真实个人好友」。
 //
 // 判别只用两条（与已开源、被验证的 DKHelper / 集赞助手 一致）：
-//   1) !isBrandContact   (CContact.h:101)    排除公众号/服务号/品牌
-//   2) m_uiSex != 0      (CBaseContact.h:153) 真实个人好友几乎都同步了性别(1/2)，
+//   1) !isBrandContact                      排除公众号/服务号/品牌
+//   2) m_uiSex != 0                         真实个人好友几乎都同步了性别(1=男/2=女)，
 //      系统账号/品牌号/硬编联系人 m_uiSex 全为 0 —— 这正是之前 realFriendScene==30 仍混入系统账号的根因
-// 不再加 @chatroom / @openim 额外防护（普通个人号无影响，保持与参考实现一致）。
-// 仍保留 [友诊] 诊断，重编后看 [好友] 计数是否恰=5 即可确认。
+// 不做 @chatroom / @openim 额外防护（普通个人号无影响，保持与参考实现一致）。
+// 保留 [好友] 计数日志：重编后看末尾「真实好友池=N」，N==5 即成立。
 + (NSArray<CContact *> *)allFriends {
     static NSArray *cached = nil;
     static dispatch_once_t once;
@@ -327,29 +334,10 @@ static NSString *DDLogConfigSummary(void) {
         for (CContact *c in raw) {
             NSString *name = c.m_nsUsrName;
             if (![name isKindOfClass:NSString.class] || name.length == 0) continue;
-            BOOL brand    = [c isBrandContact];                       // CContact.h:101
-            unsigned int sex = c.m_uiSex;                            // CBaseContact.h:153
-            // 交叉核验用的微信谓词（不参与主筛选，仅供日志对照）
-            BOOL single   = [c isWeixinSingleConatct];
-            BOOL singleC  = [c isWeixinSingleConatctCore];
-            BOOL wechatU  = [c isWechatUser];
-            BOOL normalC  = [c isNormalContact];
-            BOOL isRoom   = [name hasSuffix:@"@chatroom"];
-            BOOL openim   = [name containsString:@"@openim"];
-            BOOL hard     = [mgr isHardCodeContact:name];
-            if (brand)   { nBrand++; }
-            if (sex==0)  { nNoSex++; }
-
-            // 全量诊断：把每条联系人的关键字段打出来，按昵称认领 5 个真好友。
-            // 若 m_uiSex 列对真好友全非 0、对系统号全为 0，即证明此判据成立。
-            DDLog(@"[友诊] nick=%-12@ usr=%-22@ brand=%d sex=%u single=%d singleC=%d wechatU=%d normal=%d room=%d openim=%d hard=%d ty=%u tyExt=%llu fscene=%u rfs=%u",
-                  (c.m_nsNickName ?: @""), (name ?: @""),
-                  brand?1:0, sex,
-                  single?1:0, singleC?1:0, wechatU?1:0, normalC?1:0,
-                  isRoom?1:0, openim?1:0, hard?1:0,
-                  (unsigned)c.m_uiType, (unsigned long long)c.m_uiTypeExt,
-                  (unsigned)c.m_uiFriendScene, (unsigned)c.realFriendScene);
-
+            BOOL brand = [c isBrandContact];
+            unsigned int sex = [c m_uiSex];
+            if (brand)  { nBrand++; }
+            if (sex==0) { nNoSex++; }
             // 主筛选：非公众号 且 有性别（真实个人好友）。
             if (!brand && sex != 0) {
                 [friends addObject:c];
