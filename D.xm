@@ -80,19 +80,20 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;  // WCTableViewCellManager.h:30
 @end
 
-// 联系人基类：m_nsUsrName / m_uiType 都在这里，不在 CContact.h —— 故 CContact 须声明继承自 CBaseContact。
+// 联系人基类：m_nsUsrName 在这里，不在 CContact.h —— 故 CContact 须声明继承自 CBaseContact。
 @interface CBaseContact : NSObject
 @property (retain, nonatomic) NSString *m_nsUsrName;    // CBaseContact.h:140
-@property (nonatomic) unsigned int m_uiType;            // CBaseContact.h:155 联系人类型位掩码
 @end
 
 @interface CContact : CBaseContact
 @property (retain, nonatomic) NSString *m_nsNickName;   // CContact.h:281
 - (BOOL)isBrandContact;                                  // CContact.h:101
+- (BOOL)isMyContact;                                     // CContact.h:138 「是不是我的联系人」= 真实好友
 @end
 
 @interface CContactMgr : NSObject
-- (NSArray *)getContactList:(unsigned int)arg1 contactType:(unsigned int)arg2;
+- (NSArray *)getContactList:(unsigned int)arg1 contactType:(unsigned int)arg2;   // CContactMgr.h:173
+- (BOOL)isHardCodeContact:(id)arg1;                                              // CContactMgr.h:63 系统硬编码号判定
 @end
 
 // 服务定位链：MMContext → serviceCenter → getService:（与 DD朋友圈助手 同一套）。
@@ -303,30 +304,37 @@ static NSString *DDLogConfigSummary(void) {
 
 @implementation DDLikeHelper
 
-// 好友名单：通讯录（getContactList:1 contactType:0，CContactMgr.h:173）里按 m_uiType 筛「真好友」。
-// getContactList:contactType:0 取的是整个通讯录，混着群聊 / 陌生人 / 公众号 / 系统号，
-// 故不能只挡 isBrandContact。m_uiType 是位掩码（业界稳定取值）：
-//   1=好友  2=群聊  4=陌生人(聊过未加)  8=公众号(gh_)  ……
-// 仅保留 ==1，排除其余所有。不剔除自己——点赞区「你」由 likeFlag 控制，UI 自行渲染。
-// 只取一次并缓存。日志同时打出 m_uiType 分布，方便核对取值是否仍是标准 1（若非 1 立刻可改）。
+// 好友名单：通讯录（getContactList:1 contactType:0，CContactMgr.h:173）里过滤出真实好友。
+// 主闸门直接用微信内置语义接口 isMyContact（CContact.h:138 =「是不是我的联系人」= 真实好友），
+// 不再依赖 m_uiType 魔法数字（实测其取值无法从 dump 反推，且截图证明 m_uiType==1 拦不住系统号）。
+// 三层防御性剔除作为兜底（均头文件可证），待诊断日志确认 isMyContact 已排除后可视情况裁剪：
+//   ① @chatroom 后缀——群聊；
+//   ② isBrandContact（CContact.h:101）——gh_ 公众号；
+//   ③ isHardCodeContact:（CContactMgr.h:63）——系统硬编码号（朋友圈/微博阅读/语音输入/服务通知/filehelper…）。
+// 不剔除自己（点赞区「你」由 likeFlag 控制，UI 自行渲染）。只取一次并缓存。
 + (NSArray<CContact *> *)allFriends {
     static NSArray *cached = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSMutableArray *friends = [NSMutableArray array];
         CContactMgr *mgr = DDLContactMgr();
-        NSArray *raw = [mgr getContactList:1 contactType:0];   // 通讯录（含全部类型）
-        NSMutableDictionary *dist = [NSMutableDictionary dictionary];
+        NSArray *raw = [mgr getContactList:1 contactType:0];
+        NSUInteger nMy = 0, nRoom = 0, nBrand = 0, nHard = 0;
         for (CContact *c in raw) {
-            NSNumber *t = @(c.m_uiType);
-            dist[t] = @([dist[t] intValue] + 1);              // 统计各 m_uiType 出现次数
-            if (c.m_uiType != 1) continue;                    // 仅保留真好友
+            NSString *name = c.m_nsUsrName;
+            if (![name isKindOfClass:NSString.class] || name.length == 0) continue;
+            if (![c isMyContact]) continue;                  // 主闸门：真实好友
+            nMy++;
+            if ([name hasSuffix:@"@chatroom"]) { nRoom++; continue; }   // 兜底：群聊
+            if ([c isBrandContact])        { nBrand++; continue; }      // 兜底：公众号 gh_
+            if ([mgr isHardCodeContact:name]) { nHard++; continue; }    // 兜底：系统硬编码号
             [friends addObject:c];
         }
         cached = [friends copy];
-        DDLog(@"[好友] contactMgr=%@ 原始=%lu 真好友(m_uiType==1)=%lu 分布=%@",
-              mgr ? @"OK" : @"nil", (unsigned long)raw.count,
-              (unsigned long)cached.count, dist);
+        DDLog(@"[好友] contactMgr=%@ 原始=%lu isMyContact=%lu 兜底剔除(群=%lu 公众号=%lu 系统=%lu) 最终好友池=%lu",
+              mgr ? @"OK" : @"nil", (unsigned long)raw.count, (unsigned long)nMy,
+              (unsigned long)nRoom, (unsigned long)nBrand, (unsigned long)nHard,
+              (unsigned long)cached.count);
     });
     return cached ?: @[];
 }
