@@ -630,6 +630,82 @@ static BOOL DDLForceRebuildCell(id tv, id tlvc, id item) {
     return NO;
 }
 
+static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, id tlvc0, id tv0) {
+    NSMutableDictionary *faked = gDDLFaked();
+
+    if (turningOn) {
+        NSDictionary *snap = (tid ? faked[tid] : nil);
+        item.likeFlag = YES;
+        DDLFakeInto(item, snap[@"likes"], snap[@"comments"]);
+        DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu item=%p（延迟到浮窗收起后执行）",
+              tid, (unsigned long)[snap[@"likes"] count],
+              (unsigned long)[snap[@"comments"] count], (__bridge void *)item);
+        // 三个计数必须一致，否则就是「原本带赞失效」那类问题。
+        DDLog(@"[写入] 计数 likeCount=%d realLikeCount=%d selfLikeCount=%d likeFlag=%d likeUsers=%lu",
+              item.likeCount, item.realLikeCount, item.selfLikeCount, item.likeFlag,
+              (unsigned long)item.likeUsers.count);
+    }
+
+    id mgr = DDLTimelineMgr();
+    DDLog(@"[刷新] 起点 tid=%@ mgr=%@ item=%p", tid,
+          NSStringFromClass([mgr class]) ?: @"(nil)", (__bridge void *)item);
+    DDLProbeOpen();                      // 开 3 秒探活
+    DDLCheckVisible(tid, tlvc0);         // 0.3 秒后体检
+
+    int fired = 0;
+
+    // ⓪ 先把目标行的内容视图拆掉（必须最先做）。
+    //    05 版日志：item 指针不变时 cellForRow 会短路跳过重建，
+    //    后面几路刷得再勤也只是「用旧视图再画一遍」。
+    if (DDLForceRebuildCell(tv0, tlvc0, item)) fired++;
+
+    // ① 微信官方数据项变更出口（WCTimelineMgr.h:71，锤子同款）
+    if (mgr) { [mgr modifyDataItem:item notify:YES]; fired++; }
+
+    id tlvc = tlvc0, tv = tv0;
+    if (!tlvc) DDLog(@"[刷新] ⚠时间线 VC 为空，②③跳过");
+
+    // ② 清 cell 缓存 + 刷新 cell 视图（WCTimeLineViewController.h:289）
+    if (tlvc) {
+        @try {
+            [tlvc onActionClearCellCacheAndRefreshCellView:item];
+            DDLog(@"[刷新] ②onActionClearCellCacheAndRefreshCellView 已调用");
+            fired++;
+        } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
+    }
+
+    // ③ 改完 item 后的单行重排（WCTimeLineViewController.h:424）
+    if (tlvc) {
+        double h = 0;
+        @try {
+            id ip = [tlvc indexPathOfDataItem:item];
+            if ([ip isKindOfClass:NSIndexPath.class] && [tv isKindOfClass:UITableView.class]) {
+                h = [(UITableView *)tv rectForRowAtIndexPath:(NSIndexPath *)ip].size.height;
+            }
+        } @catch (NSException *__) {}
+        @try {
+            [tlvc onUpdateDataItem:item oldHeight:h newHeight:h];
+            DDLog(@"[刷新] ③onUpdateDataItem:oldHeight:newHeight: 已调用 h=%.1f", h);
+            fired++;
+        } @catch (NSException *e) { DDLog(@"[刷新] ③异常 %@", e.reason); }
+    }
+
+    // ④ 兜底：单行重绘
+    if (tlvc && [tv isKindOfClass:UITableView.class]) {
+        @try {
+            id ip = [tlvc indexPathOfDataItem:item];
+            if ([ip isKindOfClass:NSIndexPath.class]) {
+                [(UITableView *)tv reloadRowsAtIndexPaths:@[ip]
+                                        withRowAnimation:UITableViewRowAnimationNone];
+                DDLog(@"[刷新] ④reloadRowsAtIndexPaths 已调用");
+                fired++;
+            }
+        } @catch (NSException *e) { DDLog(@"[刷新] ④异常 %@", e.reason); }
+    }
+
+    DDLog(@"[刷新] 本次共触发 %d 条通路", fired);
+}
+
 // 刷新统一走 DDLReloadTimelineFrom()（定位主表 → reloadData），仅作保底。
 // 上一版照抄成品的优先级链，把 reloadTableView 排在第一位，实测踩坑：
 //   00:33:54.374 [刷新] 整表重绘 出口=reloadTableView   ← 确实执行了（耗时 105ms）
@@ -885,6 +961,17 @@ static NSString *DDLTidOfCell(id cell) {
 }
 
 %new
+// 真正的「写数据 + 刷新」。从长按里抽出来，好让它能被延迟调用。
+//
+// 为什么要延迟：同一版微信下锤子有效、我们无效，两者的差别不在调用哪个 API，
+// 而在**执行时机** ——
+//   锤子：长按 → 弹窗 → 输入 → 确认 → 执行（动作发生在手势早已结束、
+//         浮窗收起、界面安静之后的一个独立事件循环里）
+//   我们：长按当下同步执行（手势仍在进行、浮窗还开着、同 runloop 内
+//         四路 reload 会被 UIKit 合并，且浮窗收起动画/手势结束回调还可能
+//         再用同一份数据刷一遍这一行）
+// 故本版把写入与整体刷新挪到 [self hide] 之后 0.35s 的主线程上执行。
+%new
 // 长按点赞按钮：开则备份 + 伪造，关则恢复原样，然后统一刷新、收起浮窗。
 // 全程同步，不等任何回调；伪造状态按 tid 记住，供刷新后重建。
 - (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g {
@@ -902,10 +989,12 @@ static NSString *DDLTidOfCell(id cell) {
           item.likeCount, item.realLikeCount, item.selfLikeCount,
           (unsigned long)item.likeUsers.count);
 
+    BOOL turningOn = YES;
     if (tid && faked[tid]) {
         // 已集赞 → 取消：恢复原始数据并遗忘这条。
         DDLRestore(item, faked[tid]);
         [faked removeObjectForKey:tid];
+        turningOn = NO;
         DDLog(@"[长按] 取消集赞 tid=%@（已恢复原始值，记忆剩 %lu 条）", tid, (unsigned long)faked.count);
     } else {
         // 未集赞 → 首次生成固定伪造内容并备份原始值，记住 tid。
@@ -922,87 +1011,21 @@ static NSString *DDLTidOfCell(id cell) {
                 @"comments": comments ?: @[],
             };
         }
-        item.likeFlag = YES;
-        NSDictionary *snap = (tid ? faked[tid] : nil);
-        DDLFakeInto(item, snap[@"likes"], snap[@"comments"]);
-        DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu item=%p（固定内容，刷新不重随机）",
-              tid, (unsigned long)[snap[@"likes"] count],
-              (unsigned long)[snap[@"comments"] count], (__bridge void *)item);
-        // 三个计数必须一致，否则就是「原本带赞失效」那类问题。
-        DDLog(@"[写入] 计数 likeCount=%d realLikeCount=%d selfLikeCount=%d likeFlag=%d likeUsers=%lu",
-              item.likeCount, item.realLikeCount, item.selfLikeCount, item.likeFlag,
-              (unsigned long)item.likeUsers.count);
         DDLog(@"[长按] 开启集赞 tid=%@（记忆 %lu 条）", tid, (unsigned long)faked.count);
     }
 
-    // —— 刷新：多路齐发，每路打点 + 开探活，下次日志一眼看出哪条路真的触发了重绘 ——
-    // 04 版实测 modifyDataItem:notify: 单独用是哑弹：它执行后 2.4 秒内
-    // 没有任何目标行的 [单元格] 重建（探活窗口全开着的）。锤子靠它够用，
-    // 但 8.0.79 上已经不够。故本版补两条微信自己的「cell 缓存 / 单行重排」入口。
-    id mgr = DDLTimelineMgr();
-    DDLog(@"[刷新] 起点 tid=%@ mgr=%@ item=%p", tid,
-          NSStringFromClass([mgr class]) ?: @"(nil)", (__bridge void *)item);
-    DDLProbeOpen();                    // 开 3 秒探活
-    DDLCheckVisible(tid, self);        // 0.3 秒后体检
-
-    int fired = 0;
-
-    // ⓪ 先把目标行的内容视图拆掉（必须最先做）。
-    //    05 版日志证明：item 指针不变时，微信 cellForRow 会短路跳过重建，
-    //    后面几路刷得再勤也只是「用旧视图再画一遍」。拆掉才谈得上重绘。
-    id tlvc0 = DDLFindTimelineVC(self);
-    id tv0   = DDLTimelineTableView(tlvc0);
-    if (DDLForceRebuildCell(tv0, tlvc0, item)) fired++;
-
-    // ① 微信官方数据项变更出口（WCTimelineMgr.h:71，锤子同款）
-    if (mgr) { [mgr modifyDataItem:item notify:YES]; fired++; }
-
-    id tlvc = tlvc0, tv = tv0;            // 复用上面已定位好的 VC / 主表
-    if (!tlvc) DDLog(@"[刷新] ⚠定位不到时间线 VC，②③跳过");
-
-    // ② 清 cell 缓存 + 刷新 cell 视图（WCTimeLineViewController.h:289）
-    //    名字直指「点赞区布局缓存」那一层。
-    if (tlvc) {
-        @try {
-            [tlvc onActionClearCellCacheAndRefreshCellView:item];
-            DDLog(@"[刷新] ②onActionClearCellCacheAndRefreshCellView 已调用");
-            fired++;
-        } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
-    }
-
-    // ③ 改完 item 后的单行重排（WCTimeLineViewController.h:424）
-    //    微信自己点赞 / 删评论成功后走的就是它（oldHeight/newHeight 用来稳住 contentOffset）。
-    if (tlvc) {
-        double h = 0;
-        @try {
-            id ip = [tlvc indexPathOfDataItem:item];
-            if ([ip isKindOfClass:NSIndexPath.class] && [tv isKindOfClass:UITableView.class]) {
-                h = [(UITableView *)tv rectForRowAtIndexPath:(NSIndexPath *)ip].size.height;
-            }
-        } @catch (NSException *__) {}
-        @try {
-            [tlvc onUpdateDataItem:item oldHeight:h newHeight:h];
-            DDLog(@"[刷新] ③onUpdateDataItem:oldHeight:newHeight: 已调用 h=%.1f", h);
-            fired++;
-        } @catch (NSException *e) { DDLog(@"[刷新] ③异常 %@", e.reason); }
-    }
-
-    // ④ 兜底：单行重绘（前三版的办法，单独用无效，这里配合上面的强拆再走一次）
-    if (tlvc && [tv isKindOfClass:UITableView.class]) {
-        @try {
-            id ip = [tlvc indexPathOfDataItem:item];
-            if ([ip isKindOfClass:NSIndexPath.class]) {
-                [(UITableView *)tv reloadRowsAtIndexPaths:@[ip]
-                                        withRowAnimation:UITableViewRowAnimationNone];
-                DDLog(@"[刷新] ④reloadRowsAtIndexPaths 已调用");
-                fired++;
-            }
-        } @catch (NSException *e) { DDLog(@"[刷新] ④异常 %@", e.reason); }
-    }
-
-    DDLog(@"[刷新] 本次共触发 %d 条通路", fired);
-
+    // 先把浮窗收起来（用户当场能看到反馈），并把 VC / 主表定位好，
+    // 真正的写入与刷新交给 DDLApplyAndRefresh 在 0.35 秒后执行。
+    id preTLVC = DDLFindTimelineVC(self);
+    id preTV   = DDLTimelineTableView(preTLVC);
+    DDLog(@"[长按] 预定位 VC=%@ 主表=%@", NSStringFromClass([preTLVC class]) ?: @"(nil)",
+          NSStringFromClass([preTV class]) ?: @"(nil)");
     [self hide];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        DDLApplyAndRefresh(item, tid, turningOn, preTLVC, preTV);
+    });
 }
 
 %new
