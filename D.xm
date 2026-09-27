@@ -162,8 +162,14 @@ static inline id DDLTimelineMgr(void) {
 @end
 
 @interface WCTimelineMgr : NSObject
-- (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;       // WCTimelineMgr.h:71
 - (void)commonProcessDataAfterUpdate:(id)datas newAdItems:(id)adItems changedTime:(unsigned int)t; // :59
+@end
+
+// 朋友圈时间线视图控制器（WCTimeLineViewController.h）。用它拿主表 / 反查 item 所在行，
+// 比搜视图树精准。只声明本插件真正调用的方法。
+@interface WCTimeLineViewController : NSObject
+- (id)getContentTableView;                 // WCTimeLineViewController.h:105 时间线主表（UITableView 子类）
+- (id)indexPathOfDataItem:(id)item;        // WCTimeLineViewController.h:116 给定 item → 其 indexPath
 @end
 
 #pragma mark - 配置
@@ -466,6 +472,8 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
     objc_setAssociatedObject(item, kDDLFakedMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+// 单行刷新逻辑已移入 WCOperateFloatView.ddl_reloadRowForItem:（菜单定位：浮窗 navigationController → 时间线 VC → 行）。
+
 // %new 方法的编译期声明（Logos 运行时注入，编译器需先见到签名）。
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
@@ -553,7 +561,26 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
         DDLog(@"[刷新] 警告：WCTimelineMgr 取不到（WCFacade/ServiceCenter 链断了），本次不会自动刷新");
     }
 
+    [self ddl_reloadRowForItem:item];   // 菜单定位：浮窗 navigationController → VC → 单行刷新
     [self hide];
+}
+
+%new
+// 菜单定位：浮窗自带的 navigationController → 时间线 VC → 主表 → 该 item 所在行，只刷那一行。
+// 不依赖全局 VC 缓存、不遍历视图树（证据：WCOperateFloatView.h:11 navigationController）。
+- (void)ddl_reloadRowForItem:(id)item {
+    if (!item) return;
+    Class tlvClass = objc_getClass("WCTimeLineViewController");
+    id navOrVC = [self navigationController];
+    id tlvc = ([navOrVC isKindOfClass:tlvClass] ? navOrVC
+               : ([navOrVC respondsToSelector:@selector(topViewController)]
+                  ? [navOrVC topViewController] : nil));
+    if (![tlvc isKindOfClass:tlvClass]) return;
+    UITableView *tv = [tlvc getContentTableView];
+    if (!tv) return;
+    NSIndexPath *ip = [tlvc indexPathOfDataItem:item];
+    if (ip) [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+    else [tv reloadData];
 }
 
 %end
