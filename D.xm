@@ -80,11 +80,9 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;  // WCTableViewCellManager.h:30
 @end
 
-// 联系人基类：m_nsUsrName / m_uiSex / m_nsHeadImgUrl / m_nsRemark 都在这里，
-// 不在 CContact.h —— 故 CContact 须声明继承自 CBaseContact。
+// 联系人基类：m_nsUsrName 在这里，不在 CContact.h —— 故 CContact 须声明继承自 CBaseContact。
 @interface CBaseContact : NSObject
 @property (retain, nonatomic) NSString *m_nsUsrName;    // CBaseContact.h:140
-@property (nonatomic) unsigned int m_uiSex;             // CBaseContact.h:154
 @end
 
 @interface CContact : CBaseContact
@@ -304,8 +302,9 @@ static NSString *DDLogConfigSummary(void) {
 
 @implementation DDLikeHelper
 
-// 好友名单：排除公众号（isBrandContact）与性别未知（m_uiSex == 0）的联系人。
-// 只取一次并缓存，联系人列表不会在会话内变化。
+// 好友名单：只排除公众号（isBrandContact）。池子不剔除自己——微信点赞区
+// 显示「你」由 likeFlag 控制，列表里的自己会被 UI 去重 / 当作「你」渲染，
+// 不会出现两份。只取一次并缓存，联系人列表不会在会话内变化。
 + (NSArray<CContact *> *)allFriends {
     static NSArray *cached = nil;
     static dispatch_once_t once;
@@ -314,7 +313,7 @@ static NSString *DDLogConfigSummary(void) {
         CContactMgr *mgr = DDLContactMgr();
         NSArray *raw = [mgr getContactList:1 contactType:0];
         for (CContact *c in raw) {
-            if (![c isBrandContact] && c.m_uiSex != 0) [friends addObject:c];
+            if (![c isBrandContact]) [friends addObject:c];  // 仅排除公众号
         }
         cached = [friends copy];
         DDLog(@"[好友] contactMgr=%@ 原始=%lu 过滤后=%lu",
@@ -404,9 +403,12 @@ static NSString *DDLogConfigSummary(void) {
 // 长按手势的挂载去重键。
 static const void *kDDLLongPressKey = &kDDLLongPressKey;
 
-// 已集赞的帖子：tid → 原始数据快照。
-// 两个用途：刷新后按 tid 重新伪造（刷新会重建 item、冲掉内存改动）；
-// 再次长按则据此恢复原样（取消集赞）。
+// 幂等标记：打在已伪装的 WCDataItem 上，刷新回调命中时若内容一致可跳过重写。
+static const void *kDDLFakedMark = &kDDLFakedMark;
+
+// 已集赞的帖子：tid → @{ orig: 原始快照, likes: 固定伪造点赞, comments: 固定伪造评论 }。
+// 两个用途：刷新后按 tid 复用「固定内容」重新伪造（刷新会重建 item、冲掉内存改动）；
+// 再次长按则据 orig 恢复原样（取消集赞）。内容只在长按开启时生成一次，刷新不重随机。
 static NSMutableDictionary *gDDLFaked(void) {
     static NSMutableDictionary *d = nil;
     static dispatch_once_t once;
@@ -425,37 +427,36 @@ static NSDictionary *DDLSnapshotOf(WCDataItem *item) {
     };
 }
 
-static void DDLRestore(WCDataItem *item, NSDictionary *s) {
-    item.likeUsers    = [s[@"likeUsers"] mutableCopy];
-    item.likeCount    = [s[@"likeCount"] intValue];
-    item.commentUsers = [s[@"commentUsers"] mutableCopy];
-    item.commentCount = [s[@"commentCount"] intValue];
-    item.likeFlag     = [s[@"likeFlag"] boolValue];
-    item.cpKeyForLikeUsers = nil;               // 同下，取消时也要让点赞区重绘
+static void DDLRestore(WCDataItem *item, NSDictionary *snap) {
+    NSDictionary *o = snap[@"orig"];
+    item.likeUsers    = [o[@"likeUsers"] mutableCopy];
+    item.likeCount    = [o[@"likeCount"] intValue];
+    item.commentUsers = [o[@"commentUsers"] mutableCopy];
+    item.commentCount = [o[@"commentCount"] intValue];
+    item.likeFlag     = [o[@"likeFlag"] boolValue];
+    item.cpKeyForLikeUsers = nil;               // 取消时也要让点赞区重绘
+    objc_setAssociatedObject(item, kDDLFakedMark, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 清幂等标记
 }
 
-// 把伪造数据写回 item。
-static inline void DDLFakeInto(WCDataItem *item) {
+// 把「已生成的固定伪造内容」写回 item。
+// 本函数不再生成随机内容——内容由长按处生成一次后存进 gDDLFaked，
+// 这里只负责回填 + 清 cpKey + 打幂等标记。刷新回调复用同一份内容，评论不再随机变。
+static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *comments) {
     if (!item) return;
-
-    NSMutableArray *comments = [DDLikeHelper fakeCommentsFor:item];
     if (comments.count) {
-        item.commentUsers = comments;
+        item.commentUsers = [comments mutableCopy];
         item.commentCount = (int)comments.count;
     }
-    NSMutableArray *likes = [DDLikeHelper fakeLikeUsers];
     if (likes.count) {
-        item.likeUsers = likes;
+        item.likeUsers = [likes mutableCopy];
         item.likeCount = (int)likes.count;
     }
     // 关键：cpKey 是微信的布局缓存键（同类还有 cpKeyForMessage / cpKeyForNickname）。
     // 只改 likeUsers 而 cpKeyForLikeUsers 不变，微信认为点赞区内容没变就不重绘，
     // 表现为「评论出来了、赞没出来」。置 nil 强制重算。
-    id oldKey = item.cpKeyForLikeUsers;
     item.cpKeyForLikeUsers = nil;
-    DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu cpKey旧=%@ → nil",
-          item.tid, (unsigned long)likes.count, (unsigned long)comments.count,
-          oldKey ? @"有值" : @"nil");
+    // 幂等标记：同一 item 实例已伪装且一致时，刷新回调可跳过重写（省一次回填 + 日志）。
+    objc_setAssociatedObject(item, kDDLFakedMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // %new 方法的编译期声明（Logos 运行时注入，编译器需先见到签名）。
@@ -484,6 +485,11 @@ static inline void DDLFakeInto(WCDataItem *item) {
         [[UILongPressGestureRecognizer alloc] initWithTarget:self
                                                       action:@selector(ddl_onLikeLongPress:)];
     lp.minimumPressDuration = 1.0;                                 // 长按 1 秒触发
+    // 关键：截留触摸，避免长按被按钮当成一次普通点击而触发真实点赞。
+    // delaysTouchesBegan=YES → 按住期间触摸先被手势持有；识别成长按则取消该次触摸
+    // （不触发 m_likeBtn 的 touchUpInside 真实赞）；没按够 1 秒松手则手势失败、触摸照常下发
+    // （轻点仍走微信真实点赞）。cancelsTouchesInView 默认 YES，识别成功后即取消在视图上的触摸。
+    lp.delaysTouchesBegan = YES;
     [btn addGestureRecognizer:lp];
     objc_setAssociatedObject(btn, kDDLLongPressKey, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     DDLog(@"[手势] 已挂长按 likeBtn=%@", btn);
@@ -509,12 +515,25 @@ static inline void DDLFakeInto(WCDataItem *item) {
         [faked removeObjectForKey:tid];
         DDLog(@"[长按] 取消集赞 tid=%@（已恢复原始值，记忆剩 %lu 条）", tid, (unsigned long)faked.count);
     } else {
-        // 未集赞 → 先备份原始值，再伪造并记住 tid。
+        // 未集赞 → 首次生成固定伪造内容并备份原始值，记住 tid。
+        // 关键点：评论 / 点赞内容「只在此处生成一次」，后续刷新只复用，不再随机，
+        // 否则每次后台轮询都会重新随机、内容来回跳。
         // 不调原生 onLikeItem:——它是点赞 / 取消赞的开关，已赞时调会反而取消。
         if (!tid) DDLog(@"[长按] 警告：tid 为 nil，刷新后无法重建");
-        if (tid) faked[tid] = DDLSnapshotOf(item);
+        if (tid) {
+            NSArray *likes    = [DDLikeHelper fakeLikeUsers];
+            NSArray *comments = [DDLikeHelper fakeCommentsFor:item];
+            faked[tid] = @{
+                @"orig":     DDLSnapshotOf(item),
+                @"likes":    likes    ?: @[],
+                @"comments": comments ?: @[],
+            };
+        }
         item.likeFlag = YES;
-        DDLFakeInto(item);
+        NSDictionary *snap = (tid ? faked[tid] : nil);
+        DDLFakeInto(item, snap[@"likes"], snap[@"comments"]);
+        DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu（固定内容，刷新不重随机）",
+              tid, (unsigned long)[snap[@"likes"] count], (unsigned long)[snap[@"comments"] count]);
         DDLog(@"[长按] 开启集赞 tid=%@（记忆 %lu 条）", tid, (unsigned long)faked.count);
     }
 
@@ -540,25 +559,39 @@ static inline void DDLFakeInto(WCDataItem *item) {
 - (void)commonProcessDataAfterUpdate:(id)datas newAdItems:(id)adItems changedTime:(unsigned int)t {
     NSMutableDictionary *faked = gDDLFaked();
     BOOL isArray = [datas isKindOfClass:NSArray.class];
-    NSUInteger hit = 0;
+    NSUInteger hit = 0;     // 真正重写（微信重建出新对象）的次数
+    NSUInteger skip = 0;    // 幂等跳过（同实例已伪装且一致）的次数
 
     if (faked.count && isArray) {
         for (id obj in (NSArray *)datas) {
             if (![obj isKindOfClass:objc_getClass("WCDataItem")]) continue;
             WCDataItem *item = (WCDataItem *)obj;
             NSString *tid = item.tid;
-            if (tid && faked[tid]) {
-                item.likeFlag = YES;
-                DDLFakeInto(item);
+            NSDictionary *snap = (tid ? faked[tid] : nil);
+            if (!snap) continue;
+
+            item.likeFlag = YES;
+            NSArray *likes    = snap[@"likes"];
+            NSArray *comments = snap[@"comments"];
+            // 幂等：同一实例已伪装且内容一致（点赞 / 评论条数吻合）则跳过重写，
+            // 只在微信重建出新对象（后台轮询常见）时才回填固定内容。
+            BOOL marked     = [objc_getAssociatedObject(item, kDDLFakedMark) boolValue];
+            BOOL consistent = (item.likeUsers.count == likes.count) &&
+                              (item.commentUsers.count == comments.count);
+            if (marked && consistent) {
+                skip++;
+            } else {
+                DDLFakeInto(item, likes, comments);
                 hit++;
             }
         }
     }
 
-    DDLog(@"[刷新回调] commonProcessDataAfterUpdate datas=%@ 条数=%lu 记忆=%lu 命中重建=%lu",
-          isArray ? @"NSArray" : NSStringFromClass([datas class]),
+    NSUInteger adCount = ([adItems isKindOfClass:NSArray.class]
+                          ? (unsigned long)[(NSArray *)adItems count] : 0);
+    DDLog(@"[刷新回调] 条数=%lu 记忆=%lu 重写=%lu 跳过=%lu newAdItems=%lu",
           isArray ? (unsigned long)[(NSArray *)datas count] : 0,
-          (unsigned long)faked.count, (unsigned long)hit);
+          (unsigned long)faked.count, (unsigned long)hit, (unsigned long)skip, (unsigned long)adCount);
 
     %orig(datas, adItems, t);
 }
