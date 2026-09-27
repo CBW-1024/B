@@ -92,8 +92,12 @@
 @interface CContact : CBaseContact
 @property (retain, nonatomic) NSString *m_nsNickName;   // CContact.h:281
 - (BOOL)isBrandContact;                                  // CContact.h:101 gh_ 公众号 = 非好友
+- (BOOL)isChatroom;                                      // 群聊（@chatroom）
+- (BOOL)m_isPlugin;                                      // 插件号：微博阅读/腾讯新闻/漂流瓶/语音记事本/QQ邮箱/朋友圈入口等
+- (BOOL)isGroupCard;                                     // 群名片
 - (BOOL)isHolderContact;                                // 持有者 / 特殊号（非真人）
 - (BOOL)isWeixinTeamContact;                            // 微信团队号（非真人）
+- (BOOL)isFileHelper;                                    // 文件传输助手
 @end
 
 @interface CContactMgr : NSObject
@@ -316,17 +320,20 @@ static NSString *DDLogConfigSummary(void) {
 
 @implementation DDLikeHelper
 
-// 真实好友池 = 非公众号 + 非持有者号 + 非微信团队号 + 用户名不含 @openim。
-// 过滤判据对齐锤子 WeChatTweak.startCheckFriends 反汇编实证：
-//   isBrandContact / isHolderContact / isWeixinTeamContact /
-//   IsOpenImContactUserName: / IsOpenImKeFuContactUserName:
-// 我们用 @openim 子串检查同时覆盖企业微信联系人与客服两类；
+// 真实好友池 = 排除非真人账号，过滤判据完整对齐锤子 WeChatTweak.startCheckFriends
+// 反汇编实证的全部 9 个谓词：
+//   isBrandContact / isChatroom / m_isPlugin / isGroupCard / isHolderContact /
+//   isWeixinTeamContact / isFileHelper / IsOpenImContactUserName: / IsOpenImKeFuContactUserName:
+// @openim 子串检查同时覆盖企业微信联系人 + 客服两类；
 // 不按性别筛（m_uiSex 不卡，避免误伤未设性别的真实好友）。
+// 血泪教训：m_isPlugin / isChatroom / isFileHelper 一个都不能省 ——
+// 省掉后微博阅读/腾讯新闻/漂流瓶/文件传输助手/@chatroom 群全会被当成「点赞人」。
 + (NSArray<CContact *> *)allFriends {
     NSMutableArray *friends = [NSMutableArray array];
     CContactMgr *mgr = DDLContactMgr();
     for (CContact *c in [mgr getContactList:1 contactType:0]) {
-        if (![c isBrandContact] && ![c isHolderContact] && ![c isWeixinTeamContact] &&
+        if (![c isBrandContact] && ![c isChatroom] && ![c m_isPlugin] && ![c isGroupCard] &&
+            ![c isHolderContact] && ![c isWeixinTeamContact] && ![c isFileHelper] &&
             ![[c m_nsUsrName] containsString:@"@openim"]) {
             [friends addObject:c];
         }
