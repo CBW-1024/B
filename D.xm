@@ -713,7 +713,7 @@ static void DDLCheckVisible(NSString *tid) {
                 if (![ctid isEqualToString:tid]) shown++; else n++;
                 DDLog(@"[体检] %@cell=%@ tid=%@ item=%p 赞=%lu 评论=%lu frame=%@",
                       ([ctid isEqualToString:tid] ? @"命中 " : @"样本 "),
-                      NSStringFromClass([cell class]), ctid ?: @"(无)", (void *)it,
+                      NSStringFromClass([cell class]), ctid ?: @"(无)", (__bridge void *)it,
                       (unsigned long)lc, (unsigned long)cc, NSStringFromCGRect(cell.frame));
             }
         }
