@@ -302,21 +302,22 @@ static NSString *DDLogConfigSummary(void) {
 
 @implementation DDLikeHelper
 
-// 好友名单：只排除公众号（isBrandContact）。池子不剔除自己——微信点赞区
-// 显示「你」由 likeFlag 控制，列表里的自己会被 UI 去重 / 当作「你」渲染，
-// 不会出现两份。只取一次并缓存，联系人列表不会在会话内变化。
+// 好友名单：直接取通讯录（getContactList:1 contactType:0，CContactMgr.h:173），仅排除公众号（isBrandContact）。
+// 实测通讯录不含「朋友圈 / 微博阅读 / 语音输入」等系统号，无需按 m_uiType 细分。
+// 不剔除自己——点赞区显示「你」由 likeFlag 控制，UI 会把列表里的自己当作「你」渲染，不重复。
+// 只取一次并缓存，联系人列表不会在会话内变化。
 + (NSArray<CContact *> *)allFriends {
     static NSArray *cached = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSMutableArray *friends = [NSMutableArray array];
         CContactMgr *mgr = DDLContactMgr();
-        NSArray *raw = [mgr getContactList:1 contactType:0];
+        NSArray *raw = [mgr getContactList:1 contactType:0];   // 通讯录（含好友与公众号）
         for (CContact *c in raw) {
-            if (![c isBrandContact]) [friends addObject:c];  // 仅排除公众号
+            if (![c isBrandContact]) [friends addObject:c];   // 仅排除公众号
         }
         cached = [friends copy];
-        DDLog(@"[好友] contactMgr=%@ 原始=%lu 过滤后=%lu",
+        DDLog(@"[好友] contactMgr=%@ 原始=%lu 过滤公众号后=%lu",
               mgr ? @"OK" : @"nil", (unsigned long)raw.count, (unsigned long)cached.count);
     });
     return cached ?: @[];
