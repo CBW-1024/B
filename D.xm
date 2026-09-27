@@ -474,6 +474,37 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
 
 // 单行刷新逻辑已移入 WCOperateFloatView.ddl_reloadRowForItem:（菜单定位：浮窗 navigationController → 时间线 VC → 行）。
 
+// 刷新诊断：记录每个 tid 上次「刷新事件」的时间，用来发现同一动作导致同一条被刷新/重建多次的冗余。
+// tag 区分事件流（R=我们主动 reloadRows，C=单元格被重建），互不影响。
+static NSString *DDLGap(NSString *key, NSString *tag) {
+    static NSMutableDictionary *last;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ last = [NSMutableDictionary dictionary]; });
+    NSString *k = [tag stringByAppendingString:(key ?: @"?")];
+    NSDate *now = [NSDate date];
+    NSDate *prev = last[k];
+    last[k] = now;
+    if (!prev) return @"首次";
+    NSTimeInterval dt = [now timeIntervalSinceDate:prev] * 1000.0;
+    if (dt < 500.0) return [NSString stringWithFormat:@"⚠%.0fms", dt];
+    return [NSString stringWithFormat:@"%lldms", (long long)dt];
+}
+
+// 尽量从 cell 取 tid：cell 可能直接持有 m_dataItem，或其一级子视图持有（WCTimeLineCellView.m_dataItem）。
+// 取不到返回 nil；全程 @try 包裹，绝不因诊断影响主流程。
+static NSString *DDLTidOfCell(id cell) {
+    if (!cell) return nil;
+    @try {
+        id item = [cell valueForKey:@"m_dataItem"];
+        if ([item respondsToSelector:@selector(tid)]) return [item tid];
+        for (UIView *v in ((UIView *)cell).subviews) {
+            id it = [v valueForKey:@"m_dataItem"];
+            if ([it respondsToSelector:@selector(tid)]) return [it tid];
+        }
+    } @catch (NSException *__) {}
+    return nil;
+}
+
 // %new 方法的编译期声明（Logos 运行时注入，编译器需先见到签名）。
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
@@ -552,16 +583,17 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
         DDLog(@"[长按] 开启集赞 tid=%@（记忆 %lu 条）", tid, (unsigned long)faked.count);
     }
 
-    // 借 WCTimelineMgr 的统一出口通知一次刷新（WCTimelineMgr.h:71）。
+    // 先借 WCTimelineMgr 的统一出口通知一次（WCTimelineMgr.h:71）：让微信原生流程按当前（已伪造）模型走，
+    // 它是否会触发一次单元格重绘取决于微信内部实现，本日志无法断言 —— 用下方 [单元格] 重建日志对照。
     id mgr = DDLTimelineMgr();
     if (mgr) {
         [mgr modifyDataItem:item notify:YES];
-        DDLog(@"[刷新] modifyDataItem:notify: 已调用");
+        DDLog(@"[刷新] modifyDataItem:notify: 已调用（原生通知）");
     } else {
         DDLog(@"[刷新] 警告：WCTimelineMgr 取不到（WCFacade/ServiceCenter 链断了），本次不会自动刷新");
     }
 
-    [self ddl_reloadRowForItem:item];   // 菜单定位：浮窗 navigationController → VC → 单行刷新
+    [self ddl_reloadRowForItem:item];   // 菜单定位：浮窗 navigationController → VC → 单行刷新（确定性触发一次重绘）
     [self hide];
 }
 
@@ -569,20 +601,47 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
 // 菜单定位：浮窗自带的 navigationController → 时间线 VC → 主表 → 该 item 所在行，只刷那一行。
 // 不依赖全局 VC 缓存、不遍历视图树（证据：WCOperateFloatView.h:11 navigationController）。
 - (void)ddl_reloadRowForItem:(id)item {
-    if (!item) return;
+    if (!item) { DDLog(@"[刷新] ddl_reloadRowForItem 收到空 item，跳过"); return; }
+    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
     Class tlvClass = objc_getClass("WCTimeLineViewController");
     id navOrVC = [self navigationController];
+    DDLog(@"[刷新] 定位开始 tid=%@ nav=%@ %@", tid, NSStringFromClass([navOrVC class]),
+          navOrVC ? @"非空" : @"空");
     id tlvc = ([navOrVC isKindOfClass:tlvClass] ? navOrVC
                : ([navOrVC respondsToSelector:@selector(topViewController)]
                   ? [navOrVC topViewController] : nil));
-    if (![tlvc isKindOfClass:tlvClass]) return;
+    if (![tlvc isKindOfClass:tlvClass]) {
+        DDLog(@"[刷新] ⚠未定位到时间线 VC（实际=%@），放弃单行刷新", NSStringFromClass([tlvc class]));
+        return;
+    }
     UITableView *tv = [tlvc getContentTableView];
-    if (!tv) return;
+    if (!tv) { DDLog(@"[刷新] ⚠getContentTableView 为空，放弃"); return; }
     NSIndexPath *ip = [tlvc indexPathOfDataItem:item];
-    if (ip) [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
-    else [tv reloadData];
+    if (ip) {
+        DDLog(@"[刷新] 单行 reloadRows tid=%@ sec=%ld row=%ld %@", tid,
+              (long)ip.section, (long)ip.row, DDLGap(tid, @"R:"));
+        [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+    } else {
+        DDLog(@"[刷新] ⚠indexPathOfDataItem: 返回 nil → 退回 reloadData（整表重绘）tid=%@ %@",
+              tid, DDLGap(tid, @"R:"));
+        [tv reloadData];
+    }
 }
 
+%end
+
+%hook WCTimeLineViewController
+// 诊断钩子（WCTimeLineViewController.h:147）：观察「已集赞」帖子的单元格被重建的次数。
+// 若一次长按导致同 tid 单元格被重建 2 次且间隔极短，说明 modifyDataItem:notify: 的原生刷新
+// 与我们的 reloadRows 发生了重复渲染。仅对记忆库中的 tid 打日志，不影响任何行为。
+- (id)tableView:(id)tv cellForRowAtIndexPath:(id)ip {
+    id cell = %orig;
+    NSString *tid = DDLTidOfCell(cell);
+    if (tid && gDDLFaked()[tid]) {
+        DDLog(@"[单元格] 重建 tid=%@ %@ %@", tid, DDLGap(tid, @"C:"), NSStringFromClass([tv class]));
+    }
+    return cell;
+}
 %end
 
 %hook WCTimelineMgr
