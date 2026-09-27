@@ -163,6 +163,7 @@ static inline id DDLTimelineMgr(void) {
 
 @interface WCTimelineMgr : NSObject
 - (void)commonProcessDataAfterUpdate:(id)datas newAdItems:(id)adItems changedTime:(unsigned int)t; // :59
+- (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;   // WCTimelineMgr.h:71 统一刷新出口
 @end
 
 // 朋友圈时间线视图控制器（WCTimeLineViewController.h）。用它拿主表 / 反查 item 所在行，
@@ -311,22 +312,17 @@ static NSString *DDLogConfigSummary(void) {
 + (NSMutableArray<WCUserComment *> *)fakeCommentsFor:(WCDataItem *)origItem;
 @end
 
-@interface CContact (DDFriendExt)
-- (unsigned int)m_uiSex;
-@end
-
 @implementation DDLikeHelper
 
-// 真实好友池 = 非公众号 + 有性别 + 用户名不含 @openim。
-// 最后一项来自 WCRefine.dylib 的 +allFriends（IMP 0x0fa0434）反汇编实证：
-// 它对每个联系人依次判 isBrandContact / m_uiSex / [m_nsUsrName containsString:@"@openim"]，
-// 三者皆过才入池。@openim 是微信客服 / 开放平台机器人账号前缀（虽带性别但非真人），
-// 不剔除会被当成「点赞人」塞进列表。
+// 真实好友池 = 非公众号 + 用户名不含 @openim。
+// @openim 是微信客服 / 开放平台机器人账号前缀（非真人），不剔除会被当成「点赞人」塞进列表。
+// 注意：不卡 m_uiSex —— 没填性别（m_uiSex==0）的真实好友也要保留，
+// 之前的「有性别」条件会把一大批未设性别的用户误伤出池。
 + (NSArray<CContact *> *)allFriends {
     NSMutableArray *friends = [NSMutableArray array];
     CContactMgr *mgr = DDLContactMgr();
     for (CContact *c in [mgr getContactList:1 contactType:0]) {
-        if (![c isBrandContact] && [c m_uiSex] != 0 &&
+        if (![c isBrandContact] &&
             ![[c m_nsUsrName] containsString:@"@openim"]) {
             [friends addObject:c];
         }
@@ -506,9 +502,13 @@ static NSString *DDLTidOfCell(id cell) {
 }
 
 // %new 方法的编译期声明（Logos 运行时注入，编译器需先见到签名）。
+// 同时把本类调用的私有 API 一并前向声明，避免 "no known instance method /
+// no visible @interface" 编译错误（声明只告诉编译器签名，实现在运行时由微信提供）。
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
 - (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g;
+- (void)ddl_reloadRowForItem:(id)item;          // %new，菜单定位单行刷新
+- (id)navigationController;                     // WCOperateFloatView.h:11，浮窗自带导航栈
 @end
 
 %hook WCOperateFloatView
