@@ -12,28 +12,32 @@
 //   再次长按同一条 → 按快照恢复原样（取消集赞）并同样重绘。
 //   全程同步，不拦原生回调、不等服务器返回（本地伪装用不上）。
 //
-// 刷新方式（照成品插件反汇编的结果重写，二进制证据见下方三个坑的第一条）：
-//   改完 item 后定位时间线 VC，按优先级取一个出口：
-//     reloadTableView > reloadTableData > [valueForKey:@"tableView"/@"m_tableView"] reloadData
-//   只发一次，不再叠 WCTimelineMgr.modifyDataItem:notify:。
+// 刷新方式（实测修正过两版，下面是最终版与两次踩坑的证据）：
+//   改完 item → 定位时间线主表 → reloadData。
+//   优先级：① 主表 reloadData ② VC reloadTableView ③ VC reloadTableData。
+//
+//   第一版：单行 reloadRowsAtIndexPaths —— 「本来就有赞」的帖子加了伪赞画面不变，
+//           要再手动刷一次。原因：单行重绘绕不开点赞区那层布局缓存。
+//   第二版：照抄成品把 reloadTableView 排第一 —— 实测同样无效：
+//           00:33:54.374 [刷新] 整表重绘 出口=reloadTableView（耗时 105ms，确实执行了）
+//           之后 11 秒没有任何 [单元格] 重建 → 8.0.79 上它并不触发
+//           tableView:cellForRowAtIndexPath:。
+//   真正让画面变的是同一份日志的第 16 行：11 秒后微信自己的 [刷新回调] 重写=1，
+//   它一过伪赞就出来了 —— 说明只要有一次真正的 reloadData，画面立刻正确。
 //
 // 三个坑（都是真机踩出来的）：
-//   - 刷新必须是「整表重绘」，不能只 reloadRows 单行。
-//     成品实现（证据）如下：WCRefine.dylib 的
-//     _WCRefineReloadMomentsViewControllerAfterFakeEngagement（IMP 0x55d5d4）——
-//     它在 Apply/Cancel 改完 item 之后只做这一件事：先 WCRefineFindMomentsReloadViewController
-//     定位 VC，再 respondsToSelector: 依次试 reloadTableView(0x55d62c) →
-//     reloadTableData(0x55d6a0)，都不响应才 valueForKey:@"tableView"(0x55d714) /
-//     @"m_tableView"(0x55d814)，并对结果走 isKindOfClass 后 reloadData(0x55d9bc)。
-//     全程没有 modifyDataItem:notify:，也没有碰 cpKeyForLikeUsers
-//     （该二进制的 selrefs 里根本不存在 cpKey 字样）。
-//     锤子 WeChatTweak.dylib 同样如此：reloadTableData(IMP 0x718294) → tableViewMgr
-//     → tableView → reloadData。
-//     单行 reloadRows 的问题：只重绘该行单元格，点赞区那层带 cpKey 的布局缓存
-//     不受影响，尤其「本来就有赞」的帖子，赞区高度/布局是算好的缓存，
-//     加了伪赞也看不出来，要再手动刷一次才跳出来 —— 正是之前的现象。
+//   - 刷新必须落到「主表 reloadData」，见上面三版对比。成品的
+//     _WCRefineReloadMomentsViewControllerAfterFakeEngagement（WCRefine.dylib IMP 0x55d5d4）
+//     与本插件结构一致：改完 item 只做一次重绘，VC 级出口是它的备选；
+//     锤子 WeChatTweak.dylib 的 reloadTableData（IMP 0x718294）也是
+//     → tableViewMgr → tableView → reloadData。两者都全程没有
+//     modifyDataItem:notify:，也没碰过 cpKeyForLikeUsers
+//     （WCRefine 的 25228 条 selrefs 里搜不到 cpKey 字样）。
+//   - 微信的后台轮询会重建 item、冲掉内存改动，
+//     所以 commonProcessDataAfterUpdate: 里回填完必须自己补一次重绘
+//     （否则就是「数据对了、画面不动」）。
 //   - cpKeyForLikeUsers 是点赞区的布局缓存键，置 nil 属于双保险；
-//     成品不碰它（它们靠整表重绘兜底），保留不影响正确性。
+//     成品不碰它（它们靠重绘兜底），保留不影响正确性。
 //   - 下拉刷新 / 翻页会重建 WCDataItem 对象，内存改动全丢，
 //     故把伪造状态按 tid 记在 gDDLFaked 里，再于
 //     WCTimelineMgr.commonProcessDataAfterUpdate: 里按 tid 重新伪造。
@@ -515,7 +519,156 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
     objc_setAssociatedObject(item, kDDLFakedMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-// 刷新已从「单行 reloadRows」改为一次「整表重绘」，见 WCOperateFloatView.ddl_reloadTimelineForItem:。
+// 刷新统一走 DDLReloadTimelineFrom()（定位主表 → reloadData）。
+// 上一版照抄成品的优先级链，把 reloadTableView 排在第一位，实测踩坑：
+//   00:33:54.374 [刷新] 整表重绘 出口=reloadTableView   ← 确实执行了（耗时 105ms）
+//   之后 11 秒都没有一条 [单元格] 重建
+// 即 8.0.79 的 WCTimeLineViewController.reloadTableView 并不是「主表 reloadData」，
+// 它不触发 tableView:cellForRowAtIndexPath:。而真正拦住画面的是同一份日志的第 16 行：
+//   [刷新回调] 重写=1（微信自己的数据回调，11 秒后）—— 它一过，伪赞就出来了。
+// 结论：只要能真正触发一次主表 reloadData，画面立刻正确。故本版改为「先拿主表 reloadData」。
+
+// （DDLGap / DDLTidOfCell 定义在下面，这里先前置声明。）
+static NSString *DDLGap(NSString *key, NSString *tag);
+static NSString *DDLTidOfCell(id cell);
+
+// 探活窗口：刷新后开 3 秒，期间 cellForRowAtIndexPath 打印全部单元格（不限记忆库），
+// 用来确认「重绘到底有没有真的发生」。平时关着，避免刷屏。
+static NSTimeInterval gDDLProbeUntil = 0;
+static inline void DDLProbeOpen(void) {
+    gDDLProbeUntil = [NSDate timeIntervalSinceReferenceDate] + 3.0;
+}
+static inline BOOL DDLProbeOn(void) {
+    return [NSDate timeIntervalSinceReferenceDate] < gDDLProbeUntil;
+}
+
+// 从任意对象出发定位时间线 VC：先 navigationController/topViewController，
+// 再沿响应链 nextResponder 往上（照 WCRefine.dylib 的
+// WCRefineFindMomentsReloadViewController，IMP 0x55d414）。
+static id DDLFindTimelineVC(id start) {
+    Class tlvClass = objc_getClass("WCTimeLineViewController");
+    if (!tlvClass) return nil;
+
+    id cur = start;
+    for (int i = 0; i < 15 && cur; i++) {
+        if ([cur isKindOfClass:tlvClass]) return cur;
+        if ([cur respondsToSelector:@selector(topViewController)]) {
+            id top = [cur topViewController];
+            if ([top isKindOfClass:tlvClass]) return top;
+        }
+        if ([cur respondsToSelector:@selector(navigationController)]) {
+            id nav = [cur navigationController];
+            if ([nav isKindOfClass:tlvClass]) return nav;
+            if ([nav respondsToSelector:@selector(topViewController)]) {
+                id top = [nav topViewController];
+                if ([top isKindOfClass:tlvClass]) return top;
+            }
+        }
+        if (![cur respondsToSelector:@selector(nextResponder)]) break;
+        cur = [cur nextResponder];
+    }
+    return nil;
+}
+
+// 取时间线主表。优先用头文件里确定存在的 getContentTableView（WCTimeLineViewController.h:105），
+// 拿不到再按成品的顺序 KVC 两个键；valueForKey: 取不到会抛 NSUnknownKeyException，必须 @try。
+static id DDLTimelineTableView(id tlvc) {
+    if (!tlvc) return nil;
+    id tv = nil;
+    if ([tlvc respondsToSelector:@selector(getContentTableView)]) {
+        @try { tv = [tlvc getContentTableView]; } @catch (NSException *__) { tv = nil; }
+    }
+    for (NSString *k in @[@"tableView", @"m_tableView"]) {
+        if (tv) break;
+        @try { tv = [tlvc valueForKey:k]; } @catch (NSException *__) { tv = nil; }
+    }
+    return ([tv isKindOfClass:UITableView.class]) ? tv : nil;
+}
+
+// 唯一刷新出口：主表 reloadData。返回 YES = 已触发。
+// 优先级（与上一版相反，主表 reloadData 排第一，因为它才是实测有效的那个）：
+//   ① 主表 reloadData
+//   ② VC 的 reloadTableView（WCTimeLineViewController.h:474）
+//   ③ VC 的 reloadTableData
+static BOOL DDLReloadTimelineFrom(id start, NSString *tid) {
+    id tlvc = DDLFindTimelineVC(start);
+    if (!tlvc) {
+        DDLog(@"[刷新] ⚠未定位到时间线 VC（起点=%@）", NSStringFromClass([start class]));
+        return NO;
+    }
+    DDLog(@"[刷新] 定位到 VC=%@ tid=%@", NSStringFromClass([tlvc class]), tid);
+
+    id tv = DDLTimelineTableView(tlvc);
+    if (tv) {
+        DDLProbeOpen();                       // 开 3 秒探活，确认这次重绘真的到了 cellForRow
+        [(UITableView *)tv reloadData];
+        DDLog(@"[刷新] 主表 reloadData tid=%@ 表=%@ %@", tid,
+              NSStringFromClass([tv class]), DDLGap(tid, @"T:"));
+        return YES;
+    }
+
+    SEL chain[2];
+    chain[0] = NSSelectorFromString(@"reloadTableView");
+    chain[1] = NSSelectorFromString(@"reloadTableData");
+    for (int i = 0; i < 2; i++) {
+        if (![tlvc respondsToSelector:chain[i]]) continue;
+        DDLProbeOpen();
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [tlvc performSelector:chain[i]];
+#pragma clang diagnostic pop
+        DDLog(@"[刷新] 主表取不到，改走 VC 出口=%@ tid=%@ %@",
+              NSStringFromSelector(chain[i]), tid, DDLGap(tid, @"T:"));
+        return YES;
+    }
+
+    DDLog(@"[刷新] ⚠主表与 VC 出口都取不到 tid=%@，本次不会自动刷新", tid);
+    return NO;
+}
+
+// 刷新后体检：0.3s / 1.2s 各扫一次可见单元格，确认「画面用的那份数据」对不对。
+// 这是判断「重绘没发生」还是「重绘发生了但数据被冲掉」的分水岭。
+// 取当前 keyWindow（iOS 13+ 从 UIWindowScene 里找，不用已废弃的 UIApplication.keyWindow）。
+static UIWindow *DDLKeyWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (sc.activationState != UISceneActivationStateForegroundActive) continue;
+            if (![sc isKindOfClass:UIWindowScene.class]) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) { if (w.isKeyWindow) return w; }
+        }
+    }
+    return nil;
+}
+
+static void DDLCheckVisible(NSString *tid) {
+    if (!tid) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        DDLog(@"[体检] tid=%@ 开始", tid);
+        id tlvc = DDLFindTimelineVC(DDLKeyWindow());
+        id tv = DDLTimelineTableView(tlvc);
+        if (![tv isKindOfClass:UITableView.class]) { DDLog(@"[体检] ⚠拿不到主表"); return; }
+        NSUInteger n = 0, shown = 0;
+        for (UIView *cell in ((UITableView *)tv).visibleCells) {
+            NSString *ctid = DDLTidOfCell(cell);
+            id it = nil;
+            @try { it = [cell valueForKey:@"m_dataItem"]; } @catch (NSException *__) {}
+            NSUInteger lc = 0, cc = 0;
+            if ([it respondsToSelector:@selector(likeUsers)])    lc = [[it valueForKey:@"likeUsers"] count];
+            if ([it respondsToSelector:@selector(commentUsers)]) cc = [[it valueForKey:@"commentUsers"] count];
+
+            // 无论是否命中都打印前 3 个：能看出单元格类名、能不能读到 m_dataItem，
+            // 避免「DDLTidOfCell 取不到 tid」造成的盲区。
+            if ([ctid isEqualToString:tid] || shown < 3) {
+                if (![ctid isEqualToString:tid]) shown++; else n++;
+                DDLog(@"[体检] %@cell=%@ tid=%@ item=%p 赞=%lu 评论=%lu frame=%@",
+                      ([ctid isEqualToString:tid] ? @"命中 " : @"样本 "),
+                      NSStringFromClass([cell class]), ctid ?: @"(无)", (void *)it,
+                      (unsigned long)lc, (unsigned long)cc, NSStringFromCGRect(cell.frame));
+            }
+        }
+        if (!n) DDLog(@"[体检] ⚠可见单元格里没有 tid=%@（可能已滚出屏幕或取不到 tid）", tid);
+    });
+}
 
 // 刷新诊断：记录每个 tid 上次「刷新事件」的时间，用来发现同一动作导致同一条被刷新/重建多次的冗余。
 // tag 区分事件流（R=我们主动 reloadRows，C=单元格被重建），互不影响。
@@ -540,9 +693,15 @@ static NSString *DDLTidOfCell(id cell) {
     @try {
         id item = [cell valueForKey:@"m_dataItem"];
         if ([item respondsToSelector:@selector(tid)]) return [item tid];
+        // 往下挖两层：朋友圈单元格是 WCTimeLineCellView 套在容器里，
+        // m_dataItem 常常挂在一级子视图上（旧版只挖一层，会漏判成「取不到 tid」）。
         for (UIView *v in ((UIView *)cell).subviews) {
             id it = [v valueForKey:@"m_dataItem"];
             if ([it respondsToSelector:@selector(tid)]) return [it tid];
+            for (UIView *w in v.subviews) {
+                id it2 = [w valueForKey:@"m_dataItem"];
+                if ([it2 respondsToSelector:@selector(tid)]) return [it2 tid];
+            }
         }
     } @catch (NSException *__) {}
     return nil;
@@ -653,99 +812,42 @@ static NSString *DDLTidOfCell(id cell) {
 }
 
 %new
-// 改完 item 之后的唯一刷新出口：定位时间线 VC → 整表重绘。YES = 已触发。
+// 改完 item 之后的唯一刷新出口。实际工作都交给 DDLReloadTimelineFrom()，
+// 本方法只负责定位（从浮窗出发）和刷新后的体检。
 //
-// 优先级链照抄 WCRefine.dylib 的 _WCRefineReloadMomentsViewControllerAfterFakeEngagement
-// （IMP 0x55d5d4，该函数在 Apply(0x5456e4)/Cancel(0x546644) 之后被无条件调用一次）：
-//   1) [vc performSelector:@selector(reloadTableView)]      // WCTimeLineViewController.h:474
-//   2) [vc performSelector:@selector(reloadTableData)]      // 部分版本/别的 VC 才有
-//   3) [vc valueForKey:@"tableView"] 或 @"m_tableView" → isKindOfClass:UITableView → reloadData
-// 三个都用 respondsToSelector: 探活（头文件里不一定有声明，所以成品也用 performSelector:
-// 而不是直接调，这是它能不带私有头文件编译的原因）。
-// 链上任一环命中即返回，全部失败返回 NO，由调用方退回 modifyDataItem:notify:。
-//
-// 为什么不能再用 reloadRows 单行：见文件头。尤其「本来就有赞」的帖子，
-// 赞区是按旧内容算过高度/布局的，单行重绘过不去那层缓存。
+// 为什么不是单行 reloadRows：单行重绘绕不开点赞区那层布局缓存，
+// 「本来就有赞」的帖子加了伪赞也看不出来。
 - (BOOL)ddl_reloadTimelineForItem:(id)item {
     NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
-    Class tlvClass = objc_getClass("WCTimeLineViewController");
-    id navOrVC = [self navigationController];
-    DDLog(@"[刷新] 定位开始 tid=%@ nav=%@ %@", tid, NSStringFromClass([navOrVC class]),
-          navOrVC ? @"非空" : @"空");
-    id tlvc = ([navOrVC isKindOfClass:tlvClass] ? navOrVC
-               : ([navOrVC respondsToSelector:@selector(topViewController)]
-                  ? [navOrVC topViewController] : nil));
-
-    // 兜底：沿响应链往上找 WCTimeLineViewController。
-    // 照 WCRefine.dylib 的 WCRefineFindMomentsReloadViewController（IMP 0x55d414）：
-    // 循环 { isKindOfClass:NSClassFromString(@"WCTimeLineViewController") → 返回；
-    //        nextResponder }。比只看 topViewController 稳（浮窗可能被塞进别的容器）。
-    if (![tlvc isKindOfClass:tlvClass]) {
-        id cur = self;
-        for (int i = 0; i < 12 && cur; i++) {
-            if ([cur isKindOfClass:tlvClass]) { tlvc = cur; break; }
-            if (![cur respondsToSelector:@selector(nextResponder)]) break;
-            cur = [cur nextResponder];
-        }
-    }
-
-    if (![tlvc isKindOfClass:tlvClass]) {
-        DDLog(@"[刷新] ⚠未定位到时间线 VC（实际=%@），退回保底路径", NSStringFromClass([tlvc class]));
-        return NO;
-    }
-
-    // ① / ②：先探两个 VC 级出口，命中直接走（会连带重算行高，赞区才排得开）
-    SEL chain[2];
-    chain[0] = @selector(reloadTableView);                        // WCTimeLineViewController.h:474
-    chain[1] = NSSelectorFromString(@"reloadTableData");          // 无头文件可依，运行时取
-    for (int i = 0; i < 2; i++) {
-        if (![tlvc respondsToSelector:chain[i]]) continue;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        [tlvc performSelector:chain[i]];
-#pragma clang diagnostic pop
-        DDLog(@"[刷新] 整表重绘 tid=%@ 出口=%@ %@", tid, NSStringFromSelector(chain[i]), DDLGap(tid, @"T:"));
-        return YES;
-    }
-
-    // ③：拿 tableView 自己 reloadData。头文件里 WCTimeLineViewController.h:105
-    //     有 getContentTableView，优先用；拿不到再按成品的顺序 KVC 两个键。
-    //     valueForKey: 取不到会抛 NSUnknownKeyException，必须 @try 兜住 —— 这是诊断
-    //     / 兼容路径，绝不能把用户的微信搞崩。
-    id tv = [tlvc getContentTableView];
-    NSArray<NSString *> *keys = @[@"tableView", @"m_tableView"];
-    for (NSString *k in keys) {
-        if (tv) break;
-        @try { tv = [tlvc valueForKey:k]; } @catch (NSException *__) { tv = nil; }
-    }
-    if (!tv || ![tv isKindOfClass:UITableView.class]) {
-        DDLog(@"[刷新] ⚠tableView 取不到（实际=%@），退回保底路径", NSStringFromClass([tv class]));
-        return NO;
-    }
-    DDLog(@"[刷新] 整表重绘 tid=%@ 出口=reloadData %@", tid, DDLGap(tid, @"T:"));
-    [(UITableView *)tv reloadData];
-    return YES;
+    DDLog(@"[刷新] 定位开始 tid=%@ 起点=%@ nav=%@", tid, NSStringFromClass([self class]),
+          NSStringFromClass([[self navigationController] class]));
+    BOOL ok = DDLReloadTimelineFrom(self, tid);
+    if (ok) DDLCheckVisible(tid);
+    return ok;
 }
 
 %end
 
 %hook WCTimeLineViewController
-// 诊断钩子（WCTimeLineViewController.h:147）：确认整表重绘真的把「已集赞」的单元格重建了，
+// 诊断钩子（WCTimeLineViewController.h:147）：确认重绘真的到了 cellForRow，
 // 且重建时 item 上仍是我们写入的伪造数据（赞/评论条数要对得上）。
-// 若条数回归原始值，说明所选刷新出口会把内存改动冲掉，那就改用 tableView reloadData 那一档。
-// 仅对记忆库中的 tid 打日志，不影响任何行为。
+// 平时只打记忆库里的 tid；刷新后 3 秒探活窗口内（DDLProbeOn）打全部单元格 ——
+// 上一版就是因为没开这层，误以为 reloadTableView 生效了。
 - (id)tableView:(id)tv cellForRowAtIndexPath:(id)ip {
     id cell = %orig;
     NSString *tid = DDLTidOfCell(cell);
-    if (tid && gDDLFaked()[tid]) {
-        id it = [cell valueForKey:@"m_dataItem"];
-        NSUInteger lc = 0, cc = 0, lmc = 0;
+    BOOL probe = DDLProbeOn();
+    NSDictionary *snap = (tid ? gDDLFaked()[tid] : nil);
+    if (snap || probe) {
+        NSUInteger lc = 0, cc = 0;
+        id it = nil;
+        @try { it = [cell valueForKey:@"m_dataItem"]; } @catch (NSException *__) {}
         if ([it respondsToSelector:@selector(likeUsers)])    lc = [[it valueForKey:@"likeUsers"] count];
         if ([it respondsToSelector:@selector(commentUsers)]) cc = [[it valueForKey:@"commentUsers"] count];
-        NSDictionary *snap = gDDLFaked()[tid];
-        lmc = [snap[@"likes"] count];
-        DDLog(@"[单元格] 重建 tid=%@ %@ 赞=%lu/应=%lu 评论=%lu %@", tid, DDLGap(tid, @"C:"),
-              (unsigned long)lc, (unsigned long)lmc, (unsigned long)cc, NSStringFromClass([tv class]));
+        DDLog(@"[单元格] 重建 %@tid=%@ %@ 赞=%lu/应=%lu 评论=%lu cell=%@ 表=%@",
+              (snap ? @"" : @"(探活) "), tid ?: @"(无)", DDLGap(tid ?: @"?", @"C:"),
+              (unsigned long)lc, (unsigned long)[snap[@"likes"] count], (unsigned long)cc,
+              NSStringFromClass([cell class]), NSStringFromClass([tv class]));
     }
     return cell;
 }
@@ -794,6 +896,23 @@ static NSString *DDLTidOfCell(id cell) {
           (unsigned long)faked.count, (unsigned long)hit, (unsigned long)skip, (unsigned long)adCount);
 
     %orig(datas, adItems, t);
+
+    // 微信的后台轮询会重建 item、冲掉内存改动（日志里 11 秒后那条 [刷新回调] 重写=1 就是）。
+    // 上面回填完必须自己再补一次重绘，否则数据对了画面也不动
+    // —— 这正是「要再手动刷一次才出伪赞」的成因：手动下拉刷新会走一次 reloadData。
+    if (hit > 0 && isArray) {
+        NSString *firstTid = nil;
+        for (id obj in (NSArray *)datas) {
+            if (![obj isKindOfClass:objc_getClass("WCDataItem")]) continue;
+            if (![obj respondsToSelector:@selector(tid)]) continue;
+            NSString *tid = [obj tid];
+            if (tid && faked[tid]) { firstTid = tid; break; }
+        }
+        if (firstTid) {
+            DDLReloadTimelineFrom(DDLKeyWindow(), firstTid);
+            DDLCheckVisible(firstTid);
+        }
+    }
 }
 
 %end
