@@ -737,16 +737,24 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
         } @catch (NSException *e) { DDLog(@"[刷新] ③异常 %@", e.reason); }
     }
 
-    if (tlvc && [tv isKindOfClass:UITableView.class]) {
-        id ip = nil;
-        @try { ip = [tlvc indexPathOfDataItem:item]; } @catch (NSException *__) {}
-        if ([ip isKindOfClass:NSIndexPath.class]) {
-            [(UITableView *)tv reloadRowsAtIndexPaths:@[ip]
-                                    withRowAnimation:UITableViewRowAnimationNone];
-            DDLog(@"[刷新] ①reloadRows");
-            fired++;
-        } else {
-            DDLog(@"[刷新] ①⚠取不到 indexPath");
+    if (tlvc) {
+        @try {
+            if ([tlvc respondsToSelector:@selector(reloadDataWrap)]) {
+                [tlvc reloadDataWrap];
+                DDLog(@"[刷新] ①reloadDataWrap（整表重建，同 WCR reloadTableData：掀掉 VC 层评论行控制器缓存）");
+                fired++;
+            } else if ([tlvc respondsToSelector:@selector(reloadTableView)]) {
+                [tlvc reloadTableView];
+                DDLog(@"[刷新] ①reloadTableView（整表重建）");
+                fired++;
+            } else if ([tv isKindOfClass:UITableView.class]) {
+                [(UITableView *)tv reloadData];
+                DDLog(@"[刷新] ①reloadData（整表重建兜底）");
+                fired++;
+            }
+        } @catch (NSException *e) {
+            DDLog(@"[刷新] ①异常 %@，改走 reloadData 兜底", e.reason);
+            @try { if ([tv isKindOfClass:UITableView.class]) [(UITableView *)tv reloadData]; } @catch (NSException *__) {}
         }
     }
 
