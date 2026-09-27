@@ -305,50 +305,23 @@ static NSString *DDLogConfigSummary(void) {
 + (NSMutableArray<WCUserComment *> *)fakeCommentsFor:(WCDataItem *)origItem;
 @end
 
-// 你的 theos 头文件版本里 CContact 未前向声明 m_uiSex（8.0.79 dump 中它存在于 CBaseContact.h:154），
-// 补这个分类声明以免编译报 “property 'm_uiSex' not found”。运行时 CContact 确有此 getter
-// （参考实现 集赞助手.txt 直接用了 contact.m_uiSex != 0）。
 @interface CContact (DDFriendExt)
 - (unsigned int)m_uiSex;
 @end
 
 @implementation DDLikeHelper
 
-// 好友名单：从通讯录（getContactList:1 contactType:0）筛「真实个人好友」。
-//
-// 判别只用两条（与已开源、被验证的 DKHelper / 集赞助手 一致）：
-//   1) !isBrandContact                      排除公众号/服务号/品牌
-//   2) m_uiSex != 0                         真实个人好友几乎都同步了性别(1=男/2=女)，
-//      系统账号/品牌号/硬编联系人 m_uiSex 全为 0 —— 这正是之前 realFriendScene==30 仍混入系统账号的根因
-// 不做 @chatroom / @openim 额外防护（普通个人号无影响，保持与参考实现一致）。
-// 保留 [好友] 计数日志：重编后看末尾「真实好友池=N」，N==5 即成立。
+// 真实好友 = 非公众号 且 有性别（参考 DKHelper / 集赞助手）。
 + (NSArray<CContact *> *)allFriends {
-    static NSArray *cached = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSMutableArray *friends = [NSMutableArray array];
-        CContactMgr *mgr = DDLContactMgr();
-        NSArray *raw = [mgr getContactList:1 contactType:0];
-
-        NSUInteger nBrand = 0, nNoSex = 0;
-        for (CContact *c in raw) {
-            NSString *name = c.m_nsUsrName;
-            if (![name isKindOfClass:NSString.class] || name.length == 0) continue;
-            BOOL brand = [c isBrandContact];
-            unsigned int sex = [c m_uiSex];
-            if (brand)  { nBrand++; }
-            if (sex==0) { nNoSex++; }
-            // 主筛选：非公众号 且 有性别（真实个人好友）。
-            if (!brand && sex != 0) {
-                [friends addObject:c];
-            }
+    NSMutableArray *friends = [NSMutableArray array];
+    CContactMgr *mgr = DDLContactMgr();
+    for (CContact *c in [mgr getContactList:1 contactType:0]) {
+        if (![c isBrandContact] && [c m_uiSex] != 0) {
+            [friends addObject:c];
         }
-        cached = [friends copy];
-        DDLog(@"[好友] 原始=%lu 公众号=%lu 无性别=%lu → 真实好友池=%lu",
-              (unsigned long)raw.count, (unsigned long)nBrand, (unsigned long)nNoSex,
-              (unsigned long)cached.count);
-    });
-    return cached ?: @[];
+    }
+    DDLog(@"[好友] 真实好友池=%lu", (unsigned long)friends.count);
+    return friends;
 }
 
 // 构造伪造点赞列表。likeCount <= 0 视为未设置，返回空数组（调用方据此不覆盖原值）。
