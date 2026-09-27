@@ -124,7 +124,9 @@ static inline id DDLTimelineMgr(void) {
 - (id)getContentTableView;
 - (id)indexPathOfDataItem:(id)item;
 - (void)reloadTableView;
+- (void)reloadDataWrap;
 - (void)onActionClearCellCacheAndRefreshCellView:(id)arg1;
+- (void)onReloadCommentView:(id)arg1 ofDataItem:(id)arg2;
 - (void)onUpdateDataItem:(id)item oldHeight:(double)oh newHeight:(double)nh;
 @end
 
