@@ -577,10 +577,16 @@ static void DDLCheckVisible(NSString *tid, id start) {
 
             if ([ctid isEqualToString:tid] || shown < 3) {
                 if (![ctid isEqualToString:tid]) shown++; else n++;
-                DDLog(@"[体检] %@cell=%@ tid=%@ item=%p 赞=%lu 评论=%lu frame=%@",
+                id sub = nil;
+                @try {
+                    if ([cell respondsToSelector:@selector(m_subContentView)])
+                        sub = [(MMTableViewCell *)cell m_subContentView];
+                } @catch (NSException *__) {}
+                DDLog(@"[体检] %@cell=%@ tid=%@ item=%p 赞=%lu 评论=%lu sub=%@ frame=%@",
                       ([ctid isEqualToString:tid] ? @"命中 " : @"样本 "),
                       NSStringFromClass([cell class]), ctid ?: @"(无)", (__bridge void *)it,
-                      (unsigned long)lc, (unsigned long)cc, NSStringFromCGRect(cell.frame));
+                      (unsigned long)lc, (unsigned long)cc,
+                      NSStringFromClass([sub class]) ?: @"(无)", NSStringFromCGRect(cell.frame));
             }
         }
         if (!n) DDLog(@"[体检] ⚠可见单元格里没有 tid=%@（可能已滚出屏幕或取不到 tid）", tid);
@@ -643,6 +649,20 @@ static NSString *DDLTidOfCell(id cell) {
 static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, id tlvc0, id tv0) {
     NSMutableDictionary *faked = gDDLFaked();
 
+    id tlvc = tlvc0, tv = tv0;
+    DDLog(@"[刷新] 起点 tid=%@ item=%p", tid, (__bridge void *)item);
+    DDLProbeOpen();
+
+    int fired = 0;
+
+    if (tlvc) {
+        @try {
+            [tlvc onActionClearCellCacheAndRefreshCellView:item];
+            DDLog(@"[刷新] ⓪清 cell 缓存（必须早于任何 cellForRow）");
+            fired++;
+        } @catch (NSException *e) { DDLog(@"[刷新] ⓪异常 %@", e.reason); }
+    }
+
     if (turningOn) {
         NSDictionary *snap = (tid ? faked[tid] : nil);
         item.likeFlag = YES;
@@ -656,27 +676,19 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
               (unsigned long)item.likeUsers.count);
     }
 
-    id mgr = DDLTimelineMgr();
-    DDLog(@"[刷新] 起点 tid=%@ mgr=%@ item=%p", tid,
-          NSStringFromClass([mgr class]) ?: @"(nil)", (__bridge void *)item);
-    DDLProbeOpen();
-    DDLCheckVisible(tid, tlvc0);
+    fired += DDLForceRebuildCell(tv, tlvc, item);
 
-    int fired = 0;
-
-    fired += DDLForceRebuildCell(tv0, tlvc0, item);
-
-    if (mgr) { [mgr modifyDataItem:item notify:YES]; fired++; }
-
-    id tlvc = tlvc0, tv = tv0;
-    if (!tlvc) DDLog(@"[刷新] ⚠时间线 VC 为空，②③跳过");
-
-    if (tlvc) {
-        @try {
-            [tlvc onActionClearCellCacheAndRefreshCellView:item];
-            DDLog(@"[刷新] ②onActionClearCellCacheAndRefreshCellView 已调用");
+    if (tlvc && [tv isKindOfClass:UITableView.class]) {
+        id ip = nil;
+        @try { ip = [tlvc indexPathOfDataItem:item]; } @catch (NSException *__) {}
+        if ([ip isKindOfClass:NSIndexPath.class]) {
+            [(UITableView *)tv reloadRowsAtIndexPaths:@[ip]
+                                    withRowAnimation:UITableViewRowAnimationNone];
+            DDLog(@"[刷新] ①reloadRows（紧跟强拆，抢在任何人之前）");
             fired++;
-        } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
+        } else {
+            DDLog(@"[刷新] ①⚠取不到 indexPath");
+        }
     }
 
     if (tlvc) {
@@ -689,21 +701,16 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
         } @catch (NSException *__) {}
         @try {
             [tlvc onUpdateDataItem:item oldHeight:h newHeight:h];
-            DDLog(@"[刷新] ③onUpdateDataItem:oldHeight:newHeight: 已调用 h=%.1f", h);
+            DDLog(@"[刷新] ②onUpdateDataItem:oldHeight:newHeight: 已调用 h=%.1f", h);
             fired++;
-        } @catch (NSException *e) { DDLog(@"[刷新] ③异常 %@", e.reason); }
+        } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
     }
 
-    if (tlvc && [tv isKindOfClass:UITableView.class]) {
-        @try {
-            id ip = [tlvc indexPathOfDataItem:item];
-            if ([ip isKindOfClass:NSIndexPath.class]) {
-                [(UITableView *)tv reloadRowsAtIndexPaths:@[ip]
-                                        withRowAnimation:UITableViewRowAnimationNone];
-                DDLog(@"[刷新] ④reloadRowsAtIndexPaths 已调用");
-                fired++;
-            }
-        } @catch (NSException *e) { DDLog(@"[刷新] ④异常 %@", e.reason); }
+    id mgr = DDLTimelineMgr();
+    if (mgr) {
+        [mgr modifyDataItem:item notify:NO];
+        DDLog(@"[刷新] ③modifyDataItem notify:NO（断掉微信内部抢跑重建）");
+        fired++;
     }
 
     DDLog(@"[刷新] 本次共触发 %d 条通路", fired);
@@ -715,6 +722,8 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
             DDLog(@"[刷新] 兜底 reloadData 已执行");
         } @catch (NSException *e) { DDLog(@"[刷新] 兜底异常 %@", e.reason); }
     }
+
+    DDLCheckVisible(tid, tlvc0);
 }
 
 %hook WCOperateFloatView
