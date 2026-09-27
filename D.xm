@@ -506,11 +506,7 @@ static int DDLReloadCommentViews(id tlvc, id tv, id item) {
             } @catch (NSException *e) { DDLog(@"[评论行] 异常 %@", e.reason); }
         }
         if (found.count == 0) {
-            @try {
-                [tlvc onReloadCommentView:nil ofDataItem:item];
-                DDLog(@"[评论行] 未定位到具体 view，改按 item 全量重载评论行");
-                n++;
-            } @catch (NSException *e) { DDLog(@"[评论行] 全量重载异常 %@", e.reason); }
+            DDLog(@"[评论行] 未定位到具体 view，交给整表 reloadData 处理");
         }
     }
     if (n == 0) DDLog(@"[评论行] ⚠评论/点赞行重载未触发");
@@ -706,6 +702,7 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
     DDLProbeOpen();
 
     int fired = 0;
+    @try {
 
     if (turningOn) {
         NSDictionary *snap = (tid ? faked[tid] : nil);
@@ -720,7 +717,8 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
               (unsigned long)item.likeUsers.count);
     }
 
-    fired += DDLForceRebuildCell(tv, tlvc, item);
+    @try { fired += DDLForceRebuildCell(tv, tlvc, item); }
+    @catch (NSException *e) { DDLog(@"[强拆] 异常 %@", e.reason); }
 
     if (tlvc) {
         @try {
@@ -741,23 +739,12 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
 
     if (tlvc) {
         @try {
-            if ([tlvc respondsToSelector:@selector(reloadDataWrap)]) {
-                [tlvc reloadDataWrap];
-                DDLog(@"[刷新] ①reloadDataWrap（整表重建，同 WCR reloadTableData：掀掉 VC 层评论行控制器缓存）");
-                fired++;
-            } else if ([tlvc respondsToSelector:@selector(reloadTableView)]) {
-                [tlvc reloadTableView];
-                DDLog(@"[刷新] ①reloadTableView（整表重建）");
-                fired++;
-            } else if ([tv isKindOfClass:UITableView.class]) {
+            if ([tv isKindOfClass:UITableView.class]) {
                 [(UITableView *)tv reloadData];
-                DDLog(@"[刷新] ①reloadData（整表重建兜底）");
+                DDLog(@"[刷新] ①整表重建（安全 reloadData；WCR 的 reloadTableData 是它自己设置页的方法，不能套到时间线 VC）");
                 fired++;
             }
-        } @catch (NSException *e) {
-            DDLog(@"[刷新] ①异常 %@，改走 reloadData 兜底", e.reason);
-            @try { if ([tv isKindOfClass:UITableView.class]) [(UITableView *)tv reloadData]; } @catch (NSException *__) {}
-        }
+        } @catch (NSException *e) { DDLog(@"[刷新] ①异常 %@", e.reason); }
     }
 
     if (tlvc) {
@@ -776,9 +763,11 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
     }
 
     if ([tv isKindOfClass:UITableView.class] && tlvc) {
-        int r = DDLReloadCommentViews(tlvc, tv, item);
-        DDLog(@"[刷新] ⑤评论行定向重载 命中 %d 个", r);
-        fired += r;
+        @try {
+            int r = DDLReloadCommentViews(tlvc, tv, item);
+            DDLog(@"[刷新] ⑤评论行定向重载 命中 %d 个", r);
+            fired += r;
+        } @catch (NSException *e) { DDLog(@"[刷新] ⑤异常 %@", e.reason); }
     }
 
     DDLog(@"[刷新] 本次共触发 %d 条通路", fired);
@@ -789,6 +778,10 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
             [(UITableView *)tv reloadData];
             DDLog(@"[刷新] 兜底 reloadData 已执行");
         } @catch (NSException *e) { DDLog(@"[刷新] 兜底异常 %@", e.reason); }
+    }
+
+    } @catch (NSException *e) {
+        DDLog(@"[刷新] 整段异常已捕获，避免闪退：%@", e.reason);
     }
 
     DDLCheckVisible(tid, tlvc0);
@@ -827,6 +820,7 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
     WCDataItem *item = self.m_item;
     if (!item) { DDLog(@"[长按] m_item 为 nil，中止"); return; }
 
+    @try {
     NSString *tid = item.tid;
     NSMutableDictionary *faked = gDDLFaked();
 
@@ -868,6 +862,9 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
                    dispatch_get_main_queue(), ^{
         DDLApplyAndRefresh(item, tid, turningOn, preTLVC, preTV);
     });
+    } @catch (NSException *e) {
+        DDLog(@"[长按] 异常已捕获，避免闪退：%@", e.reason);
+    }
 }
 
 %new
