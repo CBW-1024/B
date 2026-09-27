@@ -579,7 +579,7 @@ static void DDLReapply(NSString *tag, id item) {
     if (![seen containsObject:tid]) {
         [seen addObject:tid];
         DDLog(@"[补灌] 出口=%@ tid=%@ 赞=%lu 评论=%lu", tag, tid,
-              (unsigned long)likes.count, (unsigned long)comments.count);
+              (unsigned long)[snap[@"likes"] count], (unsigned long)[snap[@"comments"] count]);
     }
 }
 
@@ -595,6 +595,7 @@ static void DDLReapply(NSString *tag, id item) {
 // （DDLGap / DDLTidOfCell 定义在下面，这里先前置声明。）
 static NSString *DDLGap(NSString *key, NSString *tag);
 static NSString *DDLTidOfCell(id cell);
+static id DDLDeepItem(id v, int depth);   // 定义在下面，DDLCheckVisible 先用，需前置声明
 
 // 探活窗口：刷新后开 3 秒，期间 cellForRowAtIndexPath 打印全部单元格（不限记忆库），
 // 用来确认「重绘到底有没有真的发生」。平时关着，避免刷屏。
