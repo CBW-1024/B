@@ -80,9 +80,10 @@
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;  // WCTableViewCellManager.h:30
 @end
 
-// 联系人基类：m_nsUsrName 在这里，不在 CContact.h —— 故 CContact 须声明继承自 CBaseContact。
+// 联系人基类：m_nsUsrName / m_uiType 都在这里，不在 CContact.h —— 故 CContact 须声明继承自 CBaseContact。
 @interface CBaseContact : NSObject
 @property (retain, nonatomic) NSString *m_nsUsrName;    // CBaseContact.h:140
+@property (nonatomic) unsigned int m_uiType;            // CBaseContact.h:155 联系人类型位掩码
 @end
 
 @interface CContact : CBaseContact
@@ -302,23 +303,30 @@ static NSString *DDLogConfigSummary(void) {
 
 @implementation DDLikeHelper
 
-// 好友名单：直接取通讯录（getContactList:1 contactType:0，CContactMgr.h:173），仅排除公众号（isBrandContact）。
-// 实测通讯录不含「朋友圈 / 微博阅读 / 语音输入」等系统号，无需按 m_uiType 细分。
-// 不剔除自己——点赞区显示「你」由 likeFlag 控制，UI 会把列表里的自己当作「你」渲染，不重复。
-// 只取一次并缓存，联系人列表不会在会话内变化。
+// 好友名单：通讯录（getContactList:1 contactType:0，CContactMgr.h:173）里按 m_uiType 筛「真好友」。
+// getContactList:contactType:0 取的是整个通讯录，混着群聊 / 陌生人 / 公众号 / 系统号，
+// 故不能只挡 isBrandContact。m_uiType 是位掩码（业界稳定取值）：
+//   1=好友  2=群聊  4=陌生人(聊过未加)  8=公众号(gh_)  ……
+// 仅保留 ==1，排除其余所有。不剔除自己——点赞区「你」由 likeFlag 控制，UI 自行渲染。
+// 只取一次并缓存。日志同时打出 m_uiType 分布，方便核对取值是否仍是标准 1（若非 1 立刻可改）。
 + (NSArray<CContact *> *)allFriends {
     static NSArray *cached = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSMutableArray *friends = [NSMutableArray array];
         CContactMgr *mgr = DDLContactMgr();
-        NSArray *raw = [mgr getContactList:1 contactType:0];   // 通讯录（含好友与公众号）
+        NSArray *raw = [mgr getContactList:1 contactType:0];   // 通讯录（含全部类型）
+        NSMutableDictionary *dist = [NSMutableDictionary dictionary];
         for (CContact *c in raw) {
-            if (![c isBrandContact]) [friends addObject:c];   // 仅排除公众号
+            NSNumber *t = @(c.m_uiType);
+            dist[t] = @([dist[t] intValue] + 1);              // 统计各 m_uiType 出现次数
+            if (c.m_uiType != 1) continue;                    // 仅保留真好友
+            [friends addObject:c];
         }
         cached = [friends copy];
-        DDLog(@"[好友] contactMgr=%@ 原始=%lu 过滤公众号后=%lu",
-              mgr ? @"OK" : @"nil", (unsigned long)raw.count, (unsigned long)cached.count);
+        DDLog(@"[好友] contactMgr=%@ 原始=%lu 真好友(m_uiType==1)=%lu 分布=%@",
+              mgr ? @"OK" : @"nil", (unsigned long)raw.count,
+              (unsigned long)cached.count, dist);
     });
     return cached ?: @[];
 }
