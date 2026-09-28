@@ -634,16 +634,18 @@ static NSString *DDLTidOfCell(id cell) {
 static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, id tlvc0, id tv0) {
     NSMutableDictionary *faked = gDDLFaked();
 
-    (void)tv0; // 保留占位参数，兼容调用点；刷新逻辑已回归锤子最小机制（modifyDataItem:notify:1），不再需要 tlvc/tv 局部
+    (void)tv0; // tv0 保留占位参数兼容调用点；tlvc0 用于下方 onActionClearCellCacheAndRefreshCellView:
     DDLog(@"[刷新] 起点 tid=%@ item=%p", tid, (__bridge void *)item);
     DDLProbeOpen();
 
     // 反汇编锤子(WeChatTweak)结论：ApplyFake 仅做 setLikeUsers:/setLikeCount: + modifyDataItem:item notify:1，
-    // 刷新完全交给微信原生管线（并由其 dataItem/m_dataItem getter 钩子持续重灌）。
-    // 我们之前额外加的 DDLForceRebuildCell / onActionClearCellCacheAndRefreshCellView: / reloadData /
-    // onUpdateDataItem: / onReloadCommentView:ofDataItem: 都是锤子从不做的事，且拆 live cell 的
-    // subview、调私有评论行方法会在布局中途触发 EXC_BAD_ACCESS（信号，@try 抓不住）→ 长按闪退。
-    // 因此这里严格回到锤子的最小机制：写假数据 → modifyDataItem:notify:1。
+    // 刷新交给微信原生管线（并由其 dataItem/m_dataItem getter 钩子持续重灌）。
+    // 锤子之所以只靠 modifyDataItem 就够，是因为它浮窗关闭后微信会重新进入时间线 VC（整页重建，
+    // 内层 WCTimeLineCommentCellView 控制器缓存天然清空）。我们是原地长按，带赞 item 的点赞行控制器
+    // 早已缓存，modifyDataItem 只刷外层 cell、掀不掉内层缓存 → 点赞行文字不变、需手动刷新一次。
+    // 因此主线仍走锤子机制（写假数据 → modifyDataItem:notify:1），并在其后补一次微信原生
+    // onActionClearCellCacheAndRefreshCellView:（WCTimeLineViewController.h:289）清掉 VC 层 cell 缓存、
+    // 强制内层控制器重绘——等价于锤子“重进时间线”的效果，且不拆 live cell subview、不闪退。
     // 持久化由现有钩子负责：%hook WCTimelineMgr modifyDataItem:（DDLReapply）+ %hook cellForRowAtIndexPath（DDLReapply）。
     @try {
 
@@ -665,6 +667,14 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
         DDLog(@"[刷新] modifyDataItem notify:1（同锤子：走微信原生管线刷新，由 WCTimelineMgr 钩子与 cellForRow 钩子持续补灌）");
     } else {
         DDLog(@"[刷新] ⚠未找到 modifyDataItem:notify: 的 mgr，刷新可能无效");
+    }
+
+    // 锤子靠“重新进入时间线 VC”清掉内层 WCTimeLineCommentCellView 控制器缓存；
+    // 我们是原地长按，带赞 item 的点赞行控制器已缓存，modifyDataItem 不会掀掉它，
+    // 故补一次微信原生清缓存+重绘（WCTimeLineViewController.h:289），强制点赞行重绘。
+    if (tlvc0 && [tlvc0 respondsToSelector:@selector(onActionClearCellCacheAndRefreshCellView:)]) {
+        [tlvc0 onActionClearCellCacheAndRefreshCellView:item];
+        DDLog(@"[刷新] onActionClearCellCacheAndRefreshCellView:（清 VC 层 cell 缓存，强制带赞 item 的点赞行重绘，等同锤子“重进时间线”效果）");
     }
 
     } @catch (NSException *e) {
