@@ -258,7 +258,8 @@ static NSString *DDLogConfigSummary(void) {
 
 @interface DDLikeHelper : NSObject
 + (NSArray<CContact *> *)allFriends;
-+ (NSMutableArray<WCUserComment *> *)fakeLikeUsers;
++ (NSMutableArray<WCUserComment *> *)fakeLikeUsersExcluding:(NSSet<NSString *> *)existing
+                                                      limit:(NSInteger)limit;
 + (NSMutableArray<WCUserComment *> *)fakeCommentsFor:(WCDataItem *)origItem;
 @end
 
@@ -289,20 +290,24 @@ static NSTimeInterval gDDLFriendCacheAt;
     return gDDLFriendCache;
 }
 
-+ (NSMutableArray<WCUserComment *> *)fakeLikeUsers {
-    NSInteger target = DDLikeConfig.shared.likeCount;
+// 「补齐到 target」而不是「追加 target 个」—— 与 fakeCommentsFor: 的语义保持一致。
+// 旧版固定造 target 个再靠 username 去重，实际新增数会随「原本点过赞的人碰不碰巧落在好友池前 N 位」
+// 在 2 和 3 之间飘（实测日志：生成=3 但新增=2）。现在由调用方算出还缺几个（limit）传进来，
+// 并且跳过 existing 里的用户名，保证稳定补齐到 target。
++ (NSMutableArray<WCUserComment *> *)fakeLikeUsersExcluding:(NSSet<NSString *> *)existing
+                                                      limit:(NSInteger)limit {
     NSMutableArray *list = [NSMutableArray array];
-    if (target <= 0) {
-        DDLog(@"[点赞] target=%ld ≤0，未设置点赞数，跳过", (long)target);
-        return list;
-    }
+    if (limit <= 0) return list;
 
     unsigned int now = (unsigned int)[NSDate date].timeIntervalSince1970;
-    NSArray<CContact *> *friends = [self allFriends];
-    [friends enumerateObjectsUsingBlock:^(CContact *c, NSUInteger idx, BOOL *stop) {
-        if ((NSInteger)idx >= target) { *stop = YES; return; }
+    __block NSInteger made = 0;
+    __block NSUInteger idx = 0;
+    [[self allFriends] enumerateObjectsUsingBlock:^(CContact *c, NSUInteger i, BOOL *stop) {
+        if (made >= limit) { *stop = YES; return; }
+        NSString *name = c.m_nsUsrName;
+        if (!name || [existing containsObject:name]) return;
         WCUserComment *u = [[objc_getClass("WCUserComment") alloc] init];
-        u.username   = c.m_nsUsrName;
+        u.username   = name;
         u.nickname   = c.m_nsNickName;
         // 锤子 ApplyFake 反汇编（fake.txt 0x7b650c-0x7b6528）：
         //   mov w2, #1 → setType:1（1=赞；2=文本评论。type=2 混入 likeUsers 会被点赞行
@@ -310,12 +315,11 @@ static NSTimeInterval gDDLFriendCacheAt;
         //   setContent:@""（0xd9f180 CFString len=0 空串，不能为 nil）
         u.type       = 1;
         u.content    = @"";
-        u.commentID  = [NSString stringWithFormat:@"%lu", (unsigned long)idx];
+        u.commentID  = [NSString stringWithFormat:@"%lu", (unsigned long)idx++];
         u.createTime = now;
         [list addObject:u];
+        made++;
     }];
-    DDLog(@"[点赞] target=%ld 好友池=%lu → 生成=%lu",
-          (long)target, (unsigned long)friends.count, (unsigned long)list.count);
     return list;
 }
 
@@ -616,8 +620,8 @@ static NSMutableSet *gDDLFakeNames(void) {
     return s;
 }
 
-// 追加式注入（对齐 WCRefineApplyManualFakeEngagementToDataItem）：
-// 保留原始名单 → 追加假的 → 写回。按 username 去重，重复点确认不会把假赞叠加两份。
+// 追加式注入：保留原始名单 → 补齐假的到 target → 写回。
+// 「补齐」而非「追加固定个数」，所以天然幂等：重复点确认不会把假赞叠加两份。
 static void DDLApplyFakeToItem(WCDataItem *di) {
     NSString *tid = ([di respondsToSelector:@selector(tid)] ? [di tid] : nil);
 
@@ -627,22 +631,28 @@ static void DDLApplyFakeToItem(WCDataItem *di) {
     for (WCUserComment *u in likes) {
         if ([u respondsToSelector:@selector(username)] && u.username) [seen addObject:u.username];
     }
-    NSUInteger addedLike = 0;
-    for (WCUserComment *u in [DDLikeHelper fakeLikeUsers]) {
-        NSString *name = ([u respondsToSelector:@selector(username)] ? u.username : nil);
-        if (name && [seen containsObject:name]) continue;
-        if (name) { [seen addObject:name]; [gDDLFakeNames() addObject:name]; }
-        [likes addObject:u];
-        addedLike++;
-    }
-    if (addedLike) {
-        [di setLikeUsers:likes];
-        [di setLikeCount:(int)likes.count];
-        [di setRealLikeCount:(int)likes.count];
-        DDLog(@"[注入] 假赞 tid=%@ 新增=%lu 合计=%lu", tid,
-              (unsigned long)addedLike, (unsigned long)likes.count);
+
+    NSInteger target = DDLikeConfig.shared.likeCount;
+    NSInteger limit  = target - (NSInteger)likes.count;   // 还缺几个
+    if (limit > 0) {
+        NSArray *fresh = [DDLikeHelper fakeLikeUsersExcluding:seen limit:limit];
+        for (WCUserComment *u in fresh) {
+            NSString *name = u.username;
+            if (name) { [seen addObject:name]; [gDDLFakeNames() addObject:name]; }
+            [likes addObject:u];
+        }
+        if (fresh.count) {
+            [di setLikeUsers:likes];
+            [di setLikeCount:(int)likes.count];
+            [di setRealLikeCount:(int)likes.count];
+            DDLog(@"[注入] 假赞 tid=%@ 新增=%lu 合计=%lu（target=%ld）",
+                  tid, (unsigned long)fresh.count, (unsigned long)likes.count, (long)target);
+        } else {
+            DDLog(@"[注入] 假赞 tid=%@ 缺 %ld 个但好友池已无可补的人", tid, (long)limit);
+        }
     } else {
-        DDLog(@"[注入] 假赞 tid=%@ 无新增（已存在/未配置点赞数）", tid);
+        DDLog(@"[注入] 假赞 tid=%@ 已有 %lu ≥ target=%ld，跳过",
+              tid, (unsigned long)likes.count, (long)target);
     }
 
     NSUInteger before = ([di respondsToSelector:@selector(commentUsers)] && [di commentUsers])
@@ -743,11 +753,15 @@ static void DDLReapplyIfNeeded(id obj) {
 
         Class alertCls = objc_getClass("WCUIAlertView");
         if (alertCls && [alertCls respondsToSelector:@selector(showAlertWithTitle:message:cancelBtnTitle:target:sel:btnTitle:target:sel:)]) {
-            NSUInteger likeN = [DDLikeHelper fakeLikeUsers].count;
-            NSInteger  cmtN  = DDLikeConfig.shared.commentCount;
+            // 弹窗只要个数。以前为了拿 count 把 WCUserComment 完整造了一遍
+            // （日志里表现为长按瞬间就冒出 [好友]/[点赞] 两行），这里直接算差值，零对象生成。
+            NSInteger curN = (NSInteger)([item respondsToSelector:@selector(likeUsers)]
+                                         ? [item likeUsers].count : 0);
+            NSInteger addN = MAX((NSInteger)0, (NSInteger)DDLikeConfig.shared.likeCount - curN);
+            NSInteger cmtN = DDLikeConfig.shared.commentCount;
             NSString *msg = [NSString stringWithFormat:
-                @"将为这条朋友圈添加 %lu 个点赞、并把评论补齐至 %ld 条。\n仅本地显示，不会发给微信服务器。",
-                (unsigned long)likeN, (long)cmtN];
+                @"将为这条朋友圈添加 %ld 个点赞、并把评论补齐至 %ld 条。\n仅本地显示，不会发给微信服务器。",
+                (long)addN, (long)cmtN];
             [alertCls showAlertWithTitle:@"集赞助手"
                                  message:msg
                          cancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)
