@@ -697,7 +697,7 @@ static NSString *DDLTidOfCell(id cell) {
 static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, id tlvc0, id tv0) {
     NSMutableDictionary *faked = gDDLFaked();
 
-    id tlvc = tlvc0, tv = tv0;
+    (void)tv0; // 保留占位参数，兼容调用点；刷新逻辑已回归锤子最小机制（modifyDataItem:notify:1），不再需要 tlvc/tv 局部
     DDLog(@"[刷新] 起点 tid=%@ item=%p", tid, (__bridge void *)item);
     DDLProbeOpen();
 
