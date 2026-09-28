@@ -523,7 +523,7 @@ static void DDLReapplyIfNeeded(id obj) {
     lp.delaysTouchesBegan = YES;
     [btn addGestureRecognizer:lp];
     objc_setAssociatedObject(btn, kDDLLongPressKey, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    DDLog(@"[手势] 已挂长按 likeBtn=%@", btn);
+    DDLog(@"[手势] 已挂长按 likeBtn=%p", btn);   // 只打地址：%@ 会展开整个按钮 description，纯占地方
 }
 
 %new
@@ -666,19 +666,16 @@ static void DDLogExportFrom(UIViewController *vc) {
     id<UITableViewDelegate> _originalDelegate;
 }
 
-- (void)ensureTableViewMgr {
-    if (self.tableViewManager) return;
-    self.tableViewManager = [[objc_getClass("WCTableViewManager") alloc]
-                              initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
-}
-
-- (instancetype)init {
-    if (self = [super init]) [self ensureTableViewMgr];
-    return self;
-}
-
 - (void)viewDidLoad {
     [super viewDidLoad];
+
+    // 原来在 init 里建一次、viewDidLoad 里又建一次，重复；init 整个删掉，只留这里。
+    if (!self.tableViewManager) {
+        self.tableViewManager = [[objc_getClass("WCTableViewManager") alloc]
+                                  initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
+    }
+    if (!_tableViewManager) return;
+
     self.title = @"集赞助手设置";
 
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
@@ -688,8 +685,6 @@ static void DDLogExportFrom(UIViewController *vc) {
     self.navigationItem.scrollEdgeAppearance = appearance;
     self.navigationItem.compactAppearance = appearance;
 
-    [self ensureTableViewMgr];
-    if (!_tableViewManager) return;
     [self buildTable];
 
     UITableView *tableView = [self.tableViewManager getTableView];
