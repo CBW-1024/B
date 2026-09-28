@@ -1,6 +1,5 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 
 #pragma mark - 微信私有接口声明
 
@@ -62,23 +61,9 @@ static inline id DDLService(Class cls) {
     MMServiceCenter *center = ctx.serviceCenter;
     return [center getService:cls];
 }
+static inline id DDLContactMgr(void)    { return DDLService(objc_getClass("CContactMgr")); }
+static inline id DDLFacadeService(void) { return DDLService(objc_getClass("WCFacade")); }
 
-static inline id DDLContactMgr(void) {
-    return DDLService(objc_getClass("CContactMgr"));
-}
-
-// 朋友圈门面（WCFacade）。锤子改完 dataItem 后就是拿它调 modifyDataItem:notify: 触发原生刷新。
-// 反汇编证据（hammer fake.txt）：
-//   0x7b5408  objc_getClass("WCFacade")                       ← 记住：是 WCFacade，不是 WCTimelineMgr
-//   0x7b5cc8  [[MMContext currentContext] getService:[WCFacade class]]
-//   0x7b61b8  [facade modifyDataItem:dataItem notify:YES]     ← 确认分支
-//   0x7b628c  [facade modifyDataItem:dataItem notify:YES]     ← 撤销分支
-// 全程没有任何 reloadData / reloadTableView，就这一句。
-static inline id DDLFacadeService(void) {
-    return DDLService(objc_getClass("WCFacade"));
-}
-
-// WCFacade.h:195 getTimelineDataInCacheByItemID: / :197 getTimelineDataItemOfIndex: / :429 modifyDataItem:notify:
 @interface WCFacade : NSObject
 - (id)getTimelineDataInCacheByItemID:(id)itemID;
 - (id)getTimelineDataItemOfIndex:(long long)index;
@@ -86,7 +71,6 @@ static inline id DDLFacadeService(void) {
 @end
 
 @interface WCOperateFloatView : UIView
-// 刻意不声明 onLikeItem: —— 我们不再踢原生点赞（那会真给作者发服务器赞）。
 - (id)m_item;
 - (id)m_likeBtn;
 - (void)hide;
@@ -114,19 +98,30 @@ static inline id DDLFacadeService(void) {
 - (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;
 @end
 
+@interface WCUIAlertView : NSObject
+- (id)initWithTitle:(id)title message:(id)message;
+- (void)showTextFieldWithMaxLen:(unsigned int)maxLen;
+- (void)setTextFieldDefaultText:(id)text;
+- (void)setRequestKeyWindow:(BOOL)flag;
+- (void)addCancelBtnTitle:(id)title target:(id)target sel:(SEL)sel;
+- (void)addBtnTitle:(id)title target:(id)target sel:(SEL)sel;
+- (void)show;
+- (id)getTextFieldText;
+@end
+
 #pragma mark - 配置
 
-static NSString * const kDDMLikeEnabled    = @"DDMoments_likeEnabled";
-static NSString * const kDDMLikeCount      = @"DDMoments_likeCount";
-static NSString * const kDDMCommentCount   = @"DDMoments_commentCount";
-static NSString * const kDDMLikeComments   = @"DDMoments_likeComments";
-static NSString * const kDDMFakeStore      = @"DDMoments_fakeStore";
+static NSString * const kDDMLikeEnabled  = @"DDMoments_likeEnabled";
+static NSString * const kDDMLikeCount    = @"DDMoments_likeCount";
+static NSString * const kDDMCommentCount = @"DDMoments_commentCount";
+static NSString * const kDDMLikeComments = @"DDMoments_likeComments";
+static NSString * const kDDMFakeStore    = @"DDMoments_fakeStore";
 
 @interface DDLikeConfig : NSObject
 @property (assign, nonatomic) BOOL likeEnabled;
-@property (assign, nonatomic) NSInteger likeCount;
-@property (assign, nonatomic) NSInteger commentCount;
-@property (copy, nonatomic) NSString *comments;
+@property (assign, nonatomic) NSInteger likeCount;      // 上次弹窗输入的点赞数，用于预填
+@property (assign, nonatomic) NSInteger commentCount;   // 上次弹窗输入的评论数，用于预填
+@property (copy, nonatomic) NSString *comments;          // 评论内容池，多条用 / 分隔
 + (instancetype)shared;
 @end
 
@@ -155,8 +150,8 @@ static NSString * const kDDMFakeStore      = @"DDMoments_fakeStore";
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
-- (void)setLikeEnabled:(BOOL)v   { _likeEnabled = v;   [self persist:@(v) key:kDDMLikeEnabled]; }
-- (void)setLikeCount:(NSInteger)v  { _likeCount = v;     [self persist:@(v) key:kDDMLikeCount]; }
+- (void)setLikeEnabled:(BOOL)v      { _likeEnabled = v;   [self persist:@(v) key:kDDMLikeEnabled]; }
+- (void)setLikeCount:(NSInteger)v    { _likeCount = v;     [self persist:@(v) key:kDDMLikeCount]; }
 - (void)setCommentCount:(NSInteger)v { _commentCount = v; [self persist:@(v) key:kDDMCommentCount]; }
 
 - (void)setComments:(NSString *)v {
@@ -172,79 +167,11 @@ static NSString * const kDDMFakeStore      = @"DDMoments_fakeStore";
 
 @end
 
-#pragma mark - 调试日志
-
-static const NSUInteger kDDLogMaxLines = 500;
-
-static NSMutableArray<NSString *> *DDLogStore(void) {
-    static NSMutableArray *lines = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ lines = [NSMutableArray array]; });
-    return lines;
-}
-
-static NSDateFormatter *DDLogFormatter(void) {
-    static NSDateFormatter *fmt = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fmt = [NSDateFormatter new];
-        fmt.dateFormat = @"HH:mm:ss.SSS";
-    });
-    return fmt;
-}
-
-static void DDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
-static void DDLog(NSString *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-
-    NSString *line = [NSString stringWithFormat:@"%@ %@",
-                      [DDLogFormatter() stringFromDate:[NSDate date]], msg];
-
-    NSMutableArray *store = DDLogStore();
-    @synchronized (store) {
-        [store addObject:line];
-        if (store.count > kDDLogMaxLines) {
-            [store removeObjectsInRange:NSMakeRange(0, store.count - kDDLogMaxLines)];
-        }
-    }
-}
-
-static NSUInteger DDLogCount(void) {
-    NSMutableArray *store = DDLogStore();
-    @synchronized (store) { return store.count; }
-}
-
-static NSString *DDLogText(void) {
-    NSMutableArray *store = DDLogStore();
-    @synchronized (store) {
-        if (store.count == 0) return @"（暂无日志）";
-        return [store componentsJoinedByString:@"\n"];
-    }
-}
-
-static void DDLogClear(void) {
-    NSMutableArray *store = DDLogStore();
-    @synchronized (store) { [store removeAllObjects]; }
-}
-
-static NSString *DDLogConfigSummary(void) {
-    DDLikeConfig *c = DDLikeConfig.shared;
-    return [NSString stringWithFormat:
-            @"[配置] 启用=%d 上次输入=%ld/%ld 评论内容=「%@」\n"
-            @"[环境] 系统=%@ 微信头文件基线=8.0.79",
-            c.likeEnabled, (long)c.likeCount, (long)c.commentCount, c.comments,
-            [UIDevice currentDevice].systemVersion];
-}
-
 #pragma mark - 核心功能
 
 @interface DDLikeHelper : NSObject
 + (NSArray<CContact *> *)allFriends;
-+ (NSMutableArray<WCUserComment *> *)fakeLikeUsersExcluding:(NSSet<NSString *> *)existing
-                                                      limit:(NSInteger)limit;
++ (NSMutableArray<WCUserComment *> *)fakeLikeUsersExcluding:(NSSet<NSString *> *)existing limit:(NSInteger)limit;
 + (NSMutableArray<WCUserComment *> *)fakeCommentsFor:(WCDataItem *)origItem target:(NSInteger)target;
 @end
 
@@ -253,36 +180,27 @@ static NSString *DDLogConfigSummary(void) {
 static NSArray<CContact *> *gDDLFriendCache;
 static NSTimeInterval gDDLFriendCacheAt;
 
-// Fisher-Yates 洗牌。好友池不够要复用时若按原顺序绕回来，被重复的一定是好友池最前面
-// 几个，点赞行里连着出现同一个昵称，很扎眼；首轮不洗的话每次集赞也总是同一批人。
-// 每轮洗一次，复用谁就是随机的，分布也均匀。锤子取完好友也是洗牌的。
+// 洗牌：复用好友时按原顺序绕回会重复出现同一批人，先洗牌让分布均匀。
 static void DDLShuffle(NSMutableArray *a) {
     for (NSUInteger i = a.count; i > 1; i--) {
         [a exchangeObjectAtIndex:i - 1 withObjectAtIndex:arc4random_uniform((uint32_t)i)];
     }
 }
 
-// 给造出来的假 WCUserComment 打个标记（关联对象），撤销时靠它把假的挑出来。
-// 早先的做法是「记下假数据的 username，撤销时按名字剔除」，那套有个硬伤：
-// 假评论很可能跟某条真实评论是同一个人（好友池就那么几个），按名字剔除会连真评论
-// 一起删掉；为了避开它又得在生成时加去重，越弄越复杂。按对象标记就没有这个约束，
-// 重名也无所谓 —— 真的那条不带标记，自然会被留下。
+// 给假数据打关联对象标记，撤销时只剔带标记的对象，不影响真实数据（即使重名）。
 static const void *kDDLFakeMarkKey = &kDDLFakeMarkKey;
 
 static inline void DDLMarkFake(WCUserComment *u) {
     objc_setAssociatedObject(u, kDDLFakeMarkKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
-
 static inline BOOL DDLIsFake(WCUserComment *u) {
     return objc_getAssociatedObject(u, kDDLFakeMarkKey) != nil;
 }
 
-// 一次注入里会被调两遍（造赞 + 造评论），所以命中缓存时静默返回，只在真正拉取时打日志。
 + (NSArray<CContact *> *)allFriends {
     if (gDDLFriendCache && ([NSDate timeIntervalSinceReferenceDate] - gDDLFriendCacheAt) < 3.0) {
         return gDDLFriendCache;
     }
-
     NSMutableArray *friends = [NSMutableArray array];
     CContactMgr *mgr = DDLContactMgr();
     for (CContact *c in [mgr getContactList:1 contactType:0]) {
@@ -294,17 +212,11 @@ static inline BOOL DDLIsFake(WCUserComment *u) {
     }
     gDDLFriendCache = [friends copy];
     gDDLFriendCacheAt = [NSDate timeIntervalSinceReferenceDate];
-    DDLog(@"[好友] 真实好友池=%lu", (unsigned long)friends.count);
     return gDDLFriendCache;
 }
 
-// 「补齐到 target」而不是「追加 target 个」—— 与 fakeCommentsFor: 的语义保持一致。
-// 旧版固定造 target 个再靠 username 去重，实际新增数会随「原本点过赞的人碰不碰巧落在好友池前 N 位」
-// 在 2 和 3 之间飘（实测日志：生成=3 但新增=2）。现在由调用方算出还缺几个（limit）传进来，
-// 并且跳过 existing 里的用户名，保证稳定补齐到 target。
-// 好友池不够就绕回来复用同一个人（点赞行会出现重复昵称，但数量必须凑够，用户要求）。
-+ (NSMutableArray<WCUserComment *> *)fakeLikeUsersExcluding:(NSSet<NSString *> *)existing
-                                                      limit:(NSInteger)limit {
+// 凑齐 limit 个假赞，第一轮跳过已赞过的人；好友不够就洗牌后复用同一个人。
++ (NSMutableArray<WCUserComment *> *)fakeLikeUsersExcluding:(NSSet<NSString *> *)existing limit:(NSInteger)limit {
     NSMutableArray *list = [NSMutableArray array];
     if (limit <= 0) return list;
     NSArray *friends = [self allFriends];
@@ -321,49 +233,34 @@ static inline BOOL DDLIsFake(WCUserComment *u) {
             if ((NSInteger)list.count >= limit) break;
             NSString *name = c.m_nsUsrName;
             if (!name) continue;
-            // 第一轮先避开已经赞过的人；之后好友不够要复用时不再避让
             if (firstRound && [existing containsObject:name]) continue;
             WCUserComment *u = [[objc_getClass("WCUserComment") alloc] init];
             u.username   = name;
             u.nickname   = c.m_nsNickName;
-            // 锤子 ApplyFake 反汇编（fake.txt 0x7b650c-0x7b6528）：
-            //   mov w2, #1 → setType:1（1=赞；2=文本评论。type=2 混入 likeUsers 会被点赞行
-            //   渲染器按评论处理，content 为 nil 时走图片占位分支 → 行内出现「图片」+空槽）
-            //   setContent:@""（0xd9f180 CFString len=0 空串，不能为 nil）
-            u.type       = 1;
-            u.content    = @"";
+            u.type       = 1;        // 1=赞；2=文本评论
+            u.content    = @"";      // 空串，不能为 nil
             u.commentID  = [NSString stringWithFormat:@"%lu", (unsigned long)idx++];
             u.createTime = now;
             DDLMarkFake(u);
             [list addObject:u];
             added = YES;
         }
-        if (!added && !firstRound) break;   // 整轮一个都没加上，别死循环
+        if (!added && !firstRound) break;
         firstRound = NO;
     }
     return list;
 }
 
-// target 由调用方给（每条朋友圈各自记的「点赞数/评论数」，不是全局配置）
+// 补齐到 target 条评论。内容取自设置里的评论池（多条用 / 分隔）；没填内容则不生成评论。
 + (NSMutableArray<WCUserComment *> *)fakeCommentsFor:(WCDataItem *)origItem target:(NSInteger)target {
-    NSMutableArray *orig = origItem.commentUsers ?: [NSMutableArray array];
-    if (target <= 0) {
-        DDLog(@"[评论] target=%ld ≤0，不补评论", (long)target);
-        return orig;
-    }
-    if ((NSInteger)orig.count >= target) {
-        DDLog(@"[评论] 已有 %lu 条 ≥ target=%ld，跳过", (unsigned long)orig.count, (long)target);
-        return orig;
-    }
+    NSMutableArray *orig = [origItem commentUsers] ?: [NSMutableArray array];
+    if (target <= 0) return orig;
+    if ((NSInteger)orig.count >= target) return orig;
 
     NSArray<NSString *> *pool = DDLikeConfig.shared.commentPool;
-    if (pool.count == 0) {
-        DDLog(@"[评论] 内容池为空（未填写评论内容），跳过");
-        return orig;
-    }
+    if (pool.count == 0) return orig;
 
     NSMutableArray *list = [orig mutableCopy];
-
     unsigned int now = (unsigned int)[NSDate date].timeIntervalSince1970;
 
     int span = (int)now - (int)origItem.createtime;
@@ -371,14 +268,8 @@ static inline BOOL DDLIsFake(WCUserComment *u) {
     if (span > 3600) span = 3600;
 
     NSArray *friends = [self allFriends];
-    if (friends.count == 0) {
-        DDLog(@"[评论] 好友池为空，补不出评论");
-        return orig;
-    }
+    if (friends.count == 0) return orig;
 
-    // 好友池不够就绕回来复用（同一个人评论多条，内容随机，看起来不重复）。
-    // 之前是一轮走完就完事，好友 6 个想凑 10 条就只能凑到 6 条。
-    // 变量名叫 friendPool：上面的 pool 是「评论内容池」，别混
     NSMutableArray *friendPool = [friends mutableCopy];
     NSUInteger idx = 0;
     while ((NSInteger)list.count < target) {
@@ -399,75 +290,20 @@ static inline BOOL DDLIsFake(WCUserComment *u) {
             [list addObject:cm];
             added = YES;
         }
-        if (!added) break;   // 整轮一个都没加上（好友都没用户名），别死循环
+        if (!added) break;
     }
 
     [list sortUsingComparator:^NSComparisonResult(WCUserComment *a, WCUserComment *b) {
         return a.createTime < b.createTime ? NSOrderedAscending : NSOrderedDescending;
     }];
-    DDLog(@"[评论] target=%ld 原有=%lu 内容池=%lu → 生成后=%lu",
-          (long)target, (unsigned long)orig.count, (unsigned long)pool.count, (unsigned long)list.count);
     return list;
 }
 
 @end
 
-#pragma mark - Hook：长按点赞 → 集赞
+#pragma mark - 持久化与解析
 
-static const void *kDDLLongPressKey = &kDDLLongPressKey;
-
-// 方案（照锤子反汇编结论，详见 Hammer_FakeLike_Mechanism.md）：
-// 长按 → 微信原生弹窗（取消/确认）→ 确认才本地注入假数据 → [WCFacade modifyDataItem:notify:YES]。
-//
-// 为什么不能用 reload 代替（旧版踩过的坑）：点赞行的布局缓存在 WCDataItemUICache
-// （likeUserLayoutStyles / likeUserHeight），按 dataItem 对象身份命中。原地改同一个对象再
-// reloadTableView / reloadDataWrap，都掀不掉这条缓存 —— 这就是「带赞 item 长按后不刷新、要手动拉一下」。
-// 锤子全程没有一句 reload，只有 [WCFacade modifyDataItem:notify:]（fake.txt 0x7b61b8 / 0x7b628c）。
-//
-// 三条关键取舍，每条都对应过去踩过的坑：
-//   1) 不调 onLikeItem: 踢原生点赞：确认后才改数据 → 不会真给作者点服务器赞，零副作用。
-//   2) 不以 likeFlag 为注入条件（WCR / 锤子都不依赖）：自己已赞过的 item 长按会把 likeFlag toggle 成 NO，
-//      以它为门槛就永远不触发——这是之前「长按零注入」的根因之一。
-//   3) 注入用「原始 + 追加」而非锤子的「整体替换」：追加且按 username 去重 → 天然幂等，
-//      “补回”就是再调一次，省掉锤子那两个快照字典（g_fakeDict / g_origDict）。
-//
-// 已彻底移除的旧做法（勿回退）：运行时穷举 WCTimeLineCellView 私有 ivar 再调 onReloadCommentCellView:
-// —— 会触发惰性 getter 副作用 / 访问已释放弱引用，是「长按闪退」的直接元凶。
-// 同理，PBCoding 深拷贝方案也已废弃。
-
-@interface WCOperateFloatView (DDLike)
-- (void)ddl_attachLongPress;
-- (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g;
-- (void)ddl_fakeConfirmed;
-- (void)ddl_fakeCancelled;
-@end
-
-// 微信原生弹窗类（WCUIAlertView.h）——带取消 + 确认两个按钮的那款，可挂输入框
-@interface WCUIAlertView : NSObject
-// WCUIAlertView.h:26 / :40 / :37 / :36 / :33 / :30 / :39 / :25
-// 自己 alloc 出来再挂按钮，不直接用 showAlertWithTitle:… 那批便捷构造器 —— 那些方法内部
-// 会立刻 show，输入框就只能挂在一个已经显示的弹窗上（长按闪退的根因，见 ddl_onLikeLongPress:）。
-// 取文本用头文件里现成的 getTextFieldText，不像锤子那样 KVC 摸 _tipsVc._tipsTextView.text。
-- (id)initWithTitle:(id)title message:(id)message;
-- (void)showTextFieldWithMaxLen:(unsigned int)maxLen;
-- (void)setTextFieldDefaultText:(id)text;   // 真文本。placeholder 只是灰字，不算输入内容
-- (void)setRequestKeyWindow:(BOOL)flag;
-- (void)addCancelBtnTitle:(id)title target:(id)target sel:(SEL)sel;
-- (void)addBtnTitle:(id)title target:(id)target sel:(SEL)sel;
-- (void)show;
-- (id)getTextFieldText;
-@end
-
-// tid → @{ @"l": 点赞数, @"c": 评论数 }
-// 每条朋友圈各自记一份「要多少赞/多少评论」，因为数量是弹窗时输入的，不再是全局配置。
-//
-// 持久化在 NSUserDefaults —— 否则微信一重启内存就清空，补回路径认不出这些 tid，
-// 假赞全没了、得重新长按一次。重启后不需要手动重建：补回路径（两个 WCFacade getter）
-// 在第一次渲染时会照常填回去。
-//
-// 只存数量，不存「注入了哪些 username」：撤销靠假对象上的关联对象标记识别
-// （DDLMarkFake / DDLIsFake），不需要名单。完整性判断也只看数量（见 DDLItemFakeIntact），
-// 因为好友池顺序一变，重新造出的人就跟上次不是同一批，按名字比对永远判不达标。
+// tid → @{ @"l": 点赞数, @"c": 评论数 }，落盘到 NSUserDefaults，重启后自动恢复。
 static NSMutableDictionary *gDDLFake(void) {
     static NSMutableDictionary *d = nil;
     static dispatch_once_t once;
@@ -478,18 +314,15 @@ static NSMutableDictionary *gDDLFake(void) {
     return d;
 }
 
-// 落盘。只在集赞/撤销/清除时调用，补回路径有预检挡着，不会高频触发。
 static void DDLFakeSave(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setObject:gDDLFake() forKey:kDDMFakeStore];
     [ud synchronize];
 }
 
-// 单个数量的上限。好友不够时是靠复用凑数的，不封顶的话输个 999999 会循环很久。
-static const NSInteger kDDLMaxCount = 100;
+static const NSInteger kDDLMaxCount = 100;   // 单边数上限，避免好友不足时复用循环跑飞
 
-// 解析弹窗输入「5/6」。返回 NO = 输入为空（调用方按「取消伪装」处理）。
-// 只填一个数字（"5"）→ 只改点赞；"0" / "0/0" / 非数字 → 都归为取消伪装。
+// 解析弹窗输入「点赞数/评论数」；返回 NO 表示输入为空，调用方按「取消伪装」处理。
 static BOOL DDLParseSpec(NSString *text, NSInteger *outL, NSInteger *outC) {
     NSString *s = [(text ?: @"") stringByTrimmingCharactersInSet:
                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -499,34 +332,22 @@ static BOOL DDLParseSpec(NSString *text, NSInteger *outL, NSInteger *outC) {
     NSInteger l = 0, c = 0;
     if (parts.count > 0) l = [parts[0] integerValue];
     if (parts.count > 1) c = [parts[1] integerValue];
-    // 封顶，免得输个天文数字把「好友不够就复用」的循环跑飞
     *outL = l > 0 ? MIN(l, kDDLMaxCount) : 0;
     *outC = c > 0 ? MIN(c, kDDLMaxCount) : 0;
     return YES;
 }
 
-// 长按那一刻必须自己留一份 item 强引用，不能指望回调时再读 self.m_item。
-// 实测证据（DDLikeHelper.log-2.txt）：[self hide] 之后微信会把浮层的 m_item 清掉，
-// 弹窗确认回调里 self.m_item 已经是 nil，日志表现为
-//   「[弹窗] 确认但 m_item 已失效，跳过」—— 假赞和评论一个都没注入。
-// 注意「self 活着」不等于「m_item 还在」：回调能打进本方法只说明 self 没被释放。
+// 长按那一刻强引用住 item 与浮层：收起浮层后 m_item 会被清空、浮层也可能被释放，
+// 弹窗回调里只能靠这两份引用拿到正确的对象。
 static WCDataItem *gDDLPendingItem = nil;
-
-// 浮层自己也得留住一份：弹窗的 target 是 self（WCOperateFloatView），而 [self hide]
-// 之后没人再持有浮层，它随时可能被释放 —— 点「确认」时 objc_msgSend 打到已释放对象上
-// 就是一次 EXC_BAD_ACCESS 闪退。留个强引用，回调走完再放。
 static WCOperateFloatView *gDDLPendingView = nil;
+static WCUIAlertView *gDDLCurrentAlert = nil;   // 确认时取输入框文本
 
-// 当前弹窗，确认回调里要用它 getTextFieldText 取输入内容
-static WCUIAlertView *gDDLCurrentAlert = nil;
-
-// 剔除带标记的假数据，stripLikes / stripCmts 控制剔哪一边。
-// 只认对象标记，不看 username —— 所以假评论跟真评论重名也不会误删真评论。
+// 剔掉带标记的假数据；stripLikes / stripCmts 控制清哪一边。
 static void DDLStripFakeFromItem(WCDataItem *di, BOOL stripLikes, BOOL stripCmts) {
     if (stripLikes) {
         NSMutableArray *likes = [NSMutableArray array];
-        for (WCUserComment *u in ([di respondsToSelector:@selector(likeUsers)] && [di likeUsers]
-                                  ? [di likeUsers] : @[])) {
+        for (WCUserComment *u in ([di likeUsers] ?: @[])) {
             if (!DDLIsFake(u)) [likes addObject:u];
         }
         [di setLikeUsers:likes];
@@ -534,8 +355,7 @@ static void DDLStripFakeFromItem(WCDataItem *di, BOOL stripLikes, BOOL stripCmts
     }
     if (stripCmts) {
         NSMutableArray *cmts = [NSMutableArray array];
-        for (WCUserComment *u in ([di respondsToSelector:@selector(commentUsers)] && [di commentUsers]
-                                  ? [di commentUsers] : @[])) {
+        for (WCUserComment *u in ([di commentUsers] ?: @[])) {
             if (!DDLIsFake(u)) [cmts addObject:u];
         }
         [di setCommentUsers:cmts];
@@ -543,27 +363,22 @@ static void DDLStripFakeFromItem(WCDataItem *di, BOOL stripLikes, BOOL stripCmts
     }
 }
 
-// 追加式注入：保留原始名单 → 补齐假的到 target → 写回。
-// 「补齐」而非「追加固定个数」，所以天然幂等：重复点确认不会把假赞叠加两份。
-// lTarget / cTarget 来自这条朋友圈自己的记录（弹窗输入的「点赞数/评论数」）。
+// 追加式注入：保留原始名单 → 补齐假的到目标数 → 写回。补齐而非追加固定个数，重复调用幂等。
 static void DDLApplyFakeToItem(WCDataItem *di, NSInteger lTarget, NSInteger cTarget) {
-    NSString *tid = ([di respondsToSelector:@selector(tid)] ? [di tid] : nil);
+    NSString *tid = [di tid];
 
-    // 某一边的目标是 0，就表示这次不要那一边的伪装：
-    // 输「5」= 只要赞、输「/6」= 只要评论。先把上一轮留在那边的假数据剔掉，
-    // 不然旧的假赞/假评论会一直挂着，看起来像没生效。
+    // 某一边的目标为 0 表示这次不要那一边（输「5」=只赞，输「/6」=只评论），先清掉上一轮的假数据。
     if (lTarget <= 0 || cTarget <= 0) {
         DDLStripFakeFromItem(di, lTarget <= 0, cTarget <= 0);
     }
 
-    NSMutableArray *likes = ([di respondsToSelector:@selector(likeUsers)] && [di likeUsers])
-                          ? [[di likeUsers] mutableCopy] : [NSMutableArray array];
+    NSMutableArray *likes = [[di likeUsers] mutableCopy] ?: [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
     for (WCUserComment *u in likes) {
-        if ([u respondsToSelector:@selector(username)] && u.username) [seen addObject:u.username];
+        if (u.username) [seen addObject:u.username];
     }
 
-    NSInteger limit = lTarget - (NSInteger)likes.count;   // 还缺几个
+    NSInteger limit = lTarget - (NSInteger)likes.count;
     if (lTarget > 0 && limit > 0) {
         NSArray *fresh = [DDLikeHelper fakeLikeUsersExcluding:seen limit:limit];
         for (WCUserComment *u in fresh) {
@@ -571,87 +386,68 @@ static void DDLApplyFakeToItem(WCDataItem *di, NSInteger lTarget, NSInteger cTar
             [likes addObject:u];
         }
         if (fresh.count) {
-            // 只写这两个，跟锤子一致。realLikeCount 不用管：全量头文件 dump 里
-            // 除了 WCDataItem.h 自己声明，没有任何第二个类读它（锤子也没设）。
             [di setLikeUsers:likes];
             [di setLikeCount:(int)likes.count];
-            DDLog(@"[注入] 假赞 tid=%@ 新增=%lu 合计=%lu（target=%ld）",
-                  tid, (unsigned long)fresh.count, (unsigned long)likes.count, (long)lTarget);
-        } else {
-            DDLog(@"[注入] 假赞 tid=%@ 缺 %ld 个但好友池已无可补的人", tid, (long)limit);
         }
-    } else {
-        DDLog(@"[注入] 假赞 tid=%@ 已有 %lu ≥ target=%ld，跳过",
-              tid, (unsigned long)likes.count, (long)lTarget);
     }
 
-    NSUInteger before = ([di respondsToSelector:@selector(commentUsers)] && [di commentUsers])
-                      ? [di commentUsers].count : 0;
+    NSUInteger before = [di commentUsers] ? [di commentUsers].count : 0;
     NSMutableArray *comments = [[DDLikeHelper fakeCommentsFor:di target:cTarget] mutableCopy];
     if (comments.count != before) {
         [di setCommentUsers:comments];
         [di setCommentCount:(int)comments.count];
-        DDLog(@"[注入] 假评论 tid=%@ %lu→%lu", tid,
-              (unsigned long)before, (unsigned long)comments.count);
-    } else {
-        DDLog(@"[注入] 假评论 tid=%@ 无新增（已达目标数/未配置）", tid);
     }
 
     if (tid) {
         gDDLFake()[tid] = @{ @"l": @(lTarget), @"c": @(cTarget) };
     }
-    DDLFakeSave();   // 落盘，这样重启微信后补回路径还能认出这条
+    DDLFakeSave();
 }
 
-// 取消伪装：两边都剔，恢复真实数据，并删掉持久化记录（重启后也不再恢复）。
+// 取消伪装：两边假数据都剔掉，并删持久化记录（重启后也不再恢复）。
 static void DDLRemoveFakeFromItem(WCDataItem *di, NSString *tid) {
     DDLStripFakeFromItem(di, YES, YES);
     [gDDLFake() removeObjectForKey:tid];
     DDLFakeSave();
-    DDLog(@"[撤销] 已剔除假数据 tid=%@ → 赞 %lu 评论 %lu", tid,
-          (unsigned long)(([di respondsToSelector:@selector(likeUsers)] && [di likeUsers])
-                          ? [di likeUsers].count : 0),
-          (unsigned long)(([di respondsToSelector:@selector(commentUsers)] && [di commentUsers])
-                          ? [di commentUsers].count : 0));
 }
 
-// 假赞是否还完整挂在 item 上：只看数量达不达标，不比对具体是谁。
-// 补回路径随 cell 渲染高频触发，这里必须便宜 —— 不造对象、不打日志，绝大多数调用到此结束。
-// 用数量而不是用户名集合，是为了跟持久化解耦：重启后好友池顺序可能变，重新造出的人
-// 跟上一次未必是同一批，按名字比对就会永远判定「不完整」，变成每次渲染都补回。
+// 假数据是否还完整挂在 item 上：只看数量达不达标，不比对具体是谁（好友池顺序会变）。
 static BOOL DDLItemFakeIntact(WCDataItem *di, NSDictionary *rec) {
     NSInteger lTarget = [rec[@"l"] integerValue];
     if (lTarget > 0) {
-        NSUInteger lc = ([di respondsToSelector:@selector(likeUsers)] && [di likeUsers])
-                      ? [di likeUsers].count : 0;
+        NSUInteger lc = [di likeUsers] ? [di likeUsers].count : 0;
         if ((NSInteger)lc < lTarget) return NO;
     }
     NSInteger cTarget = [rec[@"c"] integerValue];
     if (cTarget > 0) {
-        NSUInteger cc = ([di respondsToSelector:@selector(commentUsers)] && [di commentUsers])
-                      ? [di commentUsers].count : 0;
+        NSUInteger cc = [di commentUsers] ? [di commentUsers].count : 0;
         if ((NSInteger)cc < cTarget) return NO;
     }
     return YES;
 }
 
-// 单个 dataItem 补回（只处理已集赞的 tid）。
-// 这是锤子「刷新不丢 + 本来带赞也显示」的统一机制：hook 了 4 个「产出 dataItem」的入口，
-// 每个都在 %orig 之后立刻补回（hammer fake.txt 0x7b5574 / 0x7b56b4 / 0x7b57b8 / 0x7b58e8：
-// blr x8(%orig) → tid → objectForKey: → setLikeUsers: → setLikeCount:）。
-// DDLApplyFakeToItem 按 username 去重、幂等，所以「补回」就是再调一次，不需要存快照。
+// 单个 dataItem 补回：已集赞的 tid，在微信每次产出该 dataItem 时确认假数据还在，不在就补。
 static void DDLReapplyIfNeeded(id obj) {
     if (![obj isKindOfClass:%c(WCDataItem)]) return;
     WCDataItem *di = (WCDataItem *)obj;
-    NSString *tid = ([di respondsToSelector:@selector(tid)] ? [di tid] : nil);
+    NSString *tid = [di tid];
     if (!tid) return;
     NSDictionary *rec = gDDLFake()[tid];
-    if (!rec) return;                           // 这条没伪装过
-    if (DDLItemFakeIntact(di, rec)) return;     // 还挂着，什么都不用做
+    if (!rec) return;
+    if (DDLItemFakeIntact(di, rec)) return;
     DDLApplyFakeToItem(di, [rec[@"l"] integerValue], [rec[@"c"] integerValue]);
-    DDLog(@"[保活] 补回假赞 tid=%@", tid);      // 真被冲掉了才走到这，这时日志有价值
 }
 
+#pragma mark - Hook：长按点赞浮层
+
+static const void *kDDLLongPressKey = &kDDLLongPressKey;
+
+@interface WCOperateFloatView (DDLike)
+- (void)ddl_attachLongPress;
+- (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g;
+- (void)ddl_fakeConfirmed;
+- (void)ddl_fakeCancelled;
+@end
 
 %hook WCOperateFloatView
 
@@ -671,11 +467,9 @@ static void DDLReapplyIfNeeded(id obj) {
         [[UILongPressGestureRecognizer alloc] initWithTarget:self
                                                       action:@selector(ddl_onLikeLongPress:)];
     lp.minimumPressDuration = 1.0;
-
     lp.delaysTouchesBegan = YES;
     [btn addGestureRecognizer:lp];
     objc_setAssociatedObject(btn, kDDLLongPressKey, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    DDLog(@"[手势] 已挂长按 likeBtn=%p", btn);   // 只打地址：%@ 会展开整个按钮 description，纯占地方
 }
 
 %new
@@ -684,20 +478,13 @@ static void DDLReapplyIfNeeded(id obj) {
     if (!DDLikeConfig.shared.likeEnabled) return;
 
     WCDataItem *item = self.m_item;
-    if (!item) { DDLog(@"[长按] m_item 为 nil，中止"); return; }
+    if (!item) return;
 
-    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
-    gDDLPendingItem = item;   // 浮层收起后 m_item 会被清空，回调里只能靠这份
+    NSString *tid = [item tid];
+    gDDLPendingItem = item;
 
-    NSDictionary *rec = tid ? gDDLFake()[tid] : nil;
-    DDLog(@"[长按] 触发 tid=%@ 已伪装=%d（%ld/%ld）现有赞=%lu 评论=%lu",
-          tid, rec ? 1 : 0,
-          (long)[rec[@"l"] integerValue], (long)[rec[@"c"] integerValue],
-          (unsigned long)([item respondsToSelector:@selector(likeUsers)] ? [item likeUsers].count : 0),
-          (unsigned long)([item respondsToSelector:@selector(commentUsers)] ? [item commentUsers].count : 0));
-
-    [self hide];            // 先收起点赞浮层，免得它盖住弹窗
-    gDDLPendingView = self; // 收起后浮层随时可能被释放，弹窗回调还要打到 self 上
+    [self hide];             // 先收起点赞浮层，免得盖住弹窗
+    gDDLPendingView = self;  // 弹窗回调还要打到 self，收起后没人持有它，留个强引用
 
     Class alertCls = objc_getClass("WCUIAlertView");
     BOOL canInput = alertCls
@@ -709,36 +496,24 @@ static void DDLReapplyIfNeeded(id obj) {
                  && [alertCls instancesRespondToSelector:@selector(show)];
     if (canInput) {
         DDLikeConfig *cfg = DDLikeConfig.shared;
-        // 输入框版：数量在弹窗里输，格式「点赞数/评论数」，留空 = 取消伪装
         NSString *msg = @"请输入「点赞数/评论数」\n用＂/＂隔开，例如：8/5\n评论需设置界面自定义\n留空还原";
 
-        // 构造顺序照抄锤子（hammer fake.txt 0x7b5d1c-0x7b5e0c）：
-        //   [[WCUIAlertView alloc] initWithTitle:message:]
-        //   → showTextFieldWithMaxLen: → setTextFieldDefaultText: → setRequestKeyWindow:YES
-        //   → addCancelBtnTitle:target:sel: → addBtnTitle:handler: → show
-        // 关键是「先挂输入框和按钮、最后才 show」。之前用的是便捷构造器
-        // showAlertWithTitle:…cancelBtnTitle:target:sel:btnTitle:target:sel:，它内部会立刻
-        // show，输入框是在弹窗已经显示之后才挂上去的 —— 长按闪退就出在这里。
+        // 弹窗必须自建：先 alloc/init，再挂输入框与按钮，最后才 show。
+        // showAlertWithTitle:… 便捷构造器会立即 show，输入框将挂在一个已显示的弹窗上。
         WCUIAlertView *alert = [[alertCls alloc] initWithTitle:@"集赞设置" message:msg];
         [alert showTextFieldWithMaxLen:15];
-        // 预填上次的数值，省得每次重输。
-        // 必须用 setTextFieldDefaultText 而不是 setTextFieldPlaceHolder：placeholder 只是
-        // 灰字提示，不算输入内容 —— 用户看到框里有「5/6」直接点确认，getTextFieldText 读到
-        // 的是空串，会被当成「留空 = 取消伪装」，把刚想设的伪装给撤销掉。
+        // 预填上次的数值；用 setTextFieldDefaultText（真文本），别用 placeholder——
+        // placeholder 只是灰字提示、不算输入内容，直接点确认会读到空串被当成「取消伪装」。
         [alert setTextFieldDefaultText:(cfg.likeCount > 0 || cfg.commentCount > 0)
                                        ? [NSString stringWithFormat:@"%ld/%ld",
                                           (long)cfg.likeCount, (long)cfg.commentCount]
                                        : @"5/6"];
-        [alert setRequestKeyWindow:YES];   // 锤子也调，不然输入框抢不到键盘
+        [alert setRequestKeyWindow:YES];
         [alert addCancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)];
         [alert addBtnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
-        gDDLCurrentAlert = alert;   // 确认回调里要靠它 getTextFieldText
+        gDDLCurrentAlert = alert;
         [alert show];
-        DDLog(@"[长按] 已弹输入框弹窗 tid=%@（取消/确认）", tid);
     } else {
-        // 拿不到输入框就什么都不做。这里绝不能顺手执行上一次的数值：数量是弹窗里现输的，
-        // 没有输入就没有「这一次要多少」的依据，盲执行只会把已有伪装改坏。
-        DDLog(@"[长按] ⚠WCUIAlertView 缺少构造弹窗所需方法，本次不弹窗 tid=%@", tid);
         gDDLPendingItem = nil;
         gDDLPendingView = nil;
     }
@@ -746,59 +521,41 @@ static void DDLReapplyIfNeeded(id obj) {
 
 %new
 - (void)ddl_fakeConfirmed {
-    // 取长按那一刻的浮层，而不是 self：这两者未必是同一个对象（浮层收起后微信可能已经
-    // 换了一个新的出来），拿新浮层的 m_item 会改到别的朋友圈上。
     WCOperateFloatView *view = gDDLPendingView ?: self;
     WCDataItem *item = gDDLPendingItem ?: (WCDataItem *)view.m_item;
-    if (!item) { DDLog(@"[弹窗] 确认但 item 已失效，跳过"); return; }
-    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
+    if (!item) return;
+    NSString *tid = [item tid];
 
-    // WCUIAlertView.h:25 -(id)getTextFieldText —— 直接拿，不用像锤子那样 KVC 摸
-    // _tipsVc._tipsTextView.text。取不到时按「空输入」处理，即取消伪装。
     NSString *text = nil;
     if (gDDLCurrentAlert && [gDDLCurrentAlert respondsToSelector:@selector(getTextFieldText)]) {
         id t = [gDDLCurrentAlert getTextFieldText];
         if ([t isKindOfClass:[NSString class]]) text = t;
     }
-    DDLog(@"[弹窗] 已确认 tid=%@ 输入=「%@」", tid, text ?: @"");
 
     NSInteger l = 0, c = 0;
     BOOL hasSpec = DDLParseSpec(text, &l, &c);
     if (!hasSpec || (l <= 0 && c <= 0)) {
-        // 空 / 0 / 0/0 / 非数字 → 取消伪装
         if (tid && gDDLFake()[tid]) {
             DDLRemoveFakeFromItem(item, tid);
-        } else {
-            DDLog(@"[撤销] 这条本来就没伪装，无需处理 tid=%@", tid);
         }
     } else {
-        DDLikeConfig.shared.likeCount = l;      // 记下来，下次弹窗预填
+        DDLikeConfig.shared.likeCount = l;
         DDLikeConfig.shared.commentCount = c;
         DDLApplyFakeToItem(item, l, c);
     }
 
-    // 刷新走锤子同款：调微信原生 modifyDataItem:notify: 触发「数据项已变更」的原生更新 + 重绑。
-    // 反汇编证据（hammer fake.txt 0x7b61ac-0x7b61b8）：x0=[block+0x20](WCFacade) → x2=dataItem → w3=1 → bl modifyDataItem:notify:。
-    // reloadTableView/reloadDataWrap 那套只是 reloadData，掀不掉点赞行缓存，所以本来带赞的 item 一直不刷新。
-    // 强转成 WCFacade *：id 接收者会同时匹配 WCFacade/WCTimelineMgr 的同名声明，报 "multiple methods named"。
+    // 改完数据后用原生 modifyDataItem:notify: 触发刷新，让点赞行按新数据重绘。
     id svc = DDLFacadeService();
     if (svc && [svc respondsToSelector:@selector(modifyDataItem:notify:)]) {
         [(WCFacade *)svc modifyDataItem:item notify:YES];
-        DDLog(@"[刷新] 已调 [WCFacade modifyDataItem:notify:YES] tid=%@", tid);
-    } else {
-        // 数据已经写进 dataItem 了，只是这一下不会自动重绘，下拉一次即可看到。
-        DDLog(@"[刷新] ⚠取不到 WCFacade，本次不自动刷新 tid=%@", tid);
     }
     gDDLCurrentAlert = nil;
     gDDLPendingItem  = nil;
-    gDDLPendingView  = nil;   // 回调走完才放浮层，放早了确认按钮就打到野指针上
+    gDDLPendingView  = nil;
 }
 
 %new
 - (void)ddl_fakeCancelled {
-    NSString *tid = (gDDLPendingItem && [gDDLPendingItem respondsToSelector:@selector(tid)])
-                  ? [gDDLPendingItem tid] : nil;
-    DDLog(@"[弹窗] 已取消 tid=%@", tid);
     gDDLCurrentAlert = nil;
     gDDLPendingItem  = nil;
     gDDLPendingView  = nil;
@@ -806,12 +563,8 @@ static void DDLReapplyIfNeeded(id obj) {
 
 %end
 
-// 锤子同款「原生产出 dataItem 的入口，orig 之后立刻补回」。
-// 反汇编证据（hammer fake.txt 0x7b5408-0x7b5490）：WCFacade 上挂了 4 个 hook，全是
-// 「%orig → tid → 假赞字典 objectForKey: → setLikeUsers: → setLikeCount:」，imp 分别是
-// 0x7b5574 / 0x7b56b4 / 0x7b57b8 / 0x7b58e8。前两个在 8.0.79 头文件里有（WCFacade.h:195/:197），
-// 后两个（LL_onBeforeReturnDataItem: / LLComment_onBeforeReturnDataItem:）dump 里没有，不碰。
-// 这样无论是下拉刷新、翻页还是详情打开，微信拿到的 dataItem 本来就带假赞 —— 刷新不丢，本来带赞也照显。
+// 在微信产出 dataItem 的几个入口补回假数据：下拉刷新、翻页、进详情拿到的都是带假赞的
+// dataItem，因此刷新不丢、本来带赞也照显。
 %hook WCFacade
 
 - (id)getTimelineDataInCacheByItemID:(id)itemID {
@@ -828,35 +581,15 @@ static void DDLReapplyIfNeeded(id obj) {
 
 %end
 
+// 覆盖原生「数据项变了」的路径：先补回再走原逻辑。
 %hook WCTimelineMgr
 
-// 锤子也在 WCTimelineMgr 的 modifyDataItem:notify: 上挂了 hook（0x7b54b8，imp 0x7b5a08），
-// 同样是先补回再 %orig —— 覆盖所有原生「数据项变了」的路径。
 - (void)modifyDataItem:(id)item notify:(BOOL)notify {
     DDLReapplyIfNeeded(item);
     %orig;
 }
 
 %end
-
-#pragma mark - 日志查看 / 导出
-
-static void DDLogExportFrom(UIViewController *vc) {
-    NSString *text = [NSString stringWithFormat:@"%@\n\n%@", DDLogConfigSummary(), DDLogText()];
-    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDLikeHelper.log.txt"];
-    [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-    UIActivityViewController *av =
-        [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
-                                          applicationActivities:nil];
-
-    if (av.popoverPresentationController) {
-        av.popoverPresentationController.sourceView = vc.view;
-        av.popoverPresentationController.sourceRect =
-            CGRectMake(CGRectGetMidX(vc.view.bounds), CGRectGetMidY(vc.view.bounds), 1, 1);
-    }
-    [vc presentViewController:av animated:YES completion:nil];
-}
 
 #pragma mark - 设置界面
 
@@ -872,10 +605,10 @@ static void DDLogExportFrom(UIViewController *vc) {
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    // 原来在 init 里建一次、viewDidLoad 里又建一次，重复；init 整个删掉，只留这里。
     if (!self.tableViewManager) {
         self.tableViewManager = [[objc_getClass("WCTableViewManager") alloc]
-                                  initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
+                                  initWithFrame:[UIScreen mainScreen].bounds
+                                          style:UITableViewStyleInsetGrouped];
     }
     if (!_tableViewManager) return;
 
@@ -923,10 +656,7 @@ static void DDLogExportFrom(UIViewController *vc) {
                                         on:cfg.likeEnabled]];
 
     if (cfg.likeEnabled) {
-        // 点赞数/评论数不在设置里配 —— 长按弹窗时现输，格式「点赞数/评论数」如 5/6，
-        // 留空确认即取消伪装。设置里只留开关、评论内容池和清除记录。
         self.commentsField = [self makeFieldPlaceholder:@"多个内容用/分隔"
-                                                number:NO
                                                  value:cfg.comments];
         [sec addCell:[cellMgr normalCellForSel:nil
                                         target:nil
@@ -934,7 +664,6 @@ static void DDLogExportFrom(UIViewController *vc) {
                                     rightView:[self inputRowWithField:self.commentsField
                                                                action:@selector(commentsConfirmed:)]]];
 
-        // 已伪装的记录是持久化的（重启微信后自动恢复），给个入口清掉
         NSUInteger fakeN = gDDLFake().count;
         if (fakeN > 0) {
             [sec addCell:[cellMgr normalCellForSel:@selector(onClearFakeTapped)
@@ -944,76 +673,33 @@ static void DDLogExportFrom(UIViewController *vc) {
         }
     }
     [_tableViewManager addSection:sec];
-
-    [self addDebugSection];
-}
-
-- (void)addDebugSection {
-    Class cellMgr = objc_getClass("WCTableViewCellManager");
-    Class secMgr  = objc_getClass("WCTableViewSectionManager");
-
-    WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"调试"];
-    [sec addCell:[cellMgr normalCellForSel:@selector(onExportLogTapped)
-                                    target:self
-                                     title:@"导出日志"
-                                rightValue:[NSString stringWithFormat:@"%lu 条", (unsigned long)DDLogCount()]]];
-    [sec addCell:[cellMgr normalCellForSel:@selector(onClearLogTapped)
-                                    target:self
-                                     title:@"清空日志"
-                                rightValue:nil]];
-    [_tableViewManager addSection:sec];
-}
-
-- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)])
-        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
-}
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)])
-        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
-}
-- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)])
-        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
-    return UITableViewAutomaticDimension;
 }
 
 #pragma mark 回调
 
 - (void)onLikeEnabledSwitch:(UISwitch *)s {
     DDLikeConfig.shared.likeEnabled = s.isOn;
-    DDLog(@"[设置] 集赞开关 → %d", s.isOn);
     [self buildTable];
 }
 
-// 清掉持久化记录：这些 tid 重启微信后不再自动恢复，界面上也会立刻退回真实赞
+// 清掉持久化记录：重启后不再自动恢复；内存里已加载的 dataItem 要等微信刷新/重启才还原。
 - (void)onClearFakeTapped {
-    NSUInteger n = gDDLFake().count;
     [gDDLFake() removeAllObjects];
     DDLFakeSave();
-    // 只清记录：内存里已加载的 dataItem 还挂着假数据，要等数据被微信冲掉（下拉/重启）才还原
-    DDLog(@"[设置] 已清除 %lu 条伪装记录（重启后不再自动恢复）", (unsigned long)n);
     [self buildTable];
 }
 
-- (void)onExportLogTapped {
-    DDLogExportFrom(self);
-}
-
-- (void)onClearLogTapped {
-    DDLogClear();
-    DDLog(@"[设置] 日志已清空");
-    [self buildTable];
+- (void)commentsConfirmed:(id)sender {
+    DDLikeConfig.shared.comments = self.commentsField.text ?: @"";
+    [self.commentsField resignFirstResponder];
 }
 
 - (UITextField *)makeFieldPlaceholder:(NSString *)placeholder
-                               number:(BOOL)number
                                 value:(NSString *)value {
     UITextField *field = [[UITextField alloc] init];
     field.placeholder = placeholder;
     field.text = value;
     field.textAlignment = NSTextAlignmentRight;
-    if (number) field.keyboardType = UIKeyboardTypeNumberPad;
     return field;
 }
 
@@ -1045,9 +731,20 @@ static void DDLogExportFrom(UIViewController *vc) {
     return container;
 }
 
-- (void)commentsConfirmed:(id)sender {
-    DDLikeConfig.shared.comments = self.commentsField.text ?: @"";
-    [self.commentsField resignFirstResponder];
+#pragma mark UITableView 转发
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)])
+        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+}
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)])
+        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
+}
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)])
+        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
+    return UITableViewAutomaticDimension;
 }
 
 @end
