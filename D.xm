@@ -127,6 +127,7 @@ static inline id DDLTimelineMgr(void) {
 @interface WCTimeLineCommentCellView : UIView
 - (id)mainDataItem;
 - (void)setMainDataItem:(id)arg1;
+- (BOOL)isShowLikeCell;
 - (void)onReloadCommentCellView:(id)arg1;
 @end
 
@@ -647,9 +648,52 @@ static NSString *DDLTidOfCell(id cell) {
     return nil;
 }
 
-// （已移除 DDLReloadCommentCellViews：原实现直接调 WCTimeLineCommentCellView 的
-//  setMainDataItem:/onReloadCommentCellView:，在长按刷新时序里触发 EXC_BAD_ACCESS 闪退；
-//  锤子/WCR 反汇编证实它们从不这么干，改走下方 onActionClearCellCache + reloadRows 的安全路径）
+// 直接定位“点赞行”控制器：它是 tableView 里独立的一行，由 WCTimeLineCommentCellView 渲染，
+// 且 isShowLikeCell==YES、mainDataItem 指向本 item。找到后调用微信原生 onReloadCommentCellView:
+// 强制该行重绘（app 内点赞即时更新点赞行就靠这个方法；我们绕过原生点赞流程直接改数据，
+// 必须把这一环补回来，否则点赞行缓存的旧点赞列表不失效、需手动刷新）。
+// 注意：只调 onReloadCommentCellView:，绝不调 setMainDataItem:（那是上次 EXC_BAD_ACCESS 闪退的根因）。
+static id DDLFindLikeCellViewIn(id v, NSString *tid, int depth);
+static id DDLFindLikeCellView(NSString *tid, UITableView *tv) {
+    if (!tid || ![tv isKindOfClass:UITableView.class]) return nil;
+    for (UITableViewCell *cell in [tv visibleCells]) {
+        if (![DDLTidOfCell(cell) isEqualToString:tid]) continue;
+        id cv = nil;
+        for (NSString *k in @[@"cellView", @"m_cellView", @"_cellView"]) {
+            @try { id x = [cell valueForKey:k]; if (x) { cv = x; break; } } @catch (NSException *__) {}
+        }
+        if (!cv) { @try { id x = [cell valueForKey:@"m_subContentView"]; if (x) cv = x; } @catch (NSException *__) {} }
+        id found = DDLFindLikeCellViewIn(cv, tid, 0);
+        if (found) return found;
+    }
+    return nil;
+}
+static id DDLFindLikeCellViewIn(id v, NSString *tid, int depth) {
+    if (!v || depth > 4) return nil;
+    Class lvCls = NSClassFromString(@"WCTimeLineCommentCellView");
+    if (lvCls && [v isKindOfClass:lvCls]) {
+        @try {
+            id it = [v mainDataItem];
+            if ([it respondsToSelector:@selector(tid)] && [[it tid] isEqualToString:tid]
+                && [v respondsToSelector:@selector(isShowLikeCell)] && [v isShowLikeCell]) {
+                return v;
+            }
+        } @catch (NSException *__) {}
+    }
+    @try {
+        for (NSString *k in @[@"m_subContentView", @"cellView", @"m_cellView"]) {
+            id s = [v valueForKey:k];
+            if (s && s != v) { id r = DDLFindLikeCellViewIn(s, tid, depth + 1); if (r) return r; }
+        }
+    } @catch (NSException *__) {}
+    if ([v isKindOfClass:UIView.class]) {
+        for (UIView *sv in ((UIView *)v).subviews) {
+            id r = DDLFindLikeCellViewIn(sv, tid, depth + 1);
+            if (r) return r;
+        }
+    }
+    return nil;
+}
 
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
@@ -670,9 +714,13 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
     // 锤子之所以只靠 modifyDataItem 就够，是因为它浮窗关闭后微信会重新进入时间线 VC（整页重建，
     // 内层 WCTimeLineCommentCellView 控制器缓存天然清空）。我们是原地长按，带赞 item 的点赞行控制器
     // 早已缓存，modifyDataItem 只刷外层 cell、掀不掉内层缓存 → 点赞行文字不变、需手动刷新一次。
-    // 因此主线仍走锤子机制（写假数据 → modifyDataItem:notify:1），并在其后补一次微信原生
-    // onActionClearCellCacheAndRefreshCellView:（WCTimeLineViewController.h:289）清掉 VC 层 cell 缓存、
-    // 强制内层控制器重绘——等价于锤子“重进时间线”的效果，且不拆 live cell subview、不闪退。
+    // 真正漏掉的一环：点赞行是 tableView 里“独立的一行”（WCTimeLineCommentCellView, isShowLikeCell==YES），
+    // 我们之前只 reload 主内容行（indexPathOfDataItem: 返回的正是主内容行），点赞行从未被 reload，
+    // 其控制器缓存的旧点赞列表不失效。微信原生点赞走 onReloadCommentCellView: 重绘该行，我们绕过它直接改数据。
+    // 因此主线仍走锤子机制（写假数据 → modifyDataItem:notify:1），其后补一次微信原生
+    // onActionClearCellCacheAndRefreshCellView:（WCTimeLineViewController.h:289）清掉 VC 层 cell 缓存，
+    // 再把本 item 的全部可见行（主内容+评论+点赞行）一起 reload、并对点赞行控制器调 onReloadCommentCellView:
+    // 强制重绘——等价于微信“重进时间线 / 原生点赞”的效果，且不拆 live cell subview、不闪退。
     // 持久化由现有钩子负责：%hook WCTimelineMgr modifyDataItem:（DDLReapply）+ %hook cellForRowAtIndexPath（DDLReapply）。
     @try {
 
@@ -709,17 +757,45 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
     }
     @try {
         UITableView *tv = DDLTimelineTableView(tlvc0);
-        id ip = (tlvc0 && [tlvc0 respondsToSelector:@selector(indexPathOfDataItem:)] ? [tlvc0 indexPathOfDataItem:item] : nil);
-        if ([tv isKindOfClass:UITableView.class] && [ip isKindOfClass:NSIndexPath.class]) {
-            [(UITableView *)tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
-            DDLog(@"[刷新] ②reloadRowsAtIndexPaths: 已强制该行重建（点赞行 RichTextView tag=1000 随之重建）");
-        } else if ([tv isKindOfClass:UITableView.class]) {
-            [(UITableView *)tv reloadData];
-            DDLog(@"[刷新] ②未取到 indexPath，兜底整表 reloadData");
+        if ([tv isKindOfClass:UITableView.class]) {
+            // 关键修复：之前只 reload 主内容行（indexPathOfDataItem: 返回的正是主内容行），
+            // 而点赞行是 tableView 里“独立的一行”（WCTimeLineCommentCellView，isShowLikeCell==YES），
+            // 从未被 reload，其控制器缓存的旧点赞列表不失效 → 显示旧值、需手动刷新。
+            // 微信原生点赞走 onReloadCommentCellView: 重绘该行；我们绕过原生点赞流程直接改数据，
+            // 因此必须把本 item 的全部可见行（主内容+评论+点赞行）一起 reload，
+            // 强制点赞行控制器从当前 item 重读 likeUsers 并重绘 RichTextView(tag=1000)。
+            NSMutableArray *ips = [NSMutableArray array];
+            for (UITableViewCell *cell in [tv visibleCells]) {
+                if ([DDLTidOfCell(cell) isEqualToString:tid]) {
+                    NSIndexPath *cip = [tv indexPathForCell:cell];
+                    if (cip) [ips addObject:cip];
+                }
+            }
+            if (ips.count) {
+                [(UITableView *)tv reloadRowsAtIndexPaths:ips withRowAnimation:UITableViewRowAnimationNone];
+                DDLog(@"[刷新] ②reloadRowsAtIndexPaths: 已强制本 item 全部可见行重建（含点赞行）count=%lu", (unsigned long)ips.count);
+            } else {
+                [(UITableView *)tv reloadData];
+                DDLog(@"[刷新] ②未取到可见行，兜底整表 reloadData");
+            }
         } else {
             DDLog(@"[刷新] ②⚠未取到 tableView，跳过强制重建");
         }
     } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
+
+    // ③ 精确重绘点赞行：找到点赞行控制器并调用微信原生 onReloadCommentCellView:
+    //   只调这一个方法（绝不调 setMainDataItem:），等价于微信 app 内点赞后刷新该行，
+    //   把“绕过的原生重绘一环”补回来。上面 ② 已把该行 reload 过，这里是双保险。
+    @try {
+        UITableView *ltv = DDLTimelineTableView(tlvc0);
+        id likeCV = DDLFindLikeCellView(tid, ltv);
+        if (likeCV && [likeCV respondsToSelector:@selector(onReloadCommentCellView:)]) {
+            [likeCV onReloadCommentCellView:[likeCV mainDataItem]];
+            DDLog(@"[刷新] ③onReloadCommentCellView: 已对点赞行控制器精确重绘 tid=%@", tid);
+        } else {
+            DDLog(@"[刷新] ③未定位到点赞行控制器（或不可重绘），依赖 ② 的整行 reload");
+        }
+    } @catch (NSException *e) { DDLog(@"[刷新] ③异常（已捕获，不影响主流程）%@", e.reason); }
 
     } @catch (NSException *e) {
         DDLog(@"[刷新] 整段异常已捕获，避免闪退：%@", e.reason);
