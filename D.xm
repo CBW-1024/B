@@ -72,10 +72,23 @@ static inline id DDLContactMgr(void) {
     return DDLService(objc_getClass("CContactMgr"));
 }
 
+// 朋友圈门面（WCFacade）。锤子改完 dataItem 后就是拿它调 modifyDataItem:notify: 触发原生刷新。
+// 反汇编证据（hammer fake.txt）：
+//   0x7b5408  objc_getClass("WCFacade")                       ← 记住：是 WCFacade，不是 WCTimelineMgr
+//   0x7b5cc8  [[MMContext currentContext] getService:[WCFacade class]]
+//   0x7b61b8  [facade modifyDataItem:dataItem notify:YES]     ← 确认分支
+//   0x7b628c  [facade modifyDataItem:dataItem notify:YES]     ← 撤销分支
+// 全程没有任何 reloadData / reloadTableView，就这一句。
+static inline id DDLFacadeService(void) {
+    return DDLService(objc_getClass("WCFacade"));
+}
+
+// WCFacade.h:195 getTimelineDataInCacheByItemID: / :197 getTimelineDataItemOfIndex: / :429 modifyDataItem:notify:
 @interface WCFacade : NSObject
 - (id)getTimelineMgr;
 - (id)getTimelineDataInCacheByItemID:(id)itemID;
 - (id)getTimelineDataItemOfIndex:(long long)index;
+- (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;
 @end
 
 @interface WCOperateFloatView : UIView
@@ -664,6 +677,29 @@ static void DDLApplyFakeToItem(WCDataItem *di) {
     }
 }
 
+// 单个 dataItem 补回（只处理已集赞的 tid）。DDLApplyFakeToItem 按 username 去重，重复调用幂等，
+// 所以「补回」就是再调一次，不需要额外存快照。
+// 这是锤子「刷新不丢 + 本来带赞也显示」的统一机制：hook 了 4 个「产出 dataItem」的入口，
+// 每个都在 %orig 之后立刻补回（hammer fake.txt 0x7b5574 / 0x7b56b4 / 0x7b57b8 / 0x7b58e8：
+// blr x8(%orig) → tid → objectForKey: → setLikeUsers: → setLikeCount:）。
+static void DDLReapplyIfNeeded(id obj) {
+    if (![obj isKindOfClass:%c(WCDataItem)]) return;
+    WCDataItem *di = (WCDataItem *)obj;
+    NSString *tid = ([di respondsToSelector:@selector(tid)] ? [di tid] : nil);
+    if (!tid || !gDDLFakeOn()[tid]) return;
+    DDLApplyFakeToItem(di);
+    DDLog(@"[保活] 补回假赞 tid=%@", tid);
+}
+
+// 对一批 dataItem 补回（下拉刷新 / 翻页回来的数组）。
+static void DDLReapplyFakeIn(id datas) {
+    if (gDDLFakeOn().count == 0) return;
+    if (![datas isKindOfClass:NSArray.class]) return;
+    for (id obj in (NSArray *)datas) {
+        DDLReapplyIfNeeded(obj);
+    }
+}
+
 
 %hook WCOperateFloatView
 
@@ -738,7 +774,19 @@ static void DDLApplyFakeToItem(WCDataItem *di) {
     if (tid) gDDLFakeOn()[tid] = @YES;
     DDLog(@"[弹窗] 已确认 tid=%@", tid);
     DDLApplyFakeToItem(item);
-    [self ddl_reloadTimelineForItem:item];
+
+    // 刷新走锤子同款：调微信原生 modifyDataItem:notify: 触发「数据项已变更」的原生更新 + 重绑。
+    // 反汇编证据（hammer fake.txt 0x7b61ac-0x7b61b8）：x0=[block+0x20](WCFacade) → x2=dataItem → w3=1 → bl modifyDataItem:notify:。
+    // reloadTableView/reloadDataWrap 那套只是 reloadData，掀不掉点赞行缓存，所以本来带赞的 item 一直不刷新。
+    // 强转成 WCFacade *：id 接收者会同时匹配 WCFacade/WCTimelineMgr 的同名声明，报 "multiple methods named"。
+    id svc = DDLFacadeService();
+    if (svc && [svc respondsToSelector:@selector(modifyDataItem:notify:)]) {
+        [(WCFacade *)svc modifyDataItem:item notify:YES];
+        DDLog(@"[刷新] 已调 [WCFacade modifyDataItem:notify:YES] tid=%@", tid);
+    } else {
+        DDLog(@"[刷新] ⚠取不到 WCFacade，回退 reload tid=%@", tid);
+        [self ddl_reloadTimelineForItem:item];
+    }
     gDDLPendingItem = nil;
 }
 
@@ -779,6 +827,61 @@ static void DDLApplyFakeToItem(WCDataItem *di) {
     }
     return cell;
 }
+%end
+
+// 锤子同款「原生产出 dataItem 的入口，orig 之后立刻补回」。
+// 反汇编证据（hammer fake.txt 0x7b5408-0x7b5490）：WCFacade 上挂了 4 个 hook，全是
+// 「%orig → tid → 假赞字典 objectForKey: → setLikeUsers: → setLikeCount:」，imp 分别是
+// 0x7b5574 / 0x7b56b4 / 0x7b57b8 / 0x7b58e8。前两个在 8.0.79 头文件里有（WCFacade.h:195/:197），
+// 后两个（LL_onBeforeReturnDataItem: / LLComment_onBeforeReturnDataItem:）dump 里没有，不碰。
+// 这样无论是下拉刷新、翻页还是详情打开，微信拿到的 dataItem 本来就带假赞 —— 刷新不丢，本来带赞也照显。
+%hook WCFacade
+
+- (id)getTimelineDataInCacheByItemID:(id)itemID {
+    id r = %orig;
+    DDLReapplyIfNeeded(r);
+    return r;
+}
+
+- (id)getTimelineDataItemOfIndex:(long long)index {
+    id r = %orig;
+    DDLReapplyIfNeeded(r);
+    return r;
+}
+
+%end
+
+%hook WCTimelineMgr
+
+// 锤子也在 WCTimelineMgr 的 modifyDataItem:notify: 上挂了 hook（0x7b54b8，imp 0x7b5a08），
+// 同样是先补回再 %orig —— 覆盖所有原生「数据项变了」的路径。
+- (void)modifyDataItem:(id)item notify:(BOOL)notify {
+    DDLReapplyIfNeeded(item);
+    %orig;
+}
+
+// 兜底：服务器数据回来（下拉刷新 / 翻页）时，在 %orig 之前补回这批 dataItem。
+// 注意首个参数是 unsigned long long（WCTimelineMgr.h:74/:76/:80），写成 id 会让 ARC
+// 对一个整数指针做 objc_retain —— 必崩。
+- (void)onFirstPageUpdated:(unsigned long long)arg1 dataChanged:(BOOL)arg2 datas:(id)datas
+                   adDatas:(id)adDatas changedTime:(unsigned int)changedTime
+                   feedIds:(id)feedIds feedFlags:(id)feedFlags wsInfos:(id)wsInfos {
+    DDLReapplyFakeIn(datas);
+    %orig;
+}
+
+- (void)onNextPageUpdated:(unsigned long long)arg1 datas:(id)datas adDatas:(id)adDatas
+              changedTime:(unsigned int)changedTime wsInfos:(id)wsInfos {
+    DDLReapplyFakeIn(datas);
+    %orig;
+}
+
+- (void)onPrePageUpdated:(unsigned long long)arg1 datas:(id)datas adDatas:(id)adDatas
+             changedTime:(unsigned int)changedTime wsInfos:(id)wsInfos {
+    DDLReapplyFakeIn(datas);
+    %orig;
+}
+
 %end
 
 #pragma mark - 日志查看 / 导出
