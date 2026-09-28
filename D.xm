@@ -86,6 +86,7 @@ static inline id DDLTimelineMgr(void) {
 - (id)m_item;
 - (id)m_likeBtn;
 - (void)hide;
+- (void)onLikeItem:(id)arg1;
 @end
 
 @interface WCUserComment : NSObject
@@ -107,7 +108,6 @@ static inline id DDLTimelineMgr(void) {
 @property (nonatomic) BOOL likeFlag;
 @property (nonatomic) unsigned int createtime;
 @property (retain, nonatomic) NSString *tid;
-@property (retain, nonatomic) id cpKeyForLikeUsers;
 @end
 
 @interface MMTableViewCell : UITableViewCell
@@ -412,9 +412,7 @@ static void DDLRestore(WCDataItem *item, NSDictionary *snap) {
     item.commentUsers = [o[@"commentUsers"] mutableCopy];
     item.commentCount = [o[@"commentCount"] intValue];
     item.likeFlag     = [o[@"likeFlag"] boolValue];
-    // 恢复原始数据时同样刷新点赞行渲染缓存：用新 key 强制缓存 miss，从已还原的真实 likeUsers 重绘。
-    item.cpKeyForLikeUsers = [NSString stringWithFormat:@"ddl_r_%.0f",
-        [[NSDate date] timeIntervalSince1970] * 1000.0];
+    // 点赞行渲染缓存由微信原生整表重载（reloadDataWrap，=下拉刷新）统一重建控制器失效/重绘，这里不再手动干预。
     objc_setAssociatedObject(item, kDDLFakedMark, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
@@ -431,14 +429,7 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
         item.realLikeCount = (int)likes.count;
     }
 
-    // cpKeyForLikeUsers（WCDataItem.h:217）是微信点赞行 RichTextView 成品富文本的渲染缓存 key。
-    // 锤子/WCR 从不碰它，靠“重进时间线”让数据项整体重建、缓存随之失效（WCR 还显式 setCpKey:/clearCpKey）。
-    // 我们是原地长按刷新，必须主动让 key 失效才能掀掉旧渲染：设成每次更新都不同的新值 → 缓存 miss → 重绘新赞列表。
-    // 不能设 nil：nil 不是有效失效值，微信仍命中旧缓存 X（对应原 1 赞）→ 显示旧值、需手动刷新（带赞 item 的顽疾）。
-    item.cpKeyForLikeUsers = [NSString stringWithFormat:@"ddl_%lu_%.0f",
-        (unsigned long)(likes.count + comments.count),
-        [[NSDate date] timeIntervalSince1970] * 1000.0];
-
+    // 点赞行渲染缓存由微信原生整表重载（reloadDataWrap，=下拉刷新）统一重建控制器失效/重绘，这里不再手动干预。
     objc_setAssociatedObject(item, kDDLFakedMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
@@ -446,18 +437,24 @@ static void DDLReapply(NSString *tag, id item) {
     if (!item || ![item respondsToSelector:@selector(tid)]) return;
     NSString *tid = [(WCDataItem *)item tid];
     if (!tid) return;
-    NSDictionary *snap = gDDLFaked()[tid];
-    if (!snap) return;
+    NSDictionary *st = gDDLFaked()[tid];
+    if (!st) return;
 
-    DDLFakeInto((WCDataItem *)item, snap[@"likes"], snap[@"comments"]);
+    // active=YES 注入假赞；=NO 从原始快照还原（关闭集赞时把 item 交回真实数据）。
+    if ([st[@"active"] boolValue]) {
+        DDLFakeInto((WCDataItem *)item, st[@"likes"], st[@"comments"]);
+    } else {
+        DDLRestore((WCDataItem *)item, st);
+    }
 
     static NSMutableSet *seen = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
     if (![seen containsObject:tid]) {
         [seen addObject:tid];
-        DDLog(@"[补灌] 出口=%@ tid=%@ 赞=%lu 评论=%lu", tag, tid,
-              (unsigned long)[snap[@"likes"] count], (unsigned long)[snap[@"comments"] count]);
+        DDLog(@"[补灌] 出口=%@ tid=%@ active=%d 赞=%lu 评论=%lu", tag, tid,
+              [st[@"active"] boolValue],
+              (unsigned long)[st[@"likes"] count], (unsigned long)[st[@"comments"] count]);
     }
 }
 
@@ -528,27 +525,29 @@ static BOOL DDLReloadTimelineFrom(id start, NSString *tid) {
     }
     DDLog(@"[刷新] 定位到 VC=%@ tid=%@", NSStringFromClass([tlvc class]), tid);
 
+    // 优先走微信原生整表重载（=下拉刷新，重建 cell 控制器、清掉点赞行 UICache，等于用户手动下拉刷新）。
+    SEL native[3];
+    native[0] = NSSelectorFromString(@"reloadDataWrap");
+    native[1] = NSSelectorFromString(@"reloadTableView");
+    native[2] = NSSelectorFromString(@"reloadTableData");
+    for (int i = 0; i < 3; i++) {
+        if (![tlvc respondsToSelector:native[i]]) continue;
+        DDLProbeOpen();
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [tlvc performSelector:native[i]];
+#pragma clang diagnostic pop
+        DDLog(@"[刷新] 走 VC 原生出口=%@ tid=%@ %@", NSStringFromSelector(native[i]), tid, DDLGap(tid, @"T:"));
+        return YES;
+    }
+
+    // 兜底：手动 reloadData（部分版本无上述出口；不保证点赞行刷新，仅保底可见性）。
     id tv = DDLTimelineTableView(tlvc);
     if (tv) {
         DDLProbeOpen();
         [(UITableView *)tv reloadData];
-        DDLog(@"[刷新] 主表 reloadData tid=%@ 表=%@ %@", tid,
+        DDLog(@"[刷新] 主表 reloadData（兜底）tid=%@ 表=%@ %@", tid,
               NSStringFromClass([tv class]), DDLGap(tid, @"T:"));
-        return YES;
-    }
-
-    SEL chain[2];
-    chain[0] = NSSelectorFromString(@"reloadTableView");
-    chain[1] = NSSelectorFromString(@"reloadTableData");
-    for (int i = 0; i < 2; i++) {
-        if (![tlvc respondsToSelector:chain[i]]) continue;
-        DDLProbeOpen();
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        [tlvc performSelector:chain[i]];
-#pragma clang diagnostic pop
-        DDLog(@"[刷新] 主表取不到，改走 VC 出口=%@ tid=%@ %@",
-              NSStringFromSelector(chain[i]), tid, DDLGap(tid, @"T:"));
         return YES;
     }
 
@@ -648,85 +647,23 @@ static NSString *DDLTidOfCell(id cell) {
     return nil;
 }
 
-// 可靠定位并刷新点赞/评论行：app 内原生点赞能即时更新点赞行，靠的就是对点赞行控制器
-// (WCTimeLineCommentCellView, NSObject 控制器) 调 onReloadCommentCellView:。
-// 之前 ③ 只查 cellView/m_cellView/_cellView/m_subContentView 四个 key 且要求 isShowLikeCell==YES，
-// 结果运行时一个都摸不到——日志证实 8.0.79 的点赞行控制器嵌在主 cell 的 WCTimeLineCellView 内部、
-// 挂在一个未 dump 的属性下（且 isShowLikeCell 在该环境下不可靠）。直接改数据绕过了原生点赞流程，
-// 必须把“对点赞行控制器调 onReloadCommentCellView:”这一环补回来，否则点赞行渲染缓存不失效、需手动刷新。
+// 刷新策略（2026-09-28 重大修正）：
+// 之前在这里用运行时穷举 WCTimeLineCellView 的私有 ivar/属性（class_copyIvarList + valueForKey:）
+// 来定位点赞行控制器并调 onReloadCommentCellView: —— 这一步会触发惰性 getter 副作用 / 访问已释放的弱引用，
+// 是“长按闪退”的直接元凶，已彻底移除。
 //
-// 修法：穷举主 cell 控制器(WCTimeLineCellView)的全部属性/成员来找 WCTimeLineCommentCellView
-// （它是 NSObject，不在 UIView 子树，只能靠属性枚举摸到）。对本 tid 关联的【所有】该类控制器
-// （点赞行 + 评论行都归它管）都调一次 onReloadCommentCellView:，强制按当前 item.likeUsers 重算并重绘。
-// 评论本来就没问题，多刷一次无害；点赞行这一刷即修复。绝不调 setMainDataItem:（上次 EXC_BAD_ACCESS 根因）。
-static void DDLCollectCommentCV(id v, NSString *tid, int depth, NSMutableSet *seen, NSMutableArray *out);
-static void DDLReloadCommentViewsForTid(NSString *tid, UITableView *tv) {
-    if (!tid || ![tv isKindOfClass:UITableView.class]) return;
-    NSMutableArray *cvs = [NSMutableArray array];
-    NSMutableSet *seen = [NSMutableSet set];
-    for (UITableViewCell *cell in [tv visibleCells]) {
-        if (![DDLTidOfCell(cell) isEqualToString:tid]) continue;
-        id cv = nil;
-        for (NSString *k in @[@"cellView", @"m_cellView", @"_cellView", @"m_subContentView", @"contentView"]) {
-            @try { id x = [cell valueForKey:k]; if (x) { cv = x; break; } } @catch (NSException *__) {}
-        }
-        if (cv) DDLCollectCommentCV(cv, tid, 0, seen, cvs);
-    }
-    NSUInteger done = 0;
-    for (id c in cvs) {
-        @try {
-            if ([c respondsToSelector:@selector(onReloadCommentCellView:)]) {
-                [c onReloadCommentCellView:[c mainDataItem]];
-                done++;
-            }
-        } @catch (NSException *e) { DDLog(@"[刷新] ③单列异常 %@", e.reason); }
-    }
-    DDLog(@"[刷新] ③已对 %lu 个 WCTimeLineCommentCellView 调 onReloadCommentCellView:（含点赞行）",
-          (unsigned long)done);
-}
-static void DDLCollectCommentCV(id v, NSString *tid, int depth, NSMutableSet *seen, NSMutableArray *out) {
-    if (!v || depth > 6) return;
-    NSValue *vp = [NSValue valueWithPointer:(__bridge void *)v];
-    if ([seen containsObject:vp]) return;
-    [seen addObject:vp];
-
-    Class cvCls   = NSClassFromString(@"WCTimeLineCommentCellView");
-    Class cellCls = NSClassFromString(@"WCTimeLineCellView");
-
-    if (cvCls && [v isKindOfClass:cvCls]) {
-        @try {
-            id it = [v mainDataItem];
-            if ([it respondsToSelector:@selector(tid)] && [[it tid] isEqualToString:tid]) [out addObject:v];
-        } @catch (NSException *__) {}
-    }
-    if ([v isKindOfClass:UIView.class]) {
-        for (UIView *sv in ((UIView *)v).subviews)
-            DDLCollectCommentCV(sv, tid, depth + 1, seen, out);
-    }
-    // 仅对已知控制器类枚举属性/成员，避免对任意 UIKit 对象触发惰性 getter 副作用
-    if ((cvCls && [v isKindOfClass:cvCls]) || (cellCls && [v isKindOfClass:cellCls])) {
-        unsigned int pc = 0;
-        objc_property_t *props = class_copyPropertyList([v class], &pc);
-        for (unsigned int i = 0; i < pc; i++) {
-            @try {
-                NSString *pn = [NSString stringWithUTF8String:property_getName(props[i])];
-                id val = [v valueForKey:pn];
-                if (val && val != v) DDLCollectCommentCV(val, tid, depth + 1, seen, out);
-            } @catch (NSException *__) {}
-        }
-        free(props);
-        unsigned int ic = 0;
-        Ivar *ivs = class_copyIvarList([v class], &ic);
-        for (unsigned int i = 0; i < ic; i++) {
-            @try {
-                NSString *iname = [NSString stringWithUTF8String:ivar_getName(ivs[i])];
-                id val = [v valueForKey:iname];
-                if (val && val != v) DDLCollectCommentCV(val, tid, depth + 1, seen, out);
-            } @catch (NSException *__) {}
-        }
-        free(ivs);
-    }
-}
+// 根因（已用日志坐实）：点赞行由主 cell 的 WCTimeLineCellView 控制器渲染，其点赞列表布局缓存在
+// WCDataItemUICache(likeUserLayoutStyles/likeUserHeight)，且按 dataItem 对象身份命中；我们原地改同一个
+// dataItem 对象、再 reload/手动刷，都掀不掉这条缓存，所以“带赞 item 长按后点赞行不刷新、需手动拉一下”。
+// 而微信原生“下拉刷新”之所以能即时刷新点赞行，是因为它走的是自己的整表重载（reloadDataWrap 一族）→
+// 重建 cell 控制器 → 旧 UICache 随之丢弃、按新数据重算布局。我们之前手动 reloadRows/reloadData 复用控制器，
+// 就漏了这环。
+//
+// 修正（参考集赞助手、把“长按”与“原生”合二为一）：不再做任何手动刷新、也不碰任何私有控制器/ivar。
+// 长按只 toggle 状态；数据注入收敛到 %hook WCTimelineMgr modifyDataItem:notify: 这一条微信原生提交入口
+// （DDLReapply 在此注入/还原），刷新则直接调微信原生整表重载 reloadDataWrap（=下拉刷新，重建控制器、点赞行必刷）。
+// 二者都走微信自己的路径，这正是集赞助手能稳定刷新、而我们手动刷新不行的原因。
+// 注意：不再调 onLikeItem:，因此不会向服务器发真实的赞/取消赞，开关都只影响本地显示。
 
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
@@ -735,111 +672,6 @@ static void DDLCollectCommentCV(id v, NSString *tid, int depth, NSMutableSet *se
 - (id)navigationController;
 @end
 
-static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, id tlvc0, id tv0) {
-    NSMutableDictionary *faked = gDDLFaked();
-
-    (void)tv0; // tv0 保留占位参数兼容调用点；tlvc0 用于下方 onActionClearCellCacheAndRefreshCellView:
-    DDLog(@"[刷新] 起点 tid=%@ item=%p", tid, (__bridge void *)item);
-    DDLProbeOpen();
-
-    // 反汇编锤子(WeChatTweak)结论：ApplyFake 仅做 setLikeUsers:/setLikeCount: + modifyDataItem:item notify:1，
-    // 刷新交给微信原生管线（并由其 dataItem/m_dataItem getter 钩子持续重灌）。
-    // 锤子之所以只靠 modifyDataItem 就够，是因为它浮窗关闭后微信会重新进入时间线 VC（整页重建，
-    // 内层 WCTimeLineCommentCellView 控制器缓存天然清空）。我们是原地长按，带赞 item 的点赞行控制器
-    // 早已缓存，modifyDataItem 只刷外层 cell、掀不掉内层缓存 → 点赞行文字不变、需手动刷新一次。
-    // 真正漏掉的一环：点赞行嵌在主 cell 的 WCTimeLineCellView 内部（WCTimeLineCommentCellView 控制器，
-    // NSObject，挂在其未 dump 的属性上），reload 时该控制器被复用、不重算，故旧点赞列表不失效。
-    // 微信原生点赞恰是对该复用控制器调 onReloadCommentCellView: 重算布局；我们绕过原生流程直接改数据，
-    // 必须把这一环补回来（见下方 ③ 的运行时穷举定位 + 调 onReloadCommentCellView:）。
-    // 因此主线仍走锤子机制（写假数据 → modifyDataItem:notify:1），其后补一次微信原生
-    // onActionClearCellCacheAndRefreshCellView:（WCTimeLineViewController.h:289）清掉 VC 层 cell 缓存，
-    // 再把本 item 的全部可见行（主内容+评论+点赞行）一起 reload、并对点赞行控制器调 onReloadCommentCellView:
-    // 强制重绘——等价于微信“重进时间线 / 原生点赞”的效果，且不拆 live cell subview、不闪退。
-    // 持久化由现有钩子负责：%hook WCTimelineMgr modifyDataItem:（DDLReapply）+ %hook cellForRowAtIndexPath（DDLReapply）。
-    @try {
-
-    if (turningOn) {
-        NSDictionary *snap = (tid ? faked[tid] : nil);
-        item.likeFlag = YES;
-        DDLFakeInto(item, snap[@"likes"], snap[@"comments"]);
-        DDLog(@"[写入] tid=%@ 赞=%lu 评论=%lu item=%p",
-              tid, (unsigned long)[snap[@"likes"] count],
-              (unsigned long)[snap[@"comments"] count], (__bridge void *)item);
-        DDLog(@"[写入] 计数 likeCount=%d realLikeCount=%d selfLikeCount=%d likeFlag=%d likeUsers=%lu",
-              item.likeCount, item.realLikeCount, item.selfLikeCount, item.likeFlag,
-              (unsigned long)item.likeUsers.count);
-    }
-
-    id mgr = DDLTimelineMgr();
-    if (mgr && [mgr respondsToSelector:@selector(modifyDataItem:notify:)]) {
-        [mgr modifyDataItem:item notify:YES];
-        DDLog(@"[刷新] modifyDataItem notify:1（同锤子：走微信原生管线刷新，由 WCTimelineMgr 钩子与 cellForRow 钩子持续补灌）");
-    } else {
-        DDLog(@"[刷新] ⚠未找到 modifyDataItem:notify: 的 mgr，刷新可能无效");
-    }
-
-    // 锤子/WCR 反汇编证实：它们只靠 modifyDataItem:notify:1 提交数据，并依赖“重新进入时间线 VC”
-    // 把内层 WCTimeLineCommentCellView（含 RichTextView tag=1000 的绘制快照）缓存自然掀掉。
-    // 我们是原地长按，时间线不重建，故在提交数据后主动用微信原生手段强制该行重建：
-    //   ① onActionClearCellCacheAndRefreshCellView:（WCTimeLineViewController.h:289）清 VC 层 cell 缓存；
-    //   ② reloadRowsAtIndexPaths:（公开 UITableView API，安全）强制该 item 所在行整行重建，
-    //      新建的 WCTimeLineCommentCellView 从新 item 读数据 → RichTextView 随之重建，无需手动刷新。
-    // 不调私有控制器方法、不拆 live cell 的 subview，规避 EXC_BAD_ACCESS 闪退。
-    if (tlvc0 && [tlvc0 respondsToSelector:@selector(onActionClearCellCacheAndRefreshCellView:)]) {
-        [tlvc0 onActionClearCellCacheAndRefreshCellView:item];
-        DDLog(@"[刷新] ①onActionClearCellCacheAndRefreshCellView:（清 VC 层 cell 缓存）");
-    }
-    @try {
-        UITableView *tv = DDLTimelineTableView(tlvc0);
-        if ([tv isKindOfClass:UITableView.class]) {
-            // 先整 item 可见行一起 reload（②，公开 API、安全），把主内容+评论行拉齐；
-            // 但点赞行嵌在主 cell 的 WCTimeLineCellView 内部、其控制器在 reload 时被复用不重算，
-            // 所以②本身清不掉点赞行旧布局——真正的重绘靠下方 ③ 直接调 onReloadCommentCellView:。
-            // 微信原生点赞即时更新点赞行也是靠它（对复用的点赞行控制器重算布局），我们绕过原生流程
-            // 直接改数据，必须把这一环补回来。
-            NSMutableArray *ips = [NSMutableArray array];
-            for (UITableViewCell *cell in [tv visibleCells]) {
-                if ([DDLTidOfCell(cell) isEqualToString:tid]) {
-                    NSIndexPath *cip = [tv indexPathForCell:cell];
-                    if (cip) [ips addObject:cip];
-                }
-            }
-            if (ips.count) {
-                [(UITableView *)tv reloadRowsAtIndexPaths:ips withRowAnimation:UITableViewRowAnimationNone];
-                DDLog(@"[刷新] ②reloadRowsAtIndexPaths: 已强制本 item 全部可见行重建（含点赞行）count=%lu", (unsigned long)ips.count);
-            } else {
-                [(UITableView *)tv reloadData];
-                DDLog(@"[刷新] ②未取到可见行，兜底整表 reloadData");
-            }
-        } else {
-            DDLog(@"[刷新] ②⚠未取到 tableView，跳过强制重建");
-        }
-    } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
-
-    // ③ 精确重绘点赞行：穷举主 cell 控制器，对本 tid 的全部 WCTimeLineCommentCellView
-    // （点赞行 + 评论行）调微信原生 onReloadCommentCellView:。app 内原生点赞即时更新点赞行就靠它。
-    // 我们绕过原生点赞流程直接改数据，必须把这一环补回来。派发到下一个 run loop（② 的 reload
-    // 提交、新 cell 重建之后），确保作用在 live 控制器上，按当前 item.likeUsers 重算点赞行。
-    // 绝不调 setMainDataItem:（上次 EXC_BAD_ACCESS 根因）。
-    @try {
-        UITableView *ltv = DDLTimelineTableView(tlvc0);
-        if ([ltv isKindOfClass:UITableView.class]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                @try { DDLReloadCommentViewsForTid(tid, ltv); }
-                @catch (NSException *e) { DDLog(@"[刷新] ③异步异常 %@", e.reason); }
-            });
-            DDLog(@"[刷新] ③已派发 onReloadCommentCellView:（下一 run loop 执行，作用重建后的 live 控制器）");
-        } else {
-            DDLog(@"[刷新] ③⚠未取到 tableView，跳过精确重绘");
-        }
-    } @catch (NSException *e) { DDLog(@"[刷新] ③异常（已捕获，不影响主流程）%@", e.reason); }
-
-    } @catch (NSException *e) {
-        DDLog(@"[刷新] 整段异常已捕获，避免闪退：%@", e.reason);
-    }
-
-    DDLCheckVisible(tid, tlvc0);
-}
 
 %hook WCOperateFloatView
 
@@ -883,39 +715,52 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
           item.likeCount, item.realLikeCount, item.selfLikeCount,
           (unsigned long)item.likeUsers.count);
 
-    BOOL turningOn = YES;
-    if (tid && faked[tid]) {
-
-        DDLRestore(item, faked[tid]);
-        [faked removeObjectForKey:tid];
-        turningOn = NO;
-        DDLog(@"[长按] 取消集赞 tid=%@（已恢复原始值，记忆剩 %lu 条）",
-              tid, (unsigned long)faked.count);
-    } else {
-
-        if (!tid) DDLog(@"[长按] 警告：tid 为 nil，刷新后无法重建");
-        if (tid) {
-            NSArray *likes    = [DDLikeHelper fakeLikeUsers];
-            NSArray *comments = [DDLikeHelper fakeCommentsFor:item];
-            faked[tid] = @{
-                @"orig":     DDLSnapshotOf(item),
-                @"likes":    likes    ?: @[],
-                @"comments": comments ?: @[],
-            };
+    // 合二为一（参考集赞助手）：不手动刷新、不碰私有控制器（那套会闪退且点赞行不刷）。
+    // 长按只负责 toggle 状态；真正的“数据注入 + 点赞行刷新”都交给微信原生路径：
+    //   - 注入收敛到 %hook WCTimelineMgr modifyDataItem:（DDLReapply），搭微信原生提交这趟车；
+    //   - 刷新走微信原生整表重载 reloadDataWrap（等同下拉刷新，重建 cell 控制器、清掉点赞行 UICache）。
+    // 状态：gDDLFaked[tid] = {orig, likes, comments, active}；active=YES 注入假赞，=NO 从 orig 还原。
+    if (tid) {
+        NSMutableDictionary *st = faked[tid];
+        if (st && [st[@"active"] boolValue]) {
+            st[@"active"] = @NO;
+            DDLog(@"[长按] 取消集赞 tid=%@（active=NO，记忆剩 %lu 条）", tid, (unsigned long)faked.count);
+        } else {
+            if (!st) {
+                st = [NSMutableDictionary dictionary];
+                st[@"orig"]     = DDLSnapshotOf(item);
+                st[@"likes"]    = [DDLikeHelper fakeLikeUsers] ?: @[];
+                st[@"comments"] = [DDLikeHelper fakeCommentsFor:item] ?: @[];
+                faked[tid] = st;
+            }
+            st[@"active"] = @YES;
+            DDLog(@"[长按] 开启集赞 tid=%@（记忆 %lu 条）", tid, (unsigned long)faked.count);
         }
-        DDLog(@"[长按] 开启集赞 tid=%@（记忆 %lu 条）", tid, (unsigned long)faked.count);
+    } else {
+        DDLog(@"[长按] 警告：tid 为 nil，无法记录状态");
     }
 
-    id preTLVC = DDLFindTimelineVC(self);
-    id preTV   = DDLTimelineTableView(preTLVC);
-    DDLog(@"[长按] 预定位 VC=%@ 主表=%@", NSStringFromClass([preTLVC class]) ?: @"(nil)",
-          NSStringFromClass([preTV class]) ?: @"(nil)");
-    [self hide];
+    [self hide];  // 收起点赞/评论浮层（原 onLikeItem: 会做；我们不再调它，这里补上）
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        DDLApplyAndRefresh(item, tid, turningOn, preTLVC, preTV);
-    });
+    // 触发微信原生数据提交 + 原生整表重载（不调 onLikeItem:，避免误发服务器赞/取消赞）：
+    // 1) modifyDataItem:notify: → WCTimelineMgr 钩子在此注入/还原假赞，notify=YES 让微信原生刷新该行；
+    // 2) reloadDataWrap → WCTimeLineViewController 原生整表重载（=下拉刷新），重建 cell 控制器、点赞行必刷。
+    id mgr = DDLTimelineMgr();
+    if (mgr && [mgr respondsToSelector:@selector(modifyDataItem:notify:)]) {
+        [mgr modifyDataItem:item notify:YES];
+        DDLog(@"[长按] 已提交 modifyDataItem:notify:（钩子注入/还原）tid=%@", tid);
+    }
+    id tlvc = DDLFindTimelineVC(self);
+    BOOL didNativeReload = NO;
+    if (tlvc && [tlvc respondsToSelector:@selector(reloadDataWrap)]) {
+        [tlvc reloadDataWrap];
+        DDLog(@"[长按] 已触发 reloadDataWrap（原生整表重载）tid=%@", tid);
+        didNativeReload = YES;
+    }
+    if (!didNativeReload) {
+        // reloadDataWrap 不可用或未定位到 VC 时，用通用出口兜底（内部会再尝试 keyWindow 定位 + reloadTableView/reloadData）
+        DDLReloadTimelineFrom(self, tid);
+    }
     } @catch (NSException *e) {
         DDLog(@"[长按] 异常已捕获，避免闪退：%@", e.reason);
     }
@@ -1008,12 +853,13 @@ static int gDDLFacadeLog = 0;
             if (![obj isKindOfClass:objc_getClass("WCDataItem")]) continue;
             WCDataItem *item = (WCDataItem *)obj;
             NSString *tid = item.tid;
-            NSDictionary *snap = (tid ? faked[tid] : nil);
-            if (!snap) continue;
+            NSDictionary *st = (tid ? faked[tid] : nil);
+            if (!st) continue;
+            if (![st[@"active"] boolValue]) continue;   // 关闭集赞：新拉取的数据已是真实数据，无需重灌
 
             item.likeFlag = YES;
-            NSArray *likes    = snap[@"likes"];
-            NSArray *comments = snap[@"comments"];
+            NSArray *likes    = st[@"likes"];
+            NSArray *comments = st[@"comments"];
 
             BOOL marked     = [objc_getAssociatedObject(item, kDDLFakedMark) boolValue];
             BOOL consistent = (item.likeUsers.count == likes.count) &&
@@ -1041,7 +887,7 @@ static int gDDLFacadeLog = 0;
             if (![obj isKindOfClass:objc_getClass("WCDataItem")]) continue;
             if (![obj respondsToSelector:@selector(tid)]) continue;
             NSString *tid = [obj tid];
-            if (tid && faked[tid]) { firstItem = obj; break; }
+            if (tid && faked[tid] && [faked[tid][@"active"] boolValue]) { firstItem = obj; break; }
         }
         if (firstItem) {
             [self modifyDataItem:firstItem notify:YES];
