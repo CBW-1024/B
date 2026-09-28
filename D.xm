@@ -127,9 +127,9 @@ static inline id DDLContactMgr(void) {
 - (void)onReloadCommentCellView:(id)arg1;
 @end
 
-// 主内容控制器（头文件 WCTimeLineCellView.h:288 updateWithDataItem:actionAreaVM: 即 cell 复用时重绘整行的入口）。
-// 点赞行归它管。关键修复点：在这里把数据项替换成“假数据深拷贝”（指针变化 → 微信被迫重绑 →
-// 点赞行按新数据重算 WCDataItemUICache），等价于手动下拉刷新（服务器返回新对象）能生效的原因。
+// 主内容控制器（WCTimeLineCellView.h:288 updateWithDataItem:actionAreaVM: 即 cell 复用时重绘整行的入口）。
+// 点赞行归它管；我们不再 hook 它——数据注入收敛到 %hook WCTimelineMgr modifyDataItem:（原生数据更新上下文），
+// 微信原生重绑即刷新整行，无需深拷贝、无需手动 reload（深拷贝方案已废弃）。
 @interface WCTimeLineCellView : NSObject
 - (void)updateWithDataItem:(id)arg1 actionAreaVM:(id)arg2;
 @end
@@ -690,6 +690,13 @@ static NSString *DDLTidOfCell(id cell) {
         && [item isKindOfClass:%c(WCDataItem)]) {
         WCDataItem *di = (WCDataItem *)item;
         if ([di likeFlag]) {
+            // 假评论：在原文基础上补足到目标条数（集赞助手 commentWith: 同款；未配置/内容池空则原样返回）
+            NSMutableArray *comments = [DDLikeHelper fakeCommentsFor:di];
+            di.commentUsers = comments;
+            di.commentCount = (int)comments.count;
+            DDLog(@"[注入] modifyDataItem 已注入假评论 tid=%@ n=%lu", di.tid, (unsigned long)comments.count);
+
+            // 假赞：替换点赞名单（集赞助手 commentUsers 同款）
             NSArray<WCUserComment *> *likes = [DDLikeHelper fakeLikeUsers];
             if (likes.count) {
                 [di setLikeUsers:[likes mutableCopy]];
