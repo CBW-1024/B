@@ -648,51 +648,84 @@ static NSString *DDLTidOfCell(id cell) {
     return nil;
 }
 
-// 直接定位“点赞行”控制器：它是 tableView 里独立的一行，由 WCTimeLineCommentCellView 渲染，
-// 且 isShowLikeCell==YES、mainDataItem 指向本 item。找到后调用微信原生 onReloadCommentCellView:
-// 强制该行重绘（app 内点赞即时更新点赞行就靠这个方法；我们绕过原生点赞流程直接改数据，
-// 必须把这一环补回来，否则点赞行缓存的旧点赞列表不失效、需手动刷新）。
-// 注意：只调 onReloadCommentCellView:，绝不调 setMainDataItem:（那是上次 EXC_BAD_ACCESS 闪退的根因）。
-static id DDLFindLikeCellViewIn(id v, NSString *tid, int depth);
-static id DDLFindLikeCellView(NSString *tid, UITableView *tv) {
-    if (!tid || ![tv isKindOfClass:UITableView.class]) return nil;
+// 可靠定位并刷新点赞/评论行：app 内原生点赞能即时更新点赞行，靠的就是对点赞行控制器
+// (WCTimeLineCommentCellView, NSObject 控制器) 调 onReloadCommentCellView:。
+// 之前 ③ 只查 cellView/m_cellView/_cellView/m_subContentView 四个 key 且要求 isShowLikeCell==YES，
+// 结果运行时一个都摸不到——日志证实 8.0.79 的点赞行控制器嵌在主 cell 的 WCTimeLineCellView 内部、
+// 挂在一个未 dump 的属性下（且 isShowLikeCell 在该环境下不可靠）。直接改数据绕过了原生点赞流程，
+// 必须把“对点赞行控制器调 onReloadCommentCellView:”这一环补回来，否则点赞行渲染缓存不失效、需手动刷新。
+//
+// 修法：穷举主 cell 控制器(WCTimeLineCellView)的全部属性/成员来找 WCTimeLineCommentCellView
+// （它是 NSObject，不在 UIView 子树，只能靠属性枚举摸到）。对本 tid 关联的【所有】该类控制器
+// （点赞行 + 评论行都归它管）都调一次 onReloadCommentCellView:，强制按当前 item.likeUsers 重算并重绘。
+// 评论本来就没问题，多刷一次无害；点赞行这一刷即修复。绝不调 setMainDataItem:（上次 EXC_BAD_ACCESS 根因）。
+static void DDLCollectCommentCV(id v, NSString *tid, int depth, NSMutableSet *seen, NSMutableArray *out);
+static void DDLReloadCommentViewsForTid(NSString *tid, UITableView *tv) {
+    if (!tid || ![tv isKindOfClass:UITableView.class]) return;
+    NSMutableArray *cvs = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
     for (UITableViewCell *cell in [tv visibleCells]) {
         if (![DDLTidOfCell(cell) isEqualToString:tid]) continue;
         id cv = nil;
-        for (NSString *k in @[@"cellView", @"m_cellView", @"_cellView"]) {
+        for (NSString *k in @[@"cellView", @"m_cellView", @"_cellView", @"m_subContentView", @"contentView"]) {
             @try { id x = [cell valueForKey:k]; if (x) { cv = x; break; } } @catch (NSException *__) {}
         }
-        if (!cv) { @try { id x = [cell valueForKey:@"m_subContentView"]; if (x) cv = x; } @catch (NSException *__) {} }
-        id found = DDLFindLikeCellViewIn(cv, tid, 0);
-        if (found) return found;
+        if (cv) DDLCollectCommentCV(cv, tid, 0, seen, cvs);
     }
-    return nil;
+    NSUInteger done = 0;
+    for (id c in cvs) {
+        @try {
+            if ([c respondsToSelector:@selector(onReloadCommentCellView:)]) {
+                [c onReloadCommentCellView:[c mainDataItem]];
+                done++;
+            }
+        } @catch (NSException *e) { DDLog(@"[刷新] ③单列异常 %@", e.reason); }
+    }
+    DDLog(@"[刷新] ③已对 %lu 个 WCTimeLineCommentCellView 调 onReloadCommentCellView:（含点赞行）",
+          (unsigned long)done);
 }
-static id DDLFindLikeCellViewIn(id v, NSString *tid, int depth) {
-    if (!v || depth > 4) return nil;
-    Class lvCls = NSClassFromString(@"WCTimeLineCommentCellView");
-    if (lvCls && [v isKindOfClass:lvCls]) {
+static void DDLCollectCommentCV(id v, NSString *tid, int depth, NSMutableSet *seen, NSMutableArray *out) {
+    if (!v || depth > 6) return;
+    NSValue *vp = [NSValue valueWithPointer:(__bridge void *)v];
+    if ([seen containsObject:vp]) return;
+    [seen addObject:vp];
+
+    Class cvCls   = NSClassFromString(@"WCTimeLineCommentCellView");
+    Class cellCls = NSClassFromString(@"WCTimeLineCellView");
+
+    if (cvCls && [v isKindOfClass:cvCls]) {
         @try {
             id it = [v mainDataItem];
-            if ([it respondsToSelector:@selector(tid)] && [[it tid] isEqualToString:tid]
-                && [v respondsToSelector:@selector(isShowLikeCell)] && [v isShowLikeCell]) {
-                return v;
-            }
+            if ([it respondsToSelector:@selector(tid)] && [[it tid] isEqualToString:tid]) [out addObject:v];
         } @catch (NSException *__) {}
     }
-    @try {
-        for (NSString *k in @[@"m_subContentView", @"cellView", @"m_cellView"]) {
-            id s = [v valueForKey:k];
-            if (s && s != v) { id r = DDLFindLikeCellViewIn(s, tid, depth + 1); if (r) return r; }
-        }
-    } @catch (NSException *__) {}
     if ([v isKindOfClass:UIView.class]) {
-        for (UIView *sv in ((UIView *)v).subviews) {
-            id r = DDLFindLikeCellViewIn(sv, tid, depth + 1);
-            if (r) return r;
-        }
+        for (UIView *sv in ((UIView *)v).subviews)
+            DDLCollectCommentCV(sv, tid, depth + 1, seen, out);
     }
-    return nil;
+    // 仅对已知控制器类枚举属性/成员，避免对任意 UIKit 对象触发惰性 getter 副作用
+    if ((cvCls && [v isKindOfClass:cvCls]) || (cellCls && [v isKindOfClass:cellCls])) {
+        unsigned int pc = 0;
+        objc_property_t *props = class_copyPropertyList([v class], &pc);
+        for (unsigned int i = 0; i < pc; i++) {
+            @try {
+                NSString *pn = [NSString stringWithUTF8String:property_getName(props[i])];
+                id val = [v valueForKey:pn];
+                if (val && val != v) DDLCollectCommentCV(val, tid, depth + 1, seen, out);
+            } @catch (NSException *__) {}
+        }
+        free(props);
+        unsigned int ic = 0;
+        Ivar *ivs = class_copyIvarList([v class], &ic);
+        for (unsigned int i = 0; i < ic; i++) {
+            @try {
+                NSString *iname = [NSString stringWithUTF8String:ivar_getName(ivs[i])];
+                id val = [v valueForKey:iname];
+                if (val && val != v) DDLCollectCommentCV(val, tid, depth + 1, seen, out);
+            } @catch (NSException *__) {}
+        }
+        free(ivs);
+    }
 }
 
 @interface WCOperateFloatView (DDLike)
@@ -714,9 +747,10 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
     // 锤子之所以只靠 modifyDataItem 就够，是因为它浮窗关闭后微信会重新进入时间线 VC（整页重建，
     // 内层 WCTimeLineCommentCellView 控制器缓存天然清空）。我们是原地长按，带赞 item 的点赞行控制器
     // 早已缓存，modifyDataItem 只刷外层 cell、掀不掉内层缓存 → 点赞行文字不变、需手动刷新一次。
-    // 真正漏掉的一环：点赞行是 tableView 里“独立的一行”（WCTimeLineCommentCellView, isShowLikeCell==YES），
-    // 我们之前只 reload 主内容行（indexPathOfDataItem: 返回的正是主内容行），点赞行从未被 reload，
-    // 其控制器缓存的旧点赞列表不失效。微信原生点赞走 onReloadCommentCellView: 重绘该行，我们绕过它直接改数据。
+    // 真正漏掉的一环：点赞行嵌在主 cell 的 WCTimeLineCellView 内部（WCTimeLineCommentCellView 控制器，
+    // NSObject，挂在其未 dump 的属性上），reload 时该控制器被复用、不重算，故旧点赞列表不失效。
+    // 微信原生点赞恰是对该复用控制器调 onReloadCommentCellView: 重算布局；我们绕过原生流程直接改数据，
+    // 必须把这一环补回来（见下方 ③ 的运行时穷举定位 + 调 onReloadCommentCellView:）。
     // 因此主线仍走锤子机制（写假数据 → modifyDataItem:notify:1），其后补一次微信原生
     // onActionClearCellCacheAndRefreshCellView:（WCTimeLineViewController.h:289）清掉 VC 层 cell 缓存，
     // 再把本 item 的全部可见行（主内容+评论+点赞行）一起 reload、并对点赞行控制器调 onReloadCommentCellView:
@@ -758,12 +792,11 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
     @try {
         UITableView *tv = DDLTimelineTableView(tlvc0);
         if ([tv isKindOfClass:UITableView.class]) {
-            // 关键修复：之前只 reload 主内容行（indexPathOfDataItem: 返回的正是主内容行），
-            // 而点赞行是 tableView 里“独立的一行”（WCTimeLineCommentCellView，isShowLikeCell==YES），
-            // 从未被 reload，其控制器缓存的旧点赞列表不失效 → 显示旧值、需手动刷新。
-            // 微信原生点赞走 onReloadCommentCellView: 重绘该行；我们绕过原生点赞流程直接改数据，
-            // 因此必须把本 item 的全部可见行（主内容+评论+点赞行）一起 reload，
-            // 强制点赞行控制器从当前 item 重读 likeUsers 并重绘 RichTextView(tag=1000)。
+            // 先整 item 可见行一起 reload（②，公开 API、安全），把主内容+评论行拉齐；
+            // 但点赞行嵌在主 cell 的 WCTimeLineCellView 内部、其控制器在 reload 时被复用不重算，
+            // 所以②本身清不掉点赞行旧布局——真正的重绘靠下方 ③ 直接调 onReloadCommentCellView:。
+            // 微信原生点赞即时更新点赞行也是靠它（对复用的点赞行控制器重算布局），我们绕过原生流程
+            // 直接改数据，必须把这一环补回来。
             NSMutableArray *ips = [NSMutableArray array];
             for (UITableViewCell *cell in [tv visibleCells]) {
                 if ([DDLTidOfCell(cell) isEqualToString:tid]) {
@@ -783,17 +816,21 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
         }
     } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
 
-    // ③ 精确重绘点赞行：找到点赞行控制器并调用微信原生 onReloadCommentCellView:
-    //   只调这一个方法（绝不调 setMainDataItem:），等价于微信 app 内点赞后刷新该行，
-    //   把“绕过的原生重绘一环”补回来。上面 ② 已把该行 reload 过，这里是双保险。
+    // ③ 精确重绘点赞行：穷举主 cell 控制器，对本 tid 的全部 WCTimeLineCommentCellView
+    // （点赞行 + 评论行）调微信原生 onReloadCommentCellView:。app 内原生点赞即时更新点赞行就靠它。
+    // 我们绕过原生点赞流程直接改数据，必须把这一环补回来。派发到下一个 run loop（② 的 reload
+    // 提交、新 cell 重建之后），确保作用在 live 控制器上，按当前 item.likeUsers 重算点赞行。
+    // 绝不调 setMainDataItem:（上次 EXC_BAD_ACCESS 根因）。
     @try {
         UITableView *ltv = DDLTimelineTableView(tlvc0);
-        id likeCV = DDLFindLikeCellView(tid, ltv);
-        if (likeCV && [likeCV respondsToSelector:@selector(onReloadCommentCellView:)]) {
-            [likeCV onReloadCommentCellView:[likeCV mainDataItem]];
-            DDLog(@"[刷新] ③onReloadCommentCellView: 已对点赞行控制器精确重绘 tid=%@", tid);
+        if ([ltv isKindOfClass:UITableView.class]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try { DDLReloadCommentViewsForTid(tid, ltv); }
+                @catch (NSException *e) { DDLog(@"[刷新] ③异步异常 %@", e.reason); }
+            });
+            DDLog(@"[刷新] ③已派发 onReloadCommentCellView:（下一 run loop 执行，作用重建后的 live 控制器）");
         } else {
-            DDLog(@"[刷新] ③未定位到点赞行控制器（或不可重绘），依赖 ② 的整行 reload");
+            DDLog(@"[刷新] ③⚠未取到 tableView，跳过精确重绘");
         }
     } @catch (NSException *e) { DDLog(@"[刷新] ③异常（已捕获，不影响主流程）%@", e.reason); }
 
