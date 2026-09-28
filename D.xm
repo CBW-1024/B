@@ -378,12 +378,13 @@ static inline BOOL DDLIsFake(WCUserComment *u) {
 
     // 好友池不够就绕回来复用（同一个人评论多条，内容随机，看起来不重复）。
     // 之前是一轮走完就完事，好友 6 个想凑 10 条就只能凑到 6 条。
-    NSMutableArray *pool = [friends mutableCopy];
+    // 变量名叫 friendPool：上面的 pool 是「评论内容池」，别混
+    NSMutableArray *friendPool = [friends mutableCopy];
     NSUInteger idx = 0;
     while ((NSInteger)list.count < target) {
-        DDLShuffle(pool);
+        DDLShuffle(friendPool);
         BOOL added = NO;
-        for (CContact *c in pool) {
+        for (CContact *c in friendPool) {
             if ((NSInteger)list.count >= target) break;
             NSString *name = c.m_nsUsrName;
             if (!name) continue;
