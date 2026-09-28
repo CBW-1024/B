@@ -268,10 +268,9 @@ static NSString *DDLogConfigSummary(void) {
 static NSArray<CContact *> *gDDLFriendCache;
 static NSTimeInterval gDDLFriendCacheAt;
 
+// 一次注入里会被调两遍（造赞 + 造评论），所以命中缓存时静默返回，只在真正拉取时打日志。
 + (NSArray<CContact *> *)allFriends {
     if (gDDLFriendCache && ([NSDate timeIntervalSinceReferenceDate] - gDDLFriendCacheAt) < 3.0) {
-        DDLog(@"[好友] 复用缓存=%lu（%.2fs 前）", (unsigned long)gDDLFriendCache.count,
-              [NSDate timeIntervalSinceReferenceDate] - gDDLFriendCacheAt);
         return gDDLFriendCache;
     }
 
