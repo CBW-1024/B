@@ -167,7 +167,7 @@ static NSString * const kDDMFakeStore      = @"DDMoments_fakeStore";
 
 - (NSArray<NSString *> *)commentPool {
     if (self.comments.length == 0) return @[];
-    return [self.comments componentsSeparatedByString:@"-"];
+    return [self.comments componentsSeparatedByString:@"/"];
 }
 
 @end
@@ -710,11 +710,7 @@ static void DDLReapplyIfNeeded(id obj) {
     if (canInput) {
         DDLikeConfig *cfg = DDLikeConfig.shared;
         // 输入框版：数量在弹窗里输，格式「点赞数/评论数」，留空 = 取消伪装
-        NSString *msg = rec
-            ? [NSString stringWithFormat:
-               @"输入「点赞数/评论数」，例如 5/6。\n当前：%ld 赞 / %ld 评论\n留空确认 = 取消伪装。",
-               (long)[rec[@"l"] integerValue], (long)[rec[@"c"] integerValue]]
-            : @"输入「点赞数/评论数」，例如 5/6。\n只填一个数字则只改点赞。\n留空确认 = 取消伪装。\n仅本地显示，不会发给微信服务器。";
+        NSString *msg = @"请输入「点赞数/评论数」\n用＂/＂隔开，例如：8/5\n评论需设置界面自定义\n留空还原";
 
         // 构造顺序照抄锤子（hammer fake.txt 0x7b5d1c-0x7b5e0c）：
         //   [[WCUIAlertView alloc] initWithTitle:message:]
@@ -723,7 +719,7 @@ static void DDLReapplyIfNeeded(id obj) {
         // 关键是「先挂输入框和按钮、最后才 show」。之前用的是便捷构造器
         // showAlertWithTitle:…cancelBtnTitle:target:sel:btnTitle:target:sel:，它内部会立刻
         // show，输入框是在弹窗已经显示之后才挂上去的 —— 长按闪退就出在这里。
-        WCUIAlertView *alert = [[alertCls alloc] initWithTitle:@"集赞助手" message:msg];
+        WCUIAlertView *alert = [[alertCls alloc] initWithTitle:@"集赞设置" message:msg];
         [alert showTextFieldWithMaxLen:15];
         // 预填上次的数值，省得每次重输。
         // 必须用 setTextFieldDefaultText 而不是 setTextFieldPlaceHolder：placeholder 只是
@@ -923,13 +919,13 @@ static void DDLogExportFrom(UIViewController *vc) {
     WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"集赞设置"];
     [sec addCell:[cellMgr switchCellForSel:@selector(onLikeEnabledSwitch:)
                                     target:self
-                                     title:@"启用集赞"
+                                     title:@"启用长按集赞"
                                         on:cfg.likeEnabled]];
 
     if (cfg.likeEnabled) {
         // 点赞数/评论数不在设置里配 —— 长按弹窗时现输，格式「点赞数/评论数」如 5/6，
         // 留空确认即取消伪装。设置里只留开关、评论内容池和清除记录。
-        self.commentsField = [self makeFieldPlaceholder:@"多个内容用-分隔"
+        self.commentsField = [self makeFieldPlaceholder:@"多个内容用/分隔"
                                                 number:NO
                                                  value:cfg.comments];
         [sec addCell:[cellMgr normalCellForSel:nil
