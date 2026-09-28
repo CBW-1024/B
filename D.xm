@@ -687,7 +687,7 @@ static NSString *DDLTidOfCell(id cell) {
 // 代价：长按会真给作者点你自己的那个赞（其余赞名是假的）；这是用户已确认的取舍。
 - (void)modifyDataItem:(id)item notify:(BOOL)notify {
     if (DDLikeConfig.shared.likeEnabled
-        && [item isKindOfClass:[WCDataItem class]]) {
+        && [item isKindOfClass:%c(WCDataItem)]) {
         WCDataItem *di = (WCDataItem *)item;
         if ([di likeFlag]) {
             NSArray<WCUserComment *> *likes = [DDLikeHelper fakeLikeUsers];
