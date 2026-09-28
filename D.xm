@@ -639,42 +639,9 @@ static NSString *DDLTidOfCell(id cell) {
     return nil;
 }
 
-// 定向刷新点赞/评论行：遍历可见 cell 的 contentView 子树，找 mainDataItem 匹配 item 的
-// WCTimeLineCommentCellView 控制器，换数据 + 调其重绘入口（WCTimeLineCommentCellView.h:48），
-// 强制内部 RichTextView（tag=1000）重建内容。不拆 subview、不整表重建，安全性等同微信原生调用。
-static int DDLReloadCommentCellViews(id tv, id item) {
-    if (![tv isKindOfClass:UITableView.class] || !item) return 0;
-    Class ccvClass = objc_getClass("WCTimeLineCommentCellView");
-    if (!ccvClass) { DDLog(@"[行刷新] ⚠运行时无 WCTimeLineCommentCellView 类"); return 0; }
-    int n = 0;
-    for (UITableViewCell *cell in [(UITableView *)tv visibleCells]) {
-        if (!cell.contentView) continue;
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell.contentView];
-        while (stack.count) {
-            UIView *v = stack.lastObject;
-            [stack removeLastObject];
-            for (UIView *s in v.subviews) {
-                [stack addObject:s];
-                if (![s isKindOfClass:ccvClass]) continue;
-                WCTimeLineCommentCellView *cv = (WCTimeLineCommentCellView *)s;
-                id mit = nil;
-                @try { mit = [cv mainDataItem]; } @catch (NSException *__) {}
-                BOOL match = (mit == item);
-                if (!match && [mit respondsToSelector:@selector(tid)] && [mit isKindOfClass:objc_getClass("WCDataItem")])
-                    match = [[(WCDataItem *)mit tid] isEqualToString:[(WCDataItem *)item tid]];
-                if (!match) continue;
-                @try {
-                    [cv setMainDataItem:item];
-                    [cv onReloadCommentCellView:item];
-                    DDLog(@"[行刷新] onReloadCommentCellView: 已调用 view=%p（内部 RichTextView tag=1000 随之重建）",
-                          (__bridge void *)cv);
-                    n++;
-                } @catch (NSException *e) { DDLog(@"[行刷新] 异常 %@", e.reason); }
-            }
-        }
-    }
-    return n;
-}
+// （已移除 DDLReloadCommentCellViews：原实现直接调 WCTimeLineCommentCellView 的
+//  setMainDataItem:/onReloadCommentCellView:，在长按刷新时序里触发 EXC_BAD_ACCESS 闪退；
+//  锤子/WCR 反汇编证实它们从不这么干，改走下方 onActionClearCellCache + reloadRows 的安全路径）
 
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
@@ -721,23 +688,30 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
         DDLog(@"[刷新] ⚠未找到 modifyDataItem:notify: 的 mgr，刷新可能无效");
     }
 
-    // ①定向刷新（主通路）：直接对点赞/评论行的 WCTimeLineCommentCellView 控制器换数据+重绘，
-    //   强制其内部 RichTextView（tag=1000，内容走 setContent:+YYAsyncLayer 自绘）重建。
-    //   modifyDataItem 只刷外层 cell，掀不掉已缓存的内层控制器 → 这就是带赞 item 需手动刷一次的根因。
-    @try {
-        int rn = DDLReloadCommentCellViews(DDLTimelineTableView(tlvc0), item);
-        DDLog(@"[行刷新] 定向重绘点赞/评论行 命中 %d 个", rn);
-    } @catch (NSException *e) { DDLog(@"[行刷新] 外层异常 %@", e.reason); }
-
-    // 锤子靠“重新进入时间线 VC”清掉内层 WCTimeLineCommentCellView 控制器缓存；
-    // 我们是原地长按，带赞 item 的点赞行控制器已缓存，modifyDataItem 不会掀掉它，
-    // 故补一次微信原生清缓存+重绘（WCTimeLineViewController.h:289），强制点赞行重绘。
-    // ②兜底：微信原生粗粒度清缓存（WCTimeLineViewController.h:289），等价锤子"重进时间线"。
-    //   ①已定向刷新，②主要兜底①没命中（如行不在 visibleCells）的场景。
+    // 锤子/WCR 反汇编证实：它们只靠 modifyDataItem:notify:1 提交数据，并依赖“重新进入时间线 VC”
+    // 把内层 WCTimeLineCommentCellView（含 RichTextView tag=1000 的绘制快照）缓存自然掀掉。
+    // 我们是原地长按，时间线不重建，故在提交数据后主动用微信原生手段强制该行重建：
+    //   ① onActionClearCellCacheAndRefreshCellView:（WCTimeLineViewController.h:289）清 VC 层 cell 缓存；
+    //   ② reloadRowsAtIndexPaths:（公开 UITableView API，安全）强制该 item 所在行整行重建，
+    //      新建的 WCTimeLineCommentCellView 从新 item 读数据 → RichTextView 随之重建，无需手动刷新。
+    // 不调私有控制器方法、不拆 live cell 的 subview，规避 EXC_BAD_ACCESS 闪退。
     if (tlvc0 && [tlvc0 respondsToSelector:@selector(onActionClearCellCacheAndRefreshCellView:)]) {
         [tlvc0 onActionClearCellCacheAndRefreshCellView:item];
-        DDLog(@"[刷新] ②onActionClearCellCacheAndRefreshCellView:（兜底清 VC 层 cell 缓存）");
+        DDLog(@"[刷新] ①onActionClearCellCacheAndRefreshCellView:（清 VC 层 cell 缓存）");
     }
+    @try {
+        UITableView *tv = DDLTimelineTableView(tlvc0);
+        id ip = (tlvc0 && [tlvc0 respondsToSelector:@selector(indexPathOfDataItem:)] ? [tlvc0 indexPathOfDataItem:item] : nil);
+        if ([tv isKindOfClass:UITableView.class] && [ip isKindOfClass:NSIndexPath.class]) {
+            [(UITableView *)tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+            DDLog(@"[刷新] ②reloadRowsAtIndexPaths: 已强制该行重建（点赞行 RichTextView tag=1000 随之重建）");
+        } else if ([tv isKindOfClass:UITableView.class]) {
+            [(UITableView *)tv reloadData];
+            DDLog(@"[刷新] ②未取到 indexPath，兜底整表 reloadData");
+        } else {
+            DDLog(@"[刷新] ②⚠未取到 tableView，跳过强制重建");
+        }
+    } @catch (NSException *e) { DDLog(@"[刷新] ②异常 %@", e.reason); }
 
     } @catch (NSException *e) {
         DDLog(@"[刷新] 整段异常已捕获，避免闪退：%@", e.reason);
