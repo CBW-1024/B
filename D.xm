@@ -253,6 +253,15 @@ static NSString *DDLogConfigSummary(void) {
 static NSArray<CContact *> *gDDLFriendCache;
 static NSTimeInterval gDDLFriendCacheAt;
 
+// Fisher-Yates 洗牌。好友池不够要复用时若按原顺序绕回来，被重复的一定是好友池最前面
+// 几个，点赞行里连着出现同一个昵称，很扎眼；首轮不洗的话每次集赞也总是同一批人。
+// 每轮洗一次，复用谁就是随机的，分布也均匀。锤子取完好友也是洗牌的。
+static void DDLShuffle(NSMutableArray *a) {
+    for (NSUInteger i = a.count; i > 1; i--) {
+        [a exchangeObjectAtIndex:i - 1 withObjectAtIndex:arc4random_uniform((uint32_t)i)];
+    }
+}
+
 // 给造出来的假 WCUserComment 打个标记（关联对象），撤销时靠它把假的挑出来。
 // 早先的做法是「记下假数据的 username，撤销时按名字剔除」，那套有个硬伤：
 // 假评论很可能跟某条真实评论是同一个人（好友池就那么几个），按名字剔除会连真评论
@@ -302,11 +311,13 @@ static inline BOOL DDLIsFake(WCUserComment *u) {
     if (friends.count == 0) return list;
 
     unsigned int now = (unsigned int)[NSDate date].timeIntervalSince1970;
+    NSMutableArray *pool = [friends mutableCopy];
     NSUInteger idx = 0;
     BOOL firstRound = YES;
     while ((NSInteger)list.count < limit) {
+        DDLShuffle(pool);
         BOOL added = NO;
-        for (CContact *c in friends) {
+        for (CContact *c in pool) {
             if ((NSInteger)list.count >= limit) break;
             NSString *name = c.m_nsUsrName;
             if (!name) continue;
@@ -367,10 +378,12 @@ static inline BOOL DDLIsFake(WCUserComment *u) {
 
     // 好友池不够就绕回来复用（同一个人评论多条，内容随机，看起来不重复）。
     // 之前是一轮走完就完事，好友 6 个想凑 10 条就只能凑到 6 条。
+    NSMutableArray *pool = [friends mutableCopy];
     NSUInteger idx = 0;
     while ((NSInteger)list.count < target) {
+        DDLShuffle(pool);
         BOOL added = NO;
-        for (CContact *c in friends) {
+        for (CContact *c in pool) {
             if ((NSInteger)list.count >= target) break;
             NSString *name = c.m_nsUsrName;
             if (!name) continue;
