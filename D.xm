@@ -119,42 +119,15 @@ static inline id DDLFacadeService(void) {
 @property (retain, nonatomic) NSString *tid;
 @end
 
-@interface MMTableViewCell : UITableViewCell
-- (id)m_subContentView;
-- (void)setM_subContentView:(id)v;
-@end
-
 @interface WCTimelineMgr : NSObject
-- (void)commonProcessDataAfterUpdate:(id)datas newAdItems:(id)adItems changedTime:(unsigned int)t;
 - (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;
 @end
 
-// 点赞/评论行控制器（头文件 WCTimeLineCommentCellView.h:21 mainDataItem / :48 onReloadCommentCellView:）。
-// dump 头文件标 NSObject，但真机日志证明其实例是 cell.contentView 的直接子 view（UIView），
-// 其内部 RichTextView（tag=1000，内容走 setContent:+YYAsyncLayer 自绘，text/attributedText 恒 nil）
-// 只有调 onReloadCommentCellView: 重读 mainDataItem 才会重建内容 —— 这就是"带赞 item 需手动刷一次"的根因。
-@interface WCTimeLineCommentCellView : UIView
-- (id)mainDataItem;
-- (void)setMainDataItem:(id)arg1;
-- (BOOL)isShowLikeCell;
-- (void)onReloadCommentCellView:(id)arg1;
-@end
-
-// 主内容控制器（WCTimeLineCellView.h:288 updateWithDataItem:actionAreaVM: 即 cell 复用时重绘整行的入口）。
-// 点赞行归它管；我们不再 hook 它——注入与刷新都走「长按 → 微信原生弹窗确认 → 本地注入 + reloadTableView」，
-// 不依赖 modifyDataItem、不碰深拷贝、也不用手动 reloadDataWrap（前两版方案均已废弃）。
-@interface WCTimeLineCellView : NSObject
-- (void)updateWithDataItem:(id)arg1 actionAreaVM:(id)arg2;
-@end
-
+// 只留回退路径真正会调的三个（DDLReloadTimelineFrom 用）。
 @interface WCTimeLineViewController : NSObject
 - (id)getContentTableView;
-- (id)indexPathOfDataItem:(id)item;
 - (void)reloadTableView;
 - (void)reloadDataWrap;
-- (void)onActionClearCellCacheAndRefreshCellView:(id)arg1;
-- (void)onReloadCommentView:(id)arg1 ofDataItem:(id)arg2;
-- (void)onUpdateDataItem:(id)item oldHeight:(double)oh newHeight:(double)nh;
 @end
 
 #pragma mark - 配置
@@ -588,25 +561,24 @@ static NSString *DDLTidOfCell(id cell) {
     return nil;
 }
 
-// 刷新策略（2026-09-28 重大修正）：
-// 之前在这里用运行时穷举 WCTimeLineCellView 的私有 ivar/属性（class_copyIvarList + valueForKey:）
-// 来定位点赞行控制器并调 onReloadCommentCellView: —— 这一步会触发惰性 getter 副作用 / 访问已释放的弱引用，
-// 是“长按闪退”的直接元凶，已彻底移除。
+// 方案（照锤子反汇编结论，详见 Hammer_FakeLike_Mechanism.md）：
+// 长按 → 微信原生弹窗（取消/确认）→ 确认才本地注入假数据 → [WCFacade modifyDataItem:notify:YES]。
 //
-// 根因（已用日志坐实）：点赞行由主 cell 的 WCTimeLineCellView 控制器渲染，其点赞列表布局缓存在
-// WCDataItemUICache(likeUserLayoutStyles/likeUserHeight)，且按 dataItem 对象身份命中；我们原地改同一个
-// dataItem 对象、再 reload/手动刷，都掀不掉这条缓存，所以“带赞 item 长按后点赞行不刷新、需手动拉一下”。
-// 而微信原生“点赞/下拉刷新”之所以能即时刷新点赞行，是因为它让 WCTimeLineCellView 重新绑定【新/被改的 dataItem】
-// → 旧 UICache 失效、按新数据重算布局。
+// 为什么不能用 reload 代替（旧版踩过的坑）：点赞行的布局缓存在 WCDataItemUICache
+// （likeUserLayoutStyles / likeUserHeight），按 dataItem 对象身份命中。原地改同一个对象再
+// reloadTableView / reloadDataWrap，都掀不掉这条缓存 —— 这就是「带赞 item 长按后不刷新、要手动拉一下」。
+// 锤子全程没有一句 reload，只有 [WCFacade modifyDataItem:notify:]（fake.txt 0x7b61b8 / 0x7b628c）。
 //
-// 方案（照 WCR 反汇编结论，详见 WCR_FakeLike_Mechanism.md）：
-// 长按 → 微信原生弹窗（取消/确认）→ 确认才本地注入假数据 → 原生刷新。
 // 三条关键取舍，每条都对应过去踩过的坑：
-//   1) 不再调 onLikeItem: 踢原生点赞：确认后才改数据 → 不会真给作者点服务器赞，零副作用（无需“真赞”这趟车）。
-//   2) 不再以 likeFlag 为注入条件（WCR 也不依赖）：自己已赞过的 item 长按会把 likeFlag toggle 成 NO，
+//   1) 不调 onLikeItem: 踢原生点赞：确认后才改数据 → 不会真给作者点服务器赞，零副作用。
+//   2) 不以 likeFlag 为注入条件（WCR / 锤子都不依赖）：自己已赞过的 item 长按会把 likeFlag toggle 成 NO，
 //      以它为门槛就永远不触发——这是之前「长按零注入」的根因之一。
-//   3) 注入用 WCR 同款「原始 + 追加」（arrayWithArray + addObjectsFromArray），按 username 去重保证幂等；
-//      刷新出口照 WCR 优先 reloadTableView（原来优先 reloadDataWrap）。
+//   3) 注入用「原始 + 追加」而非锤子的「整体替换」：追加且按 username 去重 → 天然幂等，
+//      “补回”就是再调一次，省掉锤子那两个快照字典（g_fakeDict / g_origDict）。
+//
+// 已彻底移除的旧做法（勿回退）：运行时穷举 WCTimeLineCellView 私有 ivar 再调 onReloadCommentCellView:
+// —— 会触发惰性 getter 副作用 / 访问已释放弱引用，是「长按闪退」的直接元凶。
+// 同理，PBCoding 深拷贝方案也已废弃。
 
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
@@ -635,6 +607,15 @@ static NSMutableDictionary *gDDLFakeOn(void) {
 // 弹窗回调时浮层可能已 hide、m_item 失效，这里留一份强引用
 static WCDataItem *gDDLPendingItem = nil;
 
+// 已注入过的假赞用户名集合。补回路径会随 cell 渲染被高频调用，靠它做 O(n) 预检，
+// 避免每次都重新造一遍 WCUserComment（实测 1.25s 内被调 84 次，日志全被这条刷爆）。
+static NSMutableSet *gDDLFakeNames(void) {
+    static NSMutableSet *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [NSMutableSet new]; });
+    return s;
+}
+
 // 追加式注入（对齐 WCRefineApplyManualFakeEngagementToDataItem）：
 // 保留原始名单 → 追加假的 → 写回。按 username 去重，重复点确认不会把假赞叠加两份。
 static void DDLApplyFakeToItem(WCDataItem *di) {
@@ -650,7 +631,7 @@ static void DDLApplyFakeToItem(WCDataItem *di) {
     for (WCUserComment *u in [DDLikeHelper fakeLikeUsers]) {
         NSString *name = ([u respondsToSelector:@selector(username)] ? u.username : nil);
         if (name && [seen containsObject:name]) continue;
-        if (name) [seen addObject:name];
+        if (name) { [seen addObject:name]; [gDDLFakeNames() addObject:name]; }
         [likes addObject:u];
         addedLike++;
     }
@@ -677,27 +658,42 @@ static void DDLApplyFakeToItem(WCDataItem *di) {
     }
 }
 
-// 单个 dataItem 补回（只处理已集赞的 tid）。DDLApplyFakeToItem 按 username 去重，重复调用幂等，
-// 所以「补回」就是再调一次，不需要额外存快照。
+// 假赞是否还完整挂在 item 上。只做集合包含判断，不造对象、不打日志 ——
+// 补回路径随 cell 渲染高频触发，绝大多数调用到这里就结束了。
+static BOOL DDLItemFakeIntact(WCDataItem *di) {
+    NSMutableSet *fake = gDDLFakeNames();
+    if (fake.count == 0) return NO;
+
+    NSArray *likes = ([di respondsToSelector:@selector(likeUsers)] ? [di likeUsers] : nil);
+    if (likes.count == 0) return NO;
+    NSMutableSet *have = [NSMutableSet setWithCapacity:likes.count];
+    for (WCUserComment *u in likes) {
+        if ([u respondsToSelector:@selector(username)] && u.username) [have addObject:u.username];
+    }
+    if (![fake isSubsetOfSet:have]) return NO;
+
+    NSInteger cTarget = DDLikeConfig.shared.commentCount;
+    if (cTarget > 0) {
+        NSUInteger cc = ([di respondsToSelector:@selector(commentUsers)] && [di commentUsers])
+                      ? [di commentUsers].count : 0;
+        if ((NSInteger)cc < cTarget) return NO;
+    }
+    return YES;
+}
+
+// 单个 dataItem 补回（只处理已集赞的 tid）。
 // 这是锤子「刷新不丢 + 本来带赞也显示」的统一机制：hook 了 4 个「产出 dataItem」的入口，
 // 每个都在 %orig 之后立刻补回（hammer fake.txt 0x7b5574 / 0x7b56b4 / 0x7b57b8 / 0x7b58e8：
 // blr x8(%orig) → tid → objectForKey: → setLikeUsers: → setLikeCount:）。
+// DDLApplyFakeToItem 按 username 去重、幂等，所以「补回」就是再调一次，不需要存快照。
 static void DDLReapplyIfNeeded(id obj) {
     if (![obj isKindOfClass:%c(WCDataItem)]) return;
     WCDataItem *di = (WCDataItem *)obj;
     NSString *tid = ([di respondsToSelector:@selector(tid)] ? [di tid] : nil);
     if (!tid || !gDDLFakeOn()[tid]) return;
-    DDLApplyFakeToItem(di);
+    if (DDLItemFakeIntact(di)) return;          // 还挂着，什么都不用做
+    DDLApplyFakeToItem(di);                     // 真被冲掉了才重建，这时日志有价值
     DDLog(@"[保活] 补回假赞 tid=%@", tid);
-}
-
-// 对一批 dataItem 补回（下拉刷新 / 翻页回来的数组）。
-static void DDLReapplyFakeIn(id datas) {
-    if (gDDLFakeOn().count == 0) return;
-    if (![datas isKindOfClass:NSArray.class]) return;
-    for (id obj in (NSArray *)datas) {
-        DDLReapplyIfNeeded(obj);
-    }
 }
 
 
@@ -857,28 +853,6 @@ static void DDLReapplyFakeIn(id datas) {
 // 同样是先补回再 %orig —— 覆盖所有原生「数据项变了」的路径。
 - (void)modifyDataItem:(id)item notify:(BOOL)notify {
     DDLReapplyIfNeeded(item);
-    %orig;
-}
-
-// 兜底：服务器数据回来（下拉刷新 / 翻页）时，在 %orig 之前补回这批 dataItem。
-// 注意首个参数是 unsigned long long（WCTimelineMgr.h:74/:76/:80），写成 id 会让 ARC
-// 对一个整数指针做 objc_retain —— 必崩。
-- (void)onFirstPageUpdated:(unsigned long long)arg1 dataChanged:(BOOL)arg2 datas:(id)datas
-                   adDatas:(id)adDatas changedTime:(unsigned int)changedTime
-                   feedIds:(id)feedIds feedFlags:(id)feedFlags wsInfos:(id)wsInfos {
-    DDLReapplyFakeIn(datas);
-    %orig;
-}
-
-- (void)onNextPageUpdated:(unsigned long long)arg1 datas:(id)datas adDatas:(id)adDatas
-              changedTime:(unsigned int)changedTime wsInfos:(id)wsInfos {
-    DDLReapplyFakeIn(datas);
-    %orig;
-}
-
-- (void)onPrePageUpdated:(unsigned long long)arg1 datas:(id)datas adDatas:(id)adDatas
-             changedTime:(unsigned int)changedTime wsInfos:(id)wsInfos {
-    DDLReapplyFakeIn(datas);
     %orig;
 }
 
