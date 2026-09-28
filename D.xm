@@ -444,15 +444,17 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
 
 // 微信原生弹窗类（WCUIAlertView.h）——带取消 + 确认两个按钮的那款，可挂输入框
 @interface WCUIAlertView : NSObject
-+ (id)showAlertWithTitle:(id)title message:(id)message
-          cancelBtnTitle:(id)cancelTitle target:(id)cancelTarget sel:(SEL)cancelSel
-               btnTitle:(id)btnTitle target:(id)btnTarget sel:(SEL)btnSel;
-// WCUIAlertView.h:40 / :38 / :25 —— 输入「点赞数/评论数」要用到。
-// 锤子是用 KVC 摸 _tipsVc._tipsTextView.text 拿文本的，我们头文件里有现成的
-// getTextFieldText，直接用，少一层对私有 ivar 结构的依赖。
+// WCUIAlertView.h:26 / :40 / :37 / :36 / :33 / :30 / :39 / :25
+// 自己 alloc 出来再挂按钮，不直接用 showAlertWithTitle:… 那批便捷构造器 —— 那些方法内部
+// 会立刻 show，输入框就只能挂在一个已经显示的弹窗上（长按闪退的根因，见 ddl_onLikeLongPress:）。
+// 取文本用头文件里现成的 getTextFieldText，不像锤子那样 KVC 摸 _tipsVc._tipsTextView.text。
+- (id)initWithTitle:(id)title message:(id)message;
 - (void)showTextFieldWithMaxLen:(unsigned int)maxLen;
-- (void)setTextFieldPlaceHolder:(id)placeholder;
-- (void)setTextFieldDefaultText:(id)text;   // 真文本。placeholder 不算输入内容，别搞混
+- (void)setTextFieldDefaultText:(id)text;   // 真文本。placeholder 只是灰字，不算输入内容
+- (void)setRequestKeyWindow:(BOOL)flag;
+- (void)addCancelBtnTitle:(id)title target:(id)target sel:(SEL)sel;
+- (void)addBtnTitle:(id)title target:(id)target sel:(SEL)sel;
+- (void)show;
 - (id)getTextFieldText;
 @end
 
@@ -509,6 +511,11 @@ static BOOL DDLParseSpec(NSString *text, NSInteger *outL, NSInteger *outC) {
 //   「[弹窗] 确认但 m_item 已失效，跳过」—— 假赞和评论一个都没注入。
 // 注意「self 活着」不等于「m_item 还在」：回调能打进本方法只说明 self 没被释放。
 static WCDataItem *gDDLPendingItem = nil;
+
+// 浮层自己也得留住一份：弹窗的 target 是 self（WCOperateFloatView），而 [self hide]
+// 之后没人再持有浮层，它随时可能被释放 —— 点「确认」时 objc_msgSend 打到已释放对象上
+// 就是一次 EXC_BAD_ACCESS 闪退。留个强引用，回调走完再放。
+static WCOperateFloatView *gDDLPendingView = nil;
 
 // 当前弹窗，确认回调里要用它 getTextFieldText 取输入内容
 static WCUIAlertView *gDDLCurrentAlert = nil;
@@ -689,13 +696,17 @@ static void DDLReapplyIfNeeded(id obj) {
           (unsigned long)([item respondsToSelector:@selector(likeUsers)] ? [item likeUsers].count : 0),
           (unsigned long)([item respondsToSelector:@selector(commentUsers)] ? [item commentUsers].count : 0));
 
-    [self hide];   // 先收起点赞浮层，免得它盖住弹窗
+    [self hide];            // 先收起点赞浮层，免得它盖住弹窗
+    gDDLPendingView = self; // 收起后浮层随时可能被释放，弹窗回调还要打到 self 上
 
     Class alertCls = objc_getClass("WCUIAlertView");
     BOOL canInput = alertCls
-                 && [alertCls respondsToSelector:@selector(showAlertWithTitle:message:cancelBtnTitle:target:sel:btnTitle:target:sel:)]
+                 && [alertCls instancesRespondToSelector:@selector(initWithTitle:message:)]
                  && [alertCls instancesRespondToSelector:@selector(showTextFieldWithMaxLen:)]
-                 && [alertCls instancesRespondToSelector:@selector(getTextFieldText)];
+                 && [alertCls instancesRespondToSelector:@selector(getTextFieldText)]
+                 && [alertCls instancesRespondToSelector:@selector(addCancelBtnTitle:target:sel:)]
+                 && [alertCls instancesRespondToSelector:@selector(addBtnTitle:target:sel:)]
+                 && [alertCls instancesRespondToSelector:@selector(show)];
     if (canInput) {
         DDLikeConfig *cfg = DDLikeConfig.shared;
         // 输入框版：数量在弹窗里输，格式「点赞数/评论数」，留空 = 取消伪装
@@ -705,33 +716,44 @@ static void DDLReapplyIfNeeded(id obj) {
                (long)[rec[@"l"] integerValue], (long)[rec[@"c"] integerValue]]
             : @"输入「点赞数/评论数」，例如 5/6。\n只填一个数字则只改点赞。\n留空确认 = 取消伪装。\n仅本地显示，不会发给微信服务器。";
 
-        WCUIAlertView *alert = (WCUIAlertView *)[alertCls showAlertWithTitle:@"集赞助手"
-                                                                     message:msg
-                                                             cancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)
-                                                                  btnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
+        // 构造顺序照抄锤子（hammer fake.txt 0x7b5d1c-0x7b5e0c）：
+        //   [[WCUIAlertView alloc] initWithTitle:message:]
+        //   → showTextFieldWithMaxLen: → setTextFieldDefaultText: → setRequestKeyWindow:YES
+        //   → addCancelBtnTitle:target:sel: → addBtnTitle:handler: → show
+        // 关键是「先挂输入框和按钮、最后才 show」。之前用的是便捷构造器
+        // showAlertWithTitle:…cancelBtnTitle:target:sel:btnTitle:target:sel:，它内部会立刻
+        // show，输入框是在弹窗已经显示之后才挂上去的 —— 长按闪退就出在这里。
+        WCUIAlertView *alert = [[alertCls alloc] initWithTitle:@"集赞助手" message:msg];
         [alert showTextFieldWithMaxLen:15];
-        // 预填上次的数值，省得每次重输
-        // 必须用 setTextFieldDefaultText 而不是 PlaceHolder：placeholder 只是灰字提示，
-        // 不算输入内容 —— 用户看到框里有「5/6」直接点确认，getTextFieldText 读到的是空串，
-        // 会被当成「留空 = 取消伪装」，把刚想设的伪装给撤销掉。设成真文本就没这个坑，
-        // 真要取消伪装得手动把框清空。
+        // 预填上次的数值，省得每次重输。
+        // 必须用 setTextFieldDefaultText 而不是 setTextFieldPlaceHolder：placeholder 只是
+        // 灰字提示，不算输入内容 —— 用户看到框里有「5/6」直接点确认，getTextFieldText 读到
+        // 的是空串，会被当成「留空 = 取消伪装」，把刚想设的伪装给撤销掉。
         [alert setTextFieldDefaultText:(cfg.likeCount > 0 || cfg.commentCount > 0)
                                        ? [NSString stringWithFormat:@"%ld/%ld",
                                           (long)cfg.likeCount, (long)cfg.commentCount]
                                        : @"5/6"];
-        [alert setTextFieldPlaceHolder:@"留空确认 = 取消伪装"];
+        [alert setRequestKeyWindow:YES];   // 锤子也调，不然输入框抢不到键盘
+        [alert addCancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)];
+        [alert addBtnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
         gDDLCurrentAlert = alert;   // 确认回调里要靠它 getTextFieldText
+        [alert show];
         DDLog(@"[长按] 已弹输入框弹窗 tid=%@（取消/确认）", tid);
     } else {
-        // 拿不到输入框就退回上次输入的数值，至少别卡住
-        DDLog(@"[长按] ⚠WCUIAlertView 输入框不可用，按上次数值执行 tid=%@", tid);
-        [self ddl_fakeConfirmed];
+        // 拿不到输入框就什么都不做。这里绝不能顺手执行上一次的数值：数量是弹窗里现输的，
+        // 没有输入就没有「这一次要多少」的依据，盲执行只会把已有伪装改坏。
+        DDLog(@"[长按] ⚠WCUIAlertView 缺少构造弹窗所需方法，本次不弹窗 tid=%@", tid);
+        gDDLPendingItem = nil;
+        gDDLPendingView = nil;
     }
 }
 
 %new
 - (void)ddl_fakeConfirmed {
-    WCDataItem *item = gDDLPendingItem ?: (WCDataItem *)self.m_item;
+    // 取长按那一刻的浮层，而不是 self：这两者未必是同一个对象（浮层收起后微信可能已经
+    // 换了一个新的出来），拿新浮层的 m_item 会改到别的朋友圈上。
+    WCOperateFloatView *view = gDDLPendingView ?: self;
+    WCDataItem *item = gDDLPendingItem ?: (WCDataItem *)view.m_item;
     if (!item) { DDLog(@"[弹窗] 确认但 item 已失效，跳过"); return; }
     NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
 
@@ -772,7 +794,8 @@ static void DDLReapplyIfNeeded(id obj) {
         DDLog(@"[刷新] ⚠取不到 WCFacade，本次不自动刷新 tid=%@", tid);
     }
     gDDLCurrentAlert = nil;
-    gDDLPendingItem = nil;
+    gDDLPendingItem  = nil;
+    gDDLPendingView  = nil;   // 回调走完才放浮层，放早了确认按钮就打到野指针上
 }
 
 %new
@@ -781,7 +804,8 @@ static void DDLReapplyIfNeeded(id obj) {
                   ? [gDDLPendingItem tid] : nil;
     DDLog(@"[弹窗] 已取消 tid=%@", tid);
     gDDLCurrentAlert = nil;
-    gDDLPendingItem = nil;
+    gDDLPendingItem  = nil;
+    gDDLPendingView  = nil;
 }
 
 %end
@@ -904,15 +928,7 @@ static void DDLogExportFrom(UIViewController *vc) {
 
     if (cfg.likeEnabled) {
         // 点赞数/评论数不在设置里配 —— 长按弹窗时现输，格式「点赞数/评论数」如 5/6，
-        // 留空确认即取消伪装。设置里只留开关和评论内容池。
-        [sec addCell:[cellMgr normalCellForSel:nil
-                                        target:nil
-                                         title:@"数量在长按弹窗里输入"
-                                    rightValue:(cfg.likeCount > 0 || cfg.commentCount > 0)
-                                               ? [NSString stringWithFormat:@"上次 %ld/%ld",
-                                                  (long)cfg.likeCount, (long)cfg.commentCount]
-                                               : @"未输入过"]];
-
+        // 留空确认即取消伪装。设置里只留开关、评论内容池和清除记录。
         self.commentsField = [self makeFieldPlaceholder:@"多个内容用-分隔"
                                                 number:NO
                                                  value:cfg.comments];
