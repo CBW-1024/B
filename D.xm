@@ -403,6 +403,13 @@ static NSMutableDictionary *gDDLFake(void) {
     return d;
 }
 
+// 长按那一刻必须自己留一份 item 强引用，不能指望回调时再读 self.m_item。
+// 实测证据（DDLikeHelper.log-2.txt）：[self hide] 之后微信会把浮层的 m_item 清掉，
+// 弹窗确认回调里 self.m_item 已经是 nil，日志表现为
+//   「[弹窗] 确认但 m_item 已失效，跳过」—— 假赞和评论一个都没注入。
+// 注意「self 活着」不等于「m_item 还在」：回调能打进本方法只说明 self 没被释放。
+static WCDataItem *gDDLPendingItem = nil;
+
 // 追加式注入：保留原始名单 → 补齐假的到 target → 写回。
 // 「补齐」而非「追加固定个数」，所以天然幂等：重复点确认不会把假赞叠加两份。
 static void DDLApplyFakeToItem(WCDataItem *di) {
@@ -528,6 +535,8 @@ static void DDLReapplyIfNeeded(id obj) {
     if (!item) { DDLog(@"[长按] m_item 为 nil，中止"); return; }
 
     NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
+    gDDLPendingItem = item;   // 浮层收起后 m_item 会被清空，回调里只能靠这份
+
     DDLog(@"[长按] 触发 tid=%@ 已集赞=%d 现有赞=%lu 评论=%lu",
           tid, (tid && gDDLFake()[tid]) ? 1 : 0,
           (unsigned long)([item respondsToSelector:@selector(likeUsers)] ? [item likeUsers].count : 0),
@@ -559,10 +568,8 @@ static void DDLReapplyIfNeeded(id obj) {
 
 %new
 - (void)ddl_fakeConfirmed {
-    // 直接读 self.m_item：回调能打进本方法，就说明 self 还活着（否则发消息那一步就崩了）。
-    // 早期版本额外用了一个全局 gDDLPendingItem 传 item，实测多余且会串号，已删。
-    WCDataItem *item = (WCDataItem *)self.m_item;
-    if (!item) { DDLog(@"[弹窗] 确认但 m_item 已失效，跳过"); return; }
+    WCDataItem *item = gDDLPendingItem ?: (WCDataItem *)self.m_item;
+    if (!item) { DDLog(@"[弹窗] 确认但 item 已失效，跳过"); return; }
     NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
     // 先占位：即使这次一个假赞都没造出来（好友池空），也已算「集过赞」，补回路径认它。
     if (tid && !gDDLFake()[tid]) gDDLFake()[tid] = [NSMutableSet set];
@@ -581,13 +588,15 @@ static void DDLReapplyIfNeeded(id obj) {
         // 数据已经写进 dataItem 了，只是这一下不会自动重绘，下拉一次即可看到。
         DDLog(@"[刷新] ⚠取不到 WCFacade，本次不自动刷新 tid=%@", tid);
     }
+    gDDLPendingItem = nil;
 }
 
 %new
 - (void)ddl_fakeCancelled {
-    WCDataItem *item = (WCDataItem *)self.m_item;
-    NSString *tid = (item && [item respondsToSelector:@selector(tid)]) ? [item tid] : nil;
+    NSString *tid = (gDDLPendingItem && [gDDLPendingItem respondsToSelector:@selector(tid)])
+                  ? [gDDLPendingItem tid] : nil;
     DDLog(@"[弹窗] 已取消 tid=%@", tid);
+    gDDLPendingItem = nil;
 }
 
 %end
