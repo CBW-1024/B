@@ -450,69 +450,6 @@ static NSString *DDLSubList(id cell) {
     return [n componentsJoinedByString:@"+"];
 }
 
-static int DDLForceRebuildCell(id tv, id tlvc, id item) {
-    if (![tv isKindOfClass:UITableView.class] || !item) return 0;
-    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [(WCDataItem *)item tid] : nil);
-    if (!tid) return 0;
-    int n = 0;
-    for (NSIndexPath *ip in [(UITableView *)tv indexPathsForVisibleRows]) {
-        UITableViewCell *cell = [(UITableView *)tv cellForRowAtIndexPath:ip];
-        if (!cell) continue;
-        id it = DDLDeepItem(cell, 0);
-        NSString *ctid = ([it respondsToSelector:@selector(tid)] ? [(WCDataItem *)it tid] : nil);
-        if (!ctid || ![ctid isEqualToString:tid]) continue;
-        NSString *before = DDLSubList(cell);
-        @try {
-            for (UIView *sv in [cell.contentView.subviews copy]) [sv removeFromSuperview];
-            if ([cell respondsToSelector:@selector(setM_subContentView:)])
-                [(MMTableViewCell *)cell setM_subContentView:nil];
-        } @catch (NSException *e) { DDLog(@"[强拆] 异常 %@", e.reason); }
-        DDLog(@"[强拆] 行%@ 拆前cv=%@ 拆后cv=%@", ip, before, DDLSubList(cell));
-        n++;
-    }
-    if (n == 0) DDLog(@"[强拆] ⚠可见行中无 tid=%@ 匹配", tid);
-    return n;
-}
-
-static int DDLReloadCommentViews(id tlvc, id tv, id item) {
-    if (![tv isKindOfClass:UITableView.class] || !item) return 0;
-    if (![tlvc respondsToSelector:@selector(onReloadCommentView:ofDataItem:)]) {
-        DDLog(@"[评论行] ⚠VC 无 onReloadCommentView:ofDataItem:");
-        return 0;
-    }
-    int n = 0;
-    for (NSIndexPath *ip in [(UITableView *)tv indexPathsForVisibleRows]) {
-        UITableViewCell *cell = [(UITableView *)tv cellForRowAtIndexPath:ip];
-        if (!cell) continue;
-        NSMutableArray *found = [NSMutableArray array];
-        UIView *content = ((UITableViewCell *)cell).contentView;
-        for (UIView *a in content.subviews) {
-            NSString *c1 = NSStringFromClass([a class]);
-            if ([c1 rangeOfString:@"CommentCell" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                [c1 rangeOfString:@"CommentView" options:NSCaseInsensitiveSearch].location != NSNotFound)
-                [found addObject:a];
-            for (UIView *b in a.subviews) {
-                NSString *c2 = NSStringFromClass([b class]);
-                if ([c2 rangeOfString:@"CommentCell" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                    [c2 rangeOfString:@"CommentView" options:NSCaseInsensitiveSearch].location != NSNotFound)
-                    [found addObject:b];
-            }
-        }
-        for (UIView *v in found) {
-            @try {
-                [tlvc onReloadCommentView:v ofDataItem:item];
-                DDLog(@"[评论行] onReloadCommentView: %@ 已调用", NSStringFromClass([v class]));
-                n++;
-            } @catch (NSException *e) { DDLog(@"[评论行] 异常 %@", e.reason); }
-        }
-        if (found.count == 0) {
-            DDLog(@"[评论行] 未定位到具体 view，交给整表 reloadData 处理");
-        }
-    }
-    if (n == 0) DDLog(@"[评论行] ⚠评论/点赞行重载未触发");
-    return n;
-}
-
 static NSTimeInterval gDDLProbeUntil = 0;
 static inline void DDLProbeOpen(void) {
     gDDLProbeUntil = [NSDate timeIntervalSinceReferenceDate] + 3.0;
