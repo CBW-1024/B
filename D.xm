@@ -387,56 +387,6 @@ static NSTimeInterval gDDLFriendCacheAt;
 
 static const void *kDDLLongPressKey = &kDDLLongPressKey;
 
-static NSMutableDictionary *gDDLFaked(void) {
-    static NSMutableDictionary *d = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ d = [NSMutableDictionary new]; });
-    return d;
-}
-
-// 深拷贝 + 注入假数据。返回新 WCDataItem 对象（指针与原始不同），
-// 迫使 WCTimeLineCellView 在重绑时按新数据重算点赞行（WCDataItemUICache 按 dataItem 身份命中，
-// 新对象 = 新缓存 = 必重算）。原始 dataItem 始终不被修改，零服务器副作用。
-// 拷贝失败（PBCoding 异常）返回 nil —— 调用方据此跳过注入，既不污染原始对象也不崩。
-static id DDLFakeCopyItem(WCDataItem *orig, NSDictionary *snap) {
-    if (!orig) return nil;
-    Class cls = [orig class];
-    id copy = nil;
-    @try {
-        id buf = [orig toPBCodingBuffer];
-        if (buf) copy = [cls fromPBCodingBuffer:buf];
-    } @catch (NSException *e) {
-        DDLog(@"[拷贝] PBCoding 失败 tid=%@: %@", [(WCDataItem *)orig tid], e.reason);
-    }
-    if (!copy || copy == orig) return nil;
-    NSArray *likes = snap[@"likes"];
-    NSArray *comments = snap[@"comments"];
-    if (likes.count) {
-        [copy setLikeUsers:[likes mutableCopy]];
-        [copy setLikeCount:(int)likes.count];
-        [copy setRealLikeCount:(int)likes.count];
-    }
-    if (comments.count) {
-        [copy setCommentUsers:[comments mutableCopy]];
-        [copy setCommentCount:(int)comments.count];
-    }
-    [copy setLikeFlag:YES];
-    return copy;
-}
-
-// 取/生成某 tid 的假数据拷贝（同一 tid 缓存一份，避免每次渲染都深拷贝）。
-static id DDLFakeCopyForTid(NSString *tid, id orig) {
-    if (!tid || !orig) return nil;
-    NSDictionary *st = gDDLFaked()[tid];
-    if (!st || ![st[@"active"] boolValue]) return nil;
-    id copy = st[@"copy"];
-    if (!copy) {
-        copy = DDLFakeCopyItem((WCDataItem *)orig, st);
-        if (copy) st[@"copy"] = copy;
-    }
-    return copy;
-}
-
 static NSString *DDLGap(NSString *key, NSString *tag);
 static NSString *DDLTidOfCell(id cell);
 static id DDLDeepItem(id v, int depth);
@@ -634,17 +584,14 @@ static NSString *DDLTidOfCell(id cell) {
 // 根因（已用日志坐实）：点赞行由主 cell 的 WCTimeLineCellView 控制器渲染，其点赞列表布局缓存在
 // WCDataItemUICache(likeUserLayoutStyles/likeUserHeight)，且按 dataItem 对象身份命中；我们原地改同一个
 // dataItem 对象、再 reload/手动刷，都掀不掉这条缓存，所以“带赞 item 长按后点赞行不刷新、需手动拉一下”。
-// 而微信原生“下拉刷新”之所以能即时刷新点赞行，是因为它从服务器拉回【新 dataItem 对象】（新指针）→
-// WCTimeLineCellView 重绑 → 旧 UICache 随旧对象丢弃、按新数据重算布局。
+// 而微信原生“点赞/下拉刷新”之所以能即时刷新点赞行，是因为它让 WCTimeLineCellView 重新绑定【新/被改的 dataItem】
+// → 旧 UICache 失效、按新数据重算布局。
 //
-// 修正（参考集赞助手“只动渲染、不碰私有控制器”的思路，但用更安全的方式）：
-// 不在模型层注入、也不调 onLikeItem:/modifyDataItem:（避免误发服务器赞/取消赞），而是把“假数据”做成
-// 一个【全新的 WCDataItem 深拷贝】（PBCoding round-trip），在两条【必然被渲染命中的入口】替换掉原始对象：
-//   (1) %hook WCFacade getTimelineDataItemOfIndex: / getTimelineDataInCacheByItemID: —— 取项出口；
-//   (2) %hook WCTimeLineCellView updateWithDataItem:actionAreaVM: —— cell 复用重绘入口（DD朋友圈助手同款位置）。
-// 只要任一入口被命中，原始 dataItem 就被替换成新指针的假数据拷贝 → 微信被迫重绑 → 点赞行按新数据重算。
-// 原始 dataItem 始终未被修改，零服务器副作用；开关只影响本地显示。
-// 风险兜底：若 PBCoding 深拷贝失败（异常），DDLFakeCopyItem 返回 nil，调用方跳过注入（不污染、不崩）。
+// 修正（集赞助手同款，最简、不乱折腾）：长按直接调微信原生点赞入口 onLikeItem:（等同点一下赞按钮），
+// 微信自己 toggle likeFlag + 发网络请求 + 调 modifyDataItem:；我们在 %hook WCTimelineMgr modifyDataItem: 里
+// 仅当 item.likeFlag 为真时注入“假赞名列表”（fakeLikeUsers），再 %orig 让微信原生刷新整行。
+// 点赞行重绑 100% 跟原生一致（=集赞助手能即时刷新的原因），不手动 reload、不碰私有控制器。
+// 代价（用户已确认）：长按会真给作者点你自己的那个赞，其余显示的赞名是假的——这是“走原生”的取舍。
 
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
@@ -688,57 +635,16 @@ static NSString *DDLTidOfCell(id cell) {
     if (!item) { DDLog(@"[长按] m_item 为 nil，中止"); return; }
 
     @try {
-    NSString *tid = item.tid;
-    NSMutableDictionary *faked = gDDLFaked();
-
-    DDLog(@"[长按] 触发 tid=%@ likeFlag=%d 已集赞=%d 原始 likeCount=%d realLikeCount=%d selfLikeCount=%d likeUsers=%lu",
-          tid, item.likeFlag, tid ? (faked[tid] != nil) : -1,
-          item.likeCount, item.realLikeCount, item.selfLikeCount,
-          (unsigned long)item.likeUsers.count);
-
-    // 合二为一（参考集赞助手“只动渲染、不碰私有控制器”的思路）：
-    // 长按只负责 toggle 本地状态 gDDLFaked[tid] = {@"active":@YES/@NO, @"copy":nil, ...}。
-    // 真正的“数据注入 + 点赞行刷新”下沉到渲染层两入口（WCFacade 取项 + WCTimeLineCellView 渲染），
-    // 那里把本项替换成 PBCoding 深拷贝的“假数据新 dataItem”（指针变化→微信重绑→点赞行按新数据重算）。
-    // 不调 onLikeItem:/modifyDataItem:，因此零服务器副作用；开关只影响本地显示。
-    if (tid) {
-        NSMutableDictionary *st = faked[tid];
-        if (st && [st[@"active"] boolValue]) {
-            st[@"active"] = @NO;
-            st[@"copy"] = nil;   // 下一帧渲染回到真实 dataItem（指针变化→重绑），点赞行回退真实赞数
-            DDLog(@"[长按] 取消集赞 tid=%@（active=NO，记忆剩 %lu 条）", tid, (unsigned long)faked.count);
-        } else {
-            if (!st) {
-                st = [NSMutableDictionary dictionary];
-                st[@"likes"]    = [DDLikeHelper fakeLikeUsers] ?: @[];
-                st[@"comments"] = [DDLikeHelper fakeCommentsFor:item] ?: @[];
-                faked[tid] = st;
-            }
-            st[@"active"] = @YES;
-            st[@"copy"] = nil;   // 强制下次渲染重新生成假数据深拷贝（指针变化→重绑）
-            DDLog(@"[长按] 开启集赞 tid=%@（记忆 %lu 条）", tid, (unsigned long)faked.count);
+        DDLog(@"[长按] 走原生点赞 tid=%@ likeFlag=%d（真赞/取消由微信决定，刷新交原生）",
+              ([item respondsToSelector:@selector(tid)] ? [item tid] : nil), item.likeFlag);
+        // 集赞助手同款：长按 = 等同点一下赞按钮，调微信原生 onLikeItem:。
+        // 微信自己 toggle likeFlag + 发网络请求 + 调 modifyDataItem:（我们在那里注入假赞名）+ 原生刷新，
+        // 点赞行重绑 100% 跟原生一致。不再自己维护状态、不再手动 reload。
+        if ([self respondsToSelector:@selector(onLikeItem:)]) {
+            [self onLikeItem:self.m_likeBtn];
         }
-    } else {
-        DDLog(@"[长按] 警告：tid 为 nil，无法记录状态");
-    }
-
-    [self hide];  // 收起点赞/评论浮层（原 onLikeItem: 会做；我们不再调它，这里补上）
-
-    // 刷新驱动：只触发微信原生整表重载 reloadDataWrap（=下拉刷新）。
-    // 点赞行能否刷新不靠手动 reload —— 而在渲染层：本项经 WCFacade 取项 / WCTimeLineCellView 渲染两处拦截，
-    // 被替换成“假数据深拷贝”（指针变化迫使 WCTimeLineCellView 重绑 → 点赞行按新数据重算，=下拉刷新生效的原因）。
-    // 不再调 onLikeItem: / modifyDataItem:，因此不向服务器发任何赞/取消赞，开关只影响本地显示。
-    id tlvc = DDLFindTimelineVC(self);
-    BOOL didNativeReload = NO;
-    if (tlvc && [tlvc respondsToSelector:@selector(reloadDataWrap)]) {
-        [tlvc reloadDataWrap];
-        DDLog(@"[长按] 已触发 reloadDataWrap（原生整表重载）tid=%@", tid);
-        didNativeReload = YES;
-    }
-    if (!didNativeReload) {
-        // reloadDataWrap 不可用或未定位到 VC 时，用通用出口兜底（内部会再尝试 keyWindow 定位 + reloadTableView/reloadData）
-        DDLReloadTimelineFrom(self, tid);
-    }
+        [self hide];
+        DDLog(@"[长按] 已触发原生 onLikeItem（收起浮层）");
     } @catch (NSException *e) {
         DDLog(@"[长按] 异常已捕获，避免闪退：%@", e.reason);
     }
@@ -761,101 +667,41 @@ static NSString *DDLTidOfCell(id cell) {
 
 - (id)tableView:(id)tv cellForRowAtIndexPath:(id)ip {
     id cell = %orig;
-    NSString *tid = DDLTidOfCell(cell);
-    BOOL probe = DDLProbeOn();
-    NSDictionary *snap = (tid ? gDDLFaked()[tid] : nil);
-    if (snap || probe) {
+    if (DDLProbeOn()) {
+        NSString *tid = DDLTidOfCell(cell);
         NSUInteger lc = 0, cc = 0;
-
         id it = DDLDeepItem(cell, 0);
         if ([it respondsToSelector:@selector(likeUsers)])    lc = [[it valueForKey:@"likeUsers"] count];
         if ([it respondsToSelector:@selector(commentUsers)]) cc = [[it valueForKey:@"commentUsers"] count];
-        DDLog(@"[单元格] 重建 %@tid=%@ %@ 赞=%lu/应=%lu 评论=%lu/%lu item=%p cell=%@ 表=%@",
-              (snap ? @"" : @"(探活) "), tid ?: @"(无)", DDLGap(tid ?: @"?", @"C:"),
-              (unsigned long)lc, (unsigned long)[snap[@"likes"] count],
-              (unsigned long)cc, (unsigned long)[snap[@"comments"] count],
+        DDLog(@"[单元格] 重建 tid=%@ 赞=%lu 评论=%lu item=%p cell=%@ 表=%@",
+              tid ?: @"(无)", (unsigned long)lc, (unsigned long)cc,
               (__bridge void *)it, NSStringFromClass([cell class]), NSStringFromClass([tv class]));
     }
     return cell;
 }
 %end
 
-%hook WCTimeLineCellView
-
-// 渲染入口拦截（cell 复用时整行重绘都走这里）。active 的 tid 把数据项替换成“假数据深拷贝”，
-// 指针变化迫使 WCTimeLineCellView 重绑 → 点赞行按新数据重算 WCDataItemUICache（=手动下拉刷新生效的原因）。
-// 原始 dataItem 从不修改，零服务器副作用。
-- (void)updateWithDataItem:(id)item actionAreaVM:(id)vm {
-    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
-    NSDictionary *st = (tid ? gDDLFaked()[tid] : nil);
-    if (st && [st[@"active"] boolValue]) {
-        @try {
-            id copy = DDLFakeCopyForTid(tid, item);
-            if (copy) {
-                item = copy;
-                DDLog(@"[渲染] updateWithDataItem 已替换拷贝 tid=%@ 赞=%lu", tid,
-                      (unsigned long)[copy respondsToSelector:@selector(likeUsers)] ? [[copy valueForKey:@"likeUsers"] count] : 0);
-            } else {
-                DDLog(@"[渲染] updateWithDataItem 拷贝失败 tid=%@（跳过注入）", tid);
-            }
-        } @catch (NSException *e) {
-            DDLog(@"[渲染] updateWithDataItem 异常 fallback: %@", e.reason);
-        }
-    }
-    %orig(item, vm);
-}
-
-%end
-
-%hook WCFacade
-
-// 取项出口统一拦截：active 的 tid 返回“假数据深拷贝”，让任何拿到该 dataItem 的渲染路径都得到新指针 → 重绑。
-- (id)getTimelineDataInCacheByItemID:(id)itemID {
-    id item = %orig(itemID);
-    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
-    NSDictionary *st = (tid ? gDDLFaked()[tid] : nil);
-    if (st && [st[@"active"] boolValue]) {
-        id copy = DDLFakeCopyForTid(tid, item);
-        if (copy) item = copy;
-        DDLog(@"[取项] cacheByItemID tid=%@ 拷贝=%@", tid ?: @"(无)", copy ? @"Y" : @"N");
-    }
-    return item;
-}
-
-- (id)getTimelineDataItemOfIndex:(long long)index {
-    id item = %orig(index);
-    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
-    NSDictionary *st = (tid ? gDDLFaked()[tid] : nil);
-    if (st && [st[@"active"] boolValue]) {
-        id copy = DDLFakeCopyForTid(tid, item);
-        if (copy) item = copy;
-        DDLog(@"[取项] itemOfIndex idx=%lld tid=%@ 拷贝=%@", (long long)index, tid ?: @"(无)", copy ? @"Y" : @"N");
-    }
-    return item;
-}
-
-%end
-
 %hook WCTimelineMgr
 
-// 不再在模型层注入：显示层拷贝（下方 WCFacade 取项 + WCTimeLineCellView 渲染两处拦截）已覆盖，
-// 原始 dataItem 始终真实，零服务器副作用。
+// 集赞助手同款：搭微信原生点赞/数据更新这趟车。长按走原生 onLikeItem:（会真点赞/取消 + 网络 + 刷新），
+// 微信把 likeFlag 置 YES 后调 modifyDataItem: —— 我们在这里 if(likeFlag) 注入“假赞名列表”，再 %orig 让原生刷新。
+// 不手动刷、不碰私有控制器；点赞行重绑全靠微信原生（=集赞助手能即时刷新的原因）。
+// 代价：长按会真给作者点你自己的那个赞（其余赞名是假的）；这是用户已确认的取舍。
 - (void)modifyDataItem:(id)item notify:(BOOL)notify {
-    %orig(item, notify);
-}
-
-- (void)commonProcessDataAfterUpdate:(id)datas newAdItems:(id)adItems changedTime:(unsigned int)t {
-    // 网络刷新后原始 dataItem 可能被服务器新数据覆盖：清空 active tid 的拷贝缓存，下次渲染重新生成。
-    NSMutableDictionary *faked = gDDLFaked();
-    if (faked.count && [datas isKindOfClass:NSArray.class]) {
-        for (id obj in (NSArray *)datas) {
-            if (![obj isKindOfClass:objc_getClass("WCDataItem")]) continue;
-            NSString *tid = [obj respondsToSelector:@selector(tid)] ? [obj tid] : nil;
-            NSDictionary *st = (tid ? faked[tid] : nil);
-            if (st && [st[@"active"] boolValue]) st[@"copy"] = nil;
+    if (DDLikeConfig.shared.likeEnabled
+        && [item respondsToSelector:@selector(likeFlag)]
+        && [item likeFlag]) {
+        NSArray<WCUserComment *> *likes = [DDLikeHelper fakeLikeUsers];
+        if (likes.count) {
+            [item setLikeUsers:[likes mutableCopy]];
+            [item setLikeCount:(int)likes.count];
+            [item setRealLikeCount:(int)likes.count];
+            DDLog(@"[注入] modifyDataItem 已注入假赞 tid=%@ n=%lu",
+                  ([item respondsToSelector:@selector(tid)] ? [item tid] : nil),
+                  (unsigned long)likes.count);
         }
     }
-    %orig(datas, adItems, t);
+    %orig(item, notify);
 }
 
 %end
