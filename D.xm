@@ -104,8 +104,6 @@ static inline id DDLContactMgr(void) {
 @property (nonatomic) BOOL likeFlag;
 @property (nonatomic) unsigned int createtime;
 @property (retain, nonatomic) NSString *tid;
-- (id) toPBCodingBuffer;
-+ (id) fromPBCodingBuffer:(id);
 @end
 
 @interface MMTableViewCell : UITableViewCell
@@ -689,16 +687,17 @@ static NSString *DDLTidOfCell(id cell) {
 // 代价：长按会真给作者点你自己的那个赞（其余赞名是假的）；这是用户已确认的取舍。
 - (void)modifyDataItem:(id)item notify:(BOOL)notify {
     if (DDLikeConfig.shared.likeEnabled
-        && [item respondsToSelector:@selector(likeFlag)]
-        && [item likeFlag]) {
-        NSArray<WCUserComment *> *likes = [DDLikeHelper fakeLikeUsers];
-        if (likes.count) {
-            [item setLikeUsers:[likes mutableCopy]];
-            [item setLikeCount:(int)likes.count];
-            [item setRealLikeCount:(int)likes.count];
-            DDLog(@"[注入] modifyDataItem 已注入假赞 tid=%@ n=%lu",
-                  ([item respondsToSelector:@selector(tid)] ? [item tid] : nil),
-                  (unsigned long)likes.count);
+        && [item isKindOfClass:[WCDataItem class]]) {
+        WCDataItem *di = (WCDataItem *)item;
+        if ([di likeFlag]) {
+            NSArray<WCUserComment *> *likes = [DDLikeHelper fakeLikeUsers];
+            if (likes.count) {
+                [di setLikeUsers:[likes mutableCopy]];
+                [di setLikeCount:(int)likes.count];
+                [di setRealLikeCount:(int)likes.count];
+                DDLog(@"[注入] modifyDataItem 已注入假赞 tid=%@ n=%lu",
+                      di.tid, (unsigned long)likes.count);
+            }
         }
     }
     %orig(item, notify);
