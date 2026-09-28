@@ -411,7 +411,9 @@ static void DDLRestore(WCDataItem *item, NSDictionary *snap) {
     item.commentUsers = [o[@"commentUsers"] mutableCopy];
     item.commentCount = [o[@"commentCount"] intValue];
     item.likeFlag     = [o[@"likeFlag"] boolValue];
-    item.cpKeyForLikeUsers = nil;
+    // 恢复原始数据时同样刷新点赞行渲染缓存：用新 key 强制缓存 miss，从已还原的真实 likeUsers 重绘。
+    item.cpKeyForLikeUsers = [NSString stringWithFormat:@"ddl_r_%.0f",
+        [[NSDate date] timeIntervalSince1970] * 1000.0];
     objc_setAssociatedObject(item, kDDLFakedMark, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
@@ -428,7 +430,13 @@ static inline void DDLFakeInto(WCDataItem *item, NSArray *likes, NSArray *commen
         item.realLikeCount = (int)likes.count;
     }
 
-    item.cpKeyForLikeUsers = nil;
+    // cpKeyForLikeUsers（WCDataItem.h:217）是微信点赞行 RichTextView 成品富文本的渲染缓存 key。
+    // 锤子/WCR 从不碰它，靠“重进时间线”让数据项整体重建、缓存随之失效（WCR 还显式 setCpKey:/clearCpKey）。
+    // 我们是原地长按刷新，必须主动让 key 失效才能掀掉旧渲染：设成每次更新都不同的新值 → 缓存 miss → 重绘新赞列表。
+    // 不能设 nil：nil 不是有效失效值，微信仍命中旧缓存 X（对应原 1 赞）→ 显示旧值、需手动刷新（带赞 item 的顽疾）。
+    item.cpKeyForLikeUsers = [NSString stringWithFormat:@"ddl_%lu_%.0f",
+        (unsigned long)(likes.count + comments.count),
+        [[NSDate date] timeIntervalSince1970] * 1000.0];
 
     objc_setAssociatedObject(item, kDDLFakedMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
