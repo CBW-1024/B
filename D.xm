@@ -120,6 +120,16 @@ static inline id DDLTimelineMgr(void) {
 - (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;
 @end
 
+// 点赞/评论行控制器（头文件 WCTimeLineCommentCellView.h:21 mainDataItem / :48 onReloadCommentCellView:）。
+// dump 头文件标 NSObject，但真机日志证明其实例是 cell.contentView 的直接子 view（UIView），
+// 其内部 RichTextView（tag=1000，内容走 setContent:+YYAsyncLayer 自绘，text/attributedText 恒 nil）
+// 只有调 onReloadCommentCellView: 重读 mainDataItem 才会重建内容 —— 这就是"带赞 item 需手动刷一次"的根因。
+@interface WCTimeLineCommentCellView : UIView
+- (id)mainDataItem;
+- (void)setMainDataItem:(id)arg1;
+- (void)onReloadCommentCellView:(id)arg1;
+@end
+
 @interface WCTimeLineViewController : NSObject
 - (id)getContentTableView;
 - (id)indexPathOfDataItem:(id)item;
@@ -304,7 +314,12 @@ static NSTimeInterval gDDLFriendCacheAt;
         WCUserComment *u = [[objc_getClass("WCUserComment") alloc] init];
         u.username   = c.m_nsUsrName;
         u.nickname   = c.m_nsNickName;
-        u.type       = 2;
+        // 锤子 ApplyFake 反汇编（fake.txt 0x7b650c-0x7b6528）：
+        //   mov w2, #1 → setType:1（1=赞；2=文本评论。type=2 混入 likeUsers 会被点赞行
+        //   渲染器按评论处理，content 为 nil 时走图片占位分支 → 行内出现「图片」+空槽）
+        //   setContent:@""（0xd9f180 CFString len=0 空串，不能为 nil）
+        u.type       = 1;
+        u.content    = @"";
         u.commentID  = [NSString stringWithFormat:@"%lu", (unsigned long)idx];
         u.createTime = now;
         [list addObject:u];
@@ -624,6 +639,43 @@ static NSString *DDLTidOfCell(id cell) {
     return nil;
 }
 
+// 定向刷新点赞/评论行：遍历可见 cell 的 contentView 子树，找 mainDataItem 匹配 item 的
+// WCTimeLineCommentCellView 控制器，换数据 + 调其重绘入口（WCTimeLineCommentCellView.h:48），
+// 强制内部 RichTextView（tag=1000）重建内容。不拆 subview、不整表重建，安全性等同微信原生调用。
+static int DDLReloadCommentCellViews(id tv, id item) {
+    if (![tv isKindOfClass:UITableView.class] || !item) return 0;
+    Class ccvClass = objc_getClass("WCTimeLineCommentCellView");
+    if (!ccvClass) { DDLog(@"[行刷新] ⚠运行时无 WCTimeLineCommentCellView 类"); return 0; }
+    int n = 0;
+    for (UITableViewCell *cell in [(UITableView *)tv visibleCells]) {
+        if (!cell.contentView) continue;
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:cell.contentView];
+        while (stack.count) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            for (UIView *s in v.subviews) {
+                [stack addObject:s];
+                if (![s isKindOfClass:ccvClass]) continue;
+                WCTimeLineCommentCellView *cv = (WCTimeLineCommentCellView *)s;
+                id mit = nil;
+                @try { mit = [cv mainDataItem]; } @catch (NSException *__) {}
+                BOOL match = (mit == item);
+                if (!match && [mit respondsToSelector:@selector(tid)] && [mit isKindOfClass:objc_getClass("WCDataItem")])
+                    match = [[(WCDataItem *)mit tid] isEqualToString:[(WCDataItem *)item tid]];
+                if (!match) continue;
+                @try {
+                    [cv setMainDataItem:item];
+                    [cv onReloadCommentCellView:item];
+                    DDLog(@"[行刷新] onReloadCommentCellView: 已调用 view=%p（内部 RichTextView tag=1000 随之重建）",
+                          (__bridge void *)cv);
+                    n++;
+                } @catch (NSException *e) { DDLog(@"[行刷新] 异常 %@", e.reason); }
+            }
+        }
+    }
+    return n;
+}
+
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
 - (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g;
@@ -669,12 +721,22 @@ static void DDLApplyAndRefresh(WCDataItem *item, NSString *tid, BOOL turningOn, 
         DDLog(@"[刷新] ⚠未找到 modifyDataItem:notify: 的 mgr，刷新可能无效");
     }
 
+    // ①定向刷新（主通路）：直接对点赞/评论行的 WCTimeLineCommentCellView 控制器换数据+重绘，
+    //   强制其内部 RichTextView（tag=1000，内容走 setContent:+YYAsyncLayer 自绘）重建。
+    //   modifyDataItem 只刷外层 cell，掀不掉已缓存的内层控制器 → 这就是带赞 item 需手动刷一次的根因。
+    @try {
+        int rn = DDLReloadCommentCellViews(DDLTimelineTableView(tlvc0), item);
+        DDLog(@"[行刷新] 定向重绘点赞/评论行 命中 %d 个", rn);
+    } @catch (NSException *e) { DDLog(@"[行刷新] 外层异常 %@", e.reason); }
+
     // 锤子靠“重新进入时间线 VC”清掉内层 WCTimeLineCommentCellView 控制器缓存；
     // 我们是原地长按，带赞 item 的点赞行控制器已缓存，modifyDataItem 不会掀掉它，
     // 故补一次微信原生清缓存+重绘（WCTimeLineViewController.h:289），强制点赞行重绘。
+    // ②兜底：微信原生粗粒度清缓存（WCTimeLineViewController.h:289），等价锤子"重进时间线"。
+    //   ①已定向刷新，②主要兜底①没命中（如行不在 visibleCells）的场景。
     if (tlvc0 && [tlvc0 respondsToSelector:@selector(onActionClearCellCacheAndRefreshCellView:)]) {
         [tlvc0 onActionClearCellCacheAndRefreshCellView:item];
-        DDLog(@"[刷新] onActionClearCellCacheAndRefreshCellView:（清 VC 层 cell 缓存，强制带赞 item 的点赞行重绘，等同锤子“重进时间线”效果）");
+        DDLog(@"[刷新] ②onActionClearCellCacheAndRefreshCellView:（兜底清 VC 层 cell 缓存）");
     }
 
     } @catch (NSException *e) {
