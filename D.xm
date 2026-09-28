@@ -31,10 +31,6 @@
 
 @interface CBaseContact : NSObject
 @property (retain, nonatomic) NSString *m_nsUsrName;
-@property (nonatomic) unsigned int m_uiType;
-@property (nonatomic) unsigned int m_uiFriendScene;
-@property (nonatomic) unsigned int realFriendScene;
-@property (nonatomic) unsigned long long m_uiTypeExt;
 @end
 
 @interface CContact : CBaseContact
@@ -50,7 +46,6 @@
 
 @interface CContactMgr : NSObject
 - (NSArray *)getContactList:(unsigned int)arg1 contactType:(unsigned int)arg2;
-- (BOOL)isHardCodeContact:(id)arg1;
 @end
 
 @interface MMServiceCenter : NSObject
@@ -85,17 +80,16 @@ static inline id DDLFacadeService(void) {
 
 // WCFacade.h:195 getTimelineDataInCacheByItemID: / :197 getTimelineDataItemOfIndex: / :429 modifyDataItem:notify:
 @interface WCFacade : NSObject
-- (id)getTimelineMgr;
 - (id)getTimelineDataInCacheByItemID:(id)itemID;
 - (id)getTimelineDataItemOfIndex:(long long)index;
 - (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;
 @end
 
 @interface WCOperateFloatView : UIView
+// 刻意不声明 onLikeItem: —— 我们不再踢原生点赞（那会真给作者发服务器赞）。
 - (id)m_item;
 - (id)m_likeBtn;
 - (void)hide;
-- (void)onLikeItem:(id)arg1;
 @end
 
 @interface WCUserComment : NSObject
@@ -110,24 +104,14 @@ static inline id DDLFacadeService(void) {
 @interface WCDataItem : NSObject
 @property (retain, nonatomic) NSMutableArray *likeUsers;
 @property (nonatomic) int likeCount;
-@property (nonatomic) int realLikeCount;
-@property (nonatomic) int selfLikeCount;
 @property (retain, nonatomic) NSMutableArray *commentUsers;
 @property (nonatomic) int commentCount;
-@property (nonatomic) BOOL likeFlag;
 @property (nonatomic) unsigned int createtime;
 @property (retain, nonatomic) NSString *tid;
 @end
 
 @interface WCTimelineMgr : NSObject
 - (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;
-@end
-
-// 只留回退路径真正会调的三个（DDLReloadTimelineFrom 用）。
-@interface WCTimeLineViewController : NSObject
-- (id)getContentTableView;
-- (void)reloadTableView;
-- (void)reloadDataWrap;
 @end
 
 #pragma mark - 配置
@@ -374,196 +358,6 @@ static NSTimeInterval gDDLFriendCacheAt;
 
 static const void *kDDLLongPressKey = &kDDLLongPressKey;
 
-static NSString *DDLGap(NSString *key, NSString *tag);
-static NSString *DDLTidOfCell(id cell);
-static id DDLDeepItem(id v, int depth);
-
-static NSString *DDLSubList(id cell) {
-    if (![cell isKindOfClass:UITableViewCell.class]) return @"(非cell)";
-    NSArray *subs = ((UITableViewCell *)cell).contentView.subviews;
-    if (!subs.count) return @"(空)";
-    NSMutableArray *n = [NSMutableArray array];
-    for (UIView *sv in subs) [n addObject:NSStringFromClass([sv class])];
-    return [n componentsJoinedByString:@"+"];
-}
-
-static NSTimeInterval gDDLProbeUntil = 0;
-static inline void DDLProbeOpen(void) {
-    gDDLProbeUntil = [NSDate timeIntervalSinceReferenceDate] + 3.0;
-}
-static inline BOOL DDLProbeOn(void) {
-    return [NSDate timeIntervalSinceReferenceDate] < gDDLProbeUntil;
-}
-
-static id DDLFindTimelineVC(id start) {
-    Class tlvClass = objc_getClass("WCTimeLineViewController");
-    if (!tlvClass) return nil;
-
-    id cur = start;
-    for (int i = 0; i < 15 && cur; i++) {
-        if ([cur isKindOfClass:tlvClass]) return cur;
-        if ([cur respondsToSelector:@selector(topViewController)]) {
-            id top = [cur topViewController];
-            if ([top isKindOfClass:tlvClass]) return top;
-        }
-        if ([cur respondsToSelector:@selector(navigationController)]) {
-            id nav = [cur navigationController];
-            if ([nav isKindOfClass:tlvClass]) return nav;
-            if ([nav respondsToSelector:@selector(topViewController)]) {
-                id top = [nav topViewController];
-                if ([top isKindOfClass:tlvClass]) return top;
-            }
-        }
-        if (![cur respondsToSelector:@selector(nextResponder)]) break;
-        cur = [cur nextResponder];
-    }
-    return nil;
-}
-
-static id DDLTimelineTableView(id tlvc) {
-    if (!tlvc) return nil;
-    id tv = nil;
-    if ([tlvc respondsToSelector:@selector(getContentTableView)]) {
-        @try { tv = [tlvc getContentTableView]; } @catch (NSException *__) { tv = nil; }
-    }
-    for (NSString *k in @[@"tableView", @"m_tableView"]) {
-        if (tv) break;
-        @try { tv = [tlvc valueForKey:k]; } @catch (NSException *__) { tv = nil; }
-    }
-    return ([tv isKindOfClass:UITableView.class]) ? tv : nil;
-}
-
-static BOOL DDLReloadTimelineFrom(id start, NSString *tid) {
-    id tlvc = DDLFindTimelineVC(start);
-    if (!tlvc) {
-        DDLog(@"[刷新] ⚠未定位到时间线 VC（起点=%@）", NSStringFromClass([start class]));
-        return NO;
-    }
-    DDLog(@"[刷新] 定位到 VC=%@ tid=%@", NSStringFromClass([tlvc class]), tid);
-
-    // 照 WCR 反汇编结论排序：它在 ApplyManualFakeEngagement 之后紧跟的就是 reloadTableView
-    // （见 WCR_FakeLike_Mechanism.md）。原来我们把 reloadDataWrap 排第一，这里把 reloadTableView 提到最前。
-    SEL native[3];
-    native[0] = NSSelectorFromString(@"reloadTableView");
-    native[1] = NSSelectorFromString(@"reloadTableData");
-    native[2] = NSSelectorFromString(@"reloadDataWrap");
-    for (int i = 0; i < 3; i++) {
-        if (![tlvc respondsToSelector:native[i]]) continue;
-        DDLProbeOpen();
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        [tlvc performSelector:native[i]];
-#pragma clang diagnostic pop
-        DDLog(@"[刷新] 走 VC 原生出口=%@ tid=%@ %@", NSStringFromSelector(native[i]), tid, DDLGap(tid, @"T:"));
-        return YES;
-    }
-
-    // 兜底：手动 reloadData（部分版本无上述出口；不保证点赞行刷新，仅保底可见性）。
-    id tv = DDLTimelineTableView(tlvc);
-    if (tv) {
-        DDLProbeOpen();
-        [(UITableView *)tv reloadData];
-        DDLog(@"[刷新] 主表 reloadData（兜底）tid=%@ 表=%@ %@", tid,
-              NSStringFromClass([tv class]), DDLGap(tid, @"T:"));
-        return YES;
-    }
-
-    DDLog(@"[刷新] ⚠主表与 VC 出口都取不到 tid=%@，本次不会自动刷新", tid);
-    return NO;
-}
-
-static UIWindow *DDLKeyWindow(void) {
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            if (sc.activationState != UISceneActivationStateForegroundActive) continue;
-            if (![sc isKindOfClass:UIWindowScene.class]) continue;
-            for (UIWindow *w in ((UIWindowScene *)sc).windows) { if (w.isKeyWindow) return w; }
-        }
-    }
-    return nil;
-}
-
-static void DDLCheckVisible(NSString *tid, id start) {
-    if (!tid) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        id tlvc = DDLFindTimelineVC(start);
-        id tv = DDLTimelineTableView(tlvc);
-        if (![tv isKindOfClass:UITableView.class]) {
-
-            tlvc = DDLFindTimelineVC(DDLKeyWindow());
-            tv = DDLTimelineTableView(tlvc);
-        }
-        DDLog(@"[体检] tid=%@ 开始 起点=%@ VC=%@", tid,
-              NSStringFromClass([start class]) ?: @"(nil)",
-              NSStringFromClass([tlvc class]) ?: @"(nil)");
-        if (![tv isKindOfClass:UITableView.class]) { DDLog(@"[体检] ⚠拿不到主表"); return; }
-        NSUInteger n = 0, shown = 0;
-        for (UIView *cell in ((UITableView *)tv).visibleCells) {
-            NSString *ctid = DDLTidOfCell(cell);
-            id it = DDLDeepItem(cell, 0);
-            NSUInteger lc = 0, cc = 0;
-            if ([it respondsToSelector:@selector(likeUsers)])    lc = [[it valueForKey:@"likeUsers"] count];
-            if ([it respondsToSelector:@selector(commentUsers)]) cc = [[it valueForKey:@"commentUsers"] count];
-
-            if ([ctid isEqualToString:tid] || shown < 3) {
-                if (![ctid isEqualToString:tid]) shown++; else n++;
-                DDLog(@"[体检] %@cell=%@ tid=%@ item=%p 赞=%lu 评论=%lu cv=%@ frame=%@",
-                      ([ctid isEqualToString:tid] ? @"命中 " : @"样本 "),
-                      NSStringFromClass([cell class]), ctid ?: @"(无)", (__bridge void *)it,
-                      (unsigned long)lc, (unsigned long)cc,
-                      DDLSubList(cell), NSStringFromCGRect(cell.frame));
-            }
-        }
-        if (!n) DDLog(@"[体检] ⚠可见单元格里没有 tid=%@（可能已滚出屏幕或取不到 tid）", tid);
-    });
-}
-
-static NSString *DDLGap(NSString *key, NSString *tag) {
-    static NSMutableDictionary *last;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ last = [NSMutableDictionary dictionary]; });
-    NSString *k = [tag stringByAppendingString:(key ?: @"?")];
-    NSDate *now = [NSDate date];
-    NSDate *prev = last[k];
-    last[k] = now;
-    if (!prev) return @"首次";
-    NSTimeInterval dt = [now timeIntervalSinceDate:prev] * 1000.0;
-    if (dt < 500.0) return [NSString stringWithFormat:@"⚠%.0fms", dt];
-    return [NSString stringWithFormat:@"%lldms", (long long)dt];
-}
-
-static id DDLDeepItem(id v, int depth) {
-    if (!v || depth > 3 || ![v isKindOfClass:NSObject.class]) return nil;
-    @try {
-        id it = [v valueForKey:@"mainDataItem"];
-        if ([it respondsToSelector:@selector(tid)]) return it;
-    } @catch (NSException *__) {}
-    @try {
-        id it = [v valueForKey:@"m_dataItem"];
-        if ([it respondsToSelector:@selector(tid)]) return it;
-    } @catch (NSException *__) {}
-    @try {
-        id sub = [v valueForKey:@"m_subContentView"];
-        if (sub && sub != v) { id r = DDLDeepItem(sub, depth + 1); if (r) return r; }
-    } @catch (NSException *__) {}
-    if ([v isKindOfClass:UIView.class]) {
-        for (UIView *sv in ((UIView *)v).subviews) {
-            id r = DDLDeepItem(sv, depth + 1);
-            if (r) return r;
-        }
-    }
-    return nil;
-}
-
-static NSString *DDLTidOfCell(id cell) {
-    if (!cell) return nil;
-    @try {
-        id item = DDLDeepItem(cell, 0);
-        if ([item respondsToSelector:@selector(tid)]) return [item tid];
-    } @catch (NSException *__) {}
-    return nil;
-}
-
 // 方案（照锤子反汇编结论，详见 Hammer_FakeLike_Mechanism.md）：
 // 长按 → 微信原生弹窗（取消/确认）→ 确认才本地注入假数据 → [WCFacade modifyDataItem:notify:YES]。
 //
@@ -588,8 +382,6 @@ static NSString *DDLTidOfCell(id cell) {
 - (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g;
 - (void)ddl_fakeConfirmed;
 - (void)ddl_fakeCancelled;
-- (BOOL)ddl_reloadTimelineForItem:(id)item;
-- (id)navigationController;
 @end
 
 // 微信原生弹窗类（WCUIAlertView.h:19）——带取消 + 确认两个按钮的那款
@@ -599,24 +391,16 @@ static NSString *DDLTidOfCell(id cell) {
                btnTitle:(id)btnTitle target:(id)btnTarget sel:(SEL)btnSel;
 @end
 
-// 已集赞的 tid → @YES
-static NSMutableDictionary *gDDLFakeOn(void) {
+// tid → 这条朋友圈已注入的假赞用户名集合。字典里有这个 tid，就表示这条已集赞。
+// 补回路径会随 cell 渲染被高频调用，靠它做 O(n) 预检，避免每次都重新造一遍
+// WCUserComment（实测 1.25s 内被调 84 次，日志全被这条刷爆）。
+// 必须按 tid 分开存：混成一个全局并集的话，集完第 2 条之后，第 1 条会因为「不含第 2 条
+// 的假赞名字」被判成不完整，每次渲染都重建一遍 —— 刷屏就是这么复发的。
+static NSMutableDictionary *gDDLFake(void) {
     static NSMutableDictionary *d = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ d = [NSMutableDictionary new]; });
     return d;
-}
-
-// 弹窗回调时浮层可能已 hide、m_item 失效，这里留一份强引用
-static WCDataItem *gDDLPendingItem = nil;
-
-// 已注入过的假赞用户名集合。补回路径会随 cell 渲染被高频调用，靠它做 O(n) 预检，
-// 避免每次都重新造一遍 WCUserComment（实测 1.25s 内被调 84 次，日志全被这条刷爆）。
-static NSMutableSet *gDDLFakeNames(void) {
-    static NSMutableSet *s = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [NSMutableSet new]; });
-    return s;
 }
 
 // 追加式注入：保留原始名单 → 补齐假的到 target → 写回。
@@ -635,15 +419,19 @@ static void DDLApplyFakeToItem(WCDataItem *di) {
     NSInteger limit  = target - (NSInteger)likes.count;   // 还缺几个
     if (limit > 0) {
         NSArray *fresh = [DDLikeHelper fakeLikeUsersExcluding:seen limit:limit];
+        NSMutableDictionary *recDict = gDDLFake();
+        NSMutableSet *rec = tid ? (recDict[tid] ?: [NSMutableSet set]) : nil;
         for (WCUserComment *u in fresh) {
             NSString *name = u.username;
-            if (name) { [seen addObject:name]; [gDDLFakeNames() addObject:name]; }
+            if (name) { [seen addObject:name]; [rec addObject:name]; }  // rec 为 nil 时静默
             [likes addObject:u];
         }
+        if (rec) recDict[tid] = rec;
         if (fresh.count) {
+            // 只写这两个，跟锤子一致。realLikeCount 不用管：全量头文件 dump 里
+            // 除了 WCDataItem.h 自己声明，没有任何第二个类读它（锤子也没设）。
             [di setLikeUsers:likes];
             [di setLikeCount:(int)likes.count];
-            [di setRealLikeCount:(int)likes.count];
             DDLog(@"[注入] 假赞 tid=%@ 新增=%lu 合计=%lu（target=%ld）",
                   tid, (unsigned long)fresh.count, (unsigned long)likes.count, (long)target);
         } else {
@@ -669,8 +457,8 @@ static void DDLApplyFakeToItem(WCDataItem *di) {
 
 // 假赞是否还完整挂在 item 上。只做集合包含判断，不造对象、不打日志 ——
 // 补回路径随 cell 渲染高频触发，绝大多数调用到这里就结束了。
-static BOOL DDLItemFakeIntact(WCDataItem *di) {
-    NSMutableSet *fake = gDDLFakeNames();
+static BOOL DDLItemFakeIntact(WCDataItem *di, NSString *tid) {
+    NSMutableSet *fake = tid ? gDDLFake()[tid] : nil;
     if (fake.count == 0) return NO;
 
     NSArray *likes = ([di respondsToSelector:@selector(likeUsers)] ? [di likeUsers] : nil);
@@ -699,8 +487,8 @@ static void DDLReapplyIfNeeded(id obj) {
     if (![obj isKindOfClass:%c(WCDataItem)]) return;
     WCDataItem *di = (WCDataItem *)obj;
     NSString *tid = ([di respondsToSelector:@selector(tid)] ? [di tid] : nil);
-    if (!tid || !gDDLFakeOn()[tid]) return;
-    if (DDLItemFakeIntact(di)) return;          // 还挂着，什么都不用做
+    if (!tid || !gDDLFake()[tid]) return;
+    if (DDLItemFakeIntact(di, tid)) return;     // 还挂着，什么都不用做
     DDLApplyFakeToItem(di);                     // 真被冲掉了才重建，这时日志有价值
     DDLog(@"[保活] 补回假赞 tid=%@", tid);
 }
@@ -739,48 +527,45 @@ static void DDLReapplyIfNeeded(id obj) {
     WCDataItem *item = self.m_item;
     if (!item) { DDLog(@"[长按] m_item 为 nil，中止"); return; }
 
-    @try {
-        NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
-        gDDLPendingItem = item;   // 浮层收起后弹窗回调仍要用到它
+    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
+    DDLog(@"[长按] 触发 tid=%@ 已集赞=%d 现有赞=%lu 评论=%lu",
+          tid, (tid && gDDLFake()[tid]) ? 1 : 0,
+          (unsigned long)([item respondsToSelector:@selector(likeUsers)] ? [item likeUsers].count : 0),
+          (unsigned long)([item respondsToSelector:@selector(commentUsers)] ? [item commentUsers].count : 0));
 
-        DDLog(@"[长按] 触发 tid=%@ 已集赞=%d 现有赞=%lu 评论=%lu",
-              tid, (tid && gDDLFakeOn()[tid]) ? 1 : 0,
-              (unsigned long)([item respondsToSelector:@selector(likeUsers)] ? [item likeUsers].count : 0),
-              (unsigned long)([item respondsToSelector:@selector(commentUsers)] ? [item commentUsers].count : 0));
+    [self hide];   // 先收起点赞浮层，免得它盖住弹窗
 
-        [self hide];   // 先收起点赞浮层，免得它盖住弹窗
-
-        Class alertCls = objc_getClass("WCUIAlertView");
-        if (alertCls && [alertCls respondsToSelector:@selector(showAlertWithTitle:message:cancelBtnTitle:target:sel:btnTitle:target:sel:)]) {
-            // 弹窗只要个数。以前为了拿 count 把 WCUserComment 完整造了一遍
-            // （日志里表现为长按瞬间就冒出 [好友]/[点赞] 两行），这里直接算差值，零对象生成。
-            NSInteger curN = (NSInteger)([item respondsToSelector:@selector(likeUsers)]
-                                         ? [item likeUsers].count : 0);
-            NSInteger addN = MAX((NSInteger)0, (NSInteger)DDLikeConfig.shared.likeCount - curN);
-            NSInteger cmtN = DDLikeConfig.shared.commentCount;
-            NSString *msg = [NSString stringWithFormat:
-                @"将为这条朋友圈添加 %ld 个点赞、并把评论补齐至 %ld 条。\n仅本地显示，不会发给微信服务器。",
-                (long)addN, (long)cmtN];
-            [alertCls showAlertWithTitle:@"集赞助手"
-                                 message:msg
-                         cancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)
-                              btnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
-            DDLog(@"[长按] 已弹微信原生弹窗 tid=%@（取消/确认）", tid);
-        } else {
-            DDLog(@"[长按] WCUIAlertView 不可用，直接执行 tid=%@", tid);
-            [self ddl_fakeConfirmed];
-        }
-    } @catch (NSException *e) {
-        DDLog(@"[长按] 异常已捕获，避免闪退：%@", e.reason);
+    Class alertCls = objc_getClass("WCUIAlertView");
+    if (alertCls && [alertCls respondsToSelector:@selector(showAlertWithTitle:message:cancelBtnTitle:target:sel:btnTitle:target:sel:)]) {
+        // 弹窗只要个数。以前为了拿 count 把 WCUserComment 完整造了一遍
+        // （日志里表现为长按瞬间就冒出 [好友]/[点赞] 两行），这里直接算差值，零对象生成。
+        NSInteger curN = (NSInteger)([item respondsToSelector:@selector(likeUsers)]
+                                     ? [item likeUsers].count : 0);
+        NSInteger addN = MAX((NSInteger)0, (NSInteger)DDLikeConfig.shared.likeCount - curN);
+        NSInteger cmtN = DDLikeConfig.shared.commentCount;
+        NSString *msg = [NSString stringWithFormat:
+            @"将为这条朋友圈添加 %ld 个点赞、并把评论补齐至 %ld 条。\n仅本地显示，不会发给微信服务器。",
+            (long)addN, (long)cmtN];
+        [alertCls showAlertWithTitle:@"集赞助手"
+                             message:msg
+                     cancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)
+                          btnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
+        DDLog(@"[长按] 已弹微信原生弹窗 tid=%@（取消/确认）", tid);
+    } else {
+        DDLog(@"[长按] WCUIAlertView 不可用，直接执行 tid=%@", tid);
+        [self ddl_fakeConfirmed];
     }
 }
 
 %new
 - (void)ddl_fakeConfirmed {
-    WCDataItem *item = gDDLPendingItem ?: (WCDataItem *)self.m_item;
-    NSString *tid = (item && [item respondsToSelector:@selector(tid)]) ? [item tid] : nil;
-    if (!item) { DDLog(@"[弹窗] 确认但 item 已失效，跳过"); return; }
-    if (tid) gDDLFakeOn()[tid] = @YES;
+    // 直接读 self.m_item：回调能打进本方法，就说明 self 还活着（否则发消息那一步就崩了）。
+    // 早期版本额外用了一个全局 gDDLPendingItem 传 item，实测多余且会串号，已删。
+    WCDataItem *item = (WCDataItem *)self.m_item;
+    if (!item) { DDLog(@"[弹窗] 确认但 m_item 已失效，跳过"); return; }
+    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
+    // 先占位：即使这次一个假赞都没造出来（好友池空），也已算「集过赞」，补回路径认它。
+    if (tid && !gDDLFake()[tid]) gDDLFake()[tid] = [NSMutableSet set];
     DDLog(@"[弹窗] 已确认 tid=%@", tid);
     DDLApplyFakeToItem(item);
 
@@ -793,49 +578,18 @@ static void DDLReapplyIfNeeded(id obj) {
         [(WCFacade *)svc modifyDataItem:item notify:YES];
         DDLog(@"[刷新] 已调 [WCFacade modifyDataItem:notify:YES] tid=%@", tid);
     } else {
-        DDLog(@"[刷新] ⚠取不到 WCFacade，回退 reload tid=%@", tid);
-        [self ddl_reloadTimelineForItem:item];
+        // 数据已经写进 dataItem 了，只是这一下不会自动重绘，下拉一次即可看到。
+        DDLog(@"[刷新] ⚠取不到 WCFacade，本次不自动刷新 tid=%@", tid);
     }
-    gDDLPendingItem = nil;
 }
 
 %new
 - (void)ddl_fakeCancelled {
-    NSString *tid = (gDDLPendingItem && [gDDLPendingItem respondsToSelector:@selector(tid)])
-                  ? [gDDLPendingItem tid] : nil;
+    WCDataItem *item = (WCDataItem *)self.m_item;
+    NSString *tid = (item && [item respondsToSelector:@selector(tid)]) ? [item tid] : nil;
     DDLog(@"[弹窗] 已取消 tid=%@", tid);
-    gDDLPendingItem = nil;
 }
 
-%new
-
-- (BOOL)ddl_reloadTimelineForItem:(id)item {
-    NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
-    DDLog(@"[刷新] 定位开始 tid=%@ 起点=%@ nav=%@", tid, NSStringFromClass([self class]),
-          NSStringFromClass([[self navigationController] class]));
-    BOOL ok = DDLReloadTimelineFrom(self, tid);
-    if (ok) DDLCheckVisible(tid, self);
-    return ok;
-}
-
-%end
-
-%hook WCTimeLineViewController
-
-- (id)tableView:(id)tv cellForRowAtIndexPath:(id)ip {
-    id cell = %orig;
-    if (DDLProbeOn()) {
-        NSString *tid = DDLTidOfCell(cell);
-        NSUInteger lc = 0, cc = 0;
-        id it = DDLDeepItem(cell, 0);
-        if ([it respondsToSelector:@selector(likeUsers)])    lc = [[it valueForKey:@"likeUsers"] count];
-        if ([it respondsToSelector:@selector(commentUsers)]) cc = [[it valueForKey:@"commentUsers"] count];
-        DDLog(@"[单元格] 重建 tid=%@ 赞=%lu 评论=%lu item=%p cell=%@ 表=%@",
-              tid ?: @"(无)", (unsigned long)lc, (unsigned long)cc,
-              (__bridge void *)it, NSStringFromClass([cell class]), NSStringFromClass([tv class]));
-    }
-    return cell;
-}
 %end
 
 // 锤子同款「原生产出 dataItem 的入口，orig 之后立刻补回」。
@@ -873,7 +627,7 @@ static void DDLReapplyIfNeeded(id obj) {
 
 #pragma mark - 日志查看 / 导出
 
-static void DDLogExportFrom(UIViewController *vc, id sender) {
+static void DDLogExportFrom(UIViewController *vc) {
     NSString *text = [NSString stringWithFormat:@"%@\n\n%@", DDLogConfigSummary(), DDLogText()];
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDLikeHelper.log.txt"];
     [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -886,9 +640,6 @@ static void DDLogExportFrom(UIViewController *vc, id sender) {
         av.popoverPresentationController.sourceView = vc.view;
         av.popoverPresentationController.sourceRect =
             CGRectMake(CGRectGetMidX(vc.view.bounds), CGRectGetMidY(vc.view.bounds), 1, 1);
-        if ([sender isKindOfClass:UIBarButtonItem.class]) {
-            av.popoverPresentationController.barButtonItem = (UIBarButtonItem *)sender;
-        }
     }
     [vc presentViewController:av animated:YES completion:nil];
 }
@@ -1039,7 +790,7 @@ static void DDLogExportFrom(UIViewController *vc, id sender) {
 }
 
 - (void)onExportLogTapped {
-    DDLogExportFrom(self, nil);
+    DDLogExportFrom(self);
 }
 
 - (void)onClearLogTapped {
