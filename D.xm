@@ -128,8 +128,8 @@ static inline id DDLContactMgr(void) {
 @end
 
 // 主内容控制器（WCTimeLineCellView.h:288 updateWithDataItem:actionAreaVM: 即 cell 复用时重绘整行的入口）。
-// 点赞行归它管；我们不再 hook 它——数据注入收敛到 %hook WCTimelineMgr modifyDataItem:（原生数据更新上下文），
-// 微信原生重绑即刷新整行，无需深拷贝、无需手动 reload（深拷贝方案已废弃）。
+// 点赞行归它管；我们不再 hook 它——注入与刷新都走「长按 → 微信原生弹窗确认 → 本地注入 + reloadTableView」，
+// 不依赖 modifyDataItem、不碰深拷贝、也不用手动 reloadDataWrap（前两版方案均已废弃）。
 @interface WCTimeLineCellView : NSObject
 - (void)updateWithDataItem:(id)arg1 actionAreaVM:(id)arg2;
 @end
@@ -452,11 +452,12 @@ static BOOL DDLReloadTimelineFrom(id start, NSString *tid) {
     }
     DDLog(@"[刷新] 定位到 VC=%@ tid=%@", NSStringFromClass([tlvc class]), tid);
 
-    // 优先走微信原生整表重载（=下拉刷新，重建 cell 控制器、清掉点赞行 UICache，等于用户手动下拉刷新）。
+    // 照 WCR 反汇编结论排序：它在 ApplyManualFakeEngagement 之后紧跟的就是 reloadTableView
+    // （见 WCR_FakeLike_Mechanism.md）。原来我们把 reloadDataWrap 排第一，这里把 reloadTableView 提到最前。
     SEL native[3];
-    native[0] = NSSelectorFromString(@"reloadDataWrap");
-    native[1] = NSSelectorFromString(@"reloadTableView");
-    native[2] = NSSelectorFromString(@"reloadTableData");
+    native[0] = NSSelectorFromString(@"reloadTableView");
+    native[1] = NSSelectorFromString(@"reloadTableData");
+    native[2] = NSSelectorFromString(@"reloadDataWrap");
     for (int i = 0; i < 3; i++) {
         if (![tlvc respondsToSelector:native[i]]) continue;
         DDLProbeOpen();
@@ -585,37 +586,81 @@ static NSString *DDLTidOfCell(id cell) {
 // 而微信原生“点赞/下拉刷新”之所以能即时刷新点赞行，是因为它让 WCTimeLineCellView 重新绑定【新/被改的 dataItem】
 // → 旧 UICache 失效、按新数据重算布局。
 //
-// 修正（集赞助手同款，最简、不乱折腾）：长按直接调微信原生点赞入口 onLikeItem:（等同点一下赞按钮），
-// 微信自己 toggle likeFlag + 发网络请求 + 调 modifyDataItem:；我们在 %hook WCTimelineMgr modifyDataItem: 里
-// 仅当 item.likeFlag 为真时注入“假赞名列表”（fakeLikeUsers），再 %orig 让微信原生刷新整行。
-// 点赞行重绑 100% 跟原生一致（=集赞助手能即时刷新的原因），不手动 reload、不碰私有控制器。
-// 代价（用户已确认）：长按会真给作者点你自己的那个赞，其余显示的赞名是假的——这是“走原生”的取舍。
+// 方案（照 WCR 反汇编结论，详见 WCR_FakeLike_Mechanism.md）：
+// 长按 → 微信原生弹窗（取消/确认）→ 确认才本地注入假数据 → 原生刷新。
+// 三条关键取舍，每条都对应过去踩过的坑：
+//   1) 不再调 onLikeItem: 踢原生点赞：确认后才改数据 → 不会真给作者点服务器赞，零副作用（无需“真赞”这趟车）。
+//   2) 不再以 likeFlag 为注入条件（WCR 也不依赖）：自己已赞过的 item 长按会把 likeFlag toggle 成 NO，
+//      以它为门槛就永远不触发——这是之前「长按零注入」的根因之一。
+//   3) 注入用 WCR 同款「原始 + 追加」（arrayWithArray + addObjectsFromArray），按 username 去重保证幂等；
+//      刷新出口照 WCR 优先 reloadTableView（原来优先 reloadDataWrap）。
 
 @interface WCOperateFloatView (DDLike)
 - (void)ddl_attachLongPress;
 - (void)ddl_onLikeLongPress:(UILongPressGestureRecognizer *)g;
+- (void)ddl_fakeConfirmed;
+- (void)ddl_fakeCancelled;
 - (BOOL)ddl_reloadTimelineForItem:(id)item;
 - (id)navigationController;
 @end
 
-// 共用注入逻辑：在微信“数据更新上下文”（modifyDataItem）里，仅当 item 已点赞(likeFlag) 时，
-// 把点赞名单/评论名单替换成假数据。WCTimelineMgr 与 WCFacade 两条 modifyDataItem:notify: 路径共用。
-// 关键：集赞助手旧版只 hook WCTimelineMgr 就能命中；8.0.79 点赞数据更新改走 WCFacade 这层门面，
-// 所以必须两条路径都 hook，否则（像之前）注入永远不触发。
-static void DDLInjectFakeData(WCDataItem *di) {
-    if (!DDLikeConfig.shared.likeEnabled || ![di likeFlag]) return;
-    NSMutableArray *comments = [DDLikeHelper fakeCommentsFor:di];
-    di.commentUsers = comments;
-    di.commentCount = (int)comments.count;
-    DDLog(@"[注入] 假评论 tid=%@ n=%lu",
-          ([di respondsToSelector:@selector(tid)] ? [di tid] : nil), (unsigned long)comments.count);
-    NSArray<WCUserComment *> *likes = [DDLikeHelper fakeLikeUsers];
-    if (likes.count) {
-        [di setLikeUsers:[likes mutableCopy]];
+// 微信原生弹窗类（WCUIAlertView.h:19）——带取消 + 确认两个按钮的那款
+@interface WCUIAlertView : NSObject
++ (id)showAlertWithTitle:(id)title message:(id)message
+          cancelBtnTitle:(id)cancelTitle target:(id)cancelTarget sel:(SEL)cancelSel
+               btnTitle:(id)btnTitle target:(id)btnTarget sel:(SEL)btnSel;
+@end
+
+// 已集赞的 tid → @YES
+static NSMutableDictionary *gDDLFakeOn(void) {
+    static NSMutableDictionary *d = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ d = [NSMutableDictionary new]; });
+    return d;
+}
+
+// 弹窗回调时浮层可能已 hide、m_item 失效，这里留一份强引用
+static WCDataItem *gDDLPendingItem = nil;
+
+// 追加式注入（对齐 WCRefineApplyManualFakeEngagementToDataItem）：
+// 保留原始名单 → 追加假的 → 写回。按 username 去重，重复点确认不会把假赞叠加两份。
+static void DDLApplyFakeToItem(WCDataItem *di) {
+    NSString *tid = ([di respondsToSelector:@selector(tid)] ? [di tid] : nil);
+
+    NSMutableArray *likes = ([di respondsToSelector:@selector(likeUsers)] && [di likeUsers])
+                          ? [[di likeUsers] mutableCopy] : [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (WCUserComment *u in likes) {
+        if ([u respondsToSelector:@selector(username)] && u.username) [seen addObject:u.username];
+    }
+    NSUInteger addedLike = 0;
+    for (WCUserComment *u in [DDLikeHelper fakeLikeUsers]) {
+        NSString *name = ([u respondsToSelector:@selector(username)] ? u.username : nil);
+        if (name && [seen containsObject:name]) continue;
+        if (name) [seen addObject:name];
+        [likes addObject:u];
+        addedLike++;
+    }
+    if (addedLike) {
+        [di setLikeUsers:likes];
         [di setLikeCount:(int)likes.count];
         [di setRealLikeCount:(int)likes.count];
-        DDLog(@"[注入] 假赞 tid=%@ n=%lu",
-              ([di respondsToSelector:@selector(tid)] ? [di tid] : nil), (unsigned long)likes.count);
+        DDLog(@"[注入] 假赞 tid=%@ 新增=%lu 合计=%lu", tid,
+              (unsigned long)addedLike, (unsigned long)likes.count);
+    } else {
+        DDLog(@"[注入] 假赞 tid=%@ 无新增（已存在/未配置点赞数）", tid);
+    }
+
+    NSUInteger before = ([di respondsToSelector:@selector(commentUsers)] && [di commentUsers])
+                      ? [di commentUsers].count : 0;
+    NSMutableArray *comments = [[DDLikeHelper fakeCommentsFor:di] mutableCopy];
+    if (comments.count != before) {
+        [di setCommentUsers:comments];
+        [di setCommentCount:(int)comments.count];
+        DDLog(@"[注入] 假评论 tid=%@ %lu→%lu", tid,
+              (unsigned long)before, (unsigned long)comments.count);
+    } else {
+        DDLog(@"[注入] 假评论 tid=%@ 无新增（已达目标数/未配置）", tid);
     }
 }
 
@@ -654,22 +699,55 @@ static void DDLInjectFakeData(WCDataItem *di) {
     if (!item) { DDLog(@"[长按] m_item 为 nil，中止"); return; }
 
     @try {
-        DDLog(@"[长按] 触发前 likeFlag=%d tid=%@", item.likeFlag, item.tid);
-        // 对齐集赞助手成功的本质：靠「用户真实点击点赞按钮」走完整原生路径。
-        // 这里用 sendActionsForControlEvents: 模拟真实点击 m_likeBtn（UIKit 标准事件路径，最接近手点），
-        // 让微信自己 toggle likeFlag + 发网络 + 调 modifyDataItem:（我们在那里注入假赞/假评论）+ 原生刷新 + 收浮层。
-        // 不要直接调 onLikeItem:（长按 context 下它内部不真正发起点赞），也不要手动 [self hide]（会打断异步点赞流程）。
-        id btn = self.m_likeBtn;
-        if ([btn isKindOfClass:[UIControl class]]) {
-            [(UIControl *)btn sendActionsForControlEvents:UIControlEventTouchUpInside];
-            DDLog(@"[长按] 已模拟点击点赞按钮（sendActions）tid=%@ likeFlag=%d", item.tid, item.likeFlag);
+        NSString *tid = ([item respondsToSelector:@selector(tid)] ? [item tid] : nil);
+        gDDLPendingItem = item;   // 浮层收起后弹窗回调仍要用到它
+
+        DDLog(@"[长按] 触发 tid=%@ 已集赞=%d 现有赞=%lu 评论=%lu",
+              tid, (tid && gDDLFakeOn()[tid]) ? 1 : 0,
+              (unsigned long)([item respondsToSelector:@selector(likeUsers)] ? [item likeUsers].count : 0),
+              (unsigned long)([item respondsToSelector:@selector(commentUsers)] ? [item commentUsers].count : 0));
+
+        [self hide];   // 先收起点赞浮层，免得它盖住弹窗
+
+        Class alertCls = objc_getClass("WCUIAlertView");
+        if (alertCls && [alertCls respondsToSelector:@selector(showAlertWithTitle:message:cancelBtnTitle:target:sel:btnTitle:target:sel:)]) {
+            NSUInteger likeN = [DDLikeHelper fakeLikeUsers].count;
+            NSInteger  cmtN  = DDLikeConfig.shared.commentCount;
+            NSString *msg = [NSString stringWithFormat:
+                @"将为这条朋友圈添加 %lu 个点赞、并把评论补齐至 %ld 条。\n仅本地显示，不会发给微信服务器。",
+                (unsigned long)likeN, (long)cmtN];
+            [alertCls showAlertWithTitle:@"集赞助手"
+                                 message:msg
+                         cancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)
+                              btnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
+            DDLog(@"[长按] 已弹微信原生弹窗 tid=%@（取消/确认）", tid);
         } else {
-            DDLog(@"[长按] m_likeBtn 非 UIControl（%@），回退 onLikeItem", NSStringFromClass([btn class]));
-            if ([self respondsToSelector:@selector(onLikeItem:)]) [self onLikeItem:btn];
+            DDLog(@"[长按] WCUIAlertView 不可用，直接执行 tid=%@", tid);
+            [self ddl_fakeConfirmed];
         }
     } @catch (NSException *e) {
         DDLog(@"[长按] 异常已捕获，避免闪退：%@", e.reason);
     }
+}
+
+%new
+- (void)ddl_fakeConfirmed {
+    WCDataItem *item = gDDLPendingItem ?: (WCDataItem *)self.m_item;
+    NSString *tid = (item && [item respondsToSelector:@selector(tid)]) ? [item tid] : nil;
+    if (!item) { DDLog(@"[弹窗] 确认但 item 已失效，跳过"); return; }
+    if (tid) gDDLFakeOn()[tid] = @YES;
+    DDLog(@"[弹窗] 已确认 tid=%@", tid);
+    DDLApplyFakeToItem(item);
+    [self ddl_reloadTimelineForItem:item];
+    gDDLPendingItem = nil;
+}
+
+%new
+- (void)ddl_fakeCancelled {
+    NSString *tid = (gDDLPendingItem && [gDDLPendingItem respondsToSelector:@selector(tid)])
+                  ? [gDDLPendingItem tid] : nil;
+    DDLog(@"[弹窗] 已取消 tid=%@", tid);
+    gDDLPendingItem = nil;
 }
 
 %new
@@ -701,40 +779,6 @@ static void DDLInjectFakeData(WCDataItem *di) {
     }
     return cell;
 }
-%end
-
-%hook WCTimelineMgr
-
-// 集赞助手同款：搭微信原生点赞/数据更新这趟车。长按走原生 onLikeItem:（会真点赞/取消 + 网络 + 刷新），
-// 微信把 likeFlag 置 YES 后调 modifyDataItem: —— 我们在这里 if(likeFlag) 注入“假赞名列表”，再 %orig 让原生刷新。
-// 不手动刷、不碰私有控制器；点赞行重绑全靠微信原生（=集赞助手能即时刷新的原因）。
-// 代价：长按会真给作者点你自己的那个赞（其余赞名是假的）；这是用户已确认的取舍。
-- (void)modifyDataItem:(id)item notify:(BOOL)notify {
-    if ([item isKindOfClass:%c(WCDataItem)]) {
-        WCDataItem *di = (WCDataItem *)item;
-        DDLog(@"[modify] WCTimelineMgr 命中 tid=%@ likeFlag=%d notify=%d",
-              ([di respondsToSelector:@selector(tid)] ? [di tid] : nil), di.likeFlag, notify);
-        DDLInjectFakeData(di);
-    }
-    %orig(item, notify);
-}
-
-%end
-
-%hook WCFacade
-
-// 8.0.79 点赞数据更新实际走 WCFacade 这层门面（集赞助手旧版只 hook WCTimelineMgr 即可，新版不够）。
-// 与 WCTimelineMgr 共用 DDLInjectFakeData，确保无论点赞走哪条路径都能注入假数据。
-- (void)modifyDataItem:(id)item notify:(BOOL)notify {
-    if ([item isKindOfClass:%c(WCDataItem)]) {
-        WCDataItem *di = (WCDataItem *)item;
-        DDLog(@"[modify] WCFacade 命中 tid=%@ likeFlag=%d notify=%d",
-              ([di respondsToSelector:@selector(tid)] ? [di tid] : nil), di.likeFlag, notify);
-        DDLInjectFakeData(di);
-    }
-    %orig(item, notify);
-}
-
 %end
 
 #pragma mark - 日志查看 / 导出
