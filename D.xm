@@ -480,7 +480,6 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
     WCDataItem *item = self.m_item;
     if (!item) return;
 
-    NSString *tid = [item tid];
     gDDLPendingItem = item;
 
     [self hide];             // 先收起点赞浮层，免得盖住弹窗
