@@ -375,14 +375,10 @@ static void DDLStripFakeFromItem(WCDataItem *di, BOOL stripLikes, BOOL stripCmts
 }
 
 // 追加式注入：保留原始名单 → 补齐假的到目标数 → 写回。补齐而非追加固定个数，重复调用幂等。
+// 评论走目标数本身，不再受开关门控：reapply（刷新/重启）按记录恢复，已显示的假评论不会被清掉。
+// 「开关关 = 不新增评论」的拦截放在用户输入入口（ddl_fakeConfirmed），不在这里。
 static void DDLApplyFakeToItem(WCDataItem *di, NSInteger lTarget, NSInteger cTarget) {
     NSString *tid = [di tid];
-
-    // 评论被开关停用时强制评论目标为 0：这一边的假数据会被清掉、持久化记录也记 0，
-    // 刷新或重启后不再补评论（联动「设置评论内容」开关的关闭态）。
-    if (!DDLikeConfig.shared.commentsEnabled) {
-        cTarget = 0;
-    }
 
     // 某一边的目标为 0 表示这次不要那一边（输「5」=只赞，输「/6」=只评论），先清掉上一轮的假数据。
     if (lTarget <= 0 || cTarget <= 0) {
@@ -543,6 +539,9 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
             DDLRemoveFakeFromItem(item, tid);
         }
     } else {
+        // 「设置评论内容」开关关时不允许新增评论：只保留点赞目标，评论目标归零。
+        // 已存在的假评论不受影响（reapply 会按记录恢复），只是关掉开关后不能再新加。
+        if (!DDLikeConfig.shared.commentsEnabled) c = 0;
         DDLikeConfig.shared.likeCount = l;
         DDLikeConfig.shared.commentCount = c;
         DDLApplyFakeToItem(item, l, c);
@@ -696,20 +695,6 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
 
 - (void)onCommentsSwitch:(UISwitch *)s {
     DDLikeConfig.shared.commentsEnabled = s.isOn;
-    if (!s.isOn) {
-        // 停用评论：把已保存记录的评论数清零，避免刷新/重启后继续补评论；
-        // 已显示出来的假评论会在下次 dataItem 产出时被 DDLApplyFakeToItem 的清边逻辑剥掉。
-        NSMutableDictionary *fake = gDDLFake();
-        for (NSString *tid in [fake allKeys]) {
-            NSDictionary *rec = fake[tid];
-            if ([rec[@"c"] integerValue] != 0) {
-                NSMutableDictionary *m = [rec mutableCopy];
-                m[@"c"] = @0;
-                fake[tid] = m;
-            }
-        }
-        DDLFakeSave();
-    }
     [self buildTable];
 }
 
