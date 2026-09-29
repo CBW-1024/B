@@ -28,11 +28,19 @@
 @end
 
 // ========== 功能类前向声明 ==========
+// 游戏结果字段（m_uiGameType / m_uiGameContent / m_nsEmoticonMD5）归属 CExtendInfoOfEmoticon
+// （CExtendInfoOfEmoticon.h:38/37/23），不在 CMessageWrap 上；需经 m_extendInfoWithMsgType
+// （CMessageWrap.h:382）取出扩展信息对象后再读写。
 @interface CMessageWrap : NSObject
 - (unsigned int)m_uiMessageType;
+- (id)m_extendInfoWithMsgType;
+@end
+
+@interface CExtendInfoOfEmoticon : NSObject
 - (unsigned int)m_uiGameType;
 - (unsigned int)m_uiGameContent;
 - (id)m_nsEmoticonMD5;
+- (void)setM_uiGameType:(unsigned int)arg1;
 - (void)setM_uiGameContent:(unsigned int)arg1;
 - (void)setM_nsEmoticonMD5:(id)arg1;
 @end
@@ -161,31 +169,34 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
     }
     
     unsigned int messageType = [msgWrap m_uiMessageType];
-    unsigned int gameType = [msgWrap m_uiGameType];
-    
+    id extendInfo = [msgWrap m_extendInfoWithMsgType];
+    if (!extendInfo) { %orig; return; }
+
+    unsigned int gameType = [extendInfo m_uiGameType];
+
     if (messageType == 47 && (gameType == 1 || gameType == 2)) {
         WCActionSheet *actionSheet = [[%c(WCActionSheet) alloc] initWithTitle:(gameType == 1) ? @"请选择猜拳结果" : @"请选择骰子点数"];
-        
+
         if (gameType == 1) {
             [actionSheet addButtonWithTitle:@"剪刀" eventAction:^{
                 unsigned int content = 1;
                 NSString *gameMD5 = [%c(GameController) getMD5ByGameContent:content];
-                if (gameMD5) [msgWrap setM_nsEmoticonMD5:gameMD5];
-                [msgWrap setM_uiGameContent:content];
+                if (gameMD5) [extendInfo setM_nsEmoticonMD5:gameMD5];
+                [extendInfo setM_uiGameContent:content];
                 %orig(msg, msgWrap);
             }];
             [actionSheet addButtonWithTitle:@"石头" eventAction:^{
                 unsigned int content = 2;
                 NSString *gameMD5 = [%c(GameController) getMD5ByGameContent:content];
-                if (gameMD5) [msgWrap setM_nsEmoticonMD5:gameMD5];
-                [msgWrap setM_uiGameContent:content];
+                if (gameMD5) [extendInfo setM_nsEmoticonMD5:gameMD5];
+                [extendInfo setM_uiGameContent:content];
                 %orig(msg, msgWrap);
             }];
             [actionSheet addButtonWithTitle:@"布" eventAction:^{
                 unsigned int content = 3;
                 NSString *gameMD5 = [%c(GameController) getMD5ByGameContent:content];
-                if (gameMD5) [msgWrap setM_nsEmoticonMD5:gameMD5];
-                [msgWrap setM_uiGameContent:content];
+                if (gameMD5) [extendInfo setM_nsEmoticonMD5:gameMD5];
+                [extendInfo setM_uiGameContent:content];
                 %orig(msg, msgWrap);
             }];
         } else {
@@ -194,8 +205,8 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
                 NSString *title = [NSString stringWithFormat:@"%d点", i];
                 [actionSheet addButtonWithTitle:title eventAction:^{
                     NSString *gameMD5 = [%c(GameController) getMD5ByGameContent:content];
-                    if (gameMD5) [msgWrap setM_nsEmoticonMD5:gameMD5];
-                    [msgWrap setM_uiGameContent:content];
+                    if (gameMD5) [extendInfo setM_nsEmoticonMD5:gameMD5];
+                    [extendInfo setM_uiGameContent:content];
                     %orig(msg, msgWrap);
                 }];
             }
