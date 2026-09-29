@@ -498,7 +498,7 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
 
     Class alertCls = objc_getClass("WCUIAlertView");
     DDLikeConfig *cfg = DDLikeConfig.shared;
-    NSString *msg = @"请输入「点赞数/评论数」\n用＂/＂隔开，例如：8/5\n评论需设置界面自定义\n留空还原";
+    NSString *msg = @"请输入「点赞数/评论数」\n用＂/＂隔开，例如：8/6\n评论需设置界面自定义\n留空还原";
 
     // 弹窗分步构建：alloc/init → 挂输入框与按钮 → 最后统一 show。
     WCUIAlertView *alert = [[alertCls alloc] initWithTitle:@"集赞设置" message:msg];
@@ -507,7 +507,7 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
     [alert setTextFieldDefaultText:(cfg.likeCount > 0 || cfg.commentCount > 0)
                                    ? [NSString stringWithFormat:@"%ld/%ld",
                                       (long)cfg.likeCount, (long)cfg.commentCount]
-                                   : @"5/6"];
+                                   : @"8/6"];
     [alert setRequestKeyWindow:YES];
     [alert addCancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)];
     [alert addBtnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
