@@ -109,12 +109,19 @@ static inline id DDLFacadeService(void) { return DDLService(objc_getClass("WCFac
 - (id)getTextFieldText;
 @end
 
+// WeToast.h:3 / :53 —— 微信内置轻提示，DD小丑助手清理后用的同一个。
+@interface WeToast : NSObject
++ (id)toast;
+- (void)showDoneToastWithText:(id)text;
+@end
+
 #pragma mark - 配置
 
 static NSString * const kDDMLikeEnabled  = @"DDMoments_likeEnabled";
 static NSString * const kDDMLikeCount    = @"DDMoments_likeCount";
 static NSString * const kDDMCommentCount = @"DDMoments_commentCount";
 static NSString * const kDDMLikeComments = @"DDMoments_likeComments";
+static NSString * const kDDMCommentsEnabled = @"DDMoments_commentsEnabled";
 static NSString * const kDDMFakeStore    = @"DDMoments_fakeStore";
 
 @interface DDLikeConfig : NSObject
@@ -122,6 +129,7 @@ static NSString * const kDDMFakeStore    = @"DDMoments_fakeStore";
 @property (assign, nonatomic) NSInteger likeCount;      // 上次弹窗输入的点赞数，用于预填
 @property (assign, nonatomic) NSInteger commentCount;   // 上次弹窗输入的评论数，用于预填
 @property (copy, nonatomic) NSString *comments;          // 评论内容池，多条用 / 分隔
+@property (assign, nonatomic) BOOL commentsEnabled;        // 评论功能总开关：关闭即停用（不生成假评论，已生成的会被清掉）
 + (instancetype)shared;
 @end
 
@@ -141,6 +149,8 @@ static NSString * const kDDMFakeStore    = @"DDMoments_fakeStore";
         _likeCount     = [ud integerForKey:kDDMLikeCount];
         _commentCount  = [ud integerForKey:kDDMCommentCount];
         _comments      = [ud stringForKey:kDDMLikeComments] ?: @"";
+        // 未设置过则默认关闭
+        _commentsEnabled = [ud boolForKey:kDDMCommentsEnabled];
     }
     return self;
 }
@@ -153,6 +163,7 @@ static NSString * const kDDMFakeStore    = @"DDMoments_fakeStore";
 - (void)setLikeEnabled:(BOOL)v      { _likeEnabled = v;   [self persist:@(v) key:kDDMLikeEnabled]; }
 - (void)setLikeCount:(NSInteger)v    { _likeCount = v;     [self persist:@(v) key:kDDMLikeCount]; }
 - (void)setCommentCount:(NSInteger)v { _commentCount = v; [self persist:@(v) key:kDDMCommentCount]; }
+- (void)setCommentsEnabled:(BOOL)v   { _commentsEnabled = v; [self persist:@(v) key:kDDMCommentsEnabled]; }
 
 - (void)setComments:(NSString *)v {
     NSString *val = v ?: @"";
@@ -367,6 +378,12 @@ static void DDLStripFakeFromItem(WCDataItem *di, BOOL stripLikes, BOOL stripCmts
 static void DDLApplyFakeToItem(WCDataItem *di, NSInteger lTarget, NSInteger cTarget) {
     NSString *tid = [di tid];
 
+    // 评论被开关停用时强制评论目标为 0：这一边的假数据会被清掉、持久化记录也记 0，
+    // 刷新或重启后不再补评论（联动「设置评论内容」开关的关闭态）。
+    if (!DDLikeConfig.shared.commentsEnabled) {
+        cTarget = 0;
+    }
+
     // 某一边的目标为 0 表示这次不要那一边（输「5」=只赞，输「/6」=只评论），先清掉上一轮的假数据。
     if (lTarget <= 0 || cTarget <= 0) {
         DDLStripFakeFromItem(di, lTarget <= 0, cTarget <= 0);
@@ -486,36 +503,24 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
     gDDLPendingView = self;  // 弹窗回调还要打到 self，收起后没人持有它，留个强引用
 
     Class alertCls = objc_getClass("WCUIAlertView");
-    BOOL canInput = alertCls
-                 && [alertCls instancesRespondToSelector:@selector(initWithTitle:message:)]
-                 && [alertCls instancesRespondToSelector:@selector(showTextFieldWithMaxLen:)]
-                 && [alertCls instancesRespondToSelector:@selector(getTextFieldText)]
-                 && [alertCls instancesRespondToSelector:@selector(addCancelBtnTitle:target:sel:)]
-                 && [alertCls instancesRespondToSelector:@selector(addBtnTitle:target:sel:)]
-                 && [alertCls instancesRespondToSelector:@selector(show)];
-    if (canInput) {
-        DDLikeConfig *cfg = DDLikeConfig.shared;
-        NSString *msg = @"请输入「点赞数/评论数」\n用＂/＂隔开，例如：8/5\n评论需设置界面自定义\n留空还原";
+    DDLikeConfig *cfg = DDLikeConfig.shared;
+    NSString *msg = @"请输入「点赞数/评论数」\n用＂/＂隔开，例如：8/5\n评论需设置界面自定义\n留空还原";
 
-        // 弹窗必须自建：先 alloc/init，再挂输入框与按钮，最后才 show。
-        // showAlertWithTitle:… 便捷构造器会立即 show，输入框将挂在一个已显示的弹窗上。
-        WCUIAlertView *alert = [[alertCls alloc] initWithTitle:@"集赞设置" message:msg];
-        [alert showTextFieldWithMaxLen:15];
-        // 预填上次的数值；用 setTextFieldDefaultText（真文本），别用 placeholder——
-        // placeholder 只是灰字提示、不算输入内容，直接点确认会读到空串被当成「取消伪装」。
-        [alert setTextFieldDefaultText:(cfg.likeCount > 0 || cfg.commentCount > 0)
-                                       ? [NSString stringWithFormat:@"%ld/%ld",
-                                          (long)cfg.likeCount, (long)cfg.commentCount]
-                                       : @"5/6"];
-        [alert setRequestKeyWindow:YES];
-        [alert addCancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)];
-        [alert addBtnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
-        gDDLCurrentAlert = alert;
-        [alert show];
-    } else {
-        gDDLPendingItem = nil;
-        gDDLPendingView = nil;
-    }
+    // 弹窗必须自建：先 alloc/init，再挂输入框与按钮，最后才 show。
+    // showAlertWithTitle:… 便捷构造器会立即 show，输入框将挂在一个已显示的弹窗上。
+    WCUIAlertView *alert = [[alertCls alloc] initWithTitle:@"集赞设置" message:msg];
+    [alert showTextFieldWithMaxLen:15];
+    // 预填上次的数值；用 setTextFieldDefaultText（真文本），别用 placeholder——
+    // placeholder 只是灰字提示、不算输入内容，直接点确认会读到空串被当成「取消伪装」。
+    [alert setTextFieldDefaultText:(cfg.likeCount > 0 || cfg.commentCount > 0)
+                                   ? [NSString stringWithFormat:@"%ld/%ld",
+                                      (long)cfg.likeCount, (long)cfg.commentCount]
+                                   : @"5/6"];
+    [alert setRequestKeyWindow:YES];
+    [alert addCancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)];
+    [alert addBtnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
+    gDDLCurrentAlert = alert;
+    [alert show];
 }
 
 %new
@@ -526,7 +531,7 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
     NSString *tid = [item tid];
 
     NSString *text = nil;
-    if (gDDLCurrentAlert && [gDDLCurrentAlert respondsToSelector:@selector(getTextFieldText)]) {
+    if (gDDLCurrentAlert) {
         id t = [gDDLCurrentAlert getTextFieldText];
         if ([t isKindOfClass:[NSString class]]) text = t;
     }
@@ -545,7 +550,7 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
 
     // 改完数据后用原生 modifyDataItem:notify: 触发刷新，让点赞行按新数据重绘。
     id svc = DDLFacadeService();
-    if (svc && [svc respondsToSelector:@selector(modifyDataItem:notify:)]) {
+    if (svc) {
         [(WCFacade *)svc modifyDataItem:item notify:YES];
     }
     gDDLCurrentAlert = nil;
@@ -655,21 +660,29 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
                                         on:cfg.likeEnabled]];
 
     if (cfg.likeEnabled) {
-        self.commentsField = [self makeFieldPlaceholder:@"多个内容用/分隔"
-                                                 value:cfg.comments];
-        [sec addCell:[cellMgr normalCellForSel:nil
-                                        target:nil
-                                         title:@"   ↳评论内容"
-                                    rightView:[self inputRowWithField:self.commentsField
-                                                               action:@selector(commentsConfirmed:)]]];
-
-        NSUInteger fakeN = gDDLFake().count;
-        if (fakeN > 0) {
-            [sec addCell:[cellMgr normalCellForSel:@selector(onClearFakeTapped)
-                                            target:self
-                                             title:@"   ↳清除伪装记录"
-                                        rightValue:[NSString stringWithFormat:@"%lu 条", (unsigned long)fakeN]]];
+        // 评论内容开关：打开才展开输入框
+        [sec addCell:[cellMgr switchCellForSel:@selector(onCommentsSwitch:)
+                                        target:self
+                                         title:@"设置评论内容"
+                                            on:cfg.commentsEnabled]];
+        if (cfg.commentsEnabled) {
+            self.commentsField = [self makeFieldPlaceholder:@"多个内容用/分隔"
+                                                     value:cfg.comments];
+            [sec addCell:[cellMgr normalCellForSel:nil
+                                            target:nil
+                                             title:@"   ↳评论内容"
+                                        rightView:[self inputRowWithField:self.commentsField
+                                                                   action:@selector(commentsConfirmed:)]]];
         }
+
+        // 清除伪装记录：始终显示，右侧「清理」按钮（样式对齐 DD小丑助手，不显示个数）
+        UIButton *clearBtn = [self dd_actionButton:@"清理" action:@selector(onClearFakeTapped:)];
+        UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+        [clearRight addSubview:clearBtn];
+        [sec addCell:[cellMgr normalCellForSel:nil
+                                       target:nil
+                                        title:@"   ↳清除伪装记录"
+                                     rightView:clearRight]];
     }
     [_tableViewManager addSection:sec];
 }
@@ -681,11 +694,41 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
     [self buildTable];
 }
 
-// 清掉持久化记录：重启后不再自动恢复；内存里已加载的 dataItem 要等微信刷新/重启才还原。
-- (void)onClearFakeTapped {
+- (void)onCommentsSwitch:(UISwitch *)s {
+    DDLikeConfig.shared.commentsEnabled = s.isOn;
+    if (!s.isOn) {
+        // 停用评论：把已保存记录的评论数清零，避免刷新/重启后继续补评论；
+        // 已显示出来的假评论会在下次 dataItem 产出时被 DDLApplyFakeToItem 的清边逻辑剥掉。
+        NSMutableDictionary *fake = gDDLFake();
+        for (NSString *tid in [fake allKeys]) {
+            NSDictionary *rec = fake[tid];
+            if ([rec[@"c"] integerValue] != 0) {
+                NSMutableDictionary *m = [rec mutableCopy];
+                m[@"c"] = @0;
+                fake[tid] = m;
+            }
+        }
+        DDLFakeSave();
+    }
+    [self buildTable];
+}
+
+// 清掉持久化记录，并立即剥掉当前已加载 dataItem 上的假数据、触发刷新，无需手动下拉朋友圈。
+- (void)onClearFakeTapped:(id)sender {
     [gDDLFake() removeAllObjects];
     DDLFakeSave();
+
+    id facade = DDLFacadeService();
+    long long n = [facade countOfTimelineDataItem];
+    for (long long i = 0; i < n; i++) {
+        id item = [facade getTimelineDataItemOfIndex:i];
+        if ([item isKindOfClass:%c(WCDataItem)]) {
+            DDLStripFakeFromItem(item, YES, YES);
+            [(WCFacade *)facade modifyDataItem:item notify:YES];
+        }
+    }
     [self buildTable];
+    [self dd_showDoneToast:@"记录已清理"];
 }
 
 - (void)commentsConfirmed:(id)sender {
@@ -728,6 +771,26 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
     [container addSubview:btn];
 
     return container;
+}
+
+// 与 DD小丑助手一致的「清理」按钮：system 蓝文字、systemGray5 背景、圆角 6、52×34。
+- (UIButton *)dd_actionButton:(NSString *)title action:(SEL)action {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = CGRectMake(0, 0, 52, 34);
+    [btn setTitle:title forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor systemGray5Color];
+    btn.layer.cornerRadius = 6.0;
+    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return btn;
+}
+
+// 微信内置轻提示，与 DD小丑助手清理提示一致；仅成功反馈，无失败分支。
+- (void)dd_showDoneToast:(NSString *)text {
+    if (!text.length) return;
+    WeToast *toast = [%c(WeToast) toast];
+    if (toast) [toast showDoneToastWithText:text];
 }
 
 #pragma mark UITableView 转发
