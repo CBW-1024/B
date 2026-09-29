@@ -2144,7 +2144,7 @@ static void ddmInjectMarkIntoComment(id c) {
     return container;
 }
 
-// 「清理」按钮：system 蓝文字、systemGray5 背景、圆角 6、52×34。
+// 「清理」按钮：system 文字、systemGray5 背景、圆角 6、52×34。
 - (UIButton *)dd_actionButton:(NSString *)title action:(SEL)action {
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     btn.frame = CGRectMake(0, 0, 52, 34);
