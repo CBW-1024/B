@@ -507,7 +507,7 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
     [alert setTextFieldDefaultText:(cfg.likeCount > 0 || cfg.commentCount > 0)
                                    ? [NSString stringWithFormat:@"%ld/%ld",
                                       (long)cfg.likeCount, (long)cfg.commentCount]
-                                   : @"8/6"];
+                                   : @"0/0"];
     [alert setRequestKeyWindow:YES];
     [alert addCancelBtnTitle:@"取消" target:self sel:@selector(ddl_fakeCancelled)];
     [alert addBtnTitle:@"确认" target:self sel:@selector(ddl_fakeConfirmed)];
