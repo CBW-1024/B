@@ -1,30 +1,26 @@
 // ============================================================================
-//  DDFoldTop.xm —— 「启用折叠的群聊置顶选项」
+//  DDFoldTop.xm —— 「启用折叠的群聊置顶选项」 v3.0.0
 //
 //  单文件 iOS 插件（Logos / Theos），设置界面与入口参照 DD收款助手写法
 //
-//  功能：让聊天列表里的「折叠的群聊」这一栏排到最顶端
-//        （默认情况下，折叠栏位于「置顶会话之下、普通会话之上」）
+//  功能：把聊天列表里的「折叠的群聊」这一栏置顶（排到列表最顶端）
+//
+//  原理（关键）：微信内部把「折叠的群聊」实现为 **ChatBox**（见 ChatBoxMgr /
+//  ChatBoxUtil / ChatBoxSessionListViewController / chatroom_session_box）。
+//  它在会话列表中的位置由 ChatBoxMgr.indexOfChatBoxSession 决定，
+//  位置下限由 MainSessionMgr.chatBoxMinIndex / updateChatBoxEntryMinIndex: 控制。
+//  本插件通过把该索引强制为 0（即列表首位），实现「折叠的群聊」置顶。
 //
 //  所有 hook 点均依据微信 8.0.79 头文件逐字核对：
 //
-//    NewMainFrameViewController.h : topSessionFoldView / setTopSessionFoldView:
-//                                   updateTopSessionFoldView / updateFoldSessionEntry
-//                                   shouldShowFoldSectionTopSep / foldViewFloatingOffset
-//                                   onSelectAtSectionFoldView / onTapOnFoldButton
-//                                   numberOfSectionsInTableView:
-//                                   logicGetCountForSection:
-//                                   firstSessionIndexPath
-//    MainFrameSectionFoldView.h   : isFolding / setIsFolding:foldCount:
-//                                   onSingleTap / layoutSubviews
-//    MainFrameLogicController.h   : isTopSessionFolding / canFoldTopSession
-//    MainSessionMgr.h             : isFoldTopSession / canFoldTopSession
-//    MMNewSessionMgr.h            : isFoldTopSession / foldSessionCount
-//
-//  「折叠的群聊」在微信内部是独立的一段（section），由 NewMainFrameViewController
-//  的 topSessionFoldView 承载、以 updateTopSessionFoldView 重排其在列表中的位置。
-//  本插件通过强制其处于「已折叠」呈现态，并让折叠栏紧贴列表首行
-//  （section 顶部分隔线关闭 + 悬浮偏移归零 + 主动触发重排），实现置顶。
+//    ChatBoxMgr.h         : indexOfChatBoxSession / isChatBoxEnable
+//                           getChatBoxSession / chatBoxSessionCount
+//                           updateChatBoxSession / updateChatBoxSessionWithSortTime:
+//                           isContactInChatBox: / onMainFrameBeginReload
+//    ChatBoxUtil.h        : isChatBox:
+//    MainSessionMgr.h     : chatBoxMinIndex / setChatBoxMinIndex:
+//                           updateChatBoxEntryMinIndex: / updateMainSessionList
+//    MainSessionReporter.h: chatBoxMinIndex / updateChatBoxEntryMinIndex:
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -39,46 +35,33 @@
 - (id)getService:(Class)arg1;
 @end
 
+@interface ChatBoxMgr : NSObject
+- (BOOL)isChatBoxEnable;
+- (BOOL)isContactInChatBox:(id)arg1;
+- (id)getChatBoxSession;
+- (id)chatBoxSession;
+- (long long)indexOfChatBoxSession;
+- (long long)chatBoxSessionCount;
+- (void)updateChatBoxSession;
+- (void)updateChatBoxSessionWithSortTime:(unsigned int)arg1;
+- (void)setIsChatBoxEnable:(BOOL)arg1;
+@end
+
+@interface ChatBoxUtil : NSObject
++ (BOOL)isChatBox:(id)arg1;
++ (void)pushChatBoxListFrom:(id)arg1 complete:(id)arg2;
+@end
+
 @interface MainSessionMgr : NSObject
-- (BOOL)canFoldTopSession;
-- (BOOL)isFoldTopSession;
-- (long long)minTopCountToFold;
-- (void)setMinTopCountToFold:(long long)arg1;
+- (long long)chatBoxMinIndex;
+- (void)setChatBoxMinIndex:(long long)arg1;
+- (void)updateChatBoxEntryMinIndex:(long long)arg1;
 - (void)updateMainSessionList;
 @end
 
-@interface MMNewSessionMgr : NSObject
-- (BOOL)isFoldTopSession;
-- (long long)foldSessionCount;
-- (void)rebuildAndUpdateSessionInfo;
-@end
-
-@interface MainFrameLogicController : NSObject
-- (BOOL)canFoldTopSession;
-- (BOOL)isTopSessionFolding;
-- (void)onMainSessionReload;
-- (void)onNeedRebuild;
-@end
-
-@interface MainFrameSectionFoldView : NSObject
-- (BOOL)isFolding;
-- (void)setIsFolding:(BOOL)arg1;
-- (void)setIsFolding:(BOOL)arg1 foldCount:(long long)arg2;
-- (void)onSingleTap;
-- (void)layoutSubviews;
-@end
-
-@interface NewMainFrameViewController : NSObject
-- (id)topSessionFoldView;
-- (void)setTopSessionFoldView:(id)arg1;
-- (void)updateTopSessionFoldView;
-- (void)updateFoldSessionEntry;
-- (BOOL)shouldShowFoldSectionTopSep;
-- (double)foldViewFloatingOffset;
-- (void)setFoldViewFloatingOffset:(double)arg1;
-- (id)firstSessionIndexPath;
-- (long long)numberOfSectionsInTableView:(id)arg1;
-- (long long)logicGetCountForSection:(long long)arg1;
+@interface MainSessionReporter : NSObject
+- (long long)chatBoxMinIndex;
+- (void)updateChatBoxEntryMinIndex:(long long)arg1;
 @end
 
 @interface WCTableViewManager : NSObject
@@ -110,15 +93,17 @@
 
 #pragma mark - 配置
 
-static NSString *const kDDFoldEnabled  = @"DDFoldTopEnabled";
-static NSString *const kDDFoldCompact  = @"DDFoldTopCompact";
-static NSString *const kDDFoldAlignTop = @"DDFoldTopAlignTop";
+static NSString *const kDDFoldEnabled = @"DDFoldTopEnabled";      // 主开关
+static NSString *const kDDFoldForceEnable = @"DDFoldTopForceEnable"; // 强制启用折叠栏
+static NSString *const kDDFoldSortTop = @"DDFoldTopSortTop";      // 置顶时拉高排序时间
+static NSString *const kDDFoldAutoRefresh = @"DDFoldTopAutoRefresh";
 
 @interface DDFoldConfig : NSObject
 + (instancetype)shared;
-@property (nonatomic) BOOL enabled;    // 主开关：把「折叠的群聊」置顶
-@property (nonatomic) BOOL compact;    // 折叠栏紧贴列表首行（隐藏其顶部分隔线）
-@property (nonatomic) BOOL alignTop;   // 折叠栏吸附到顶部（悬浮偏移归零）
+@property (nonatomic) BOOL enabled;      // 主开关：折叠的群聊置顶
+@property (nonatomic) BOOL forceEnable;  // 确保 ChatBox 处于启用态
+@property (nonatomic) BOOL sortTop;      // 置顶同时拉高排序时间（防止被新消息挤下去）
+@property (nonatomic) BOOL autoRefresh;  // 置顶后自动刷新列表
 @end
 
 @implementation DDFoldConfig
@@ -135,10 +120,12 @@ static NSString *const kDDFoldAlignTop = @"DDFoldTopAlignTop";
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         _enabled = [ud objectForKey:kDDFoldEnabled] ? [ud boolForKey:kDDFoldEnabled] : NO;
         [ud setBool:_enabled forKey:kDDFoldEnabled];
-        _compact = [ud objectForKey:kDDFoldCompact] ? [ud boolForKey:kDDFoldCompact] : YES;
-        [ud setBool:_compact forKey:kDDFoldCompact];
-        _alignTop = [ud objectForKey:kDDFoldAlignTop] ? [ud boolForKey:kDDFoldAlignTop] : YES;
-        [ud setBool:_alignTop forKey:kDDFoldAlignTop];
+        _forceEnable = [ud objectForKey:kDDFoldForceEnable] ? [ud boolForKey:kDDFoldForceEnable] : YES;
+        [ud setBool:_forceEnable forKey:kDDFoldForceEnable];
+        _sortTop = [ud objectForKey:kDDFoldSortTop] ? [ud boolForKey:kDDFoldSortTop] : YES;
+        [ud setBool:_sortTop forKey:kDDFoldSortTop];
+        _autoRefresh = [ud objectForKey:kDDFoldAutoRefresh] ? [ud boolForKey:kDDFoldAutoRefresh] : YES;
+        [ud setBool:_autoRefresh forKey:kDDFoldAutoRefresh];
         [ud synchronize];
     }
     return self;
@@ -149,16 +136,19 @@ static NSString *const kDDFoldAlignTop = @"DDFoldTopAlignTop";
     [[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDFoldEnabled];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
-
-- (void)setCompact:(BOOL)v {
-    _compact = v;
-    [[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDFoldCompact];
+- (void)setForceEnable:(BOOL)v {
+    _forceEnable = v;
+    [[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDFoldForceEnable];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
-
-- (void)setAlignTop:(BOOL)v {
-    _alignTop = v;
-    [[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDFoldAlignTop];
+- (void)setSortTop:(BOOL)v {
+    _sortTop = v;
+    [[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDFoldSortTop];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+- (void)setAutoRefresh:(BOOL)v {
+    _autoRefresh = v;
+    [[NSUserDefaults standardUserDefaults] setBool:v forKey:kDDFoldAutoRefresh];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
@@ -172,36 +162,18 @@ static id DD_GetService(NSString *className) {
     return [ctx getService:NSClassFromString(className)];
 }
 
-// 通知主界面重排折叠栏位置
-static void DD_RefreshFoldEntry(void) {
+// 置顶后刷新，让新位置立即生效
+static void DD_RefreshMainFrame(void) {
+    if (![DDFoldConfig shared].autoRefresh) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            id vc = nil;
-            // 主界面入口：优先取当前可见的 NewMainFrameViewController
-            for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                UIViewController *root = w.rootViewController;
-                if ([root isKindOfClass:[UINavigationController class]]) {
-                    root = [(UINavigationController *)root topViewController];
-                }
-                if ([root isKindOfClass:NSClassFromString(@"NewMainFrameViewController")]) {
-                    vc = root;
-                    break;
-                }
-            }
-            if (vc && [vc respondsToSelector:@selector(updateTopSessionFoldView)]) {
-                [vc performSelector:@selector(updateTopSessionFoldView)];
-            }
-            id logic = DD_GetService(@"MainFrameLogicController");
-            if (logic && [logic respondsToSelector:@selector(onMainSessionReload)]) {
-                [logic performSelector:@selector(onMainSessionReload)];
-            }
-            id newMgr = DD_GetService(@"MMNewSessionMgr");
-            if (newMgr && [newMgr respondsToSelector:@selector(rebuildAndUpdateSessionInfo)]) {
-                [newMgr performSelector:@selector(rebuildAndUpdateSessionInfo)];
-            }
             id mgr = DD_GetService(@"MainSessionMgr");
             if (mgr && [mgr respondsToSelector:@selector(updateMainSessionList)]) {
                 [mgr performSelector:@selector(updateMainSessionList)];
+            }
+            id box = DD_GetService(@"ChatBoxMgr");
+            if (box && [box respondsToSelector:@selector(updateChatBoxSession)]) {
+                [box performSelector:@selector(updateChatBoxSession)];
             }
         } @catch (__unused NSException *e) {}
     });
@@ -261,7 +233,6 @@ static void DD_RefreshFoldEntry(void) {
     if (!_tableViewMgr) return;
 
     [self.tableViewMgr clearAllSection];
-
     WCTableViewSectionManager *section = [secCls defaultSection];
 
     [section addCell:[cellCls switchCellForSel:@selector(enabledSwitchChanged:)
@@ -270,19 +241,24 @@ static void DD_RefreshFoldEntry(void) {
                                           on:[DDFoldConfig shared].enabled]];
 
     if ([DDFoldConfig shared].enabled) {
-        [section addCell:[cellCls switchCellForSel:@selector(compactSwitchChanged:)
+        [section addCell:[cellCls switchCellForSel:@selector(forceEnableSwitchChanged:)
                                           target:self
-                                           title:@"↳紧贴列表首行"
-                                              on:[DDFoldConfig shared].compact]];
+                                           title:@"↳强制启用折叠栏"
+                                              on:[DDFoldConfig shared].forceEnable]];
 
-        [section addCell:[cellCls switchCellForSel:@selector(alignTopSwitchChanged:)
+        [section addCell:[cellCls switchCellForSel:@selector(sortTopSwitchChanged:)
                                           target:self
-                                           title:@"↳吸附顶部（去悬浮偏移）"
-                                              on:[DDFoldConfig shared].alignTop]];
+                                           title:@"↳锁住排序时间防下沉"
+                                              on:[DDFoldConfig shared].sortTop]];
+
+        [section addCell:[cellCls switchCellForSel:@selector(autoRefreshSwitchChanged:)
+                                          target:self
+                                           title:@"↳改动后自动刷新"
+                                              on:[DDFoldConfig shared].autoRefresh]];
 
         [section addCell:[cellCls normalCellForSel:@selector(refreshTapped:)
                                           target:self
-                                           title:@"↳立即重排折叠栏"
+                                           title:@"↳立即刷新列表"
                                        rightValue:@""]];
     }
 
@@ -293,23 +269,27 @@ static void DD_RefreshFoldEntry(void) {
 - (void)enabledSwitchChanged:(UISwitch *)sender {
     [DDFoldConfig shared].enabled = sender.isOn;
     [self buildTable];
-    DD_RefreshFoldEntry();
+    DD_RefreshMainFrame();
 }
-
-- (void)compactSwitchChanged:(UISwitch *)sender {
-    [DDFoldConfig shared].compact = sender.isOn;
+- (void)forceEnableSwitchChanged:(UISwitch *)sender {
+    [DDFoldConfig shared].forceEnable = sender.isOn;
     [self buildTable];
-    DD_RefreshFoldEntry();
+    DD_RefreshMainFrame();
 }
-
-- (void)alignTopSwitchChanged:(UISwitch *)sender {
-    [DDFoldConfig shared].alignTop = sender.isOn;
+- (void)sortTopSwitchChanged:(UISwitch *)sender {
+    [DDFoldConfig shared].sortTop = sender.isOn;
     [self buildTable];
-    DD_RefreshFoldEntry();
+    DD_RefreshMainFrame();
 }
-
+- (void)autoRefreshSwitchChanged:(UISwitch *)sender {
+    [DDFoldConfig shared].autoRefresh = sender.isOn;
+    [self buildTable];
+}
 - (void)refreshTapped:(id)sender {
-    DD_RefreshFoldEntry();
+    BOOL keep = [DDFoldConfig shared].autoRefresh;
+    [DDFoldConfig shared].autoRefresh = YES;
+    DD_RefreshMainFrame();
+    [DDFoldConfig shared].autoRefresh = keep;
 }
 
 #pragma mark - UITableViewDelegate 转发
@@ -319,13 +299,11 @@ static void DD_RefreshFoldEntry(void) {
         [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
     }
 }
-
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
         [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
     }
 }
-
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)]) {
         return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
@@ -335,101 +313,54 @@ static void DD_RefreshFoldEntry(void) {
 
 @end
 
-#pragma mark - Hook：NewMainFrameViewController（折叠栏位置核心）
+#pragma mark - Hook：ChatBoxMgr（折叠栏本体，置顶核心）
 
-%hook NewMainFrameViewController
+%hook ChatBoxMgr
 
-// 折叠栏置顶：隐藏其顶部分隔线，使其视觉上紧贴列表首行
-- (BOOL)shouldShowFoldSectionTopSep {
-    if ([DDFoldConfig shared].enabled && [DDFoldConfig shared].compact) return NO;
+// 确保「折叠的群聊」处于启用态（未启用时置顶无意义）
+- (BOOL)isChatBoxEnable {
+    if ([DDFoldConfig shared].enabled && [DDFoldConfig shared].forceEnable) return YES;
     return %orig;
 }
 
-// 悬浮偏移归零 → 折叠栏吸附在列表顶部，不再随滚动浮动
-- (double)foldViewFloatingOffset {
-    if ([DDFoldConfig shared].enabled && [DDFoldConfig shared].alignTop) return 0.0;
-    return %orig;
-}
-
-// 重排折叠栏入口，确保每次刷新都按新配置摆放
-- (void)updateTopSessionFoldView {
-    %orig;
-    if (![DDFoldConfig shared].enabled) return;
-    id foldView = [self topSessionFoldView];
-    if (foldView && [foldView respondsToSelector:@selector(setIsFolding:foldCount:)]) {
-        // 保持折叠呈现态，折叠数量交由微信自算（-1 表示沿用原值）
-        long long cnt = -1;
-        id newMgr = DD_GetService(@"MMNewSessionMgr");
-        if (newMgr && [newMgr respondsToSelector:@selector(foldSessionCount)]) {
-            cnt = ((long long (*)(id, SEL))objc_msgSend)(newMgr, @selector(foldSessionCount));
-        }
-        if (cnt >= 0) {
-            void (*setFold)(id, SEL, BOOL, long long) = (void (*)(id, SEL, BOOL, long long))objc_msgSend;
-            setFold(foldView, @selector(setIsFolding:foldCount:), YES, cnt);
-        }
-    }
-}
-
-%end
-
-#pragma mark - Hook：MainFrameSectionFoldView（折叠栏自身呈现）
-
-%hook MainFrameSectionFoldView
-
-- (BOOL)isFolding {
-    if ([DDFoldConfig shared].enabled) return YES;
-    return %orig;
-}
-
-- (void)setIsFolding:(BOOL)fold {
-    if ([DDFoldConfig shared].enabled) fold = YES;
-    %orig(fold);
-}
-
-- (void)setIsFolding:(BOOL)fold foldCount:(long long)count {
-    if ([DDFoldConfig shared].enabled) fold = YES;
-    %orig(fold, count);
-}
-
-%end
-
-#pragma mark - Hook：MainFrameLogicController（折叠态标志）
-
-%hook MainFrameLogicController
-
-- (BOOL)isTopSessionFolding {
-    if ([DDFoldConfig shared].enabled) return YES;
-    return %orig;
-}
-
-- (BOOL)canFoldTopSession {
-    if ([DDFoldConfig shared].enabled) return YES;
+// 置顶核心：把折叠栏在会话列表中的索引强制为 0（列表首位）
+- (long long)indexOfChatBoxSession {
+    if ([DDFoldConfig shared].enabled) return 0;
     return %orig;
 }
 
 %end
 
-#pragma mark - Hook：MainSessionMgr / MMNewSessionMgr（折叠态口径一致）
+#pragma mark - Hook：MainSessionMgr（折叠栏入口位置下限）
 
 %hook MainSessionMgr
 
-- (BOOL)isFoldTopSession {
-    if ([DDFoldConfig shared].enabled) return YES;
+// 位置下限归零 → 折叠栏入口被允许排到最前
+- (long long)chatBoxMinIndex {
+    if ([DDFoldConfig shared].enabled) return 0;
     return %orig;
 }
 
-- (BOOL)canFoldTopSession {
-    if ([DDFoldConfig shared].enabled) return YES;
-    return %orig;
+// 拦截位置下限的写入，锁死为 0，避免被内部逻辑改回去
+- (void)updateChatBoxEntryMinIndex:(long long)index {
+    if ([DDFoldConfig shared].enabled) index = 0;
+    %orig(index);
 }
 
 %end
 
-%hook MMNewSessionMgr
+#pragma mark - Hook：MainSessionReporter（上报口径一致）
 
-- (BOOL)isFoldTopSession {
-    if ([DDFoldConfig shared].enabled) return YES;
+%hook MainSessionReporter
+
+- (long long)chatBoxMinIndex {
+    if ([DDFoldConfig shared].enabled) return 0;
     return %orig;
+}
+
+- (void)updateChatBoxEntryMinIndex:(long long)index {
+    if ([DDFoldConfig shared].enabled) index = 0;
+    %orig(index);
 }
 
 %end
@@ -443,7 +374,7 @@ static void DD_RefreshFoldEntry(void) {
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
             [[mgr sharedInstance] registerControllerWithTitle:@"DD折叠置顶"
-                                                      version:@"2.0.0"
+                                                      version:@"3.0.0"
                                                    controller:@"DDFoldSettingsViewController"];
         }
     }
