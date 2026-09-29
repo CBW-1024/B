@@ -2,8 +2,9 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-// ========== 微信内部类前向声明（类型对齐 class-dump 头文件；
-//   CMessageWrap 的 game/md5 访问器运行时由微信二进制实现，这里仅补签名让 -Werror 编译通过） ==========
+// ========== 微信内部类前向声明 ==========
+// 插件需要调用微信私有 API，这里只声明用到的类与方法签名，
+// 具体实现由微信二进制在运行时提供。
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -19,8 +20,8 @@
 @end
 
 @interface WCTableViewManager : NSObject
-- (id)initWithFrame:(CGRect)arg1 style:(NSInteger)arg2;   // 头文件把 UITableViewStyle 误解析为 CGSize，按真实枚举(NSInteger)用
-- (id)getTableView;                                       // WCTableViewManager.h:17
+- (id)initWithFrame:(CGRect)arg1 style:(NSInteger)arg2;
+- (id)getTableView;
 @property (nonatomic, weak) id delegate;
 - (void)clearAllSection;
 - (void)addSection:(id)arg1;
@@ -28,9 +29,8 @@
 @end
 
 // ========== 功能类前向声明 ==========
-// 游戏结果字段（m_uiGameType / m_uiGameContent / m_nsEmoticonMD5）归属 CExtendInfoOfEmoticon
-// （CExtendInfoOfEmoticon.h:38/37/23），不在 CMessageWrap 上；需经 m_extendInfoWithMsgType
-// （CMessageWrap.h:382）取出扩展信息对象后再读写。
+// 猜拳 / 骰子的结果字段（类型、内容、MD5）位于 CExtendInfoOfEmoticon，
+// 需先通过 m_extendInfoWithMsgType 取出扩展信息对象，再对其读写。
 @interface CMessageWrap : NSObject
 - (unsigned int)m_uiMessageType;
 - (id)m_extendInfoWithMsgType;
@@ -96,7 +96,7 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
 
 @end
 
-// ========== 设置界面（结构参考 DD集赞助手） ==========
+// ========== 设置界面 ==========
 @interface DDGameCheatSettingsViewController : UIViewController
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @end
@@ -105,7 +105,7 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"DD猜拳骰子辅助";
+    self.title = @"猜拳骰子设置";
 
     if (!self.tableViewManager) {
         self.tableViewManager = [[objc_getClass("WCTableViewManager") alloc]
@@ -123,7 +123,7 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
 
     [self buildTable];
 
-    UITableView *tableView = [self.tableViewManager getTableView];   // WCTableViewManager.h:17
+    UITableView *tableView = [self.tableViewManager getTableView];
     tableView.frame = self.view.bounds;
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
@@ -145,10 +145,10 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
     Class cellMgr = objc_getClass("WCTableViewCellManager");
     Class secMgr  = objc_getClass("WCTableViewSectionManager");
 
-    WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"猜拳骰子"];
+    WCTableViewSectionManager *sec = [secMgr sectionWithHeader:@"游戏设置"];
     [sec addCell:[cellMgr switchCellForSel:@selector(onSwitchChanged:)
                                     target:self
-                                     title:@"启用猜拳骰子控制"
+                                     title:@"猜拳骰子控制"
                                         on:[DDGameCheatConfig sharedConfig].gameCheatEnabled]];
     [_tableViewManager addSection:sec];
 }
@@ -170,7 +170,6 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
     
     unsigned int messageType = [msgWrap m_uiMessageType];
     id extendInfo = [msgWrap m_extendInfoWithMsgType];
-    if (!extendInfo) { %orig; return; }
 
     unsigned int gameType = [extendInfo m_uiGameType];
 
@@ -181,21 +180,21 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
             [actionSheet addButtonWithTitle:@"剪刀" eventAction:^{
                 unsigned int content = 1;
                 NSString *gameMD5 = [%c(GameController) getMD5ByGameContent:content];
-                if (gameMD5) [extendInfo setM_nsEmoticonMD5:gameMD5];
+                [extendInfo setM_nsEmoticonMD5:gameMD5];
                 [extendInfo setM_uiGameContent:content];
                 %orig(msg, msgWrap);
             }];
             [actionSheet addButtonWithTitle:@"石头" eventAction:^{
                 unsigned int content = 2;
                 NSString *gameMD5 = [%c(GameController) getMD5ByGameContent:content];
-                if (gameMD5) [extendInfo setM_nsEmoticonMD5:gameMD5];
+                [extendInfo setM_nsEmoticonMD5:gameMD5];
                 [extendInfo setM_uiGameContent:content];
                 %orig(msg, msgWrap);
             }];
             [actionSheet addButtonWithTitle:@"布" eventAction:^{
                 unsigned int content = 3;
                 NSString *gameMD5 = [%c(GameController) getMD5ByGameContent:content];
-                if (gameMD5) [extendInfo setM_nsEmoticonMD5:gameMD5];
+                [extendInfo setM_nsEmoticonMD5:gameMD5];
                 [extendInfo setM_uiGameContent:content];
                 %orig(msg, msgWrap);
             }];
@@ -205,7 +204,7 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
                 NSString *title = [NSString stringWithFormat:@"%d点", i];
                 [actionSheet addButtonWithTitle:title eventAction:^{
                     NSString *gameMD5 = [%c(GameController) getMD5ByGameContent:content];
-                    if (gameMD5) [extendInfo setM_nsEmoticonMD5:gameMD5];
+                    [extendInfo setM_nsEmoticonMD5:gameMD5];
                     [extendInfo setM_uiGameContent:content];
                     %orig(msg, msgWrap);
                 }];
@@ -219,10 +218,8 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
                 break;
             }
         }
-        if (windowScene && actionSheet) {
-            UIWindow *window = windowScene.windows.firstObject;
-            if (window) [actionSheet showInView:window];
-        }
+        UIWindow *window = windowScene.windows.firstObject;
+        [actionSheet showInView:window];
         return;
     }
     
@@ -235,7 +232,7 @@ static NSString * const kDDGameCheatEnabledKey = @"DDGameCheat_Enabled";
 %ctor {
     @autoreleasepool {
         if (NSClassFromString(@"WCPluginsMgr")) {
-            [[objc_getClass("WCPluginsMgr") sharedInstance] registerControllerWithTitle:@"DD猜拳骰子辅助" version:@"1.0.0" controller:@"DDGameCheatSettingsViewController"];
+            [[objc_getClass("WCPluginsMgr") sharedInstance] registerControllerWithTitle:@"DD猜拳骰子助手" version:@"1.0.0" controller:@"DDGameCheatSettingsViewController"];
         }
     }
 }
