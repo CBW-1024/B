@@ -67,6 +67,7 @@ static inline id DDLFacadeService(void) { return DDLService(objc_getClass("WCFac
 @interface WCFacade : NSObject
 - (id)getTimelineDataInCacheByItemID:(id)itemID;
 - (id)getTimelineDataItemOfIndex:(long long)index;
+- (long long)countOfTimelineDataItem;
 - (void)modifyDataItem:(id)arg1 notify:(BOOL)arg2;
 @end
 
