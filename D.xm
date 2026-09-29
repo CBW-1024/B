@@ -262,6 +262,8 @@
 
 @interface WCPayTransferMessageViewModel : WCPayBaseMessageViewModel
 - (CMessageWrap *)messageWrap;
+- (id)titleText;
+- (id)descText;
 @end
 
 // WCPayBaseMessageCellView 无自身方法，只作为 WCPayTransferMessageCellView 的父类占位。
@@ -1194,6 +1196,48 @@ static void DDApplyTransferOverrideToModel(id vm) {
 - (void)dealloc {
     %orig;
     DDTransferDetailLeave();
+}
+%end
+
+#pragma mark - 转账金额实时生效修复（读取点拦截，替代 m_nsContent 传播依赖）
+// 原来只在 setViewModel:/layoutContentView 改 m_nsContent，已显示的 cell 因金额已缓存而不刷新，
+// 必须退出重进（重建 cell）才生效。改为在“读取金额”的访问器上直接返回改写值：
+// cell 每次 layout 重读 titleText/descText 都会拿到最新改写值，首次修改也实时生效。
+// 详情页仍走原 MMUILabel 兜底，原 setViewModel:/layoutContentView 逻辑保持不变。
+%hook WCPayTransferMessageViewModel
+- (id)titleText {
+    NSString *s = %orig;
+    if ([DDGlobalConfig shared].transferEnabled) {
+        NSString *amt = DDJokerCachedAmount([self messageWrap]);
+        if (amt.length) {
+            static NSRegularExpression *re;
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{
+                re = [NSRegularExpression regularExpressionWithPattern:@"¥\\d[\\d,]*\\.\\d{2}" options:0 error:nil];
+            });
+            s = [re stringByReplacingMatchesInString:s options:0
+                        range:NSMakeRange(0, s.length)
+                        withTemplate:[@"¥" stringByAppendingString:amt]];
+        }
+    }
+    return s;
+}
+- (id)descText {
+    NSString *s = %orig;
+    if ([DDGlobalConfig shared].transferEnabled) {
+        NSString *amt = DDJokerCachedAmount([self messageWrap]);
+        if (amt.length) {
+            static NSRegularExpression *re;
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{
+                re = [NSRegularExpression regularExpressionWithPattern:@"¥\\d[\\d,]*\\.\\d{2}" options:0 error:nil];
+            });
+            s = [re stringByReplacingMatchesInString:s options:0
+                        range:NSMakeRange(0, s.length)
+                        withTemplate:[@"¥" stringByAppendingString:amt]];
+        }
+    }
+    return s;
 }
 %end
 
