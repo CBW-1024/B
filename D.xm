@@ -1998,7 +1998,7 @@ static void ddmInjectMarkIntoComment(id c) {
                                                                    action:@selector(commentsConfirmed:)]]];
         }
 
-        // 清除伪装记录：始终显示，右侧「清理」按钮（样式对齐 DD小丑助手，不显示个数）
+        // 清除伪装记录：始终显示，右侧「清理」按钮
         UIButton *clearBtn = [self dd_actionButton:@"清理" action:@selector(onClearFakeTapped:)];
         UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
         [clearRight addSubview:clearBtn];
@@ -2144,7 +2144,7 @@ static void ddmInjectMarkIntoComment(id c) {
     return container;
 }
 
-// 与 DD小丑助手一致的「清理」按钮：system 蓝文字、systemGray5 背景、圆角 6、52×34。
+// 「清理」按钮：system 蓝文字、systemGray5 背景、圆角 6、52×34。
 - (UIButton *)dd_actionButton:(NSString *)title action:(SEL)action {
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     btn.frame = CGRectMake(0, 0, 52, 34);
@@ -2157,7 +2157,7 @@ static void ddmInjectMarkIntoComment(id c) {
     return btn;
 }
 
-// 微信内置轻提示，与 DD小丑助手清理提示一致；仅成功反馈，无失败分支。
+// 微信内置WeToast轻提示
 - (void)dd_showDoneToast:(NSString *)text {
     if (!text.length) return;
     WeToast *toast = [%c(WeToast) toast];
