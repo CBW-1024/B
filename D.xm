@@ -24,7 +24,6 @@
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightView:(id)arg4;
 @end
 
@@ -130,7 +129,7 @@ static NSString * const kDDMFakeStore    = @"DDMoments_fakeStore";
 @property (assign, nonatomic) NSInteger likeCount;      // 上次弹窗输入的点赞数，用于预填
 @property (assign, nonatomic) NSInteger commentCount;   // 上次弹窗输入的评论数，用于预填
 @property (copy, nonatomic) NSString *comments;          // 评论内容池，多条用 / 分隔
-@property (assign, nonatomic) BOOL commentsEnabled;        // 评论功能总开关：关闭即停用（不生成假评论，已生成的会被清掉）
+@property (assign, nonatomic) BOOL commentsEnabled;        // 评论总开关：关闭则收起输入框、不再新增假评论（已存在的保留）
 + (instancetype)shared;
 @end
 
@@ -375,9 +374,7 @@ static void DDLStripFakeFromItem(WCDataItem *di, BOOL stripLikes, BOOL stripCmts
     }
 }
 
-// 追加式注入：保留原始名单 → 补齐假的到目标数 → 写回。补齐而非追加固定个数，重复调用幂等。
-// 评论走目标数本身，不再受开关门控：reapply（刷新/重启）按记录恢复，已显示的假评论不会被清掉。
-// 「开关关 = 不新增评论」的拦截放在用户输入入口（ddl_fakeConfirmed），不在这里。
+// 追加式注入：保留真实名单，把假数据补齐到目标数后写回；重复调用幂等。
 static void DDLApplyFakeToItem(WCDataItem *di, NSInteger lTarget, NSInteger cTarget) {
     NSString *tid = [di tid];
 
@@ -503,12 +500,10 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
     DDLikeConfig *cfg = DDLikeConfig.shared;
     NSString *msg = @"请输入「点赞数/评论数」\n用＂/＂隔开，例如：8/5\n评论需设置界面自定义\n留空还原";
 
-    // 弹窗必须自建：先 alloc/init，再挂输入框与按钮，最后才 show。
-    // showAlertWithTitle:… 便捷构造器会立即 show，输入框将挂在一个已显示的弹窗上。
+    // 弹窗分步构建：alloc/init → 挂输入框与按钮 → 最后统一 show。
     WCUIAlertView *alert = [[alertCls alloc] initWithTitle:@"集赞设置" message:msg];
     [alert showTextFieldWithMaxLen:15];
-    // 预填上次的数值；用 setTextFieldDefaultText（真文本），别用 placeholder——
-    // placeholder 只是灰字提示、不算输入内容，直接点确认会读到空串被当成「取消伪装」。
+    // 预填上次的数值；用 setTextFieldDefaultText 写入真实文本（而非 placeholder 灰字提示）。
     [alert setTextFieldDefaultText:(cfg.likeCount > 0 || cfg.commentCount > 0)
                                    ? [NSString stringWithFormat:@"%ld/%ld",
                                       (long)cfg.likeCount, (long)cfg.commentCount]
@@ -540,8 +535,7 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
             DDLRemoveFakeFromItem(item, tid);
         }
     } else {
-        // 「设置评论内容」开关关时不允许新增评论：只保留点赞目标，评论目标归零。
-        // 已存在的假评论不受影响（reapply 会按记录恢复），只是关掉开关后不能再新加。
+        // 「设置评论内容」未开启时不新增评论：评论目标归零，仅保留点赞目标。
         if (!DDLikeConfig.shared.commentsEnabled) c = 0;
         DDLikeConfig.shared.likeCount = l;
         DDLikeConfig.shared.commentCount = c;
