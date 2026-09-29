@@ -657,14 +657,14 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
         // 评论内容开关：打开才展开输入框
         [sec addCell:[cellMgr switchCellForSel:@selector(onCommentsSwitch:)
                                         target:self
-                                         title:@"设置评论内容"
+                                         title:@"↳设置评论内容"
                                             on:cfg.commentsEnabled]];
         if (cfg.commentsEnabled) {
             self.commentsField = [self makeFieldPlaceholder:@"多个内容用/分隔"
                                                      value:cfg.comments];
             [sec addCell:[cellMgr normalCellForSel:nil
                                             target:nil
-                                             title:@"   ↳评论内容"
+                                             title:@"   ↳自定义内容"
                                         rightView:[self inputRowWithField:self.commentsField
                                                                    action:@selector(commentsConfirmed:)]]];
         }
@@ -675,7 +675,7 @@ static const void *kDDLLongPressKey = &kDDLLongPressKey;
         [clearRight addSubview:clearBtn];
         [sec addCell:[cellMgr normalCellForSel:nil
                                        target:nil
-                                        title:@"   ↳清除伪装记录"
+                                        title:@"↳清空伪装记录"
                                      rightView:clearRight]];
     }
     [_tableViewManager addSection:sec];
