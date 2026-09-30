@@ -483,9 +483,14 @@ static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提�
 }
 
 // 微信原生「正在处理」提示（loading 样式 + 转圈）。PHImageManager 回调可能在后台线程，统一回主线程。
+// 注意：WeToast 是微信私有类，不在 tweak 的链接路径里；因此必须用 NSClassFromString 取 Class 变量后
+// 再发消息（[cls toast]），绝不能写 [WeToast toast]——后者会让编译器生成 OBJC_CLASS_$_WeToast 链接符号，
+// 链接期报 undefined symbols。手写 @interface 仅用于编译期类型检查，不参与符号引用。
 - (void)dd_showShelling {
     dispatch_async(dispatch_get_main_queue(), ^{
-        WeToast *toast = [WeToast toast];
+        Class cls = NSClassFromString(@"WeToast");
+        if (!cls) return;
+        WeToast *toast = [cls toast];
         if (!toast) return;
         [toast setLoadingStyle:YES];
         [toast showToastWithText:@"正在套壳"];
@@ -505,7 +510,9 @@ static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提�
     dispatch_async(dispatch_get_main_queue(), ^{
         [gBusyToast hideWithAnimated:YES];
         gBusyToast = nil;
-        [[WeToast toast] showDoneToastWithText:@"套壳成功"];
+        Class cls = NSClassFromString(@"WeToast");
+        if (!cls) return;
+        [[cls toast] showDoneToastWithText:@"套壳成功"];
     });
 }
 
