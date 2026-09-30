@@ -358,6 +358,31 @@ static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提�
 static dispatch_queue_t gShellQueue = nil;
 static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃后续连拍）
 
+// 微信原生提示：开始 loading / 收起 loading / 成功（运行时取 WeToast 类）
+static void DD_ShowShelling(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        Class cls = NSClassFromString(@"WeToast");
+        WeToast *toast = [cls toast];
+        [toast setLoadingStyle:YES];
+        [toast showToastWithText:@"正在套壳"];
+        gBusyToast = toast;
+    });
+}
+static void DD_HideShelling(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [gBusyToast hideWithAnimated:YES];
+        gBusyToast = nil;
+    });
+}
+static void DD_ShowShellDone(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [gBusyToast hideWithAnimated:YES];
+        gBusyToast = nil;
+        Class cls = NSClassFromString(@"WeToast");
+        [[cls toast] showDoneToastWithText:@"套壳成功"];
+    });
+}
+
 @interface DDShellWatcher : NSObject
 + (instancetype)shared;
 - (void)shellLatestScreenshotWithCompletion:(void (^)(void))completion;
@@ -428,33 +453,11 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
     });
 }
 
-// 通过微信内置提示控件显示 loading / 成功提示（运行时取类）
-- (void)dd_showShelling {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        Class cls = NSClassFromString(@"WeToast");
-        WeToast *toast = [cls toast];
-        [toast setLoadingStyle:YES];
-        [toast showToastWithText:@"正在套壳"];
-        gBusyToast = toast;
-    });
-}
+// 微信原生提示的实例包装（转发到文件级静态函数，供截图路径调用）
+- (void)dd_showShelling { DD_ShowShelling(); }
+- (void)dd_hideShelling { DD_HideShelling(); }
+- (void)dd_showShellDone { DD_ShowShellDone(); }
 
-- (void)dd_hideShelling {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [gBusyToast hideWithAnimated:YES];
-        gBusyToast = nil;
-    });
-}
-
-// 收起「正在套壳」并弹出微信原生成功提示（带勾选图标）
-- (void)dd_showShellDone {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [gBusyToast hideWithAnimated:YES];
-        gBusyToast = nil;
-        Class cls = NSClassFromString(@"WeToast");
-        [[cls toast] showDoneToastWithText:@"套壳成功"];
-    });
-}
 
 @end
 
@@ -601,11 +604,11 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
         UIImage *img = info[UIImagePickerControllerOriginalImage];
         DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
         if (!img || !t) return;
-        [self dd_showShelling];
+        DD_ShowShelling();
         UIImage *outImg = DD_ComposeShellImage(img, t);
-        if (!outImg) { [self dd_hideShelling]; return; } // 合成失败：静默收起提示
+        if (!outImg) { DD_HideShelling(); return; } // 合成失败：静默收起提示
         DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
-        [self dd_showShellDone];
+        DD_ShowShellDone();
     }];
 }
 
@@ -640,4 +643,3 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
         }
     }
 }
-h
