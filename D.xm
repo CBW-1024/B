@@ -1239,12 +1239,17 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     // 导航栏：和素材库页同一套（不透明灰 + 无阴影线）
     DD_ApplyNavigationBarAppearance(self);
 
+    // 页面底色：和素材库页、导航栏同一个灰（systemGroupedBackgroundColor）。
+    // 不显式设的话，InsetGrouped 表格的 inset 空隙会露默认白底，跟顶部灰导航栏对不上
+    self.view.backgroundColor = DD_PageBackgroundColor();
+
     [self ensureTableViewMgr];
     if (!_tableViewMgr) return;
     UITableView *tableView = [self.tableViewMgr getTableView];
     tableView.frame = self.view.bounds;
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
+    tableView.backgroundColor = DD_PageBackgroundColor(); // 分组灰，和页面/导航栏一致；section 卡片是白
     [self.view addSubview:tableView];
 }
 
