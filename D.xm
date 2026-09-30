@@ -728,9 +728,11 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 //   点「导出」用微信原生 WCActionSheet 弹「选择导出方式」：选择导出 / 全部导出（取消自带）；
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
 //   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择，选「选择」同样进选择态。
-@interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout>
+@interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
+@property (nonatomic, strong) UISearchBar *searchBar;
 @property (nonatomic, strong) UICollectionView *collectionView;
-@property (nonatomic, strong) NSArray<NSString *> *names;
+@property (nonatomic, strong) NSArray<NSString *> *allNames;       // 排序后的全量，搜索只是过滤展示
+@property (nonatomic, strong) NSArray<NSString *> *names;          // 当前展示（可能是过滤结果）
 @property (nonatomic) BOOL isSelectMode;                          // 是否处于选择态
 @property (nonatomic, strong) NSMutableSet<NSString *> *picked;    // 选择态下勾选的模板
 @property (nonatomic, copy) NSString *tappedTpl;                   // 刚弹出操作菜单的那个模板
@@ -747,7 +749,16 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
     layout.minimumLineSpacing = kDDShellTplGap;
     layout.sectionInset = UIEdgeInsetsMake(kDDShellTplGap, kDDShellTplGap, kDDShellTplGap, kDDShellTplGap);
 
-    self.collectionView = [[UICollectionView alloc] initWithFrame:self.view.bounds collectionViewLayout:layout];
+    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44.0)];
+    self.searchBar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    self.searchBar.placeholder = @"搜索套壳名称";
+    self.searchBar.delegate = self;
+    [self.view addSubview:self.searchBar];
+
+    CGRect cvFrame = self.view.bounds;
+    cvFrame.origin.y = 44.0;
+    cvFrame.size.height -= 44.0;
+    self.collectionView = [[UICollectionView alloc] initWithFrame:cvFrame collectionViewLayout:layout];
     self.collectionView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     if (@available(iOS 13.0, *)) {
         self.collectionView.backgroundColor = [UIColor systemBackgroundColor];
@@ -768,16 +779,39 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 - (void)reloadList {
     NSMutableArray *all = [DD_AllTemplateNames() mutableCopy];
     [all sortUsingSelector:@selector(localizedStandardCompare:)];
-    self.names = all;
-    [self updateTitle];
+    self.allNames = all;
+    [self applySearchFilter];
     [self updateEmptyState];
-    [self.collectionView reloadData];
 }
 
 - (void)updateTitle {
     self.title = self.isSelectMode
         ? [NSString stringWithFormat:@"已选择（%ld个）", (long)self.picked.count]
         : [NSString stringWithFormat:@"套壳库（%ld个）", (long)self.names.count];
+}
+
+// 搜索过滤：只动展示的 names，全量 allNames 不变；标题跟着显示过滤后的数量
+- (void)applySearchFilter {
+    NSString *kw = (self.searchBar.text ?: @"").lowercaseString;
+    if (!kw.length) {
+        self.names = self.allNames;
+    } else {
+        NSMutableArray *m = [NSMutableArray array];
+        for (NSString *n in self.allNames) {
+            if ([n.lowercaseString containsString:kw]) [m addObject:n];
+        }
+        self.names = m;
+    }
+    [self updateTitle];
+    [self.collectionView reloadData];
+}
+
+- (void)searchBar:(UISearchBar *)sb textDidChange:(NSString *)text {
+    [self applySearchFilter];
+}
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)sb {
+    [sb resignFirstResponder];
 }
 
 // 空态用背景视图占满，不占一个格子
@@ -850,9 +884,6 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 //   普通态：导入 / 导出
 //   选择态：取消 / 导出 / 删除
 - (void)setupNavigationBar {
-    self.navigationItem.leftBarButtonItems = nil;
-    self.navigationItem.leftBarButtonItem = nil;
-
     UIBarButtonItem *right, *mid, *left;
     if (self.isSelectMode) {
         right = [self navButton:@"取消" action:@selector(cancelExportSelectMode)];
@@ -866,10 +897,12 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
         mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
         left  = nil;
     }
+    // rightBarButtonItems 数组首个显示在最靠屏幕边缘：取消 / 导入贴着右边缘，
+    // 左侧不动，系统返回箭头保持原位
     NSMutableArray *items = [NSMutableArray array];
-    if (left)  [items addObject:left];
-    if (mid)   [items addObject:mid];
     if (right) [items addObject:right];
+    if (mid)   [items addObject:mid];
+    if (left)  [items addObject:left];
     self.navigationItem.rightBarButtonItems = items;
 }
 
@@ -884,9 +917,9 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
     id sheet = [[sheetCls alloc] initWithTitle:title
                                        delegate:self
-                              cancelButtonTitle:nil      // 取消按钮 WCActionSheet 自带
-                         destructiveButtonTitle:nil
-                               otherButtonTitles:nil];
+                                 cancelButtonTitle:@"取消"
+                            destructiveButtonTitle:nil
+                                  otherButtonTitles:nil];
     if (!sheet) return;
 
     NSMutableArray *list = [NSMutableArray array];
