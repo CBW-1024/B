@@ -549,9 +549,7 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
 @property (nonatomic) BOOL tplExpanded;
 @end
 
-@implementation DDShellSettingsViewController {
-    id<UITableViewDelegate> _originalDelegate;
-}
+@implementation DDShellSettingsViewController
 
 - (void)ensureTableViewMgr {
     if (_tableViewMgr) return;
@@ -586,8 +584,7 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     [self.view addSubview:tableView];
-    _originalDelegate = self.tableViewMgr.delegate;
-    self.tableViewMgr.delegate = self;
+    self.tableViewMgr.delegate = self; // 让 willDisplayCell 回调到本 VC（画勾选标记）
 }
 
 - (void)buildTable {
@@ -667,28 +664,14 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
     [self buildTable];
 }
 
-#pragma mark - UITableViewDelegate 转发
+#pragma mark - UITableViewDelegate
 
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)]) {
-        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
-    }
     WCTableViewCellManager *cellInfo = (WCTableViewCellManager *)[self.tableViewMgr cellInfoAtIndexPath:indexPath];
     if (cellInfo && [cellInfo.userInfo isKindOfClass:[NSString class]]) {
         NSString *t = cellInfo.userInfo;
         cell.accessoryType = [t isEqualToString:DD_ActiveTemplateName()] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
     }
-}
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
-        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
-    }
-}
-- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)]) {
-        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
-    }
-    return UITableViewAutomaticDimension;
 }
 
 @end
