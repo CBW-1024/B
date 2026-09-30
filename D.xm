@@ -405,9 +405,22 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 
 #pragma mark - 监听器
 
+// 微信原生 toast（接口来自 8.0.79 头文件 WeToast.h）
+@interface WeToast : NSObject
++ (id)toast;
+- (void)setLoadingStyle:(BOOL);
+- (void)showToastWithText:(id);
+- (void)showDoneToastWithText:(id);
+- (void)hideWithAnimated:(int);
+@end
+
 @interface DDShellWatcher : NSObject
 + (instancetype)shared;
 - (void)shellLatestScreenshot;
+- (void)dd_showShelling;
+- (void)dd_hideShelling;
+- (void)dd_showShellDone;
+@property (nonatomic, strong) WeToast *busyToast; // 进行中的「正在套壳」提示
 @end
 
 @implementation DDShellWatcher
@@ -448,19 +461,46 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
             PHImageRequestOptions *ro = [PHImageRequestOptions new];
             ro.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
             ro.networkAccessAllowed = NO;
+            [self dd_showShelling]; // 开始：微信原生「正在套壳」转圈提示
             [[PHImageManager defaultManager] requestImageForAsset:asset
                                                        targetSize:PHImageManagerMaximumSize
                                                       contentMode:PHImageContentModeDefault
                                                           options:ro
                                                     resultHandler:^(UIImage *img, NSDictionary *info) {
-                if (!img) return;
-                UIImage *outImg = DD_ComposeShellImage(img, t);
-                if (!outImg) return;
+                UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
+                if (!outImg) { [self dd_hideShelling]; return; } // 失败：静默收起，不给提示
                 DD_SaveImageToAlbum(outImg);
                 [[DDShellConfig shared] markProcessed:asset.localIdentifier];
                 if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
+                [self dd_showShellDone]; // 结束：成功提示（先收起「正在套壳」）
             }];
         });
+    });
+}
+
+// 微信原生「正在处理」提示（loading 样式 + 转圈），PHImageManager 回调可能在后台线程，统一回主线程
+- (void)dd_showShelling {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        WeToast *toast = [WeToast toast];
+        [toast setLoadingStyle:YES];
+        [toast showToastWithText:@"正在套壳"];
+        self.busyToast = toast;
+    });
+}
+
+- (void)dd_hideShelling {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.busyToast hideWithAnimated:1];
+        self.busyToast = nil;
+    });
+}
+
+// 收起「正在套壳」并弹出微信原生成功提示（带勾选图标）
+- (void)dd_showShellDone {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.busyToast hideWithAnimated:1];
+        self.busyToast = nil;
+        [[WeToast toast] showDoneToastWithText:@"套壳成功"];
     });
 }
 
