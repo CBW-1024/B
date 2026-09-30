@@ -619,6 +619,7 @@ static const NSInteger DD_SHEET_EXPORT = 0x5ea1;
 // 它用的是 3 列（(屏宽-40)/3）；这里按双排取 2 列，要跟 WCR 完全一致把下面的 2 改成 3。
 static const NSInteger kDDShellTplColumns = 2;
 static const CGFloat   kDDShellTplGap     = 10.0;
+static const CGFloat   kDDShellSearchH    = 44.0; // 搜索条高度，和 WCR 的 setupSearchBar 一致
 
 // 缩略图缓存：模板 png 是全尺寸图（可能上千像素），每格都整图解一次码滚动会卡，
 // 这里按格子边长解码一次后缓存，名字变了（重命名）路径也变，不会串图。
@@ -668,10 +669,10 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
         UIColor *bg;
         UIColor *fg;
         if (@available(iOS 13.0, *)) {
-            bg = [UIColor secondarySystemBackgroundColor];
+            bg = [UIColor secondarySystemGroupedBackgroundColor]; // 灰页面上格子用白色，层次才对
             fg = [UIColor labelColor];
         } else {
-            bg = [UIColor colorWithWhite:0.95 alpha:1.0];
+            bg = [UIColor whiteColor];
             fg = [UIColor darkTextColor];
         }
 
@@ -729,8 +730,8 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
 //   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择，选「选择」同样进选择态。
 @interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate, UIGestureRecognizerDelegate>
+@property (nonatomic, strong) UISearchBar *searchBar;
 @property (nonatomic, weak) id origPopDelegate;                   // 侧滑手势原代理，离开页面时还原
-@property (nonatomic, strong) UISearchController *searchController; // 挂在导航栏上，与导航栏同底色
 @property (nonatomic, strong) UICollectionView *collectionView;
 @property (nonatomic, strong) NSArray<NSString *> *allNames;       // 排序后的全量，搜索只是过滤展示
 @property (nonatomic, strong) NSArray<NSString *> *names;          // 当前展示（可能是过滤结果）
@@ -756,38 +757,63 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
     [self setupBackButton];
 
-    // 搜索框放进导航栏（navigationItem.searchController）：和导航栏连成一体、同底色，
-    // 不再是自己贴在 view 上的一块，进出页面也不会闪
-    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
-    self.searchController.obscuresBackgroundDuringPresentation = NO;
-    self.searchController.hidesNavigationBarDuringPresentation = NO;
-    self.searchController.searchBar.placeholder = @"搜索套壳名称";
-    self.searchController.searchBar.delegate = self;
-    self.definesPresentationContext = YES;
-    self.navigationItem.searchController = self.searchController;
-    self.navigationItem.hidesSearchBarWhenScrolling = NO; // 常驻显示，滚动时不收起以免抖动
+    // 页面底色：微信设置页那个分组灰（WCR 的 viewDidLoad 也是 view.backgroundColor = 表格灰）
+    if (@available(iOS 13.0, *)) {
+        self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    } else {
+        self.view.backgroundColor = [UIColor colorWithWhite:0.949 alpha:1.0];
+    }
 
+    [self setupSearchBar];
+    [self setupCollectionView];
+    [self setupNavigationBar];
+    [self reloadList];
+}
+
+// 搜索条：和 WCR 一样自己贴在 view 顶上，不挂 navigationItem.searchController——
+// 那个会把导航栏撑高一截，跟设置页对不上。用 minimal 样式（没有自带灰底和分隔线），
+// 四周透出来的就是页面灰，看上去和导航栏连成一片。
+- (void)setupSearchBar {
+    UISearchBar *sb = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, kDDShellSearchH)];
+    sb.placeholder = @"搜索套壳名称";
+    sb.delegate = self;
+    sb.searchBarStyle = UISearchBarStyleMinimal;
+    if (@available(iOS 13.0, *)) {
+        sb.searchTextField.backgroundColor = [UIColor secondarySystemBackgroundColor]; // 输入框本身是白的
+    }
+    self.searchBar = sb;
+    [self.view addSubview:sb];
+}
+
+- (void)setupCollectionView {
     UICollectionViewFlowLayout *layout = [[UICollectionViewFlowLayout alloc] init];
     layout.minimumInteritemSpacing = kDDShellTplGap;
     layout.minimumLineSpacing = kDDShellTplGap;
     layout.sectionInset = UIEdgeInsetsMake(kDDShellTplGap, kDDShellTplGap, kDDShellTplGap, kDDShellTplGap);
 
-    CGRect cvFrame = self.view.bounds;
-    self.collectionView = [[UICollectionView alloc] initWithFrame:cvFrame collectionViewLayout:layout];
-    self.collectionView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    if (@available(iOS 13.0, *)) {
-        self.collectionView.backgroundColor = [UIColor systemBackgroundColor];
-    } else {
-        self.collectionView.backgroundColor = [UIColor whiteColor];
-    }
-    self.collectionView.alwaysBounceVertical = YES;
-    self.collectionView.delegate = self;
-    self.collectionView.dataSource = self;
-    [self.collectionView registerClass:[DDShellTplCell class] forCellWithReuseIdentifier:@"DDShellTplCell"];
-    [self.view addSubview:self.collectionView];
+    // frame 交给 viewDidLayoutSubviews，这里先零尺寸占位
+    UICollectionView *cv = [[UICollectionView alloc] initWithFrame:CGRectZero collectionViewLayout:layout];
+    cv.backgroundColor = [UIColor clearColor]; // 透出页面灰，和搜索条、导航栏同一片底色
+    cv.alwaysBounceVertical = YES;
+    cv.delegate = self;
+    cv.dataSource = self;
+    [cv registerClass:[DDShellTplCell class] forCellWithReuseIdentifier:@"DDShellTplCell"];
+    self.collectionView = cv;
+    [self.view addSubview:cv];
+}
 
-    [self setupNavigationBar];
-    [self reloadList];
+// 布局跟 WCR 的 viewDidLayoutSubviews 一个算法：搜索条压在最上面，网格从它底下开始铺满剩余
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat top = 0;
+    if (@available(iOS 11.0, *)) {
+        top = self.view.safeAreaInsets.top; // 上面设了 UIRectEdgeNone，正常就是 0
+    }
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    self.searchBar.frame = CGRectMake(0, top, w, kDDShellSearchH);
+    self.collectionView.frame = CGRectMake(0, top + kDDShellSearchH, w, h - top - kDDShellSearchH);
+    [self.view bringSubviewToFront:self.searchBar];
 }
 
 // 返回按钮：黑色小箭头、不带上一页标题（微信原生样式）；自定义后系统侧滑会失效，一并接回来
@@ -848,7 +874,7 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
 // 搜索过滤：只动展示的 names，全量 allNames 不变；标题跟着显示过滤后的数量
 - (void)applySearchFilter {
-    NSString *kw = (self.searchController.searchBar.text ?: @"").lowercaseString;
+    NSString *kw = (self.searchBar.text ?: @"").lowercaseString;
     if (!kw.length) {
         self.names = self.allNames;
     } else {
@@ -876,12 +902,14 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
         self.collectionView.backgroundView = nil;
         return;
     }
+    // 首次进来 collectionView 还没布局（frame 是零），靠 autoresizing 跟着撑开
     UILabel *l = [[UILabel alloc] initWithFrame:self.collectionView.bounds];
     l.text = @"（空：把 name.png + name.cfg 一起放 Documents/DDShell/模板/name/）";
     l.numberOfLines = 0;
     l.font = [UIFont systemFontOfSize:13.0];
     l.textColor = [UIColor grayColor];
     l.textAlignment = NSTextAlignmentCenter;
+    l.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.collectionView.backgroundView = l;
 }
 
