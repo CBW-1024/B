@@ -111,16 +111,17 @@
 static NSString *const kDDShellEnabled     = @"DDShellEnabled";
 static NSString *const kDDShellAuto        = @"DDShellAutoShell";
 static NSString *const kDDShellSelectedTpl = @"DDShellSelectedTpl";
-static NSString *const kDDShellShotDelay   = @"DDShellShotDelay";
 static NSString *const kDDShellDeleteSrc   = @"DDShellDeleteOriginal";
 static NSString *const kDDShellProcessed   = @"DDShellProcessedIds";
+
+// 截图后固定等待 1 秒，等系统把截图异步写入相册后再去取（不再提供自定义）
+static const NSTimeInterval kDDShellDelay = 1.0;
 
 @interface DDShellConfig : NSObject
 + (instancetype)shared;
 @property (nonatomic) BOOL enabled;
 @property (nonatomic) BOOL autoShell;
 @property (nonatomic) BOOL deleteOriginal;
-@property (nonatomic) double shotDelay;
 @property (nonatomic, copy) NSString *selectedTpl;
 - (BOOL)hasProcessed:(NSString *)lid;
 - (void)markProcessed:(NSString *)lid;
@@ -141,13 +142,10 @@ static NSString *const kDDShellProcessed   = @"DDShellProcessedIds";
         _enabled        = [ud objectForKey:kDDShellEnabled]   ? [ud boolForKey:kDDShellEnabled]   : NO;
         _autoShell      = [ud objectForKey:kDDShellAuto]      ? [ud boolForKey:kDDShellAuto]      : YES;
         _deleteOriginal = [ud objectForKey:kDDShellDeleteSrc] ? [ud boolForKey:kDDShellDeleteSrc] : NO;
-        _shotDelay      = [ud objectForKey:kDDShellShotDelay] ? [ud doubleForKey:kDDShellShotDelay] : 1.2;
-        if (_shotDelay < 0) _shotDelay = 0;
         _selectedTpl = [ud stringForKey:kDDShellSelectedTpl] ?: @"";
         [ud setBool:_enabled forKey:kDDShellEnabled];
         [ud setBool:_autoShell forKey:kDDShellAuto];
         [ud setBool:_deleteOriginal forKey:kDDShellDeleteSrc];
-        [ud setDouble:_shotDelay forKey:kDDShellShotDelay];
         [ud setObject:_selectedTpl forKey:kDDShellSelectedTpl];
         [ud synchronize];
     }
@@ -157,7 +155,6 @@ static NSString *const kDDShellProcessed   = @"DDShellProcessedIds";
 - (void)setEnabled:(BOOL)v        { _enabled = v;        [self dd_setBool:v forKey:kDDShellEnabled]; }
 - (void)setAutoShell:(BOOL)v      { _autoShell = v;      [self dd_setBool:v forKey:kDDShellAuto]; }
 - (void)setDeleteOriginal:(BOOL)v { _deleteOriginal = v; [self dd_setBool:v forKey:kDDShellDeleteSrc]; }
-- (void)setShotDelay:(double)v    { _shotDelay = v;      [self dd_setDouble:v forKey:kDDShellShotDelay]; }
 - (void)setSelectedTpl:(NSString *)v {
     _selectedTpl = [v copy] ?: @"";
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
@@ -168,11 +165,6 @@ static NSString *const kDDShellProcessed   = @"DDShellProcessedIds";
 - (void)dd_setBool:(BOOL)v forKey:(NSString *)k {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setBool:v forKey:k];
-    [ud synchronize];
-}
-- (void)dd_setDouble:(double)v forKey:(NSString *)k {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setDouble:v forKey:k];
     [ud synchronize];
 }
 
@@ -222,9 +214,6 @@ static NSString *DD_TplDir(void) {
 @end
 
 // 机身前景图（模板只支持 png+cfg，不再有 _dark 变体）
-static UIImage *DD_FrameImage(DDShellTemplate *t) {
-    return t.image;
-}
 
 static NSString *DD_CfgPath(NSString *name) {
     return [[DD_TplDir() stringByAppendingPathComponent:name] stringByAppendingPathExtension:@"cfg"];
@@ -259,11 +248,7 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     if (!name.length) return nil;
     NSString *png = [[DD_TplDir() stringByAppendingPathComponent:name] stringByAppendingPathExtension:@"png"];
     NSData *d = [NSData dataWithContentsOfFile:png];
-    if (!d.length) {
-        NSString *jpg = [[DD_TplDir() stringByAppendingPathComponent:name] stringByAppendingPathExtension:@"jpg"];
-        d = [NSData dataWithContentsOfFile:jpg];
-        if (!d.length) return nil;
-    }
+    if (!d.length) return nil; // 只支持 png+cfg，无 png 直接视为模板无效
     UIImage *img = [UIImage imageWithData:d];
     if (!img || img.size.width < 8 || img.size.height < 8) return nil;
 
@@ -315,7 +300,7 @@ static CIVector *DD_CIVec(CGPoint p, CGFloat canvasH) {
 
 static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (!shot || !t) return nil;
-    UIImage *frameImg = DD_FrameImage(t);
+    UIImage *frameImg = t.image;
     CGImageRef frameCG = frameImg.CGImage;
     CGImageRef shotCG = shot.CGImage;
     if (!frameCG || !shotCG) return nil;
@@ -381,19 +366,34 @@ static void DD_EnsurePhotoAuth(void (^ready)(BOOL)) {
     }];
 }
 
-static void DD_LatestImageAsset(void (^done)(PHAsset *)) {
+// 取「最近 50 张里、尚未处理过的最旧一张」作为下一张待套壳截图。
+// 按 creationDate 倒序取最近的，遍历时保留最后一个未处理的（即最旧未处理），
+// 这样连拍 A<B<C 会按顺序各处理一次、不漏不重；我们自己保存的成品（已 markProcessed）会被排除。
+static void DD_NextUnprocessedImageAsset(void (^done)(PHAsset *)) {
     PHFetchOptions *o = [PHFetchOptions new];
     o.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:NO]];
-    o.fetchLimit = 1;
+    o.fetchLimit = 50;
     PHFetchResult *r = [PHAsset fetchAssetsWithMediaType:PHAssetMediaTypeImage options:o];
-    if (done) done([r firstObject]);
+    PHAsset *found = nil;
+    for (PHAsset *a in r) {
+        if ([[DDShellConfig shared] hasProcessed:a.localIdentifier]) continue;
+        found = a; // 倒序遍历，最终落到的就是最旧的那张未处理
+    }
+    if (done) done(found);
 }
 
 static void DD_SaveImageToAlbum(UIImage *img) {
     if (!img) return;
+    __block PHObjectPlaceholder *ph = nil;
     [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
-        [PHAssetChangeRequest creationRequestForAssetFromImage:img];
-    } completionHandler:nil];
+        PHAssetChangeRequest *req = [PHAssetChangeRequest creationRequestForAssetFromImage:img];
+        ph = req.placeholderForCreatedAsset;
+    } completionHandler:^(BOOL success, NSError *error) {
+        // 把我们自己的成品也标记为「已处理」，防止后续被当成未处理截图重复套壳
+        if (success && ph.localIdentifier.length) {
+            [[DDShellConfig shared] markProcessed:ph.localIdentifier];
+        }
+    }];
 }
 
 static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
@@ -419,9 +419,15 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 
 static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提示，供成功后收起
 
+// 连拍串行：用串行队列 + 在途/待处理标志，把多次截屏串成一条 FIFO 流水线，
+// 保证截图一张张按顺序处理、互不重叠，避免共享 gBusyToast 与并发请求相册造成的提示错乱与乱序。
+static dispatch_queue_t gShellQueue = nil;
+static BOOL gShellBusy = NO;   // 是否有任务正在处理
+static NSInteger gShellPending = 0; // 待处理的截屏事件计数（连拍时可能 >1）
+
 @interface DDShellWatcher : NSObject
 + (instancetype)shared;
-- (void)shellLatestScreenshot;
+- (void)shellLatestScreenshotWithCompletion:(void (^)(void))completion;
 - (void)dd_showShelling;
 - (void)dd_hideShelling;
 - (void)dd_showShellDone;
@@ -448,20 +454,39 @@ static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提�
 
 - (void)onScreenshot:(NSNotification *)n {
     if (![DDShellConfig shared].enabled || ![DDShellConfig shared].autoShell) return;
-    NSTimeInterval delay = [DDShellConfig shared].shotDelay;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self shellLatestScreenshot];
+    // 固定等待 1 秒，等系统把截图异步写入相册后再去取（不再提供自定义）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDDShellDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!gShellQueue) gShellQueue = dispatch_queue_create("com.ddshell.shell", DISPATCH_QUEUE_SERIAL);
+        dispatch_async(gShellQueue, ^{
+            gShellPending += 1;     // 登记一次待处理
+            [self dd_runNextShell]; // 空闲则立即开干，忙碌则等上一张完成后自动接力
+        });
     });
 }
 
-- (void)shellLatestScreenshot {
+// 在串行队列上执行：取出一个待处理任务串行处理，完成后自动接力下一张
+// （保证连拍按顺序、不重叠，且同一时刻只有一个 gBusyToast）
+- (void)dd_runNextShell {
+    if (gShellBusy) return;          // 上一张仍在处理，等它的 completion 里再来接力
+    if (gShellPending <= 0) return;  // 没有待处理
+    gShellPending -= 1;
+    gShellBusy = YES;
+    [self shellLatestScreenshotWithCompletion:^{
+        dispatch_async(gShellQueue, ^{
+            gShellBusy = NO;
+            [self dd_runNextShell]; // 接力处理下一张
+        });
+    }];
+}
+
+- (void)shellLatestScreenshotWithCompletion:(void (^)(void))completion {
     DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
-    if (!t) return;
+    if (!t) { if (completion) completion(); return; }
     DD_EnsurePhotoAuth(^(BOOL ok) {
-        if (!ok) return;
-        DD_LatestImageAsset(^(PHAsset *asset) {
-            if (!asset) return;
-            if ([[DDShellConfig shared] hasProcessed:asset.localIdentifier]) return; // 去重
+        if (!ok) { if (completion) completion(); return; }
+        DD_NextUnprocessedImageAsset(^(PHAsset *asset) {
+            if (!asset) { if (completion) completion(); return; }
+            if ([[DDShellConfig shared] hasProcessed:asset.localIdentifier]) { if (completion) completion(); return; } // 去重
             PHImageRequestOptions *ro = [PHImageRequestOptions new];
             ro.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
             ro.networkAccessAllowed = NO;
@@ -472,11 +497,12 @@ static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提�
                                                           options:ro
                                                     resultHandler:^(UIImage *img, NSDictionary *info) {
                 UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
-                if (!outImg) { [self dd_hideShelling]; return; } // 失败：静默收起，不给提示
+                if (!outImg) { [self dd_hideShelling]; if (completion) completion(); return; } // 失败：静默收起，不给提示
                 DD_SaveImageToAlbum(outImg);
                 [[DDShellConfig shared] markProcessed:asset.localIdentifier];
                 if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
                 [self dd_showShellDone]; // 结束：成功提示（先收起「正在套壳」）
+                if (completion) completion();
             }];
         });
     });
@@ -603,10 +629,6 @@ static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提�
             }
         }
 
-        [section addCell:[cellCls normalCellForSel:@selector(shotDelayTapped:)
-                                            target:self title:@"↳截图后延时"
-                                         rightValue:[NSString stringWithFormat:@"%.1f 秒", [DDShellConfig shared].shotDelay]]];
-
         [section addCell:[cellCls switchCellForSel:@selector(deleteSwitchChanged:)
                                             target:self title:@"↳套壳后删除原图"
                                                 on:[DDShellConfig shared].deleteOriginal]];
@@ -632,12 +654,6 @@ static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提�
     if (t.length) [DDShellConfig shared].selectedTpl = t;
     self.tplExpanded = NO;
     [self buildTable];
-}
-
-- (void)shotDelayTapped:(id)sender {
-    [self dd_inputTitle:@"截图后延时" message:@"截图落相册需要一点时间，单位：秒" current:[DDShellConfig shared].shotDelay apply:^(double v) {
-        [DDShellConfig shared].shotDelay = v;
-    }];
 }
 
 - (void)enabledSwitchChanged:(UISwitch *)sender {
