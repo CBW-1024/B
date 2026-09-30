@@ -1,68 +1,11 @@
 // ============================================================================
-//  DDShell.xm —— 模板套壳（截图后套模板并保存到相册）  v3.0.0
+//  DDShell.xm —— 截图模板套壳插件
 //
-//  单文件 iOS 插件（Logos / Theos），设置界面与入口参照 DD收款助手写法
-//
-//  ── 逆向来源 ──────────────────────────────────────────────────────────────
-//  ZDY_v1.3.7.dylib : ScreenshotShellHelper / SSShellLibraryVC / SSShellEditorVC
-//                     PHPhotoLibrary 落相册
-//  WCRefine.dylib   : 完整工业级实现，本版按它校正合成算法
-//      WCRefineScreenshotFrameProcessor  @ 0x279da60
-//          applyFrameToImage:secondImage:   0x74659c  ← 真正的合成主体
-//          applyFrameToImage:               0x7464f4  （薄封装，尾调用上面那个）
-//      WCRefineScreenRecordingFrameTemplate @ 0x279d948（录屏路径，本插件不涉及）
-//
-//  ── WCR applyFrameToImage:secondImage: 的真实指令流（已逐条反汇编核对）────
-//   objc_msgSend = __got[0x640]；模板 cfg 全为 objectForKeyedSubscript: + floatValue
-//   1. W = cfg["template_width"]，H = cfg["template_height"]；W<=0 || H<=0 直接返回 nil
-//   2. frame = [UIImage imageWithContentsOfFile: <机身前景图路径>]
-//      scale = frame.scale；scale <= 0 时回退 [UIScreen mainScreen].scale
-//   3. UIGraphicsBeginImageContextWithOptions(CGSizeMake(W, H), NO, scale)
-//      ctx = UIGraphicsGetCurrentContext()
-//   4. CIContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer:@NO}]
-//      （GOT[0x708] = _kCIContextUseSoftwareRenderer，值为 @NO，即强制走 GPU）
-//   5. shotCG = [shot CGImage]
-//      A = CGImageGetWidth(shotCG)，B = CGImageGetHeight(shotCG)
-//      src = [CIImage imageWithCGImage:shotCG]
-//   6. f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"]
-//      setValue:forKey: 共 6 次（kCIInputImageKey 从 GOT[0x720] 取）：
-//        inputTopLeft      = CIVector(LT.x, H - LT.y)
-//        inputTopRight     = CIVector(RT.x, H - RT.y)
-//        inputBottomLeft   = CIVector(LB.x, H - LB.y)
-//        inputBottomRight  = CIVector(RB.x, H - RB.y)
-//        inputExtent       = CIVector(CGRectMake(0, 0, A, B))   ← 截图自身像素尺寸
-//      （CFG 字符串已确认：inputTopLeft/inputTopRight/inputBottomLeft/
-//        inputBottomRight/inputExtent，滤镜名 CIPerspectiveTransformWithExtent）
-//   7. cg = [ciCtx createCGImage:f.outputImage fromRect:f.outputImage.extent]
-//      CGContextDrawImage(ctx, extent, cg)          ← 1:1，不做二次缩放
-//      CGImageRelease(cg)
-//      （第二张图 secondImage 走同一套，mode=double 时用）
-//   8. [frame drawInRect:CGRectMake(0, 0, W, H)]    ← 机身图盖在最上层
-//   9. out = UIGraphicsGetImageFromCurrentImageContext(); UIGraphicsEndImageContext()
-//
-//  ── 由上面第 6/7 条得出的关键结论（本版据此修正模糊与尺寸错位）────────────
-//   ★ 截图【整张】透视映射到 cfg 四角围成的屏幕窗，且 inputExtent 必须是
-//     「截图自身的像素尺寸 (A,B)」，四角点落在模板画布坐标系 (W,H) 中。
-//     这样无论模板多大，截图都恰好 1:1 填满窗口（像素级贴合），不会出现
-//     「截图被缩放 / 窗口尺寸对不上」的问题。之前用 Wout×Hout 当 inputExtent
-//     并给角点乘 S 是错的，会让角点跑到 extent 外被裁、尺寸错位。
-//   ★ WCR【不做任何超采样】，输出就是 template_width×template_height × scale
-//     （模板 PNG 为 1× 时 scale=1）。绝不能用 UIGraphicsImageRenderer 的
-//     默认 scale（= 屏幕 2x/3x），那会把画布放大 3 倍、截图被拉伸 3 倍 → 糊。
-//   ★ 输出画布固定 1×（1 单位 = 1 像素 = 模板像素），保证输出尺寸严格等于
-//     template_width×template_height。不用默认 scale（= 屏幕 2x/3x），否则画布被放大 3 倍。
-//
-//  ── 模板格式（强制 png + cfg 成对）────────────────────────────────────────
-//  把 name.png 与 name.cfg 一起放进 Documents/DDShellTemplates/。两者缺一则
-//  该模板不生效（不自动探测、不回退 _dark）。name.cfg 为 JSON，字段：
-//    {"template_width":1170,"template_height":2532,
-//     "left_top_x":..,"left_top_y":.., "right_top_x":..,"right_top_y":..,
-//     "left_bottom_x":..,"left_bottom_y":.., "right_bottom_x":..,"right_bottom_y":..}
-//  四角坐标为模板像素坐标（左上原点），即屏幕窗在 PNG 中的位置。
-//
-//  本插件不 hook 微信内部逻辑，纯系统层实现：
-//    截图 → UIApplicationUserDidTakeScreenshotNotification
-//    取相册最新截图 → 透视贴进模板屏幕窗 → 存回相册
+//  功能：截图后自动把截图套入模板，并保存回相册。
+//  流程：监听系统截屏通知 → 从相册取最新截图 → 透视贴入模板窗口 → 存回相册。
+//  模板：将 name.png 与 name.cfg 一同放入
+//        Documents/DDShellTemplates/，两者缺一不可。
+//  cfg 为 JSON，字段：template_width / template_height 与四个屏幕窗角点坐标。
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -71,7 +14,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#pragma mark - 微信类声明（入口用，与 DD收款助手保持一致，勿改）
+#pragma mark - 微信类声明
 
 @interface MMContext : NSObject
 + (id)activeUserContext;
@@ -114,7 +57,7 @@ static NSString *const kDDShellSelectedTpl = @"DDShellSelectedTpl";
 static NSString *const kDDShellDeleteSrc   = @"DDShellDeleteOriginal";
 static NSString *const kDDShellProcessed   = @"DDShellProcessedIds";
 
-// 截图后固定等待 1 秒，等系统把截图异步写入相册后再去取（不再提供自定义）
+// 截图后固定等待 1 秒，等系统把截图写入相册后再取
 static const NSTimeInterval kDDShellDelay = 1.0;
 
 @interface DDShellConfig : NSObject
@@ -168,7 +111,7 @@ static const NSTimeInterval kDDShellDelay = 1.0;
     [ud synchronize];
 }
 
-// 已处理过的 asset 去重（对应 WCR 的 AlbumEnhancementProcessedIds）
+// 已处理过的截图去重，避免重复套壳
 - (BOOL)hasProcessed:(NSString *)lid {
     if (!lid.length) return NO;
     NSArray *arr = [[NSUserDefaults standardUserDefaults] arrayForKey:kDDShellProcessed];
@@ -189,7 +132,7 @@ static const NSTimeInterval kDDShellDelay = 1.0;
 
 #pragma mark - 模板目录
 
-// Documents/DDShellTemplates/（WCR 用 Documents/WCRefine/frames，结构相同）
+// 模板目录：Documents/DDShellTemplates/
 static NSString *DD_TplDir(void) {
     static NSString *dir;
     static dispatch_once_t onceToken;
@@ -228,7 +171,7 @@ static NSString *DD_ActualFile(NSString *base, NSString *ext) {
     return nil;
 }
 
-// 模板 cfg 路径（与 name.png 同目录、同名、.cfg 扩展名，大小写不敏感）
+// 模板 cfg 路径：与 name.png 同目录、同名、.cfg 扩展名（大小写不敏感）
 static NSString *DD_CfgPath(NSString *name) {
     return DD_ActualFile(name, @"cfg");
 }
@@ -240,7 +183,7 @@ static NSDictionary *DD_LoadCfg(NSString *name) {
     return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
 }
 
-// 素材库：仅保留「同时具备 name.png 与 name.cfg」的模板（强制 png+cfg 成对）
+// 仅保留同时具备 name.png 与 name.cfg 的模板（强制 png+cfg 成对）
 static NSArray<NSString *> *DD_AllTemplateNames(void) {
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:DD_TplDir() error:nil] ?: @[];
     NSMutableSet *pngs = [NSMutableSet set];
@@ -253,7 +196,7 @@ static NSArray<NSString *> *DD_AllTemplateNames(void) {
     }
     NSMutableArray *out = [NSMutableArray array];
     for (NSString *b in pngs) {
-        if ([cfgs containsObject:b]) [out addObject:b]; // 必须 png 与 cfg 同时存在
+        if ([cfgs containsObject:b]) [out addObject:b]; // png 与 cfg 必须同时存在
     }
     return [out sortedArrayUsingSelector:@selector(compare:)];
 }
@@ -262,7 +205,7 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     if (!name.length) return nil;
     NSString *png = DD_ActualFile(name, @"png"); // 扩展名大小写不敏感
     NSData *d = png ? [NSData dataWithContentsOfFile:png] : nil;
-    if (!d.length) return nil; // 只支持 png+cfg，无 png 直接视为模板无效
+    if (!d.length) return nil; // 无 png 则模板无效
     UIImage *img = [UIImage imageWithData:d];
     if (!img) return nil;
 
@@ -270,11 +213,11 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     t.name = name;
     t.image = img;
 
-    // cfg 必须存在，否则模板不生效（不再自动探测、不回退）
+    // cfg 必须存在，否则模板不生效
     NSDictionary *cfg = DD_LoadCfg(name);
     if (!cfg) return nil;
 
-    // 画布尺寸取 cfg 的 template_width/height（对齐 WCR）；缺字段则 W/H 为 0，下方 W<1 拦截 → 模板无效。
+    // 画布尺寸取 cfg 的 template_width / template_height；缺字段则 W/H 为 0，下方 W<1 拦截判模板无效
     double lw = [cfg[@"template_width"] doubleValue];
     double lh = [cfg[@"template_height"] doubleValue];
     CGSize canvas = CGSizeMake(lw, lh);
@@ -288,7 +231,7 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
         if (![x respondsToSelector:@selector(doubleValue)] || ![y respondsToSelector:@selector(doubleValue)]) { ok = NO; break; }
         pts[i] = CGPointMake([x doubleValue], [y doubleValue]);
     }
-    if (!ok) return nil; // 四角缺失 → 模板不生效
+    if (!ok) return nil; // 四角坐标缺失则模板不生效
 
     t.canvasSize = canvas; // 画布尺寸
     t.lt = pts[0]; t.rt = pts[1]; t.lb = pts[2]; t.rb = pts[3];
@@ -302,9 +245,9 @@ static NSString *DD_ActiveTemplateName(void) {
 }
 
 
-#pragma mark - 合成（核心：透视贴进屏幕窗）
+#pragma mark - 合成
 
-// UIKit 坐标（左上原点）→ CoreImage 坐标（左下原点）
+// UIKit 坐标（左上原点）→ CoreImage 坐标（左下原点）翻转
 static CIVector *DD_CIVec(CGPoint p, CGFloat canvasH) {
     return [CIVector vectorWithCGPoint:CGPointMake(p.x, canvasH - p.y)];
 }
@@ -319,22 +262,20 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
     if (W < 1.0 || H < 1.0) return nil;
 
-    // 截图按【像素】计（与 WCR 一致：CGImageGetWidth/Height，不走 UIImage.size）
+    // 截图按实际像素尺寸计算（CGImageGetWidth/Height）
     CGFloat A = (CGFloat)CGImageGetWidth(shotCG);
     CGFloat B = (CGFloat)CGImageGetHeight(shotCG);
     if (A < 1.0 || B < 1.0) return nil;
 
-    // 输出画布固定 1×（1 单位 = 1 像素 = 模板像素），保证输出尺寸 == template_width×template_height。
-    // 绝不能用 UIGraphicsImageRenderer / beginContext 的默认 scale（= 屏幕 2x/3x），
-    // 那会把画布放大 3 倍、截图被拉伸 3 倍 → 糊。
+    // 输出画布固定 1 倍（1 单位 = 1 像素），保证输出尺寸严格等于模板尺寸；
+    // 不能用屏幕倍率（2x/3x），否则画布被放大、截图被拉伸变糊。
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(W, H), NO, 1.0);
 
-    // 与 WCR 完全一致：CIContext 强制 GPU（kCIContextUseSoftwareRenderer = @NO）
+    // 使用 GPU 渲染 CoreImage
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
 
-    // 整张截图透视映射到 cfg 四角围成的屏幕窗。
-    // ★ inputExtent 必须是截图自身像素尺寸 (A,B)，四角点落在模板画布 (W,H) 坐标系中，
-    //   这样截图恰好 1:1 填满窗口，不会出现尺寸错位 / 被裁。
+    // 将整张截图透视映射到 cfg 四角围成的屏幕窗；
+    // inputExtent 用截图自身像素尺寸，四角点落在模板画布坐标系中，保证 1:1 贴合。
     CIImage *src = [CIImage imageWithCGImage:shotCG];
     CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
     [f setDefaults];
@@ -350,8 +291,7 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         CGRect ext = o.extent;
         CGImageRef cg = [ci createCGImage:o fromRect:ext];
         if (cg) {
-            // CI 的 extent 是左下原点坐标；UIKit 上下文是左上原点，转换后 1:1 贴入，
-            // 用 [UIImage drawInRect:] 规避 CGContextDrawImage 在 UIKit 上下文里的翻转歧义。
+            // 通过 UIImage 绘制规避 UIKit 上下文的坐标翻转
             UIImage *layer = [UIImage imageWithCGImage:cg scale:1.0 orientation:UIImageOrientationUp];
             CGRect r = CGRectMake(ext.origin.x,
                                  H - ext.origin.y - ext.size.height,
@@ -361,7 +301,7 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         }
     }
 
-    // 机身前景图盖在最上层（WCR 用 [frame drawInRect:]）
+    // 机身前景图盖在最上层
     [frameImg drawInRect:CGRectMake(0, 0, W, H)];
 
     UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
@@ -371,9 +311,7 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
 #pragma mark - 相册
 
-// 取相册里「最新」的一张图作为本次要套壳的截图。
-// 连拍时本插件只处理一张（视为同一张），处理中到达的截屏事件在 onScreenshot 里直接丢弃；
-// 被丢弃的连拍截图更旧、永远成不了「最新」，也不会在后续单张截屏时被误当成最新图翻出来套。
+// 从相册取最新一张图作为本次要套壳的截图
 static void DD_LatestImageAsset(void (^done)(PHAsset *)) {
     PHFetchOptions *o = [PHFetchOptions new];
     o.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:NO]];
@@ -389,7 +327,7 @@ static void DD_SaveImageToAlbum(UIImage *img) {
         PHAssetChangeRequest *req = [PHAssetChangeRequest creationRequestForAssetFromImage:img];
         ph = req.placeholderForCreatedAsset;
     } completionHandler:^(BOOL success, NSError *error) {
-        // 把我们自己的成品也标记为「已处理」，防止后续被当成未处理截图重复套壳
+        // 把套壳成品也标记为已处理，避免后续被当成未处理截图重复套壳
         if (success && ph.localIdentifier.length) {
             [[DDShellConfig shared] markProcessed:ph.localIdentifier];
         }
@@ -405,10 +343,7 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 
 #pragma mark - 监听器
 
-// 微信原生 toast。工程未导入 WeToast.h，这里手写一份精简前向声明（完整 @interface），
-// 仅补充套壳提示用到的几个方法。放在顶层、不进入任何 @implementation，编译器即视为已知类；
-// theos 对 tweak 默认允许 undefined symbol 延迟绑定到宿主（微信）进程中的符号（与引用
-// WCPluginsMgr / WCTableViewManager 等微信类同一机制），因此无需在编译期链接微信头文件。
+// 微信内置提示控件，运行时通过类名获取，不在编译期链接。
 @interface WeToast : NSObject
 + (instancetype)toast;
 - (void)setLoadingStyle:(BOOL)style;
@@ -417,10 +352,9 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 - (void)hideWithAnimated:(BOOL)animated;
 @end
 
-static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提示，供成功后收起
+static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提示，完成后收起
 
-// 连拍互斥：用串行队列 + 在途标志，保证同一时刻只处理一张截图。
-// 连拍视为同一张，处理中到达的截屏事件直接丢弃，只出一张成品，避免共享 gBusyToast 错乱。
+// 连拍互斥：同一时刻只处理一张截图，处理中到达的截屏事件直接丢弃
 static dispatch_queue_t gShellQueue = nil;
 static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃后续连拍）
 
@@ -453,15 +387,15 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
 
 - (void)onScreenshot:(NSNotification *)n {
     if (![DDShellConfig shared].enabled || ![DDShellConfig shared].autoShell) return;
-    // 固定等待 1 秒，等系统把截图异步写入相册后再去取（不再提供自定义）
+    // 固定等待 1 秒，等系统把截图写入相册后再取
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDDShellDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gShellQueue) gShellQueue = dispatch_queue_create("com.ddshell.shell", DISPATCH_QUEUE_SERIAL);
         dispatch_async(gShellQueue, ^{
-            if (gShellBusy) return; // 连拍：已有任务在处理，本次直接丢弃（连拍截图视为同一张，无需全部处理）
+            if (gShellBusy) return; // 连拍：已有任务在处理，本次直接丢弃
             gShellBusy = YES;
             [self shellLatestScreenshotWithCompletion:^{
                 dispatch_async(gShellQueue, ^{
-                    gShellBusy = NO; // 处理完，解除互斥，放行下一次截屏
+                    gShellBusy = NO; // 处理完解除互斥，放行下一次截屏
                 });
             }];
         });
@@ -477,30 +411,27 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
         PHImageRequestOptions *ro = [PHImageRequestOptions new];
         ro.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
         ro.networkAccessAllowed = NO;
-        [self dd_showShelling]; // 开始：微信原生「正在套壳」转圈提示
+        [self dd_showShelling]; // 开始：显示「正在套壳」转圈提示
         [[PHImageManager defaultManager] requestImageForAsset:asset
                                                    targetSize:PHImageManagerMaximumSize
                                                   contentMode:PHImageContentModeDefault
                                                       options:ro
                                                 resultHandler:^(UIImage *img, NSDictionary *info) {
             UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
-            if (!outImg) { [self dd_hideShelling]; if (completion) completion(); return; } // 失败：静默收起，不给提示
+            if (!outImg) { [self dd_hideShelling]; if (completion) completion(); return; } // 合成失败：静默收起提示
             DD_SaveImageToAlbum(outImg);
             [[DDShellConfig shared] markProcessed:asset.localIdentifier];
             if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
-            [self dd_showShellDone]; // 结束：成功提示（先收起「正在套壳」）
+            [self dd_showShellDone]; // 结束：显示「套壳成功」提示
             if (completion) completion();
         }];
     });
 }
 
-// 微信原生「正在处理」提示（loading 样式 + 转圈）。PHImageManager 回调可能在后台线程，统一回主线程。
-// 注意：WeToast 是微信私有类，不在 tweak 的链接路径里；因此必须用 NSClassFromString 取 Class 变量后
-// 再发消息（[cls toast]），绝不能写 [WeToast toast]——后者会让编译器生成 OBJC_CLASS_$_WeToast 链接符号，
-// 链接期报 undefined symbols。手写 @interface 仅用于编译期类型检查，不参与符号引用。
+// 通过微信内置提示控件显示 loading / 成功提示（运行时取类）
 - (void)dd_showShelling {
     dispatch_async(dispatch_get_main_queue(), ^{
-        Class cls = NSClassFromString(@"WeToast"); // WeToast 已确认存在，无需 nil 守卫
+        Class cls = NSClassFromString(@"WeToast");
         WeToast *toast = [cls toast];
         [toast setLoadingStyle:YES];
         [toast showToastWithText:@"正在套壳"];
@@ -520,7 +451,7 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
     dispatch_async(dispatch_get_main_queue(), ^{
         [gBusyToast hideWithAnimated:YES];
         gBusyToast = nil;
-        Class cls = NSClassFromString(@"WeToast"); // WeToast 已确认存在，无需 nil 守卫
+        Class cls = NSClassFromString(@"WeToast");
         [[cls toast] showDoneToastWithText:@"套壳成功"];
     });
 }
@@ -529,7 +460,7 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
 
 #pragma mark - 设置界面
 
-@interface DDShellSettingsViewController : UIViewController <UITableViewDelegate>
+@interface DDShellSettingsViewController : UIViewController <UITableViewDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
 @property (nonatomic) BOOL tplExpanded;
 @end
@@ -569,7 +500,7 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     [self.view addSubview:tableView];
-    self.tableViewMgr.delegate = self; // 让 willDisplayCell 回调到本 VC（画勾选标记）
+    self.tableViewMgr.delegate = self; // 让 willDisplayCell 回调到本 VC（绘制勾选标记）
 }
 
 - (void)buildTable {
@@ -610,8 +541,12 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
         }
 
         [section addCell:[cellCls switchCellForSel:@selector(deleteSwitchChanged:)
-                                            target:self title:@"↳套壳后删除原图"
+                                            target:self title:@"↳删除套壳截图"
                                                 on:[DDShellConfig shared].deleteOriginal]];
+
+        [section addCell:[cellCls normalCellForSel:@selector(pickFromAlbumTapped:)
+                                            target:self title:@"↳相册选图套壳"
+                                         rightValue:nil]];
     }
 
     [self.tableViewMgr addSection:section];
@@ -649,6 +584,35 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
     [self buildTable];
 }
 
+#pragma mark - 相册选图套壳
+
+// 从相册挑选一张图，套入当前模板后存回相册（不删除所选原图）
+- (void)pickFromAlbumTapped:(id)sender {
+    if (!DD_TemplateNamed(DD_ActiveTemplateName())) return; // 无可用模板则不开选择器
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.delegate = self;
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    [picker dismissViewControllerAnimated:YES completion:^{
+        UIImage *img = info[UIImagePickerControllerOriginalImage];
+        DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
+        if (!img || !t) return;
+        [self dd_showShelling];
+        UIImage *outImg = DD_ComposeShellImage(img, t);
+        if (!outImg) { [self dd_hideShelling]; return; } // 合成失败：静默收起提示
+        DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
+        [self dd_showShellDone];
+    }];
+}
+
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
 #pragma mark - UITableViewDelegate
 
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -661,7 +625,7 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
 
 @end
 
-#pragma mark - 注册入口（与 DD收款助手一致，勿改）
+#pragma mark - 注册入口
 
 %ctor {
     @autoreleasepool {
@@ -671,8 +635,9 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
         id mgr = objc_getClass("WCPluginsMgr");
         if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
             [[mgr sharedInstance] registerControllerWithTitle:@"DD模板套壳"
-                                                      version:@"3.0.0"
+                                                      version:@"1.0.0"
                                                    controller:@"DDShellSettingsViewController"];
         }
     }
 }
+h
