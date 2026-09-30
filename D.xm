@@ -213,10 +213,24 @@ static NSString *DD_TplDir(void) {
 @implementation DDShellTemplate
 @end
 
-// 机身前景图（模板只支持 png+cfg，不再有 _dark 变体）
+// 按基名 + 扩展名在模板目录里找磁盘上真实存在的文件，扩展名大小写不敏感。
+// iOS 文件系统大小写敏感，若直接拼小写扩展名，Foo.PNG / Foo.CFG 会被找不到。
+static NSString *DD_ActualFile(NSString *base, NSString *ext) {
+    NSString *dir = DD_TplDir();
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil] ?: @[];
+    NSString *lowerExt = ext.lowercaseString;
+    for (NSString *f in files) {
+        if (![f.stringByDeletingPathExtension isEqualToString:base]) continue;
+        if ([f.pathExtension.lowercaseString isEqualToString:lowerExt]) {
+            return [dir stringByAppendingPathComponent:f];
+        }
+    }
+    return nil;
+}
 
+// 模板 cfg 路径（与 name.png 同目录、同名、.cfg 扩展名，大小写不敏感）
 static NSString *DD_CfgPath(NSString *name) {
-    return [[DD_TplDir() stringByAppendingPathComponent:name] stringByAppendingPathExtension:@"cfg"];
+    return DD_ActualFile(name, @"cfg");
 }
 
 static NSDictionary *DD_LoadCfg(NSString *name) {
@@ -246,8 +260,8 @@ static NSArray<NSString *> *DD_AllTemplateNames(void) {
 
 static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     if (!name.length) return nil;
-    NSString *png = [[DD_TplDir() stringByAppendingPathComponent:name] stringByAppendingPathExtension:@"png"];
-    NSData *d = [NSData dataWithContentsOfFile:png];
+    NSString *png = DD_ActualFile(name, @"png"); // 扩展名大小写不敏感
+    NSData *d = png ? [NSData dataWithContentsOfFile:png] : nil;
     if (!d.length) return nil; // 只支持 png+cfg，无 png 直接视为模板无效
     UIImage *img = [UIImage imageWithData:d];
     if (!img || img.size.width < 8 || img.size.height < 8) return nil;
@@ -366,20 +380,15 @@ static void DD_EnsurePhotoAuth(void (^ready)(BOOL)) {
     }];
 }
 
-// 取「最近 50 张里、尚未处理过的最旧一张」作为下一张待套壳截图。
-// 按 creationDate 倒序取最近的，遍历时保留最后一个未处理的（即最旧未处理），
-// 这样连拍 A<B<C 会按顺序各处理一次、不漏不重；我们自己保存的成品（已 markProcessed）会被排除。
-static void DD_NextUnprocessedImageAsset(void (^done)(PHAsset *)) {
+// 取相册里「最新」的一张图作为本次要套壳的截图。
+// 连拍时本插件只处理一张（视为同一张），处理中到达的截屏事件在 onScreenshot 里直接丢弃；
+// 被丢弃的连拍截图更旧、永远成不了「最新」，也不会在后续单张截屏时被误当成最新图翻出来套。
+static void DD_LatestImageAsset(void (^done)(PHAsset *)) {
     PHFetchOptions *o = [PHFetchOptions new];
     o.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:NO]];
-    o.fetchLimit = 50;
+    o.fetchLimit = 1;
     PHFetchResult *r = [PHAsset fetchAssetsWithMediaType:PHAssetMediaTypeImage options:o];
-    PHAsset *found = nil;
-    for (PHAsset *a in r) {
-        if ([[DDShellConfig shared] hasProcessed:a.localIdentifier]) continue;
-        found = a; // 倒序遍历，最终落到的就是最旧的那张未处理
-    }
-    if (done) done(found);
+    if (done) done([r firstObject]);
 }
 
 static void DD_SaveImageToAlbum(UIImage *img) {
@@ -419,11 +428,10 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 
 static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提示，供成功后收起
 
-// 连拍串行：用串行队列 + 在途/待处理标志，把多次截屏串成一条 FIFO 流水线，
-// 保证截图一张张按顺序处理、互不重叠，避免共享 gBusyToast 与并发请求相册造成的提示错乱与乱序。
+// 连拍互斥：用串行队列 + 在途标志，保证同一时刻只处理一张截图。
+// 连拍视为同一张，处理中到达的截屏事件直接丢弃，只出一张成品，避免共享 gBusyToast 错乱。
 static dispatch_queue_t gShellQueue = nil;
-static BOOL gShellBusy = NO;   // 是否有任务正在处理
-static NSInteger gShellPending = 0; // 待处理的截屏事件计数（连拍时可能 >1）
+static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃后续连拍）
 
 @interface DDShellWatcher : NSObject
 + (instancetype)shared;
@@ -458,25 +466,15 @@ static NSInteger gShellPending = 0; // 待处理的截屏事件计数（连拍�
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDDShellDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gShellQueue) gShellQueue = dispatch_queue_create("com.ddshell.shell", DISPATCH_QUEUE_SERIAL);
         dispatch_async(gShellQueue, ^{
-            gShellPending += 1;     // 登记一次待处理
-            [self dd_runNextShell]; // 空闲则立即开干，忙碌则等上一张完成后自动接力
+            if (gShellBusy) return; // 连拍：已有任务在处理，本次直接丢弃（连拍截图视为同一张，无需全部处理）
+            gShellBusy = YES;
+            [self shellLatestScreenshotWithCompletion:^{
+                dispatch_async(gShellQueue, ^{
+                    gShellBusy = NO; // 处理完，解除互斥，放行下一次截屏
+                });
+            }];
         });
     });
-}
-
-// 在串行队列上执行：取出一个待处理任务串行处理，完成后自动接力下一张
-// （保证连拍按顺序、不重叠，且同一时刻只有一个 gBusyToast）
-- (void)dd_runNextShell {
-    if (gShellBusy) return;          // 上一张仍在处理，等它的 completion 里再来接力
-    if (gShellPending <= 0) return;  // 没有待处理
-    gShellPending -= 1;
-    gShellBusy = YES;
-    [self shellLatestScreenshotWithCompletion:^{
-        dispatch_async(gShellQueue, ^{
-            gShellBusy = NO;
-            [self dd_runNextShell]; // 接力处理下一张
-        });
-    }];
 }
 
 - (void)shellLatestScreenshotWithCompletion:(void (^)(void))completion {
@@ -484,7 +482,7 @@ static NSInteger gShellPending = 0; // 待处理的截屏事件计数（连拍�
     if (!t) { if (completion) completion(); return; }
     DD_EnsurePhotoAuth(^(BOOL ok) {
         if (!ok) { if (completion) completion(); return; }
-        DD_NextUnprocessedImageAsset(^(PHAsset *asset) {
+        DD_LatestImageAsset(^(PHAsset *asset) {
             if (!asset) { if (completion) completion(); return; }
             if ([[DDShellConfig shared] hasProcessed:asset.localIdentifier]) { if (completion) completion(); return; } // 去重
             PHImageRequestOptions *ro = [PHImageRequestOptions new];
@@ -667,30 +665,6 @@ static NSInteger gShellPending = 0; // 待处理的截屏事件计数（连拍�
 - (void)deleteSwitchChanged:(UISwitch *)sender {
     [DDShellConfig shared].deleteOriginal = sender.isOn;
     [self buildTable];
-}
-
-- (void)dd_alert:(NSString *)title message:(NSString *)msg {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)dd_inputTitle:(NSString *)title message:(NSString *)msg current:(double)cur apply:(void (^)(double))apply {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.keyboardType = UIKeyboardTypeDecimalPad;
-        tf.text = [NSString stringWithFormat:@"%.1f", cur];
-    }];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
-        NSString *txt = ac.textFields.firstObject.text ?: @"";
-        double v = txt.doubleValue;
-        if (v < 0) v = 0;
-        if (v > 30) v = 30;
-        if (apply) apply(v);
-        dispatch_async(dispatch_get_main_queue(), ^{ [self buildTable]; });
-    }]];
-    [self presentViewController:ac animated:YES completion:nil];
 }
 
 #pragma mark - UITableViewDelegate 转发
