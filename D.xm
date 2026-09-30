@@ -728,8 +728,9 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 //   点「导出」用微信原生 WCActionSheet 弹「选择导出方式」：选择导出 / 全部导出（取消自带）；
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
 //   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择，选「选择」同样进选择态。
-@interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
+@interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate, UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;
+@property (nonatomic, weak) id origPopDelegate;                   // 侧滑手势原代理，离开页面时还原
 @property (nonatomic, strong) UICollectionView *collectionView;
 @property (nonatomic, strong) NSArray<NSString *> *allNames;       // 排序后的全量，搜索只是过滤展示
 @property (nonatomic, strong) NSArray<NSString *> *names;          // 当前展示（可能是过滤结果）
@@ -743,13 +744,24 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.picked = [NSMutableSet set];
+    self.edgesForExtendedLayout = UIRectEdgeNone; // view 从导航栏底下开始，搜索栏才不会顶进状态栏
+
+    // 导航栏和设置页同一套：默认背景（不透明）、去掉底部阴影线
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    [appearance configureWithDefaultBackground];
+    appearance.shadowColor = nil;
+    self.navigationItem.standardAppearance = appearance;
+    self.navigationItem.scrollEdgeAppearance = appearance;
+    self.navigationItem.compactAppearance = appearance;
+
+    [self setupBackButton];
 
     UICollectionViewFlowLayout *layout = [[UICollectionViewFlowLayout alloc] init];
     layout.minimumInteritemSpacing = kDDShellTplGap;
     layout.minimumLineSpacing = kDDShellTplGap;
     layout.sectionInset = UIEdgeInsetsMake(kDDShellTplGap, kDDShellTplGap, kDDShellTplGap, kDDShellTplGap);
 
-    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44.0)];
+    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(10.0, 2.0, self.view.bounds.size.width - 20.0, 40.0)];
     self.searchBar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     self.searchBar.placeholder = @"搜索套壳名称";
     self.searchBar.delegate = self;
@@ -773,6 +785,47 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
     [self setupNavigationBar];
     [self reloadList];
+}
+
+// 返回按钮：黑色小箭头、不带上一页标题（微信原生样式）；自定义后系统侧滑会失效，一并接回来
+- (void)setupBackButton {
+    UIBarButtonItem *back;
+    if (@available(iOS 13.0, *)) {
+        back = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"chevron.left"]
+                                                style:UIBarButtonItemStylePlain
+                                               target:self
+                                               action:@selector(goBackTapped)];
+    } else {
+        back = [[UIBarButtonItem alloc] initWithTitle:@"〈"
+                                                style:UIBarButtonItemStylePlain
+                                               target:self
+                                               action:@selector(goBackTapped)];
+    }
+    back.tintColor = [UIColor blackColor];
+    self.navigationItem.leftBarButtonItem = back;
+
+    UIGestureRecognizer *pop = self.navigationController.interactivePopGestureRecognizer;
+    if (pop) {
+        self.origPopDelegate = pop.delegate;
+        pop.delegate = self; // 自定义返回按钮会关掉边缘侧滑，换成自己代理后恢复
+        pop.enabled = YES;
+    }
+}
+
+- (void)goBackTapped {
+    [self.navigationController popViewControllerAnimated:YES];
+}
+
+// 只有栈里不止一层、且当前正在最上层时才允许侧滑，防止根页面误滑卡死
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gr {
+    UINavigationController *nav = self.navigationController;
+    return nav.viewControllers.count > 1 && nav.topViewController == self;
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    UIGestureRecognizer *pop = self.navigationController.interactivePopGestureRecognizer;
+    if (pop && pop.delegate == self) pop.delegate = self.origPopDelegate; // 还原，别影响别的页面
 }
 
 // 默认按名称排序（本地化、数字感知：「模板2」排在「模板10」前面）
