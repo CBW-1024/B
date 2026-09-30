@@ -666,16 +666,8 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
 - (instancetype)initWithFrame:(CGRect)frame {
     if (self = [super initWithFrame:frame]) {
-        UIColor *bg;
-        UIColor *fg;
-        if (@available(iOS 13.0, *)) {
-            bg = [UIColor secondarySystemGroupedBackgroundColor]; // 灰页面上格子用白色，层次才对
-            fg = [UIColor labelColor];
-        } else {
-            bg = [UIColor whiteColor];
-            fg = [UIColor darkTextColor];
-        }
-
+        UIColor *bg = [UIColor secondarySystemGroupedBackgroundColor]; // 灰页面上格子用白色，层次才对
+        UIColor *fg = [UIColor labelColor];
         self.contentView.backgroundColor = bg;
         self.contentView.layer.cornerRadius = 8.0;   // 同 WCR
         self.contentView.layer.masksToBounds = YES;
@@ -724,6 +716,26 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
 @end
 
+// 页面底色：微信设置页那个分组灰
+static UIColor *DD_PageBackgroundColor(void) {
+    return [UIColor systemGroupedBackgroundColor];
+}
+
+// 设置页和素材库页共用同一套导航栏外观：不透明 + 和页面底色同一个灰。
+// 不能用 configureWithDefaultBackground，那个是「默认半透明」，最终颜色会被导航栏背后的内容
+// 影响——设置页的表格延伸到导航栏底下（背后是灰），素材库页设了 UIRectEdgeNone（背后没内容），
+// 同一个外观会渲染出一深一浅两种灰。这里直接钉死不透明底色，两页一致，也不会有接缝。
+static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
+    if (!vc) return;
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    [appearance configureWithOpaqueBackground]; // 不透明，不再受背后内容影响
+    appearance.backgroundColor = DD_PageBackgroundColor();
+    appearance.shadowColor = nil;               // 去掉底部那条阴影线
+    vc.navigationItem.standardAppearance = appearance;
+    vc.navigationItem.scrollEdgeAppearance = appearance;
+    vc.navigationItem.compactAppearance = appearance;
+}
+
 // 独立的素材库页面，交互对齐 WCRefineScreenshotFrameLibraryViewController：
 //   双排网格列出模板，右上角常驻 导出 / 导入（导入最靠右），默认按名称排序；
 //   点「导出」用微信原生 WCActionSheet 弹「选择导出方式」：选择导出 / 全部导出（取消自带）；
@@ -745,20 +757,12 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
     self.picked = [NSMutableSet set];
     self.edgesForExtendedLayout = UIRectEdgeNone; // view 从导航栏底下开始，搜索栏才不会顶进状态栏
 
-    // 导航栏和设置页同一套：默认背景（不透明）、去掉底部阴影线
-    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
-    [appearance configureWithDefaultBackground];
-    appearance.shadowColor = nil;
-    self.navigationItem.standardAppearance = appearance;
-    self.navigationItem.scrollEdgeAppearance = appearance;
-    self.navigationItem.compactAppearance = appearance;
+    // 导航栏：和设置页同一套（不透明灰 + 无阴影线）
+    DD_ApplyNavigationBarAppearance(self);
 
-    // 页面底色：微信设置页那个分组灰（WCR 的 viewDidLoad 也是 view.backgroundColor = 表格灰）
-    if (@available(iOS 13.0, *)) {
-        self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
-    } else {
-        self.view.backgroundColor = [UIColor colorWithWhite:0.949 alpha:1.0];
-    }
+    // 页面底色：微信设置页那个分组灰（WCR 的 viewDidLoad 也是 view.backgroundColor = 表格灰），
+    // 和导航栏同一个色，整页连成一片
+    self.view.backgroundColor = DD_PageBackgroundColor();
 
     [self setupSearchBar];
     [self setupCollectionView];
@@ -774,9 +778,7 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
     sb.placeholder = @"搜索套壳名称";
     sb.delegate = self;
     sb.searchBarStyle = UISearchBarStyleMinimal;
-    if (@available(iOS 13.0, *)) {
-        sb.searchTextField.backgroundColor = [UIColor secondarySystemBackgroundColor]; // 输入框本身是白的
-    }
+    sb.searchTextField.backgroundColor = [UIColor secondarySystemBackgroundColor]; // 输入框本身是白的
     self.searchBar = sb;
     [self.view addSubview:sb];
 }
@@ -801,10 +803,7 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 // 布局跟 WCR 的 viewDidLayoutSubviews 一个算法：搜索条压在最上面，网格从它底下开始铺满剩余
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    CGFloat top = 0;
-    if (@available(iOS 11.0, *)) {
-        top = self.view.safeAreaInsets.top; // 上面设了 UIRectEdgeNone，正常就是 0
-    }
+    CGFloat top = self.view.safeAreaInsets.top; // 上面设了 UIRectEdgeNone，正常就是 0
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
     self.searchBar.frame = CGRectMake(0, top, w, kDDShellSearchH);
@@ -1236,12 +1235,8 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
     [super viewDidLoad];
     self.title = @"模板套壳设置";
 
-    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
-    [appearance configureWithDefaultBackground];
-    appearance.shadowColor = nil;
-    self.navigationItem.standardAppearance = appearance;
-    self.navigationItem.scrollEdgeAppearance = appearance;
-    self.navigationItem.compactAppearance = appearance;
+    // 导航栏：和素材库页同一套（不透明灰 + 无阴影线）
+    DD_ApplyNavigationBarAppearance(self);
 
     [self ensureTableViewMgr];
     if (!_tableViewMgr) return;
