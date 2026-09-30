@@ -742,6 +742,7 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
 //   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择，选「选择」同样进选择态。
 @interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
+@property (nonatomic, strong) UISearchBar *searchBar;                  // 自己贴 view 顶上的搜索框（不挂 navigationItem.searchController，避免撑高导航栏）
 @property (nonatomic, strong) UICollectionView *collectionView;
 @property (nonatomic, strong) NSArray<NSString *> *allNames;       // 排序后的全量，搜索只是过滤展示
 @property (nonatomic, strong) NSArray<NSString *> *names;          // 当前展示（可能是过滤结果）
