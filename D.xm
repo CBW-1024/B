@@ -40,22 +40,25 @@
 //   8. [frame drawInRect:CGRectMake(0, 0, W, H)]    ← 机身图盖在最上层
 //   9. out = UIGraphicsGetImageFromCurrentImageContext(); UIGraphicsEndImageContext()
 //
-//  ── 由上面第 6/7 条得出的关键结论（本版据此修正模糊）──────────────────────
-//   ★ inputExtent 与四角点必须处在「同一个坐标空间」，否则角点会被 extent 裁掉。
-//     WCR 里两者恰好重合，是因为它假定模板像素尺寸 == 截图像素尺寸
-//     （inputExtent 用截图像素、角点用模板像素，只有两者相等才成立）。
-//     本插件要兼容任意尺寸模板，因此统一到「输出画布空间」：
-//       inputExtent = CGRectMake(0, 0, Wout, Hout)，四角点同步乘 S。
-//   ★ WCR 本身【不做任何超采样】：输出就是模板像素尺寸 × scale(=1)。
-//     所以 S>1 只在「屏幕窗明显小于截图」时才需要，且必须连 inputExtent 一起放大。
-//   ★ 输出画布固定 1×（1 单位 = 1 像素），与 WCR 的 scale 语义一致，
-//     绝不能用 UIGraphicsImageRenderer 的默认 scale（= 屏幕 2x/3x），
-//     那会把画布 backing store 放大 3 倍、截图被拉伸 3 倍 —— 这正是「截图糊」的元凶。
+//  ── 由上面第 6/7 条得出的关键结论（本版据此修正模糊与尺寸错位）────────────
+//   ★ 截图【整张】透视映射到 cfg 四角围成的屏幕窗，且 inputExtent 必须是
+//     「截图自身的像素尺寸 (A,B)」，四角点落在模板画布坐标系 (W,H) 中。
+//     这样无论模板多大，截图都恰好 1:1 填满窗口（像素级贴合），不会出现
+//     「截图被缩放 / 窗口尺寸对不上」的问题。之前用 Wout×Hout 当 inputExtent
+//     并给角点乘 S 是错的，会让角点跑到 extent 外被裁、尺寸错位。
+//   ★ WCR【不做任何超采样】，输出就是 template_width×template_height × scale
+//     （模板 PNG 为 1× 时 scale=1）。绝不能用 UIGraphicsImageRenderer 的
+//     默认 scale（= 屏幕 2x/3x），那会把画布放大 3 倍、截图被拉伸 3 倍 → 糊。
+//   ★ 输出画布固定 1×（1 单位 = 1 像素 = 模板像素），保证输出尺寸严格等于
+//     template_width×template_height。不用默认 scale（= 屏幕 2x/3x），否则画布被放大 3 倍。
 //
-//  ── 使用方式 ──────────────────────────────────────────────────────────────
-//  模板文件自行放入 Documents/DDShellTemplates/（name.png，可选 name_dark.png，
-//  以及可选的 name.cfg 描述屏幕窗四角）。缺省 name.cfg 时，插件在加载模板时会
-//  根据图片的透明镂空区自动探测屏幕窗（对齐 WCR 的 refineCandidatePoints 思路）。
+//  ── 模板格式（强制 png + cfg 成对）────────────────────────────────────────
+//  把 name.png 与 name.cfg 一起放进 Documents/DDShellTemplates/。两者缺一则
+//  该模板不生效（不自动探测、不回退 _dark）。name.cfg 为 JSON，字段：
+//    {"template_width":1170,"template_height":2532,
+//     "left_top_x":..,"left_top_y":.., "right_top_x":..,"right_top_y":..,
+//     "left_bottom_x":..,"left_bottom_y":.., "right_bottom_x":..,"right_bottom_y":..}
+//  四角坐标为模板像素坐标（左上原点），即屏幕窗在 PNG 中的位置。
 //
 //  本插件不 hook 微信内部逻辑，纯系统层实现：
 //    截图 → UIApplicationUserDidTakeScreenshotNotification
@@ -210,21 +213,17 @@ static NSString *DD_TplDir(void) {
 
 @interface DDShellTemplate : NSObject
 @property (nonatomic, copy)   NSString *name;        // 模板名（不含扩展名）
-@property (nonatomic, strong) UIImage  *image;       // 日间图
-@property (nonatomic, strong) UIImage  *darkImage;   // 夜间图（可选）
-@property (nonatomic)         CGSize    canvasSize;  // 模板像素尺寸
-@property (nonatomic)         CGPoint   lt, rt, lb, rb; // 屏幕窗四角（UIKit 坐标，左上原点，像素）
-@property (nonatomic)         BOOL      hasRegion;   // 是否已确定屏幕窗
+@property (nonatomic, strong) UIImage  *image;       // 机身前景图（png）
+@property (nonatomic)         CGSize    canvasSize;  // 模板画布像素尺寸（来自 cfg 的 template_width/height）
+@property (nonatomic)         CGPoint   lt, rt, lb, rb; // 屏幕窗四角（UIKit 坐标，左上原点，像素，来自 cfg）
 @end
 
 @implementation DDShellTemplate
 @end
 
-// 当前生效的机身图（按系统深浅色自动选 _dark）
+// 机身前景图（模板只支持 png+cfg，不再有 _dark 变体）
 static UIImage *DD_FrameImage(DDShellTemplate *t) {
-    if (!t) return nil;
-    BOOL dark = (UITraitCollection.currentTraitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
-    return (dark && t.darkImage) ? t.darkImage : t.image;
+    return t.image;
 }
 
 static NSString *DD_CfgPath(NSString *name) {
@@ -238,22 +237,23 @@ static NSDictionary *DD_LoadCfg(NSString *name) {
     return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
 }
 
-// 素材库：所有不以 _dark 结尾的 png/jpg 的 basename
+// 素材库：仅保留「同时具备 name.png 与 name.cfg」的模板（强制 png+cfg 成对）
 static NSArray<NSString *> *DD_AllTemplateNames(void) {
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:DD_TplDir() error:nil];
-    NSMutableArray *out = [NSMutableArray array];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:DD_TplDir() error:nil] ?: @[];
+    NSMutableSet *pngs = [NSMutableSet set];
+    NSMutableSet *cfgs = [NSMutableSet set];
     for (NSString *f in files) {
         NSString *low = f.lowercaseString;
-        if (!([low hasSuffix:@".png"] || [low hasSuffix:@".jpg"] || [low hasSuffix:@".jpeg"])) continue;
         NSString *base = f.stringByDeletingPathExtension;
-        if ([base.lowercaseString hasSuffix:@"_dark"]) continue;
-        [out addObject:base];
+        if ([low hasSuffix:@".png"])      [pngs addObject:base];
+        else if ([low hasSuffix:@".cfg"]) [cfgs addObject:base];
+    }
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *b in pngs) {
+        if ([cfgs containsObject:b]) [out addObject:b]; // 必须 png 与 cfg 同时存在
     }
     return [out sortedArrayUsingSelector:@selector(compare:)];
 }
-
-// 前向声明：实现位于下方「屏幕窗自动探测」节，加载模板时按需调用
-static CGRect DD_DetectScreenRegion(UIImage *img);
 
 static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     if (!name.length) return nil;
@@ -270,48 +270,32 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     DDShellTemplate *t = [DDShellTemplate new];
     t.name = name;
     t.image = img;
-    t.canvasSize = CGSizeMake(img.size.width * img.scale, img.size.height * img.scale);
 
-    NSString *darkPath = [[DD_TplDir() stringByAppendingPathComponent:[name stringByAppendingString:@"_dark"]] stringByAppendingPathExtension:@"png"];
-    NSData *dd = [NSData dataWithContentsOfFile:darkPath];
-    if (dd.length) {
-        UIImage *di = [UIImage imageWithData:dd];
-        if (di && fabs(di.size.width * di.scale - t.canvasSize.width) < 2.0) t.darkImage = di;
-    }
-
+    // cfg 必须存在，否则模板不生效（不再自动探测、不回退）
     NSDictionary *cfg = DD_LoadCfg(name);
+    if (!cfg) return nil;
+
+    // 画布尺寸优先取 cfg 的 template_width/height（对齐 WCR）；缺省则用图片自身像素尺寸，
+    // 以免手作 cfg 漏写这两个字段时模板被误判为无效。
     double lw = [cfg[@"template_width"] doubleValue];
     double lh = [cfg[@"template_height"] doubleValue];
-    // cfg 里记录的模板尺寸；与真实图不符（换过图）则作废，需重新探测
-    BOOL sizeOK = (lw > 0 && lh > 0 && fabs(lw - t.canvasSize.width) < 2.0 && fabs(lh - t.canvasSize.height) < 2.0);
-    if (sizeOK) {
-        NSArray *keys = @[@"left_top", @"right_top", @"left_bottom", @"right_bottom"];
-        CGPoint pts[4];
-        BOOL ok = YES;
-        for (NSUInteger i = 0; i < 4; i++) {
-            id x = cfg[[keys[i] stringByAppendingString:@"_x"]];
-            id y = cfg[[keys[i] stringByAppendingString:@"_y"]];
-            if (![x respondsToSelector:@selector(doubleValue)] || ![y respondsToSelector:@selector(doubleValue)]) { ok = NO; break; }
-            pts[i] = CGPointMake([x doubleValue], [y doubleValue]);
-        }
-        if (ok) {
-            t.lt = pts[0]; t.rt = pts[1]; t.lb = pts[2]; t.rb = pts[3];
-            t.hasRegion = YES;
-        }
-    }
+    CGFloat iw = img.size.width * img.scale;
+    CGFloat ih = img.size.height * img.scale;
+    CGSize canvas = (lw > 0 && lh > 0) ? CGSizeMake(lw, lh) : CGSizeMake(iw, ih);
 
-    // 缺 cfg（或 cfg 尺寸不匹配失效）时，按 WCR 同款思路从透明镂空区自动探测屏幕窗，
-    // 不再依赖设置页手动触发；探测失败则 hasRegion 保持 NO，合成走等比居中回退。
-    if (!t.hasRegion) {
-        CGRect dr = DD_DetectScreenRegion(t.image);
-        if (!CGRectIsEmpty(dr)) {
-            t.lt = CGPointMake(CGRectGetMinX(dr), CGRectGetMinY(dr));
-            t.rt = CGPointMake(CGRectGetMaxX(dr), CGRectGetMinY(dr));
-            t.lb = CGPointMake(CGRectGetMinX(dr), CGRectGetMaxY(dr));
-            t.rb = CGPointMake(CGRectGetMaxX(dr), CGRectGetMaxY(dr));
-            t.hasRegion = YES;
-        }
+    NSArray *keys = @[@"left_top", @"right_top", @"left_bottom", @"right_bottom"];
+    CGPoint pts[4];
+    BOOL ok = YES;
+    for (NSUInteger i = 0; i < 4; i++) {
+        id x = cfg[[keys[i] stringByAppendingString:@"_x"]];
+        id y = cfg[[keys[i] stringByAppendingString:@"_y"]];
+        if (![x respondsToSelector:@selector(doubleValue)] || ![y respondsToSelector:@selector(doubleValue)]) { ok = NO; break; }
+        pts[i] = CGPointMake([x doubleValue], [y doubleValue]);
     }
+    if (!ok) return nil; // 四角缺失 → 模板不生效
+
+    t.canvasSize = canvas; // 画布尺寸
+    t.lt = pts[0]; t.rt = pts[1]; t.lb = pts[2]; t.rb = pts[3];
     return t;
 }
 
@@ -321,84 +305,6 @@ static NSString *DD_ActiveTemplateName(void) {
     return [DD_AllTemplateNames() firstObject] ?: @"";
 }
 
-#pragma mark - 屏幕窗自动探测（对齐 WCR refineCandidatePoints:withDarkFrameUsingRGBA:）
-
-// 降采样 → 从图像中心 flood fill 找 alpha 连通透明区 → 返回其在原图中的外接矩形（UIKit 坐标）
-static CGRect DD_DetectScreenRegion(UIImage *img) {
-    CGImageRef cg = img.CGImage;
-    if (!cg) return CGRectZero;
-    CGFloat W = (CGFloat)CGImageGetWidth(cg);
-    CGFloat H = (CGFloat)CGImageGetHeight(cg);
-    if (W < 16 || H < 16) return CGRectZero;
-
-    CGFloat scale = MIN(1.0, 256.0 / MAX(W, H));
-    size_t sw = (size_t)MAX(8, round(W * scale));
-    size_t sh = (size_t)MAX(8, round(H * scale));
-
-    size_t bytesPerRow = sw * 4;
-    unsigned char *buf = (unsigned char *)calloc(bytesPerRow * sh, 1);
-    if (!buf) return CGRectZero;
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(buf, sw, sh, 8, bytesPerRow, cs,
-                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGColorSpaceRelease(cs);
-    if (!ctx) { free(buf); return CGRectZero; }
-    CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
-    CGContextDrawImage(ctx, CGRectMake(0, 0, sw, sh), cg);
-    CGContextRelease(ctx);
-
-    const int kAlphaThreshold = 24; // 约 10%
-    size_t n = sw * sh;
-    unsigned char *visited = (unsigned char *)calloc(n, 1);
-    int *stack = (int *)malloc(n * sizeof(int));
-    if (!visited || !stack) { free(buf); free(visited); free(stack); return CGRectZero; }
-
-    // 起点：中心；中心不透明则线性扫描找第一个透明像素
-    size_t start = (sh / 2) * sw + (sw / 2);
-    if (buf[start * 4 + 3] > kAlphaThreshold) {
-        size_t found = n;
-        for (size_t i = 0; i < n; i++) {
-            if (buf[i * 4 + 3] <= kAlphaThreshold) { found = i; break; }
-        }
-        if (found == n) { free(buf); free(visited); free(stack); return CGRectZero; }
-        start = found;
-    }
-
-    size_t sp = 0;
-    stack[sp++] = (int)start;
-    visited[start] = 1;
-    size_t minX = sw, maxX = 0, minY = sh, maxY = 0;
-
-    while (sp > 0) {
-        int idx = stack[--sp];
-        int x = idx % (int)sw;
-        int y = idx / (int)sw;
-        if ((size_t)x < minX) minX = (size_t)x;
-        if ((size_t)x > maxX) maxX = (size_t)x;
-        if ((size_t)y < minY) minY = (size_t)y;
-        if ((size_t)y > maxY) maxY = (size_t)y;
-
-        if (x > 0)            { size_t j = idx - 1;  if (!visited[j] && buf[j*4+3] <= kAlphaThreshold) { visited[j] = 1; stack[sp++] = (int)j; } }
-        if (x < (int)sw - 1)  { size_t j = idx + 1;  if (!visited[j] && buf[j*4+3] <= kAlphaThreshold) { visited[j] = 1; stack[sp++] = (int)j; } }
-        if (y > 0)            { size_t j = idx - sw; if (!visited[j] && buf[j*4+3] <= kAlphaThreshold) { visited[j] = 1; stack[sp++] = (int)j; } }
-        if (y < (int)sh - 1)  { size_t j = idx + sw; if (!visited[j] && buf[j*4+3] <= kAlphaThreshold) { visited[j] = 1; stack[sp++] = (int)j; } }
-    }
-
-    free(buf);
-    free(visited);
-    free(stack);
-
-    CGFloat area  = (CGFloat)(maxX - minX + 1) * (CGFloat)(maxY - minY + 1);
-    CGFloat total = (CGFloat)sw * (CGFloat)sh;
-    // 占比异常说明整图透明或没有真正的镂空窗，交给回退逻辑处理
-    if (area > total * 0.92 || area < total * 0.02) return CGRectZero;
-
-    // buffer 由 CGContext 绘制，原点在左下；转换回 UIKit（左上原点）
-    CGFloat top = (CGFloat)(sh - 1 - maxY);
-    CGRect r = CGRectMake((CGFloat)minX / scale, top / scale,
-                          (CGFloat)(maxX - minX + 1) / scale, (CGFloat)(maxY - minY + 1) / scale);
-    return CGRectIntegral(r);
-}
 
 #pragma mark - 合成（核心：透视贴进屏幕窗）
 
@@ -417,81 +323,53 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
     if (W < 1.0 || H < 1.0) return nil;
 
-    // 截图按【像素】计（WCR 也是用 CGImageGetWidth/Height，不走 UIImage.size）
-    CGFloat shotW = (CGFloat)CGImageGetWidth(shotCG);
-    CGFloat shotH = (CGFloat)CGImageGetHeight(shotCG);
-    CGSize shotSize = CGSizeMake(shotW, shotH);
+    // 截图按【像素】计（与 WCR 一致：CGImageGetWidth/Height，不走 UIImage.size）
+    CGFloat A = (CGFloat)CGImageGetWidth(shotCG);
+    CGFloat B = (CGFloat)CGImageGetHeight(shotCG);
+    if (A < 1.0 || B < 1.0) return nil;
 
-    // ── 输出倍率 ───────────────────────────────────────────────────────────
-    // WCR 本身不做超采样（S≡1），因为它假定模板像素尺寸 == 截图像素尺寸。
-    // 本插件兼容任意尺寸模板：只有当“屏幕窗长边 < 截图像素长边”时才放大画布，
-    // 使截图映射进窗口的比例接近 1:1，避免被压缩后又被放大导致糊。
-    // 注意：S 一旦生效，inputExtent 与四角点必须同步放大（见下），否则角点被裁。
-    CGFloat winLong = (t.hasRegion)
-        ? MAX(MAX(fabs(t.rt.x - t.lt.x), fabs(t.rb.x - t.lb.x)),
-              MAX(fabs(t.lb.y - t.lt.y), fabs(t.rb.y - t.rt.y)))
-        : MAX(W, H);
-    CGFloat shotLong = MAX(shotSize.width, shotSize.height);
-    CGFloat S = 1.0;
-    if (winLong > 1.0 && shotLong > 1.0) {
-        S = shotLong / winLong;
-        if (S < 1.0) S = 1.0;
-        if (S > 4.0) S = 4.0;
-    }
-    CGFloat Wout = W * S, Hout = H * S;
+    // 输出画布固定 1×（1 单位 = 1 像素 = 模板像素），保证输出尺寸 == template_width×template_height。
+    // 绝不能用 UIGraphicsImageRenderer / beginContext 的默认 scale（= 屏幕 2x/3x），
+    // 那会把画布放大 3 倍、截图被拉伸 3 倍 → 糊。
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(W, H), NO, 1.0);
 
+    // 与 WCR 完全一致：CIContext 强制 GPU（kCIContextUseSoftwareRenderer = @NO）
+    CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
+
+    // 整张截图透视映射到 cfg 四角围成的屏幕窗。
+    // ★ inputExtent 必须是截图自身像素尺寸 (A,B)，四角点落在模板画布 (W,H) 坐标系中，
+    //   这样截图恰好 1:1 填满窗口，不会出现尺寸错位 / 被裁。
     CIImage *src = [CIImage imageWithCGImage:shotCG];
-    CIImage *base = nil;
+    CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
+    [f setDefaults];
+    [f setValue:src forKey:kCIInputImageKey];
+    [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, A, B)] forKey:@"inputExtent"];
+    [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
+    [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
+    [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
+    [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
+    CIImage *o = [f valueForKey:kCIOutputImageKey];
 
-    if (t.hasRegion) {
-        CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
-        if (f) {
-            [f setDefaults];
-            [f setValue:src forKey:kCIInputImageKey];
-            // ★ inputExtent 必须与四角点同一坐标空间：统一用「输出画布」。
-            //   （WCR 用 src.extent，只在模板尺寸 == 截图像素尺寸时才等价）
-            [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, Wout, Hout)] forKey:@"inputExtent"];
-            // 角点按输出倍率 S 放大到输出坐标系，Y 轴翻转（UIKit 左上 → CI 左下）
-            [f setValue:DD_CIVec(CGPointMake(t.lt.x * S, t.lt.y * S), Hout) forKey:@"inputTopLeft"];
-            [f setValue:DD_CIVec(CGPointMake(t.rt.x * S, t.rt.y * S), Hout) forKey:@"inputTopRight"];
-            [f setValue:DD_CIVec(CGPointMake(t.rb.x * S, t.rb.y * S), Hout) forKey:@"inputBottomRight"];
-            [f setValue:DD_CIVec(CGPointMake(t.lb.x * S, t.lb.y * S), Hout) forKey:@"inputBottomLeft"];
-            CIImage *o = [f valueForKey:kCIOutputImageKey];
-            if (o) base = o;
+    if (o) {
+        CGRect ext = o.extent;
+        CGImageRef cg = [ci createCGImage:o fromRect:ext];
+        if (cg) {
+            // CI 的 extent 是左下原点坐标；UIKit 上下文是左上原点，转换后 1:1 贴入，
+            // 用 [UIImage drawInRect:] 规避 CGContextDrawImage 在 UIKit 上下文里的翻转歧义。
+            UIImage *layer = [UIImage imageWithCGImage:cg scale:1.0 orientation:UIImageOrientationUp];
+            CGRect r = CGRectMake(ext.origin.x,
+                                 H - ext.origin.y - ext.size.height,
+                                 ext.size.width, ext.size.height);
+            [layer drawInRect:r];
+            CGImageRelease(cg);
         }
     }
 
-    if (!base) {
-        // 回退（无 cfg 且探测失败）：截图等比例居中放进画布（输出坐标系），不做拉伸变形
-        CGFloat s = MIN(Wout / shotW, Hout / shotH);
-        CIImage *scaled = [src imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
-        base = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation((Wout - shotW * s) / 2.0, (Hout - shotH * s) / 2.0)];
-    }
-    base = [base imageByCroppingToRect:CGRectMake(0, 0, Wout, Hout)];
+    // 机身前景图盖在最上层（WCR 用 [frame drawInRect:]）
+    [frameImg drawInRect:CGRectMake(0, 0, W, H)];
 
-    static CIContext *ctx;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ ctx = [CIContext contextWithOptions:nil]; });
-    CGImageRef shellCG = [ctx createCGImage:base fromRect:CGRectMake(0, 0, Wout, Hout)];
-    if (!shellCG) return nil;
-
-    // ── 最终合成（对齐 WCR：1× 画布 + UIKit 绘制）────────────────────────
-    // 画布 scale 必须为 1.0（1 单位 = 1 像素）。若用 UIGraphicsImageRenderer 的
-    // 默认 scale(=屏幕 2x/3x)，backing store 会被放大 3 倍、截图被拉伸 3 倍 → 糊。
-    // CI 的 createCGImage: 已把左下原点坐标翻正，这里直接按 UIKit 语义 1:1 贴入，
-    // 不用 CGContextDrawImage（UIKit 上下文里它的翻转语义极易搞反）。
-    UIImage *shellImg = [UIImage imageWithCGImage:shellCG scale:1.0 orientation:UIImageOrientationUp];
-    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
-    fmt.scale = 1.0;
-    fmt.opaque = NO;
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(Wout, Hout) format:fmt];
-    UIImage *img = [renderer imageWithActions:^(UIGraphicsImageRendererContext *rc) {
-        (void)rc;
-        // 先贴透视后的截图，机身前景图再盖在最上层（WCR 用的是 [frame drawInRect:]）
-        [shellImg drawInRect:CGRectMake(0, 0, Wout, Hout)];
-        [frameImg drawInRect:CGRectMake(0, 0, Wout, Hout)];
-    }];
-    CGImageRelease(shellCG);
+    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
     return img;
 }
 
@@ -664,7 +542,7 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
             if (tpls.count == 0) {
                 [section addCell:[cellCls centerCellForSel:@selector(noopTapped:)
                                                     target:self
-                                                     title:@"（空：模板 PNG 放 Documents/DDShellTemplates/）"]];
+                                                     title:@"（空：把 name.png + name.cfg 一起放 Documents/DDShellTemplates/）"]];
             }
             for (NSString *t in tpls) {
                 WCTableViewCellManager *c = [cellCls centerCellForSel:@selector(tplOptionTapped:) target:self title:t];
