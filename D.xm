@@ -406,12 +406,14 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 #pragma mark - 监听器
 
 // 微信原生 toast（接口来自 8.0.79 头文件 WeToast.h）
-@interface WeToast : NSObject
+// 用分类补充方法声明，避免与工程已导入的微信头文件重复 @interface 引发解析冲突
+@class WeToast;
+@interface WeToast (DDShellToast)
 + (id)toast;
-- (void)setLoadingStyle:(BOOL);
-- (void)showToastWithText:(id);
-- (void)showDoneToastWithText:(id);
-- (void)hideWithAnimated:(int);
+- (void)setLoadingStyle:(BOOL)style;
+- (void)showToastWithText:(id)text;
+- (void)showDoneToastWithText:(id)text;
+- (void)hideWithAnimated:(int)animated;
 @end
 
 @interface DDShellWatcher : NSObject
