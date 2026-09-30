@@ -213,12 +213,6 @@ static NSDictionary *DD_LoadCfg(NSString *name) {
     return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
 }
 
-static void DD_SaveCfg(NSString *name, NSDictionary *cfg) {
-    if (!name.length || !cfg) return;
-    NSData *d = [NSJSONSerialization dataWithJSONObject:cfg options:NSJSONWritingPrettyPrinted error:nil];
-    if (d) [d writeToFile:DD_CfgPath(name) atomically:YES];
-}
-
 // 素材库：所有不以 _dark 结尾的 png/jpg 的 basename
 static NSArray<NSString *> *DD_AllTemplateNames(void) {
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:DD_TplDir() error:nil];
