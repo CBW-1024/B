@@ -405,16 +405,19 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 
 #pragma mark - 监听器
 
-// 微信原生 toast（接口来自 8.0.79 头文件 WeToast.h）
-// 用分类补充方法声明，避免与工程已导入的微信头文件重复 @interface 引发解析冲突
-@class WeToast;
-@interface WeToast (DDShellToast)
-+ (id)toast;
+// 微信原生 toast。工程未导入 WeToast.h，这里手写一份精简前向声明（完整 @interface），
+// 仅补充套壳提示用到的几个方法。放在顶层、不进入任何 @implementation，编译器即视为已知类；
+// theos 对 tweak 默认允许 undefined symbol 延迟绑定到宿主（微信）进程中的符号（与引用
+// WCPluginsMgr / WCTableViewManager 等微信类同一机制），因此无需在编译期链接微信头文件。
+@interface WeToast : NSObject
++ (instancetype)toast;
 - (void)setLoadingStyle:(BOOL)style;
-- (void)showToastWithText:(id)text;
-- (void)showDoneToastWithText:(id)text;
-- (void)hideWithAnimated:(int)animated;
+- (void)showToastWithText:(NSString *)text;
+- (void)showDoneToastWithText:(NSString *)text;
+- (void)hideWithAnimated:(BOOL)animated;
 @end
+
+static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提示，供成功后收起
 
 @interface DDShellWatcher : NSObject
 + (instancetype)shared;
@@ -422,7 +425,6 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 - (void)dd_showShelling;
 - (void)dd_hideShelling;
 - (void)dd_showShellDone;
-@property (nonatomic, strong) WeToast *busyToast; // 进行中的「正在套壳」提示
 @end
 
 @implementation DDShellWatcher
@@ -480,28 +482,29 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
     });
 }
 
-// 微信原生「正在处理」提示（loading 样式 + 转圈），PHImageManager 回调可能在后台线程，统一回主线程
+// 微信原生「正在处理」提示（loading 样式 + 转圈）。PHImageManager 回调可能在后台线程，统一回主线程。
 - (void)dd_showShelling {
     dispatch_async(dispatch_get_main_queue(), ^{
         WeToast *toast = [WeToast toast];
+        if (!toast) return;
         [toast setLoadingStyle:YES];
         [toast showToastWithText:@"正在套壳"];
-        self.busyToast = toast;
+        gBusyToast = toast;
     });
 }
 
 - (void)dd_hideShelling {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self.busyToast hideWithAnimated:1];
-        self.busyToast = nil;
+        [gBusyToast hideWithAnimated:YES];
+        gBusyToast = nil;
     });
 }
 
 // 收起「正在套壳」并弹出微信原生成功提示（带勾选图标）
 - (void)dd_showShellDone {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self.busyToast hideWithAnimated:1];
-        self.busyToast = nil;
+        [gBusyToast hideWithAnimated:YES];
+        gBusyToast = nil;
         [[WeToast toast] showDoneToastWithText:@"套壳成功"];
     });
 }
