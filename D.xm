@@ -264,7 +264,7 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     NSData *d = png ? [NSData dataWithContentsOfFile:png] : nil;
     if (!d.length) return nil; // 只支持 png+cfg，无 png 直接视为模板无效
     UIImage *img = [UIImage imageWithData:d];
-    if (!img || img.size.width < 8 || img.size.height < 8) return nil;
+    if (!img) return nil;
 
     DDShellTemplate *t = [DDShellTemplate new];
     t.name = name;
@@ -274,13 +274,10 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     NSDictionary *cfg = DD_LoadCfg(name);
     if (!cfg) return nil;
 
-    // 画布尺寸优先取 cfg 的 template_width/height（对齐 WCR）；缺省则用图片自身像素尺寸，
-    // 以免手作 cfg 漏写这两个字段时模板被误判为无效。
+    // 画布尺寸取 cfg 的 template_width/height（对齐 WCR）；缺字段则 W/H 为 0，下方 W<1 拦截 → 模板无效。
     double lw = [cfg[@"template_width"] doubleValue];
     double lh = [cfg[@"template_height"] doubleValue];
-    CGFloat iw = img.size.width * img.scale;
-    CGFloat ih = img.size.height * img.scale;
-    CGSize canvas = (lw > 0 && lh > 0) ? CGSizeMake(lw, lh) : CGSizeMake(iw, ih);
+    CGSize canvas = CGSizeMake(lw, lh);
 
     NSArray *keys = @[@"left_top", @"right_top", @"left_bottom", @"right_bottom"];
     CGPoint pts[4];
@@ -373,12 +370,6 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 }
 
 #pragma mark - 相册
-
-static void DD_EnsurePhotoAuth(void (^ready)(BOOL)) {
-    [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus s) {
-        if (ready) ready(s == PHAuthorizationStatusAuthorized || s == PHAuthorizationStatusLimited);
-    }];
-}
 
 // 取相册里「最新」的一张图作为本次要套壳的截图。
 // 连拍时本插件只处理一张（视为同一张），处理中到达的截屏事件在 onScreenshot 里直接丢弃；
@@ -480,29 +471,26 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
 - (void)shellLatestScreenshotWithCompletion:(void (^)(void))completion {
     DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
     if (!t) { if (completion) completion(); return; }
-    DD_EnsurePhotoAuth(^(BOOL ok) {
-        if (!ok) { if (completion) completion(); return; }
-        DD_LatestImageAsset(^(PHAsset *asset) {
-            if (!asset) { if (completion) completion(); return; }
-            if ([[DDShellConfig shared] hasProcessed:asset.localIdentifier]) { if (completion) completion(); return; } // 去重
-            PHImageRequestOptions *ro = [PHImageRequestOptions new];
-            ro.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
-            ro.networkAccessAllowed = NO;
-            [self dd_showShelling]; // 开始：微信原生「正在套壳」转圈提示
-            [[PHImageManager defaultManager] requestImageForAsset:asset
-                                                       targetSize:PHImageManagerMaximumSize
-                                                      contentMode:PHImageContentModeDefault
-                                                          options:ro
-                                                    resultHandler:^(UIImage *img, NSDictionary *info) {
-                UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
-                if (!outImg) { [self dd_hideShelling]; if (completion) completion(); return; } // 失败：静默收起，不给提示
-                DD_SaveImageToAlbum(outImg);
-                [[DDShellConfig shared] markProcessed:asset.localIdentifier];
-                if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
-                [self dd_showShellDone]; // 结束：成功提示（先收起「正在套壳」）
-                if (completion) completion();
-            }];
-        });
+    DD_LatestImageAsset(^(PHAsset *asset) {
+        if (!asset) { if (completion) completion(); return; }
+        if ([[DDShellConfig shared] hasProcessed:asset.localIdentifier]) { if (completion) completion(); return; } // 去重
+        PHImageRequestOptions *ro = [PHImageRequestOptions new];
+        ro.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
+        ro.networkAccessAllowed = NO;
+        [self dd_showShelling]; // 开始：微信原生「正在套壳」转圈提示
+        [[PHImageManager defaultManager] requestImageForAsset:asset
+                                                   targetSize:PHImageManagerMaximumSize
+                                                  contentMode:PHImageContentModeDefault
+                                                      options:ro
+                                                resultHandler:^(UIImage *img, NSDictionary *info) {
+            UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
+            if (!outImg) { [self dd_hideShelling]; if (completion) completion(); return; } // 失败：静默收起，不给提示
+            DD_SaveImageToAlbum(outImg);
+            [[DDShellConfig shared] markProcessed:asset.localIdentifier];
+            if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
+            [self dd_showShellDone]; // 结束：成功提示（先收起「正在套壳」）
+            if (completion) completion();
+        }];
     });
 }
 
@@ -512,10 +500,8 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
 // 链接期报 undefined symbols。手写 @interface 仅用于编译期类型检查，不参与符号引用。
 - (void)dd_showShelling {
     dispatch_async(dispatch_get_main_queue(), ^{
-        Class cls = NSClassFromString(@"WeToast");
-        if (!cls) return;
+        Class cls = NSClassFromString(@"WeToast"); // WeToast 已确认存在，无需 nil 守卫
         WeToast *toast = [cls toast];
-        if (!toast) return;
         [toast setLoadingStyle:YES];
         [toast showToastWithText:@"正在套壳"];
         gBusyToast = toast;
@@ -534,8 +520,7 @@ static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃
     dispatch_async(dispatch_get_main_queue(), ^{
         [gBusyToast hideWithAnimated:YES];
         gBusyToast = nil;
-        Class cls = NSClassFromString(@"WeToast");
-        if (!cls) return;
+        Class cls = NSClassFromString(@"WeToast"); // WeToast 已确认存在，无需 nil 守卫
         [[cls toast] showDoneToastWithText:@"套壳成功"];
     });
 }
