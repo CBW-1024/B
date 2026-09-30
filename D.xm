@@ -729,8 +729,8 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
 //   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择，选「选择」同样进选择态。
 @interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate, UIGestureRecognizerDelegate>
-@property (nonatomic, strong) UISearchBar *searchBar;
 @property (nonatomic, weak) id origPopDelegate;                   // 侧滑手势原代理，离开页面时还原
+@property (nonatomic, strong) UISearchController *searchController; // 挂在导航栏上，与导航栏同底色
 @property (nonatomic, strong) UICollectionView *collectionView;
 @property (nonatomic, strong) NSArray<NSString *> *allNames;       // 排序后的全量，搜索只是过滤展示
 @property (nonatomic, strong) NSArray<NSString *> *names;          // 当前展示（可能是过滤结果）
@@ -756,20 +756,23 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
     [self setupBackButton];
 
+    // 搜索框放进导航栏（navigationItem.searchController）：和导航栏连成一体、同底色，
+    // 不再是自己贴在 view 上的一块，进出页面也不会闪
+    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.searchController.obscuresBackgroundDuringPresentation = NO;
+    self.searchController.hidesNavigationBarDuringPresentation = NO;
+    self.searchController.searchBar.placeholder = @"搜索套壳名称";
+    self.searchController.searchBar.delegate = self;
+    self.definesPresentationContext = YES;
+    self.navigationItem.searchController = self.searchController;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO; // 常驻显示，滚动时不收起以免抖动
+
     UICollectionViewFlowLayout *layout = [[UICollectionViewFlowLayout alloc] init];
     layout.minimumInteritemSpacing = kDDShellTplGap;
     layout.minimumLineSpacing = kDDShellTplGap;
     layout.sectionInset = UIEdgeInsetsMake(kDDShellTplGap, kDDShellTplGap, kDDShellTplGap, kDDShellTplGap);
 
-    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(10.0, 2.0, self.view.bounds.size.width - 20.0, 40.0)];
-    self.searchBar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    self.searchBar.placeholder = @"搜索套壳名称";
-    self.searchBar.delegate = self;
-    [self.view addSubview:self.searchBar];
-
     CGRect cvFrame = self.view.bounds;
-    cvFrame.origin.y = 44.0;
-    cvFrame.size.height -= 44.0;
     self.collectionView = [[UICollectionView alloc] initWithFrame:cvFrame collectionViewLayout:layout];
     self.collectionView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     if (@available(iOS 13.0, *)) {
@@ -845,7 +848,7 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
 // 搜索过滤：只动展示的 names，全量 allNames 不变；标题跟着显示过滤后的数量
 - (void)applySearchFilter {
-    NSString *kw = (self.searchBar.text ?: @"").lowercaseString;
+    NSString *kw = (self.searchController.searchBar.text ?: @"").lowercaseString;
     if (!kw.length) {
         self.names = self.allNames;
     } else {
