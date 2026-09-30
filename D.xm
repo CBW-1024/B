@@ -729,9 +729,7 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 //   点「导出」用微信原生 WCActionSheet 弹「选择导出方式」：选择导出 / 全部导出（取消自带）；
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
 //   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择，选「选择」同样进选择态。
-@interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate, UIGestureRecognizerDelegate>
-@property (nonatomic, strong) UISearchBar *searchBar;
-@property (nonatomic, weak) id origPopDelegate;                   // 侧滑手势原代理，离开页面时还原
+@interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
 @property (nonatomic, strong) UICollectionView *collectionView;
 @property (nonatomic, strong) NSArray<NSString *> *allNames;       // 排序后的全量，搜索只是过滤展示
 @property (nonatomic, strong) NSArray<NSString *> *names;          // 当前展示（可能是过滤结果）
@@ -754,8 +752,6 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
     self.navigationItem.standardAppearance = appearance;
     self.navigationItem.scrollEdgeAppearance = appearance;
     self.navigationItem.compactAppearance = appearance;
-
-    [self setupBackButton];
 
     // 页面底色：微信设置页那个分组灰（WCR 的 viewDidLoad 也是 view.backgroundColor = 表格灰）
     if (@available(iOS 13.0, *)) {
@@ -816,46 +812,10 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
     [self.view bringSubviewToFront:self.searchBar];
 }
 
-// 返回按钮：黑色小箭头、不带上一页标题（微信原生样式）；自定义后系统侧滑会失效，一并接回来
-- (void)setupBackButton {
-    UIBarButtonItem *back;
-    if (@available(iOS 13.0, *)) {
-        back = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"chevron.left"]
-                                                style:UIBarButtonItemStylePlain
-                                               target:self
-                                               action:@selector(goBackTapped)];
-    } else {
-        back = [[UIBarButtonItem alloc] initWithTitle:@"〈"
-                                                style:UIBarButtonItemStylePlain
-                                               target:self
-                                               action:@selector(goBackTapped)];
-    }
-    back.tintColor = [UIColor blackColor];
-    self.navigationItem.leftBarButtonItem = back;
-
-    UIGestureRecognizer *pop = self.navigationController.interactivePopGestureRecognizer;
-    if (pop) {
-        self.origPopDelegate = pop.delegate;
-        pop.delegate = self; // 自定义返回按钮会关掉边缘侧滑，换成自己代理后恢复
-        pop.enabled = YES;
-    }
-}
-
-- (void)goBackTapped {
-    [self.navigationController popViewControllerAnimated:YES];
-}
-
-// 只有栈里不止一层、且当前正在最上层时才允许侧滑，防止根页面误滑卡死
-- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gr {
-    UINavigationController *nav = self.navigationController;
-    return nav.viewControllers.count > 1 && nav.topViewController == self;
-}
-
-- (void)viewWillDisappear:(BOOL)animated {
-    [super viewWillDisappear:animated];
-    UIGestureRecognizer *pop = self.navigationController.interactivePopGestureRecognizer;
-    if (pop && pop.delegate == self) pop.delegate = self.origPopDelegate; // 还原，别影响别的页面
-}
+// 返回按钮不自定义：直接用系统那个返回指示器，字形、大小、颜色都跟设置页完全一致。
+// 之前用 SF Symbol chevron.left 手搓了一个，跟 UIKit 自己画的系统箭头不是同一个尺寸；
+// 而且自定义 leftBarButtonItem 会把边缘侧滑返回弄失效，还得抢手势代理才能救回来。
+// 箭头旁边不显示上一页标题，靠 push 前把上一页的 backBarButtonItem 标题置空（见 openLibraryTapped:）。
 
 // 默认按名称排序（本地化、数字感知：「模板2」排在「模板10」前面）
 - (void)reloadList {
@@ -1337,6 +1297,12 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 }
 
 - (void)openLibraryTapped:(id)sender {
+    // push 前把上一页的返回标题清空，素材库页就只剩系统那个返回箭头，不会带「模板套壳设置」字样。
+    // 必须在 push 之前设，否则转场动画里会先闪一下旧标题。
+    self.navigationItem.backBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@""
+                                                                             style:UIBarButtonItemStylePlain
+                                                                            target:nil
+                                                                            action:nil];
     [self.navigationController pushViewController:[DDShellLibraryViewController new] animated:YES];
 }
 
