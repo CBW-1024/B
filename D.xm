@@ -7,25 +7,50 @@
 //  ZDY_v1.3.7.dylib : ScreenshotShellHelper / SSShellLibraryVC / SSShellEditorVC
 //                     PHPhotoLibrary 落相册
 //  WCRefine.dylib   : 完整工业级实现，本版按它校正合成算法
-//      WCRefineScreenshotFrameProcessor
-//          wcr_compositedFrameImageForSourceImage:templateInfo:
-//          initWithPerspectiveCornersLeftTop:rightTop:leftBottom:rightBottom:
-//          templateSize:frameImage:
+//      WCRefineScreenshotFrameProcessor  @ 0x279da60
+//          applyFrameToImage:secondImage:   0x74659c  ← 真正的合成主体
+//          applyFrameToImage:               0x7464f4  （薄封装，尾调用上面那个）
+//      WCRefineScreenRecordingFrameTemplate @ 0x279d948（录屏路径，本插件不涉及）
 //
-//  ── WCR 关键机制（本版已对齐）────────────────────────────────────────────
-//  1. 模板不是「一张图盖上去」，而是「带镂空屏幕窗的机身前景图」
-//     模板三件套：name.png / name_dark.png / name.cfg
-//     name.cfg（JSON，字段顺序取自 WCR 的写入模板）：
-//       {"name":"", "author":"", "created_at":0, "mode":"single",
-//        "template_width":1170, "template_height":2532,
-//        "left_top_x":..,"left_top_y":.., "right_top_x":..,"right_top_y":..,
-//        "left_bottom_x":..,"left_bottom_y":.., "right_bottom_x":..,"right_bottom_y":..}
-//  2. 合成用 CIPerspectiveTransformWithExtent：
-//     把整张截图透视映射到四角点围成的四边形（屏幕窗），模板再叠在上层。
-//     截图内容不会被裁掉，且支持斜角/透视模板。
-//  3. 探测屏幕窗用 refineCandidatePoints:withDarkFrameUsingRGBA: 同款思路：
-//     降采样 → 从中心 flood fill 找 alpha 连通区 → 得到屏幕窗矩形 → 落 cfg 缓存。
-//  4. 去重：screenshotFrameAlbumEnhancementProcessedIds，避免同一 asset 反复套壳。
+//  ── WCR applyFrameToImage:secondImage: 的真实指令流（已逐条反汇编核对）────
+//   objc_msgSend = __got[0x640]；模板 cfg 全为 objectForKeyedSubscript: + floatValue
+//   1. W = cfg["template_width"]，H = cfg["template_height"]；W<=0 || H<=0 直接返回 nil
+//   2. frame = [UIImage imageWithContentsOfFile: <机身前景图路径>]
+//      scale = frame.scale；scale <= 0 时回退 [UIScreen mainScreen].scale
+//   3. UIGraphicsBeginImageContextWithOptions(CGSizeMake(W, H), NO, scale)
+//      ctx = UIGraphicsGetCurrentContext()
+//   4. CIContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer:@NO}]
+//      （GOT[0x708] = _kCIContextUseSoftwareRenderer，值为 @NO，即强制走 GPU）
+//   5. shotCG = [shot CGImage]
+//      A = CGImageGetWidth(shotCG)，B = CGImageGetHeight(shotCG)
+//      src = [CIImage imageWithCGImage:shotCG]
+//   6. f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"]
+//      setValue:forKey: 共 6 次（kCIInputImageKey 从 GOT[0x720] 取）：
+//        inputTopLeft      = CIVector(LT.x, H - LT.y)
+//        inputTopRight     = CIVector(RT.x, H - RT.y)
+//        inputBottomLeft   = CIVector(LB.x, H - LB.y)
+//        inputBottomRight  = CIVector(RB.x, H - RB.y)
+//        inputExtent       = CIVector(CGRectMake(0, 0, A, B))   ← 截图自身像素尺寸
+//      （CFG 字符串已确认：inputTopLeft/inputTopRight/inputBottomLeft/
+//        inputBottomRight/inputExtent，滤镜名 CIPerspectiveTransformWithExtent）
+//   7. cg = [ciCtx createCGImage:f.outputImage fromRect:f.outputImage.extent]
+//      CGContextDrawImage(ctx, extent, cg)          ← 1:1，不做二次缩放
+//      CGImageRelease(cg)
+//      （第二张图 secondImage 走同一套，mode=double 时用）
+//   8. [frame drawInRect:CGRectMake(0, 0, W, H)]    ← 机身图盖在最上层
+//   9. out = UIGraphicsGetImageFromCurrentImageContext(); UIGraphicsEndImageContext()
+//
+//  ── 由上面第 6/7 条得出的关键结论（本版据此修正模糊）──────────────────────
+//   ★ inputExtent 与四角点必须处在「同一个坐标空间」，否则角点会被 extent 裁掉。
+//     WCR 里两者恰好重合，是因为它假定模板像素尺寸 == 截图像素尺寸
+//     （inputExtent 用截图像素、角点用模板像素，只有两者相等才成立）。
+//     本插件要兼容任意尺寸模板，因此统一到「输出画布空间」：
+//       inputExtent = CGRectMake(0, 0, Wout, Hout)，四角点同步乘 S。
+//   ★ WCR 本身【不做任何超采样】：输出就是模板像素尺寸 × scale(=1)。
+//     所以 S>1 只在「屏幕窗明显小于截图」时才需要，且必须连 inputExtent 一起放大。
+//   ★ 输出画布固定 1×（1 单位 = 1 像素），与 WCR 的 scale 语义一致，
+//     绝不能用 UIGraphicsImageRenderer 的默认 scale（= 屏幕 2x/3x），
+//     那会把画布 backing store 放大 3 倍、截图被拉伸 3 倍 —— 这正是「截图糊」的元凶。
 //
 //  ── 使用方式 ──────────────────────────────────────────────────────────────
 //  模板文件自行放入 Documents/DDShellTemplates/（name.png，可选 name_dark.png，
@@ -390,6 +415,31 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (!frameCG || !shotCG) return nil;
 
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
+    if (W < 1.0 || H < 1.0) return nil;
+
+    // 截图按【像素】计（WCR 也是用 CGImageGetWidth/Height，不走 UIImage.size）
+    CGFloat shotW = (CGFloat)CGImageGetWidth(shotCG);
+    CGFloat shotH = (CGFloat)CGImageGetHeight(shotCG);
+    CGSize shotSize = CGSizeMake(shotW, shotH);
+
+    // ── 输出倍率 ───────────────────────────────────────────────────────────
+    // WCR 本身不做超采样（S≡1），因为它假定模板像素尺寸 == 截图像素尺寸。
+    // 本插件兼容任意尺寸模板：只有当“屏幕窗长边 < 截图像素长边”时才放大画布，
+    // 使截图映射进窗口的比例接近 1:1，避免被压缩后又被放大导致糊。
+    // 注意：S 一旦生效，inputExtent 与四角点必须同步放大（见下），否则角点被裁。
+    CGFloat winLong = (t.hasRegion)
+        ? MAX(MAX(fabs(t.rt.x - t.lt.x), fabs(t.rb.x - t.lb.x)),
+              MAX(fabs(t.lb.y - t.lt.y), fabs(t.rb.y - t.rt.y)))
+        : MAX(W, H);
+    CGFloat shotLong = MAX(shotSize.width, shotSize.height);
+    CGFloat S = 1.0;
+    if (winLong > 1.0 && shotLong > 1.0) {
+        S = shotLong / winLong;
+        if (S < 1.0) S = 1.0;
+        if (S > 4.0) S = 4.0;
+    }
+    CGFloat Wout = W * S, Hout = H * S;
+
     CIImage *src = [CIImage imageWithCGImage:shotCG];
     CIImage *base = nil;
 
@@ -398,35 +448,50 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         if (f) {
             [f setDefaults];
             [f setValue:src forKey:kCIInputImageKey];
-            [f setValue:[CIVector vectorWithCGRect:src.extent] forKey:@"inputExtent"];
-            [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
-            [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
-            [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
-            [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
-            CIImage *out = [f valueForKey:kCIOutputImageKey];
-            if (out) base = out;
+            // ★ inputExtent 必须与四角点同一坐标空间：统一用「输出画布」。
+            //   （WCR 用 src.extent，只在模板尺寸 == 截图像素尺寸时才等价）
+            [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, Wout, Hout)] forKey:@"inputExtent"];
+            // 角点按输出倍率 S 放大到输出坐标系，Y 轴翻转（UIKit 左上 → CI 左下）
+            [f setValue:DD_CIVec(CGPointMake(t.lt.x * S, t.lt.y * S), Hout) forKey:@"inputTopLeft"];
+            [f setValue:DD_CIVec(CGPointMake(t.rt.x * S, t.rt.y * S), Hout) forKey:@"inputTopRight"];
+            [f setValue:DD_CIVec(CGPointMake(t.rb.x * S, t.rb.y * S), Hout) forKey:@"inputBottomRight"];
+            [f setValue:DD_CIVec(CGPointMake(t.lb.x * S, t.lb.y * S), Hout) forKey:@"inputBottomLeft"];
+            CIImage *o = [f valueForKey:kCIOutputImageKey];
+            if (o) base = o;
         }
     }
 
     if (!base) {
-        // 回退（无 cfg 且探测失败）：截图等比例居中放进画布，不做拉伸变形
-        CGFloat sw = src.extent.size.width, sh = src.extent.size.height;
-        CGFloat s = MIN(W / sw, H / sh);
+        // 回退（无 cfg 且探测失败）：截图等比例居中放进画布（输出坐标系），不做拉伸变形
+        CGFloat s = MIN(Wout / shotW, Hout / shotH);
         CIImage *scaled = [src imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
-        base = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation((W - sw * s) / 2.0, (H - sh * s) / 2.0)];
+        base = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation((Wout - shotW * s) / 2.0, (Hout - shotH * s) / 2.0)];
     }
-
-    CIImage *frame = [CIImage imageWithCGImage:frameCG];
-    CIImage *out = [frame imageByCompositingOverImage:base];
-    out = [out imageByCroppingToRect:CGRectMake(0, 0, W, H)];
+    base = [base imageByCroppingToRect:CGRectMake(0, 0, Wout, Hout)];
 
     static CIContext *ctx;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{ ctx = [CIContext contextWithOptions:nil]; });
-    CGImageRef cg = [ctx createCGImage:out fromRect:out.extent];
-    if (!cg) return nil;
-    UIImage *img = [UIImage imageWithCGImage:cg scale:1.0 orientation:UIImageOrientationUp];
-    CGImageRelease(cg);
+    CGImageRef shellCG = [ctx createCGImage:base fromRect:CGRectMake(0, 0, Wout, Hout)];
+    if (!shellCG) return nil;
+
+    // ── 最终合成（对齐 WCR：1× 画布 + UIKit 绘制）────────────────────────
+    // 画布 scale 必须为 1.0（1 单位 = 1 像素）。若用 UIGraphicsImageRenderer 的
+    // 默认 scale(=屏幕 2x/3x)，backing store 会被放大 3 倍、截图被拉伸 3 倍 → 糊。
+    // CI 的 createCGImage: 已把左下原点坐标翻正，这里直接按 UIKit 语义 1:1 贴入，
+    // 不用 CGContextDrawImage（UIKit 上下文里它的翻转语义极易搞反）。
+    UIImage *shellImg = [UIImage imageWithCGImage:shellCG scale:1.0 orientation:UIImageOrientationUp];
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+    fmt.scale = 1.0;
+    fmt.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(Wout, Hout) format:fmt];
+    UIImage *img = [renderer imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+        (void)rc;
+        // 先贴透视后的截图，机身前景图再盖在最上层（WCR 用的是 [frame drawInRect:]）
+        [shellImg drawInRect:CGRectMake(0, 0, Wout, Hout)];
+        [frameImg drawInRect:CGRectMake(0, 0, Wout, Hout)];
+    }];
+    CGImageRelease(shellCG);
     return img;
 }
 
