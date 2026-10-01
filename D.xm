@@ -707,23 +707,11 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
 @end
 
-// 分组底色：不写死色值，直接向设置页同一个来源要——现造一个同款 WCTableViewManager，
-// 读它 tableView 的底色。这样素材库页和设置页必然同色：微信换主题、改默认值两边一起变。
-// 已实测能读到色值，不做 nil 退回、不兜底。
-static UIColor *DD_WCGroupBackgroundColor(void) {
-    static UIColor *color;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        id mgrCls = objc_getClass("WCTableViewManager");
-        WCTableViewManager *mgr = [[mgrCls alloc] initWithFrame:CGRectZero
-                                                          style:UITableViewStyleInsetGrouped];
-        // getTableView 返回 id，必须转成 UITableView *：否则编译器按 id 随便挑一个
-        // backgroundColor 声明（挑到了 CALayer 的，返回 CGColorRef），类型就对不上了
-        UITableView *tv = (UITableView *)[mgr getTableView];
-        color = tv.backgroundColor;
-    });
-    return color;
-}
+// 分组底色：不写死色值，也不为了取色专门造对象 —— 设置页本来就有现成的 tableView
+// （WCTableViewManager 建的），它的 backgroundColor 就是这个灰，设置页加载时顺手存到这里。
+// 素材库的入口在设置页上，必然先经过设置页，所以到这里一定有值。
+// 微信换主题、改默认值，两边跟着一起变，不会出现两页差一档的情况。
+static UIColor *DD_GroupBackgroundColor = nil;
 
 // 导航栏外观完全不碰：8.0.79 用 WCCustomNavigationBar / WCCustomNavigationBarCoordinator 自己实现了
 // 整套导航栏（背景、标题、返回箭头、转场渲染），压根不走 UIKit 的 UINavigationBarAppearance。
@@ -765,8 +753,8 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     // WCR / ZDY 的素材库和我们的设置页全都是默认全屏布局，靠 viewDidLayoutSubviews 里量
     // safeAreaInsets.top 把搜索栏推到导航栏下面（见 viewDidLayoutSubviews），导航栏则保持微信原样。
 
-    // 页面底色：取和设置页同一个来源（WCTableViewManager 表格的底色），两页必然同色
-    self.view.backgroundColor = DD_WCGroupBackgroundColor();
+    // 页面底色跟设置页同一个色（来源见 DD_GroupBackgroundColor 的注释）
+    self.view.backgroundColor = DD_GroupBackgroundColor;
 
     [self setupSearchBar];
     [self setupCollectionView];
@@ -1260,15 +1248,11 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     // backBarButtonItem，实测它的素材库返回箭头照样是蓝色的 —— 说明光设这个没用，
     // 微信只有在走它自己的 PushViewController: 时才会接管返回按钮（见 openLibraryTapped:）。
 
-    // 页面底色：和素材库同一个来源（WCTableViewManager 表格的底色），两页必然同色。
-    // 表格不再铺到导航栏底下（见 viewDidLayoutSubviews），导航栏那一块透出来的就是这层灰。
-    // 顺带把底色的首次计算放在本页：它第一次要建一个 WCTableViewManager 取色，放在这里算，
-    // 等下进素材库时就已经缓存好了，不会卡在转场动画里。
-    self.view.backgroundColor = DD_WCGroupBackgroundColor();
-
-    // 分组底色不在这里设：沿用 WCTableViewManager 自带的那套（和 DD收款助手设置页完全一致）。
-    // 原来强行钉成 systemGroupedBackgroundColor，跟微信自己的主题色差一档，两页放一起看就不一样。
+    // 页面底色：直接拿现成 tableView 的底色（同一个来源，不必另外造对象取色），
+    // 顺便存进 DD_GroupBackgroundColor 给素材库用 —— 素材库入口就在本页，必然先走到这里。
     UITableView *tableView = [self.tableViewMgr getTableView];
+    DD_GroupBackgroundColor = tableView.backgroundColor;
+    self.view.backgroundColor = DD_GroupBackgroundColor;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     // tableView.backgroundColor 保持不动（交给 WCTableViewManager），卡片之间/四周的底色和收款助手同源；
     // 卡片本身的颜色由微信的 cell 决定，本来两边就是一样的。
