@@ -747,8 +747,17 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
 // 同一个外观会渲染出一深一浅两种灰。这里直接钉死不透明底色，两页一致，也不会有接缝。
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     if (!vc) return;
-    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
-    [appearance configureWithOpaqueBackground]; // 不透明、不带毛玻璃（该方法本身已清空 backgroundEffect），不再受背后内容影响
+
+    // 关键：从「当前已生效的」那份 appearance 拷贝，而不是 alloc init 一份空的。
+    // 空 alloc 的 UINavigationBarAppearance 里 buttonAppearance / backButtonAppearance 都是 UIKit 默认值，
+    // 赋给 navigationItem 后会覆盖微信在 UINavigationBar.appearance 上配的那套按钮外观，
+    // 返回箭头就被打回系统默认（默认 tint + 默认字号），和设置页那颗大小和颜色都对不上。
+    // 拷贝之后只改背景两项，按钮/返回箭头那一套原样继承，两页必然一致。
+    UINavigationBar *bar = vc.navigationController.navigationBar;
+    UINavigationBarAppearance *base = bar.standardAppearance ?: [[UINavigationBar appearance] standardAppearance];
+    UINavigationBarAppearance *appearance = [base copy] ?: [[UINavigationBarAppearance alloc] init];
+
+    [appearance configureWithOpaqueBackground]; // 只重置背景/阴影，不动按钮外观
     appearance.backgroundColor = DD_NavBarBackgroundColor();
     appearance.shadowColor = nil;               // 去掉底部那条阴影线
     vc.navigationItem.standardAppearance = appearance;
