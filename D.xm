@@ -740,7 +740,7 @@ static UIColor *DD_NavBarBackgroundColor(void) {
 // 另外也不能用 configureWithDefaultBackground，那个是「默认半透明」，颜色会被导航栏背后的内容
 // 影响（设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），同一个外观会渲染出一深一浅两种灰。
 // 这里复制现有外观后只改背景（去毛玻璃 + 钉死底色 + 去阴影线），标题样式原样保留；
-// 按钮则换成一套空的 buttonAppearance，纯按 tint 渲染（见函数内注释）。
+// 按钮则统一改用箭头那套外观，跟返回指示器同色（见函数内注释）。
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     UINavigationBarAppearance *base = vc.navigationController.navigationBar.standardAppearance;
     UINavigationBarAppearance *appearance = [base copy];
@@ -748,10 +748,11 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     appearance.backgroundImage = nil;
     appearance.backgroundColor = DD_NavBarBackgroundColor();
     appearance.shadowColor = nil;        // 去掉底部那条阴影线
-    // 右上角按钮直接用 tint 渲染：给一个不带任何文字属性的 buttonAppearance，
-    // 颜色就完全由 UINavigationBar 的 tintColor 决定，和返回箭头一致；
-    // 不走 copy 出来的那套 buttonAppearance（它可能带微信自己的按钮色，且转场前后解析时机不一致）。
-    appearance.buttonAppearance = [[UIBarButtonItemAppearance alloc] initWithStyle:UIBarButtonItemStylePlain];
+    // 右上角按钮跟返回箭头同色：直接借用箭头那套外观。
+    // 自己 init 出来的 UIBarButtonItem 归 buttonAppearance 管，挂上自定义 item 外观后那套是空的，
+    // 会掉到 tint 兜底，且转场结束前后解析时机不同、颜色会闪一下；
+    // 箭头的 backButtonAppearance 不参与这套解析，永远稳定，按钮沿用它就再也不会漂。
+    appearance.buttonAppearance = base.backButtonAppearance;
 
     vc.navigationItem.standardAppearance = appearance;
     vc.navigationItem.scrollEdgeAppearance = appearance;
