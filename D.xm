@@ -725,24 +725,14 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     return color;
 }
 
-// 设置页和素材库页共用同一套导航栏外观：基于微信导航栏当前的外观来改，只覆盖背景四项
-// （去毛玻璃 + 去背景图 + 钉底色 + 去阴影线），标题、返回箭头、按钮基础样式全部沿用微信那套。
-// 不能从零 [[UINavigationBarAppearance alloc] init]：那样 backIndicatorImage 是 nil，
-// 返回箭头会退化成系统默认的亮蓝粗 chevron，跟微信自己的黑细箭头对不上。
-// 也不能用 configureWithDefaultBackground：那个是半透明的，底色会被导航栏背后的内容影响
-// （设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），同一个外观会渲染出一深一浅两种灰。
-// 按钮颜色不归这里管：那层压不过微信给 UIBarButtonItem 定的全局 appearance 代理，只能按 item 钉，见 navButton:。
-static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
-    UINavigationBarAppearance *appearance = [vc.navigationController.navigationBar.standardAppearance copy];
-    appearance.backgroundEffect = nil;   // 去毛玻璃（效果等价于 opaque）
-    appearance.backgroundImage = nil;
-    appearance.backgroundColor = DD_WCGroupBackgroundColor(); // 导航栏底色沿用分组底色，和页面同一个来源
-    appearance.shadowColor = nil;        // 去掉底部那条阴影线
-
-    vc.navigationItem.standardAppearance = appearance;
-    vc.navigationItem.scrollEdgeAppearance = appearance;
-    vc.navigationItem.compactAppearance = appearance;
-}
+// 导航栏外观完全不碰：8.0.79 用 WCCustomNavigationBar / WCCustomNavigationBarCoordinator 自己实现了
+// 整套导航栏（背景、标题、返回箭头、转场渲染），压根不走 UIKit 的 UINavigationBarAppearance。
+// 一旦给 navigationItem 设 appearance，就会跟微信的 applyNavigationItem: /
+// updateRendererBackgroundForActiveTransition 打架：转场闪烁、按钮色被改、返回箭头退化成系统默认的
+// 亮蓝粗 chevron（微信那颗黑细箭头来自 defaultBackIndicator，会被 item 级 appearance 顶掉）。
+// WCR / ZDY 的素材库也都是一次都不设，导航栏保持微信原样。
+// 按钮颜色照样要按 item 钉：微信的 MMNavigationItemMgr 会用 tryCopyButtonItem: 把按钮过一遍手改色，
+// 见 navButton:。
 
 // 独立的素材库页面，交互对齐 WCRefineScreenshotFrameLibraryViewController：
 //   双排网格列出模板，右上角常驻 导出 / 导入（导入最靠右），默认按名称排序；
@@ -765,9 +755,6 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     [super viewDidLoad];
     self.picked = [NSMutableSet set];
     self.edgesForExtendedLayout = UIRectEdgeNone; // view 从导航栏底下开始，搜索栏才不会顶进状态栏
-
-    // 验证用：先不设导航栏外观，看返回箭头是否恢复成微信的黑细样式
-    // DD_ApplyNavigationBarAppearance(self);
 
     // 页面底色：取和设置页同一个来源（WCTableViewManager 表格的底色），两页必然同色
     self.view.backgroundColor = DD_WCGroupBackgroundColor();
@@ -1248,10 +1235,7 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     [super viewDidLoad];
     self.title = @"模板套壳设置";
 
-    // 导航栏交给微信自己的 WCCustomNavigationBar：8.0.79 不用 UIKit 的 UINavigationBarAppearance，
-    // 设了会跟它的 applyNavigationItem: / updateRendererBackgroundForActiveTransition 打架
-    // （转场闪烁 + 按钮色被改 + 返回箭头退化）。两页都不设，导航栏才是微信原样、两页也才一致。
-    // DD_ApplyNavigationBarAppearance(self);
+    // 导航栏不设任何外观，保持微信原样（原因见文件上方「导航栏外观完全不碰」那段注释）。
 
     // 分组底色不在这里设：沿用 WCTableViewManager 自带的那套（和 DD收款助手设置页完全一致）。
     // 原来强行钉成 systemGroupedBackgroundColor，跟微信自己的主题色差一档，两页放一起看就不一样。
