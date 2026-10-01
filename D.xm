@@ -726,8 +726,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 // updateRendererBackgroundForActiveTransition 打架：转场闪烁、按钮色被改、返回箭头退化成系统默认的
 // 亮蓝粗 chevron（微信那颗黑细箭头来自 defaultBackIndicator，会被 item 级 appearance 顶掉）。
 // WCR / ZDY 的素材库也都是一次都不设，导航栏保持微信原样。
-// 按钮颜色照样要按 item 钉：微信的 MMNavigationItemMgr 会用 tryCopyButtonItem: 把按钮过一遍手改色，
-// 见 navButton:。
+// 按钮颜色同样不钉，交给微信自己的 UIBarButtonItem appearance 代理，见 navButton:。
 
 // 独立的素材库页面，交互对齐 WCRefineScreenshotFrameLibraryViewController：
 //   双排网格列出模板，右上角常驻 导出 / 导入（导入最靠右），默认按名称排序；
@@ -917,21 +916,16 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 #pragma mark 导航栏
 
-// 按钮颜色只能按 item 钉：
-// 优先级是「item 自己的 titleTextAttributes」>「微信全局给 UIBarButtonItem 定的 appearance 代理」
-// >「导航栏外观里的 buttonAppearance」。改 buttonAppearance 那一层完全没用（实测两版都无效），
-// 代理那层又读不到也改不动，所以直接钉在最上面那层。
-// 钉的颜色取导航栏的 tintColor：跟着微信主题走，不写死。
-// （原来注释写「也就是返回箭头用的那个色」，不对 —— 返回箭头是 Coordinator 的
-// defaultBackIndicator 画出来的，跟 tintColor 不是一回事，两者只是碰巧都是微信的主题色。）
+// 按钮颜色不钉：push 走微信自己的 PushViewController: 之后，导航栏由 WCCustomNavigationBar 接管，
+// 右键颜色交给微信自己的 UIBarButtonItem appearance 代理，跟微信其他页面必然一致。
+// 之前钉过 titleTextAttributes（取 navigationBar.tintColor），那是导航栏还没被接管时的补救措施。
+// 另外踩过的坑记一下，免得以后再绕回来：改 buttonAppearance 那一层完全没用（实测两版都无效），
+// 代理那层又读不到也改不动 —— 接管之后这些都不用管了。
 - (UIBarButtonItem *)navButton:(NSString *)title action:(SEL)action {
-    UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:title
-                                                             style:UIBarButtonItemStylePlain
-                                                            target:self
-                                                            action:action];
-    UIColor *tint = self.navigationController.navigationBar.tintColor;
-    [item setTitleTextAttributes:@{ NSForegroundColorAttributeName: tint } forState:UIControlStateNormal];
-    return item;
+    return [[UIBarButtonItem alloc] initWithTitle:title
+                                            style:UIBarButtonItemStylePlain
+                                           target:self
+                                           action:action];
 }
 
 // 右上角按钮（数组首个最靠右）：
