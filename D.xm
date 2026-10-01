@@ -725,29 +725,18 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     return color;
 }
 
-// 导航栏底色：直接复用分组底色（同一个来源），导航栏和页面底色永远一致，
-// 微信换主题时两边一起变，不会再出现一深一浅。
-// 想让导航栏独立成别的色，把下面这行换成写死色值即可，例如：
-//   return [UIColor colorWithRed:0xF2/255.0 green:0xF2/255.0 blue:0xF7/255.0 alpha:1.0]; // #F2F2F7
-static UIColor *DD_NavBarBackgroundColor(void) {
-    return DD_WCGroupBackgroundColor();
-}
-
-// 设置页和素材库页共用同一套导航栏外观：不透明 + 和页面底色同一个灰。
-// 关键点：外观要「复制导航栏现有的再改背景」，不要从零 [[... alloc] init] + configureWithOpaqueBackground。
-// 后者是系统默认样式，会把按钮配色一起重置掉，按钮文字色掉回 tintColor 继承、比微信自己的浅——
-// 表现就是 push 动画期间还是对的，动画一结束（切到我们的外观）按钮闪一下变浅。
-// 另外也不能用 configureWithDefaultBackground，那个是「默认半透明」，颜色会被导航栏背后的内容
-// 影响（设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），同一个外观会渲染出一深一浅两种灰。
-// 这里复制现有外观后只改背景（去毛玻璃 + 钉死底色 + 去阴影线），标题样式原样保留。
-// 按钮颜色不在这里处理：那层优先级压不过微信给 UIBarButtonItem 定的全局 appearance 代理，
-// 只能按 item 钉，见 navButton:。
+// 设置页和素材库页共用同一套导航栏外观。
+// 做法：复制导航栏现有的外观，只改背景（去毛玻璃 + 钉底色 + 去阴影线）——
+// 这样标题和返回箭头的样式还是微信原来那套；从零 alloc init + configureWithOpaqueBackground
+// 是系统默认样式，会把标题和箭头一起退回系统默认；configureWithDefaultBackground 又是半透明的，
+// 底色会被导航栏背后的内容影响（设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），两页会不一样。
+// 按钮颜色不归这里管：那层压不过微信给 UIBarButtonItem 定的全局 appearance 代理，只能按 item 钉，见 navButton:。
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     UINavigationBarAppearance *base = vc.navigationController.navigationBar.standardAppearance;
     UINavigationBarAppearance *appearance = [base copy];
-    appearance.backgroundEffect = nil;   // 去毛玻璃（等价于 opaque，但不会顺手重置按钮样式）
+    appearance.backgroundEffect = nil;   // 去毛玻璃（效果等价于 opaque，但不会重置标题/箭头样式）
     appearance.backgroundImage = nil;
-    appearance.backgroundColor = DD_NavBarBackgroundColor();
+    appearance.backgroundColor = DD_WCGroupBackgroundColor(); // 导航栏底色沿用分组底色，和页面同一个来源
     appearance.shadowColor = nil;        // 去掉底部那条阴影线
 
     vc.navigationItem.standardAppearance = appearance;
