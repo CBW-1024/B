@@ -739,13 +739,20 @@ static UIColor *DD_NavBarBackgroundColor(void) {
 // 表现就是 push 动画期间还是对的，动画一结束（切到我们的外观）按钮闪一下变浅。
 // 另外也不能用 configureWithDefaultBackground，那个是「默认半透明」，颜色会被导航栏背后的内容
 // 影响（设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），同一个外观会渲染出一深一浅两种灰。
-// 这里复制现有外观后只改背景（去毛玻璃 + 钉死底色 + 去阴影线），按钮/标题样式原样保留。
+// 这里复制现有外观后只改背景（去毛玻璃 + 钉死底色 + 去阴影线），标题样式原样保留；
+// 按钮则统一改用箭头那套外观，跟返回指示器同色（见函数内注释）。
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
-    UINavigationBarAppearance *appearance = [vc.navigationController.navigationBar.standardAppearance copy];
+    UINavigationBarAppearance *base = vc.navigationController.navigationBar.standardAppearance;
+    UINavigationBarAppearance *appearance = [base copy];
     appearance.backgroundEffect = nil;   // 去毛玻璃（等价于 opaque，但不会顺手重置按钮样式）
     appearance.backgroundImage = nil;
     appearance.backgroundColor = DD_NavBarBackgroundColor();
     appearance.shadowColor = nil;        // 去掉底部那条阴影线
+    // 右上角按钮跟返回箭头同色：直接借用箭头那套外观。
+    // 自己 init 出来的 UIBarButtonItem 归 buttonAppearance 管，挂上自定义 item 外观后那套是空的，
+    // 会掉到 tint 兜底，且转场结束前后解析时机不同、颜色会闪一下；
+    // 箭头的 backButtonAppearance 不参与这套解析，永远稳定，按钮沿用它就再也不会漂。
+    appearance.buttonAppearance = base.backButtonAppearance;
 
     vc.navigationItem.standardAppearance = appearance;
     vc.navigationItem.scrollEdgeAppearance = appearance;
