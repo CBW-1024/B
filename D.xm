@@ -715,7 +715,7 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         id mgrCls = objc_getClass("WCTableViewManager");
-        WCTableViewManager *mgr = [[mgrCls alloc] initWithFrame:[UIScreen mainScreen].bounds
+        WCTableViewManager *mgr = [[mgrCls alloc] initWithFrame:CGRectZero
                                                           style:UITableViewStyleInsetGrouped];
         // getTableView 返回 id，必须转成 UITableView *：否则编译器按 id 随便挑一个
         // backgroundColor 声明（挑到了 CALayer 的，返回 CGColorRef），类型就对不上了
@@ -725,16 +725,15 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     return color;
 }
 
-// 设置页和素材库页共用同一套导航栏外观。
-// 做法：复制导航栏现有的外观，只改背景（去毛玻璃 + 钉底色 + 去阴影线）——
-// 这样标题和返回箭头的样式还是微信原来那套；从零 alloc init + configureWithOpaqueBackground
-// 是系统默认样式，会把标题和箭头一起退回系统默认；configureWithDefaultBackground 又是半透明的，
-// 底色会被导航栏背后的内容影响（设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），两页会不一样。
+// 设置页和素材库页共用同一套导航栏外观：从零建一个外观，只配背景（去毛玻璃 + 钉底色 + 去阴影线）。
+// 从零建的代价：标题和返回箭头不再沿用微信那套，会变成系统默认样式——先试效果，不行再改回
+// [navigationBar.standardAppearance copy]（那样标题和箭头就是微信原样）。
+// 不能用 configureWithDefaultBackground：那个是半透明的，底色会被导航栏背后的内容影响
+// （设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），同一个外观会渲染出一深一浅两种灰。
 // 按钮颜色不归这里管：那层压不过微信给 UIBarButtonItem 定的全局 appearance 代理，只能按 item 钉，见 navButton:。
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
-    UINavigationBarAppearance *base = vc.navigationController.navigationBar.standardAppearance;
-    UINavigationBarAppearance *appearance = [base copy];
-    appearance.backgroundEffect = nil;   // 去毛玻璃（效果等价于 opaque，但不会重置标题/箭头样式）
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    appearance.backgroundEffect = nil;   // 去毛玻璃（效果等价于 opaque）
     appearance.backgroundImage = nil;
     appearance.backgroundColor = DD_WCGroupBackgroundColor(); // 导航栏底色沿用分组底色，和页面同一个来源
     appearance.shadowColor = nil;        // 去掉底部那条阴影线
@@ -939,9 +938,6 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
                                                             action:action];
     UIColor *tint = self.navigationController.navigationBar.tintColor;
     [item setTitleTextAttributes:@{ NSForegroundColorAttributeName: tint } forState:UIControlStateNormal];
-    // 禁用态单独钉，免得勾不上时「删除/导出」跟正常态撞色
-    [item setTitleTextAttributes:@{ NSForegroundColorAttributeName: [UIColor tertiaryLabelColor] }
-                        forState:UIControlStateDisabled];
     return item;
 }
 
@@ -965,9 +961,9 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     // rightBarButtonItems 数组首个显示在最靠屏幕边缘：取消 / 导入贴着右边缘，
     // 左侧不动，系统返回箭头保持原位
     NSMutableArray *items = [NSMutableArray array];
-    if (right) [items addObject:right];
-    if (mid)   [items addObject:mid];
-    if (left)  [items addObject:left];
+    [items addObject:right];
+    [items addObject:mid];
+    if (left) [items addObject:left]; // 普通态只有两个，addObject:nil 会崩，这个判空必须留
     self.navigationItem.rightBarButtonItems = items;
 }
 
