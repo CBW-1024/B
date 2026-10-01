@@ -239,10 +239,10 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     return t;
 }
 
+// 当前生效的模板：只认显式应用过的那个，库里有但没应用过就算没有
 static NSString *DD_ActiveTemplateName(void) {
     NSString *sel = [DDShellConfig shared].selectedTpl;
-    if (sel.length && DD_TemplateNamed(sel)) return sel;
-    return [DD_AllTemplateNames() firstObject] ?: @"";
+    return (sel.length && DD_TemplateNamed(sel)) ? sel : @"";
 }
 
 
@@ -261,7 +261,9 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (!frameCG || !shotCG) return nil;
 
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
-    if (W < 1.0 || H < 1.0) return nil;
+    // 尺寸来自 cfg，上限也得挡：不加的话一个离谱的 template_width 就会去开几亿像素的
+    // 画布，内存打满直接闪退，连「套壳失败」都来不及弹。8192 是 CoreGraphics 常见纹理上限。
+    if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil;
 
     // 截图按实际像素尺寸参与计算
     CGFloat A = (CGFloat)CGImageGetWidth(shotCG);
@@ -346,7 +348,8 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 + (instancetype)toast;
 - (void)setLoadingStyle:(BOOL)style;
 - (void)showToastWithText:(NSString *)text;
-- (void)showDoneToastWithText:(NSString *)text;
+- (void)showDoneToastWithText:(NSString *)text;   // 方形带 ✓
+- (void)showErrorToastWithText:(NSString *)text;  // 方形带错误图标
 - (void)hideWithAnimated:(BOOL)animated;
 @end
 
@@ -360,7 +363,7 @@ static WeToast *DD_Toast(void) {
     return [NSClassFromString(@"WeToast") toast];
 }
 
-// 开始 loading / 收起 loading / 成功
+// 开始 loading / 收起 loading / 成功 / 失败 / 纯文字
 static void DD_ShowShelling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         WeToast *toast = DD_Toast();
@@ -369,17 +372,19 @@ static void DD_ShowShelling(void) {
         gBusyToast = toast;
     });
 }
-static void DD_HideShelling(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [gBusyToast hideWithAnimated:YES];
-        gBusyToast = nil;
-    });
-}
 static void DD_ShowShellDone(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [gBusyToast hideWithAnimated:YES];
         gBusyToast = nil;
         [DD_Toast() showDoneToastWithText:@"套壳成功"];
+    });
+}
+static void DD_ShowShellError(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // loading 和这个是同一个 WeToast 实例，先收起再弹
+        [gBusyToast hideWithAnimated:YES];
+        gBusyToast = nil;
+        [DD_Toast() showErrorToastWithText:text];
     });
 }
 static void DD_ShowToast(NSString *text) {
@@ -392,7 +397,6 @@ static void DD_ShowToast(NSString *text) {
 + (instancetype)shared;
 - (void)shellLatestScreenshotWithCompletion:(void (^)(void))completion;
 - (void)dd_showShelling;
-- (void)dd_hideShelling;
 - (void)dd_showShellDone;
 @end
 
@@ -448,7 +452,7 @@ static void DD_ShowToast(NSString *text) {
                                                       options:ro
                                                 resultHandler:^(UIImage *img, NSDictionary *info) {
             UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
-            if (!outImg) { [self dd_hideShelling]; DD_ShowToast(@"套壳失败"); completion(); return; }
+            if (!outImg) { DD_ShowShellError(@"套壳失败"); completion(); return; }
             DD_SaveImageToAlbum(outImg);
             [[DDShellConfig shared] markProcessed:asset.localIdentifier];
             if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
@@ -460,7 +464,6 @@ static void DD_ShowToast(NSString *text) {
 
 // 转发到文件级静态函数，供截图路径调用
 - (void)dd_showShelling { DD_ShowShelling(); }
-- (void)dd_hideShelling { DD_HideShelling(); }
 - (void)dd_showShellDone { DD_ShowShellDone(); }
 
 
@@ -595,6 +598,19 @@ static NSString *DD_ExportTemplatesToZip(NSArray<NSString *> *names) {
 
 #pragma mark - 套壳素材库
 
+// 微信原生弹窗（运行时按类名取，编译期不产生链接符号）。
+// 按钮回调全用无参 selector：微信调用时带不带参数不确定，无参声明收不到也安全，
+// 反过来说带参声明读不到值就是垃圾数据。按钮靠不同 selector 区分，输入框内容用
+// getTextFieldText 从存下来的实例里取。
+@interface WCUIAlertView : NSObject
+- (instancetype)initWithTitle:(id)title message:(id)message;
+- (void)addBtnTitle:(id)title target:(id)target sel:(SEL)sel;
+- (void)setTextFieldDefaultText:(id)text;
+- (void)showTextFieldWithMaxLen:(unsigned int)len;
+- (void)show;
+- (id)getTextFieldText;
+@end
+
 // 两个 sheet 的 tag：套壳操作 / 选择导出方式
 static const NSInteger DD_SHEET_TPL    = 0x5e9d;
 static const NSInteger DD_SHEET_EXPORT = 0x5ea1;
@@ -616,15 +632,26 @@ static NSCache *DD_ThumbCache(void) {
     return cache;
 }
 
-static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
+static NSString *DD_ThumbKey(NSString *name, CGFloat side) {
     NSString *path = DD_ActualFile(name, @"png");
-    if (!path.length || side <= 0) return nil;
+    return (path.length && side > 0) ? [NSString stringWithFormat:@"%@|%d", path, (int)side] : nil;
+}
 
-    NSString *key = [NSString stringWithFormat:@"%@|%d", path, (int)side];
+// 只查缓存，读不到就返回 nil：主线程调这个，不解码
+static UIImage *DD_CachedThumb(NSString *name, CGFloat side) {
+    NSString *key = DD_ThumbKey(name, side);
+    return key ? [DD_ThumbCache() objectForKey:key] : nil;
+}
+
+// 生成缩略图并进缓存：会解整张 png，只在后台线程调
+static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
+    NSString *key = DD_ThumbKey(name, side);
+    if (!key) return nil;
+
     UIImage *hit = [DD_ThumbCache() objectForKey:key];
     if (hit) return hit;
 
-    UIImage *src = [UIImage imageWithContentsOfFile:path];
+    UIImage *src = [UIImage imageWithContentsOfFile:DD_ActualFile(name, @"png")];
     if (!src || src.size.width <= 0 || src.size.height <= 0) return nil;
 
     CGFloat rate = MIN(side / src.size.width, side / src.size.height); // 等比缩放
@@ -718,7 +745,8 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 //   双排网格列出模板，右上角常驻 导出 / 导入（导入最靠右），默认按名称排序；
 //   点「导出」用微信原生 WCActionSheet 弹「选择导出方式」：选择导出 / 全部导出（取消自带）；
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
-//   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择，选「选择」同样进选择态。
+//   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择 / 删除此模板，
+//   选「选择」同样进选择态。
 @interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;           // 自己贴在 view 顶上的搜索框（不挂 navigationItem.searchController，那个会撑高导航栏）
 @property (nonatomic, strong) UICollectionView *collectionView;
@@ -727,6 +755,10 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 @property (nonatomic) BOOL isSelectMode;                        // 是否处于选择态
 @property (nonatomic, strong) NSMutableSet<NSString *> *picked; // 选择态下勾选的模板
 @property (nonatomic, copy) NSString *tappedTpl;                // 刚弹出操作菜单的那个模板
+@property (nonatomic, copy) NSString *activeName;               // 当前生效的模板，列表刷新时算一次（每格现算会各解码一次全尺寸 png）
+@property (nonatomic, strong) WCUIAlertView *renameAlert;       // 正在弹的重命名框，回调里取输入框内容用
+@property (nonatomic, copy) NSString *renamingName;             // 正在改名的模板原名
+@property (nonatomic, strong) NSArray<NSString *> *pendingDelete; // 删除确认框待删的模板
 @end
 
 @implementation DDShellLibraryViewController
@@ -796,6 +828,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     NSMutableArray *all = [DD_AllTemplateNames() mutableCopy];
     [all sortUsingSelector:@selector(localizedStandardCompare:)];
     self.allNames = all;
+    self.activeName = DD_ActiveTemplateName();
     [self applySearchFilter];
     [self updateEmptyState];
 }
@@ -864,10 +897,21 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     cell.nameLabel.text = n;
     CGFloat gap = kDDShellTplGap;
     CGFloat w = floor((cv.bounds.size.width - gap * (kDDShellTplColumns + 1)) / kDDShellTplColumns);
-    cell.thumbView.image = DD_ThumbForName(n, w);
+    // 缩略图命中缓存当场给；没命中就丢后台解，回来时确认这格还显示着同一个模板再填
+    cell.thumbView.image = DD_CachedThumb(n, w);
+    if (!cell.thumbView.image) {
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            UIImage *img = DD_ThumbForName(n, w);
+            if (!img) return;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                DDShellTplCell *c = (DDShellTplCell *)[cv cellForItemAtIndexPath:ip];
+                if (c && [c.nameLabel.text isEqualToString:n]) c.thumbView.image = img;
+            });
+        });
+    }
 
     BOOL picked = self.isSelectMode && [self.picked containsObject:n];
-    BOOL active = !self.isSelectMode && [n isEqualToString:DD_ActiveTemplateName()];
+    BOOL active = !self.isSelectMode && [n isEqualToString:self.activeName];
     cell.checkLabel.hidden = !picked;
     cell.markView.hidden = !(picked || active);
     // 蓝框 = 已勾选待导出，绿框 = 当前正在用的模板
@@ -888,7 +932,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
     // 普通态：弹出模板操作菜单（应用模板 / 重命名 / 选择），取消按钮 WCActionSheet 自带
     self.tappedTpl = n;
-    [self showWCActionSheet:@"套壳操作" tag:DD_SHEET_TPL items:@[@"应用模板", @"重命名", @"选择"]];
+    [self showWCActionSheet:@"套壳操作" tag:DD_SHEET_TPL items:@[@"应用模板", @"重命名", @"选择", @"删除此模板"]];
 }
 
 #pragma mark 导航栏
@@ -962,7 +1006,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     if (tag == DD_SHEET_EXPORT) { // 选择导出方式：0=选择导出 1=全部导出
         if (idx == 0) [self enterExportSelectMode];
         else if (idx == 1) [self exportAllFrames];
-    } else if (tag == DD_SHEET_TPL) { // 套壳操作：0=应用模板 1=重命名 2=选择
+    } else if (tag == DD_SHEET_TPL) { // 套壳操作：0=应用模板 1=重命名 2=选择 3=删除此模板
         NSString *n = self.tappedTpl;
         if (idx == 0 && n.length) {
             [DDShellConfig shared].selectedTpl = n;
@@ -971,6 +1015,8 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
             [self renameTemplateNamed:n];
         } else if (idx == 2) {
             [self enterExportSelectModeWithName:n];
+        } else if (idx == 3 && n.length) {
+            [self confirmDeleteNames:@[n]];
         }
     }
     self.tappedTpl = nil;
@@ -1046,15 +1092,22 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 #pragma mark 重命名
 
 - (void)renameTemplateNamed:(NSString *)name {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"重命名"
-                                                                message:name
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.text = name; }];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [self renameTemplate:name to:ac.textFields.firstObject.text];
-    }]];
-    [self presentViewController:ac animated:YES completion:nil];
+    self.renamingName = name;
+    WCUIAlertView *av = [[NSClassFromString(@"WCUIAlertView") alloc] initWithTitle:@"重命名" message:name];
+    [av setTextFieldDefaultText:name];
+    [av addBtnTitle:@"取消" target:self sel:@selector(ddAlertCancelled)];
+    [av addBtnTitle:@"确定" target:self sel:@selector(ddRenameConfirmed)];
+    [av showTextFieldWithMaxLen:32];
+    [av show];
+    self.renameAlert = av;
+}
+
+- (void)ddRenameConfirmed {
+    NSString *text = [self.renameAlert getTextFieldText];
+    NSString *oldName = self.renamingName;
+    self.renameAlert = nil;
+    self.renamingName = nil;
+    [self renameTemplate:oldName to:text];
 }
 
 // 目录和目录里的 png/cfg 一起改名；当前正在用的模板被改名则同步选中记录
@@ -1086,7 +1139,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 #pragma mark 删除
 
-// 实际删除：连整目录一起删；删掉的是当前模板则回落到第一个剩下的模板
+// 实际删除：连整目录一起删；删掉的是当前模板则清空选择
 - (void)deleteNames:(NSArray<NSString *> *)names {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSInteger n = 0;
@@ -1094,9 +1147,9 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         NSString *dir = DD_TplFolder(name);
         if (dir.length && [fm removeItemAtPath:dir error:nil]) n++;
     }
-    NSString *active = [DDShellConfig shared].selectedTpl;
-    if (active.length && [names containsObject:active]) {
-        [DDShellConfig shared].selectedTpl = DD_AllTemplateNames().firstObject ?: @"";
+    // 删掉正在用的就清空选择，不自动顶下一个
+    if ([names containsObject:[DDShellConfig shared].selectedTpl]) {
+        [DDShellConfig shared].selectedTpl = @"";
     }
     DD_ShowToast([NSString stringWithFormat:@"已删除 %ld 个模板", (long)n]);
 }
@@ -1113,15 +1166,26 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         ? [NSString stringWithFormat:@"确定要删除「%@」这个套壳模板吗？", names.firstObject]
         : [NSString stringWithFormat:@"确定要删除选中的 %ld 个套壳模板吗？", (long)names.count];
 
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"确认删除"
-                                                                message:msg
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        [self deleteNames:names];
-        if (self.isSelectMode) [self cancelExportSelectMode]; else [self reloadList];
-    }]];
-    [self presentViewController:ac animated:YES completion:nil];
+    self.pendingDelete = names;
+    WCUIAlertView *av = [[NSClassFromString(@"WCUIAlertView") alloc] initWithTitle:@"确认删除" message:msg];
+    [av addBtnTitle:@"取消" target:self sel:@selector(ddAlertCancelled)];
+    [av addBtnTitle:@"删除" target:self sel:@selector(ddDeleteConfirmed)];
+    [av show];
+}
+
+- (void)ddDeleteConfirmed {
+    NSArray *names = self.pendingDelete;
+    self.pendingDelete = nil;
+    [self deleteNames:names];
+    [self reloadList];                                    // 重新读盘排序，去掉已删的
+    if (self.isSelectMode) [self cancelExportSelectMode]; // 再退出选择态
+}
+
+// 取消按钮共用：把弹窗带的临时状态清掉
+- (void)ddAlertCancelled {
+    self.renameAlert = nil;
+    self.renamingName = nil;
+    self.pendingDelete = nil;
 }
 
 #pragma mark 导入
@@ -1311,9 +1375,10 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [picker dismissViewControllerAnimated:YES completion:^{
         UIImage *img = info[UIImagePickerControllerOriginalImage];
         DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
+        if (!t) { DD_ShowShellError(@"套壳失败"); return; } // 选图这会儿模板没了
         DD_ShowShelling();
         UIImage *outImg = DD_ComposeShellImage(img, t);
-        if (!outImg) { DD_HideShelling(); DD_ShowToast(@"套壳失败"); return; }
+        if (!outImg) { DD_ShowShellError(@"套壳失败"); return; }
         DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
         DD_ShowShellDone();
     }];
