@@ -90,15 +90,15 @@ static const NSTimeInterval kDDShellDelay = 1.0;
 - (instancetype)init {
     if (self = [super init]) {
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        _enabled        = [ud objectForKey:kDDShellEnabled]   ? [ud boolForKey:kDDShellEnabled]   : NO;
-        _autoShell      = [ud objectForKey:kDDShellAuto]      ? [ud boolForKey:kDDShellAuto]      : YES;
-        _deleteOriginal = [ud objectForKey:kDDShellDeleteSrc] ? [ud boolForKey:kDDShellDeleteSrc] : NO;
-        _selectedTpl = [ud stringForKey:kDDShellSelectedTpl] ?: @"";
+        // boolForKey 未设置时返回 NO，只有 autoShell 默认开，需要单独判一次
+        _enabled        = [ud boolForKey:kDDShellEnabled];
+        _autoShell      = [ud objectForKey:kDDShellAuto] ? [ud boolForKey:kDDShellAuto] : YES;
+        _deleteOriginal = [ud boolForKey:kDDShellDeleteSrc];
+        _selectedTpl    = [ud stringForKey:kDDShellSelectedTpl] ?: @"";
         [ud setBool:_enabled forKey:kDDShellEnabled];
         [ud setBool:_autoShell forKey:kDDShellAuto];
         [ud setBool:_deleteOriginal forKey:kDDShellDeleteSrc];
         [ud setObject:_selectedTpl forKey:kDDShellSelectedTpl];
-        [ud synchronize];
     }
     return self;
 }
@@ -108,32 +108,25 @@ static const NSTimeInterval kDDShellDelay = 1.0;
 - (void)setDeleteOriginal:(BOOL)v { _deleteOriginal = v; [self dd_setBool:v forKey:kDDShellDeleteSrc]; }
 - (void)setSelectedTpl:(NSString *)v {
     _selectedTpl = [v copy] ?: @"";
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setObject:_selectedTpl forKey:kDDShellSelectedTpl];
-    [ud synchronize];
+    [[NSUserDefaults standardUserDefaults] setObject:_selectedTpl forKey:kDDShellSelectedTpl];
 }
 
 - (void)dd_setBool:(BOOL)v forKey:(NSString *)k {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:v forKey:k];
-    [ud synchronize];
+    [[NSUserDefaults standardUserDefaults] setBool:v forKey:k];
 }
 
 // 已处理过的截图去重，避免重复套壳
 - (BOOL)hasProcessed:(NSString *)lid {
     if (!lid.length) return NO;
     NSArray *arr = [[NSUserDefaults standardUserDefaults] arrayForKey:kDDShellProcessed];
-    return arr ? [arr containsObject:lid] : NO;
+    return [arr containsObject:lid]; // 对 nil 发消息返回 NO，不用判空
 }
 - (void)markProcessed:(NSString *)lid {
     if (!lid.length) return;
-    NSArray *old = [[NSUserDefaults standardUserDefaults] arrayForKey:kDDShellProcessed] ?: @[];
-    NSMutableArray *m = [old mutableCopy];
+    NSMutableArray *m = [[[NSUserDefaults standardUserDefaults] arrayForKey:kDDShellProcessed] ?: @[] mutableCopy];
     [m addObject:lid];
     if (m.count > 200) m = [[m subarrayWithRange:NSMakeRange(m.count - 200, 200)] mutableCopy];
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setObject:m forKey:kDDShellProcessed];
-    [ud synchronize];
+    [[NSUserDefaults standardUserDefaults] setObject:m forKey:kDDShellProcessed];
 }
 
 @end
@@ -174,7 +167,7 @@ static NSString *DD_TplFolder(NSString *name) {
 static NSString *DD_FileInFolder(NSString *dir, NSString *name, NSString *ext) {
     if (!dir.length || !name.length) return nil;
     NSString *want = [[name stringByAppendingPathExtension:ext] lowercaseString];
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil] ?: @[];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil]; // 为 nil 时 for-in 不进循环
     for (NSString *f in files) {
         if ([f.lowercaseString isEqualToString:want]) return [dir stringByAppendingPathComponent:f];
     }
@@ -201,7 +194,7 @@ static NSDictionary *DD_LoadCfg(NSString *name) {
 // 枚举模板：根目录下每个子目录是一个模板，必须同时含 <名称>.png 与 <名称>.cfg
 static NSArray<NSString *> *DD_AllTemplateNames(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *items = [fm contentsOfDirectoryAtPath:DD_TplDir() error:nil] ?: @[];
+    NSArray *items = [fm contentsOfDirectoryAtPath:DD_TplDir() error:nil]; // 为 nil 时 for-in 不进循环
     NSMutableArray *out = [NSMutableArray array];
     for (NSString *item in items) {
         NSString *dir = [DD_TplDir() stringByAppendingPathComponent:item];
@@ -237,16 +230,13 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
 
     NSArray *keys = @[@"left_top", @"right_top", @"left_bottom", @"right_bottom"];
     CGPoint pts[4];
-    BOOL ok = YES;
     for (NSUInteger i = 0; i < 4; i++) {
         id x = cfg[[keys[i] stringByAppendingString:@"_x"]];
         id y = cfg[[keys[i] stringByAppendingString:@"_y"]];
-        if (![x respondsToSelector:@selector(doubleValue)] || ![y respondsToSelector:@selector(doubleValue)]) { ok = NO; break; }
+        if (!x || !y) return nil; // 四角坐标缺失则模板不生效
         pts[i] = CGPointMake([x doubleValue], [y doubleValue]);
     }
-    if (!ok) return nil; // 四角坐标缺失则模板不生效
-
-    t.canvasSize = canvas; // 画布尺寸
+    t.canvasSize = canvas;
     t.lt = pts[0]; t.rt = pts[1]; t.lb = pts[2]; t.rb = pts[3];
     return t;
 }
@@ -371,11 +361,15 @@ static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提�
 static dispatch_queue_t gShellQueue = nil;
 static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃后续连拍）
 
-// 微信原生提示：开始 loading / 收起 loading / 成功（运行时取 WeToast 类）
+// 微信原生提示（运行时按类名取 WeToast，编译期不产生链接符号）
+static WeToast *DD_Toast(void) {
+    return [NSClassFromString(@"WeToast") toast];
+}
+
+// 开始 loading / 收起 loading / 成功
 static void DD_ShowShelling(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        Class cls = NSClassFromString(@"WeToast");
-        WeToast *toast = [cls toast];
+        WeToast *toast = DD_Toast();
         [toast setLoadingStyle:YES];
         [toast showToastWithText:@"正在套壳"];
         gBusyToast = toast;
@@ -391,14 +385,12 @@ static void DD_ShowShellDone(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [gBusyToast hideWithAnimated:YES];
         gBusyToast = nil;
-        Class cls = NSClassFromString(@"WeToast");
-        [[cls toast] showDoneToastWithText:@"套壳成功"];
+        [DD_Toast() showDoneToastWithText:@"套壳成功"];
     });
 }
 static void DD_ShowToast(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        Class cls = NSClassFromString(@"WeToast");
-        [[cls toast] showToastWithText:text];
+        [DD_Toast() showToastWithText:text];
     });
 }
 
@@ -497,23 +489,22 @@ static void DD_ShowToast(NSString *text) {
 
 // 打包整个目录，zip 内保留该目录名（同 WCR：顶层有个 WCRefine_frames/）
 static BOOL DD_ZipDirectory(NSString *srcDir, NSString *zipPath) {
-    Class C = objc_getClass("QSSZipArchive");
-    if (!C) return NO;
-    return [C createZipFileAtPath:zipPath withContentsOfDirectory:srcDir keepParentDirectory:YES];
+    // 类不存在时 objc_getClass 返回 nil，对 nil 发消息返回 NO，不用额外判空
+    return [objc_getClass("QSSZipArchive") createZipFileAtPath:zipPath
+                                      withContentsOfDirectory:srcDir
+                                          keepParentDirectory:YES];
 }
 
 // 解包 zip 到目录
 static BOOL DD_UnzipToDirectory(NSString *zipPath, NSString *destDir) {
-    Class C = objc_getClass("QSSZipArchive");
-    if (!C) return NO;
-    return [C unzipFileAtPath:zipPath toDestination:destDir];
+    return [objc_getClass("QSSZipArchive") unzipFileAtPath:zipPath toDestination:destDir];
 }
 
 // 递归找出所有合法模板目录：目录名与目录内的 <目录名>.png、<目录名>.cfg 三者齐备。
 // zip 内可能是 DDShell模板/xx/、xx/ 或别的层级，所以要下钻。
 static void DD_CollectTemplateFolders(NSString *dir, NSMutableArray<NSString *> *out) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil] ?: @[];
+    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil]; // 为 nil 时 for-in 不进循环
     for (NSString *item in items) {
         if ([item hasPrefix:@"."] || [item isEqualToString:@"__MACOSX"]) continue;
         NSString *p = [dir stringByAppendingPathComponent:item];
@@ -530,7 +521,7 @@ static void DD_CollectTemplateFolders(NSString *dir, NSMutableArray<NSString *> 
 // 递归收集 root 下所有普通文件（跳过隐藏项与 macOS 资源叉）
 static void DD_CollectFiles(NSString *dir, NSMutableArray<NSString *> *out) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil] ?: @[];
+    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil]; // 为 nil 时 for-in 不进循环
     for (NSString *item in items) {
         if ([item hasPrefix:@"."] || [item isEqualToString:@"__MACOSX"]) continue;
         NSString *p = [dir stringByAppendingPathComponent:item];
@@ -750,13 +741,11 @@ static UIColor *DD_NavBarBackgroundColor(void) {
 // 影响（设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），同一个外观会渲染出一深一浅两种灰。
 // 这里复制现有外观后只改背景（去毛玻璃 + 钉死底色 + 去阴影线），按钮/标题样式原样保留。
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
-    if (!vc) return;
-    UINavigationBarAppearance *base = vc.navigationController.navigationBar.standardAppearance;
-    UINavigationBarAppearance *appearance = [base copy] ?: [[UINavigationBarAppearance alloc] init];
-    appearance.backgroundEffect = nil;            // 去毛玻璃（等价于 opaque，但不会顺手重置按钮样式）
+    UINavigationBarAppearance *appearance = [vc.navigationController.navigationBar.standardAppearance copy];
+    appearance.backgroundEffect = nil;   // 去毛玻璃（等价于 opaque，但不会顺手重置按钮样式）
     appearance.backgroundImage = nil;
     appearance.backgroundColor = DD_NavBarBackgroundColor();
-    appearance.shadowColor = nil;                 // 去掉底部那条阴影线
+    appearance.shadowColor = nil;        // 去掉底部那条阴影线
 
     vc.navigationItem.standardAppearance = appearance;
     vc.navigationItem.scrollEdgeAppearance = appearance;
@@ -959,7 +948,6 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
         right = [self navButton:@"取消" action:@selector(cancelExportSelectMode)];
         mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
         left  = [self navButton:@"删除" action:@selector(deleteSelectedFrames)];
-        right.enabled = YES; // 取消任何时候都能点
         BOOL has = self.picked.count > 0; // 一个都没勾上时导出和删除不可点
         mid.enabled = has;
         left.enabled = has;
@@ -967,10 +955,6 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
         right = [self navButton:@"导入" action:@selector(uploadButtonTapped)];
         mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
         left  = nil;
-        // 显式置 YES：不写理论上也是 YES，但一旦上面选择态那批把 enabled 改过，
-        // 复用/重建时状态容易串，写清楚最稳
-        right.enabled = YES;
-        mid.enabled = YES;
     }
     // rightBarButtonItems 数组首个显示在最靠屏幕边缘：取消 / 导入贴着右边缘，
     // 左侧不动，系统返回箭头保持原位
@@ -992,27 +976,23 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
 
     id sheet = [[sheetCls alloc] initWithTitle:title
                                        delegate:self
-                                 cancelButtonTitle:@"取消"
-                            destructiveButtonTitle:nil
-                                  otherButtonTitles:nil];
-    if (!sheet) return;
+                              cancelButtonTitle:@"取消"
+                         destructiveButtonTitle:nil
+                              otherButtonTitles:nil];
 
     NSMutableArray *list = [NSMutableArray array];
     for (NSString *t in items) {
-        id item = [[itemCls alloc] initWithTitle:t];
-        if (item) [list addObject:item];
+        [list addObject:[[itemCls alloc] initWithTitle:t]];
     }
     [sheet setValue:list forKey:@"buttonTitleList"];
     [sheet setValue:@(tag) forKey:@"tag"];
-    if ([sheet respondsToSelector:@selector(showInView:)]) {
-        [sheet performSelector:@selector(showInView:) withObject:self.view];
-    }
+    [sheet performSelector:@selector(showInView:) withObject:self.view];
 }
 
 // WCActionSheetDelegate 回调：按 tag 分发，buttonTitleList[0] 对应 index 0；
 // 点自带「取消」的 index 落在所有 item 之后，不会命中任何分支。
 - (void)actionSheet:(id)sheet clickedButtonAtIndex:(NSInteger)idx {
-    NSInteger tag = [sheet respondsToSelector:@selector(tag)] ? [sheet tag] : 0;
+    NSInteger tag = [sheet tag];
 
     if (tag == DD_SHEET_EXPORT) { // 选择导出方式：0=选择导出 1=全部导出
         if (idx == 0) [self enterExportSelectMode];
@@ -1189,10 +1169,8 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
 
 // 从系统文件导入：zip / 模板目录 / 散装 png + cfg 都支持
 - (void)uploadButtonTapped {
-    Class cls = NSClassFromString(@"UIDocumentPickerViewController");
-    if (!cls) return;
     NSArray *types = @[@"public.item", @"public.content", @"public.data", @"public.folder", @"public.zip-archive"];
-    DDFilePicker *picker = [(DDFilePicker *)[cls alloc] initWithDocumentTypes:types inMode:0]; // 0 = Import
+    DDFilePicker *picker = [[NSClassFromString(@"UIDocumentPickerViewController") alloc] initWithDocumentTypes:types inMode:0]; // 0 = Import
     picker.allowsMultipleSelection = YES;
     picker.delegate = self;
     [self presentViewController:picker animated:YES completion:nil];
@@ -1272,8 +1250,6 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
 
     // 分组底色不在这里设：沿用 WCTableViewManager 自带的那套（和 DD收款助手设置页完全一致）。
     // 原来强行钉成 systemGroupedBackgroundColor，跟微信自己的主题色差一档，两页放一起看就不一样。
-    [self ensureTableViewMgr];
-    if (!_tableViewMgr) return;
     UITableView *tableView = [self.tableViewMgr getTableView];
     tableView.frame = self.view.bounds;
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -1291,9 +1267,7 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
 
 - (void)buildTable {
     id cellCls = objc_getClass("WCTableViewCellManager");
-    id secCls = objc_getClass("WCTableViewSectionManager");
-    if (!_tableViewMgr) return;
-
+    id secCls  = objc_getClass("WCTableViewSectionManager");
     [self.tableViewMgr clearAllSection];
     WCTableViewSectionManager *section = [secCls defaultSection];
 
