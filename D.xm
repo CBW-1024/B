@@ -726,7 +726,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 // updateRendererBackgroundForActiveTransition 打架：转场闪烁、按钮色被改、返回箭头退化成系统默认的
 // 亮蓝粗 chevron（微信那颗黑细箭头来自 defaultBackIndicator，会被 item 级 appearance 顶掉）。
 // WCR / ZDY 的素材库也都是一次都不设，导航栏保持微信原样。
-// 按钮颜色照样要按 item 钉，实测删掉就会变色（原因见 navButton:）。
+// 按钮只在 navButton: 里按 WCR 的工厂逐行对齐，颜色一个都不碰。
 
 // 独立的素材库页面，交互对齐 WCRefineScreenshotFrameLibraryViewController：
 //   双排网格列出模板，右上角常驻 导出 / 导入（导入最靠右），默认按名称排序；
@@ -762,9 +762,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     // 页面底色跟设置页同一个色（来源见 DD_GroupBackgroundColor 的注释）
     self.view.backgroundColor = DD_GroupBackgroundColor;
 
-    [self setupSearchBar];
-    [self setupCollectionView];
+    // 顺序跟 WCR 的 viewDidLoad 一致：先装配导航栏，再铺网格，最后搜索条。
+    // 导航栏排在最前面是有意义的 —— 微信的 WCCustomNavigationBar 会 KVO 监听
+    // navigationItem 的 rightBarButtonItems（barButtonItemObservationKeys /
+    // bindNavigationItemObservers:），越早把按钮挂上去，微信越早按它自己的配色渲染，
+    // 不会等到转场收尾才补一刀。放在最后就会看到按钮先进来是系统默认色、再被刷一遍。
     [self setupNavigationBar];
+    [self setupCollectionView];
+    [self setupSearchBar];
     [self reloadList];
 }
 
@@ -916,19 +921,23 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 #pragma mark 导航栏
 
-// 按钮颜色不钉，一个都不设 —— WCR 的 createNavigationBarButtonWithTitle:target:action: 就是
-// 只做 initWithTitle:style:target:action: + setEnabled:YES，没有任何颜色代码。
+// 按钮颜色一个都不钉：WCR 的 createNavigationBarButtonWithTitle:target:action: 反汇编出来
+// 就只有两句 —— initWithTitle:style:target:action: 加 setEnabled:YES，没有任何颜色代码，
+// 它的素材库实测进页面时按钮颜色是不跳的。我们照抄这两句，连 setEnabled:YES 一起。
 // 钉过两版都失败了，两种失败方式记一下，别再回头试：
 //   1. setTitleTextAttributes:forState: 只能钉一个状态，disabled 会掉回系统默认色；
 //   2. 钉 tintColor 更糟：viewDidLoad 里读 navigationBar.tintColor 时微信的导航栏还没接管完，
-//      读到的是系统默认亮蓝 #007AFF，钉死之后转场结束微信才把按钮刷成它自己的色，
-//      肉眼就是「亮蓝 → 浅色」跳一下。钉得越死，这一下跳得越明显。
-// 按钮也不禁用（见 setupNavigationBar），所以不存在 disabled 状态，从头到尾只有微信给的那一个色。
+//      读到的是系统默认亮蓝 #007AFF，钉死之后微信再把自己的色刷上来，就是「亮蓝 → 浅色」。
+//      注意这一刷跟钉不钉色无关 —— 它是微信 WCCustomNavigationBar 自己 KVO 到
+//      rightBarButtonItems 之后的渲染，钉色只是让这一下更显眼（钉住的值被改，改完才回来）。
+//      要消掉它只能让微信早点渲染，见 viewDidLoad 里 setupNavigationBar 的排位。
 - (UIBarButtonItem *)navButton:(NSString *)title action:(SEL)action {
-    return [[UIBarButtonItem alloc] initWithTitle:title
-                                            style:UIBarButtonItemStylePlain
-                                           target:self
-                                           action:action];
+    UIBarButtonItem *b = [[UIBarButtonItem alloc] initWithTitle:title
+                                                          style:UIBarButtonItemStylePlain
+                                                         target:self
+                                                         action:action];
+    b.enabled = YES; // WCR 工厂里有这一句：永远可点，不跟着勾选数禁用
+    return b;
 }
 
 // 右上角按钮（数组首个最靠右）：
