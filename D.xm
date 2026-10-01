@@ -716,9 +716,11 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
 @end
 
-// 页面底色：微信设置页那个分组灰
+// 页面底色：比 systemGroupedBackgroundColor(#F2F2F7) 更稳一点的系统灰。
+// 之前用 systemGroupedBackgroundColor 在不少屏上几乎读成白色（用户反馈「偏白」），
+// 这里换成 systemGray5Color(#E5E5EA)，导航栏和页面都引用它，一起变灰、仍保持同色。
 static UIColor *DD_PageBackgroundColor(void) {
-    return [UIColor systemGroupedBackgroundColor];
+    return [UIColor systemGray5Color];
 }
 
 // 设置页和素材库页共用同一套导航栏外观：不透明 + 和页面底色同一个灰。
@@ -730,6 +732,7 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithOpaqueBackground]; // 不透明，不再受背后内容影响
     appearance.backgroundColor = DD_PageBackgroundColor();
+    appearance.backgroundEffect = nil;           // 去掉导航栏默认的毛玻璃，否则会把背景色冲淡、显得比页面偏白
     appearance.shadowColor = nil;               // 去掉底部那条阴影线
     vc.navigationItem.standardAppearance = appearance;
     vc.navigationItem.scrollEdgeAppearance = appearance;
