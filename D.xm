@@ -743,15 +743,21 @@ static UIColor *DD_NavBarBackgroundColor(void) {
 }
 
 // 设置页和素材库页共用同一套导航栏外观：不透明 + 和页面底色同一个灰。
-// 不能用 configureWithDefaultBackground，那个是「默认半透明」，最终颜色会被导航栏背后的内容
-// 影响——设置页的表格延伸到导航栏底下（背后是灰），素材库页设了 UIRectEdgeNone（背后没内容），
-// 同一个外观会渲染出一深一浅两种灰。这里直接钉死不透明底色，两页一致，也不会有接缝。
+// 关键点：外观要「复制导航栏现有的再改背景」，不要从零 [[... alloc] init] + configureWithOpaqueBackground。
+// 后者是系统默认样式，会把按钮配色一起重置掉，按钮文字色掉回 tintColor 继承、比微信自己的浅——
+// 表现就是 push 动画期间还是对的，动画一结束（切到我们的外观）按钮闪一下变浅。
+// 另外也不能用 configureWithDefaultBackground，那个是「默认半透明」，颜色会被导航栏背后的内容
+// 影响（设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），同一个外观会渲染出一深一浅两种灰。
+// 这里复制现有外观后只改背景（去毛玻璃 + 钉死底色 + 去阴影线），按钮/标题样式原样保留。
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     if (!vc) return;
-    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
-    [appearance configureWithOpaqueBackground]; // 不透明、不带毛玻璃（该方法本身已清空 backgroundEffect），不再受背后内容影响
+    UINavigationBarAppearance *base = vc.navigationController.navigationBar.standardAppearance;
+    UINavigationBarAppearance *appearance = [base copy] ?: [[UINavigationBarAppearance alloc] init];
+    appearance.backgroundEffect = nil;            // 去毛玻璃（等价于 opaque，但不会顺手重置按钮样式）
+    appearance.backgroundImage = nil;
     appearance.backgroundColor = DD_NavBarBackgroundColor();
-    appearance.shadowColor = nil;               // 去掉底部那条阴影线
+    appearance.shadowColor = nil;                 // 去掉底部那条阴影线
+
     vc.navigationItem.standardAppearance = appearance;
     vc.navigationItem.scrollEdgeAppearance = appearance;
     vc.navigationItem.compactAppearance = appearance;
@@ -953,6 +959,7 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
         right = [self navButton:@"取消" action:@selector(cancelExportSelectMode)];
         mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
         left  = [self navButton:@"删除" action:@selector(deleteSelectedFrames)];
+        right.enabled = YES; // 取消任何时候都能点
         BOOL has = self.picked.count > 0; // 一个都没勾上时导出和删除不可点
         mid.enabled = has;
         left.enabled = has;
@@ -960,6 +967,10 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
         right = [self navButton:@"导入" action:@selector(uploadButtonTapped)];
         mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
         left  = nil;
+        // 显式置 YES：不写理论上也是 YES，但一旦上面选择态那批把 enabled 改过，
+        // 复用/重建时状态容易串，写清楚最稳
+        right.enabled = YES;
+        mid.enabled = YES;
     }
     // rightBarButtonItems 数组首个显示在最靠屏幕边缘：取消 / 导入贴着右边缘，
     // 左侧不动，系统返回箭头保持原位
