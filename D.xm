@@ -353,7 +353,7 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 - (void)hideWithAnimated:(BOOL)animated;
 @end
 
-static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提示，完成后收起
+static WeToast *gBusyToast = nil; // 进行中的 loading 提示（套壳 / 导出），完成后收起
 
 // 连拍互斥：同一时刻只处理一张，处理中到达的截屏事件直接丢弃
 static dispatch_queue_t gShellQueue = nil;
@@ -364,26 +364,29 @@ static WeToast *DD_Toast(void) {
 }
 
 // 开始 loading / 收起 loading / 成功 / 失败 / 纯文字
-static void DD_ShowShelling(void) {
+static void DD_ShowLoading(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
         WeToast *toast = DD_Toast();
         [toast setLoadingStyle:YES];
-        [toast showToastWithText:@"正在套壳"];
+        [toast showToastWithText:text];
         gBusyToast = toast;
     });
 }
+// 收起 loading：调用方都在主线程
+static void DD_HideLoading(void) {
+    [gBusyToast hideWithAnimated:YES];
+    gBusyToast = nil;
+}
 static void DD_ShowShellDone(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [gBusyToast hideWithAnimated:YES];
-        gBusyToast = nil;
+        DD_HideLoading();
         [DD_Toast() showDoneToastWithText:@"套壳成功"];
     });
 }
 // 方形带错误图标的提示。loading 用的是同一个 WeToast 实例，先收起再弹
 static void DD_ShowError(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [gBusyToast hideWithAnimated:YES];
-        gBusyToast = nil;
+        DD_HideLoading();
         [DD_Toast() showErrorToastWithText:text];
     });
 }
@@ -463,7 +466,7 @@ static void DD_ShowToast(NSString *text) {
 }
 
 // 转发到文件级静态函数，供截图路径调用
-- (void)dd_showShelling { DD_ShowShelling(); }
+- (void)dd_showShelling { DD_ShowLoading(@"正在套壳"); }
 - (void)dd_showShellDone { DD_ShowShellDone(); }
 
 
@@ -1071,22 +1074,29 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 // 打包后调起系统分享（存到文件 / 隔空投送等），分享成功则退出选择态
 - (void)shareZipForNames:(NSArray<NSString *> *)names {
-    NSString *zip = DD_ExportTemplatesToZip(names);
-    if (!zip) { DD_ShowToast(@"导出失败"); return; }
+    // 打包要整批拷贝模板 png，主线程干会卡住、loading 也转不起来，所以丢后台
+    DD_ShowLoading(@"正在导出模板");
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *zip = DD_ExportTemplatesToZip(names);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!zip) { DD_ShowError(@"导出失败"); return; }
 
-    NSString *tmpDir = zip.stringByDeletingLastPathComponent; // 打包用的临时目录，分享结束后删掉
-    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[ [NSURL fileURLWithPath:zip] ]
-                                                                     applicationActivities:nil];
-    av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *err) {
-        [[NSFileManager defaultManager] removeItemAtPath:tmpDir error:nil];
-        if (completed) [self cancelExportSelectMode];
-    };
-    UIPopoverPresentationController *pop = av.popoverPresentationController;
-    if (pop) { // iPad 需要锚点，否则崩溃
-        pop.sourceView = self.view;
-        pop.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
-    }
-    [self presentViewController:av animated:YES completion:nil];
+            DD_HideLoading();
+            NSString *tmpDir = zip.stringByDeletingLastPathComponent; // 打包用的临时目录，分享结束后删掉
+            UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[ [NSURL fileURLWithPath:zip] ]
+                                                                             applicationActivities:nil];
+            av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *err) {
+                [[NSFileManager defaultManager] removeItemAtPath:tmpDir error:nil];
+                if (completed) [self cancelExportSelectMode];
+            };
+            UIPopoverPresentationController *pop = av.popoverPresentationController;
+            if (pop) { // iPad 需要锚点，否则崩溃
+                pop.sourceView = self.view;
+                pop.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+            }
+            [self presentViewController:av animated:YES completion:nil];
+        });
+    });
 }
 
 #pragma mark 重命名
@@ -1178,8 +1188,8 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 // 删除确认，单个和批量共用
 - (void)confirmDeleteNames:(NSArray<NSString *> *)names {
     NSString *msg = names.count == 1
-        ? [NSString stringWithFormat:@"确定要删除「%@」这个套壳模板吗？", names.firstObject]
-        : [NSString stringWithFormat:@"确定要删除选中的 %ld 个套壳模板吗？", (long)names.count];
+        ? [NSString stringWithFormat:@"已选：「%@」", names.firstObject]
+        : [NSString stringWithFormat:@"已选：%ld 个模板", (long)names.count];
 
     self.pendingDelete = names;
     WCUIAlertView *av = [[NSClassFromString(@"WCUIAlertView") alloc] initWithTitle:@"确认删除" message:msg];
@@ -1391,11 +1401,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         UIImage *img = info[UIImagePickerControllerOriginalImage];
         DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
         if (!t) { DD_ShowError(@"套壳失败"); return; } // 选图这会儿模板没了
-        DD_ShowShelling();
-        UIImage *outImg = DD_ComposeShellImage(img, t);
-        if (!outImg) { DD_ShowError(@"套壳失败"); return; }
-        DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
-        DD_ShowShellDone();
+        // 合成要开全尺寸画布，主线程干会卡住、loading 也转不起来，所以丢后台
+        DD_ShowLoading(@"正在套壳");
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            UIImage *outImg = DD_ComposeShellImage(img, t);
+            if (!outImg) { DD_ShowError(@"套壳失败"); return; }
+            DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
+            DD_ShowShellDone();
+        });
     }];
 }
 
