@@ -723,6 +723,29 @@ static UIColor *DD_NavBarBackgroundColor(void) {
     return [UIColor systemGroupedBackgroundColor];
 }
 
+// 分组底色：不写死色值，直接向设置页同一个来源要——现造一个同款 WCTableViewManager，
+// 读它 tableView 的底色。这样素材库页和设置页必然同色：微信换主题、改默认值两边一起变，
+// 不用在两处各写一次 systemGroupedBackgroundColor（那正是之前两页对不上的原因）。
+// 读不到就返回 nil，不做任何兜底色值。
+static UIColor *DD_WCGroupBackgroundColor(void) {
+    static UIColor *color;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        UITableView *tv = nil;
+        @try {
+            id mgrCls = objc_getClass("WCTableViewManager");
+            WCTableViewManager *mgr = [mgrCls alloc];
+            mgr = [mgr initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
+            tv = [mgr getTableView];
+        } @catch (NSException *e) {
+            tv = nil;
+        }
+        // 拿不到就是 nil（调用处等于不设，交给微信/UIKit 自己），不写死任何色值做兜底
+        color = tv.backgroundColor ?: tv.backgroundView.backgroundColor;
+    });
+    return color;
+}
+
 // 设置页和素材库页共用同一套导航栏外观：不透明 + 和页面底色同一个灰。
 // 不能用 configureWithDefaultBackground，那个是「默认半透明」，最终颜色会被导航栏背后的内容
 // 影响——设置页的表格延伸到导航栏底下（背后是灰），素材库页设了 UIRectEdgeNone（背后没内容），
@@ -763,8 +786,8 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     // 导航栏：和设置页同一套（不透明灰 + 无阴影线）
     DD_ApplyNavigationBarAppearance(self);
 
-    // 页面底色：系统分组灰（iOS/微信设置页的标准浅灰），和导航栏解耦、各自独立。
-    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    // 页面底色：取和设置页同一个来源（WCTableViewManager 的表格底色），两页必然一致
+    self.view.backgroundColor = DD_WCGroupBackgroundColor();
 
     [self setupSearchBar];
     [self setupCollectionView];
@@ -793,7 +816,7 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
 
     // frame 交给 viewDidLayoutSubviews，这里先零尺寸占位
     UICollectionView *cv = [[UICollectionView alloc] initWithFrame:CGRectZero collectionViewLayout:layout];
-    cv.backgroundColor = [UIColor clearColor]; // 透出页面灰，和搜索条、导航栏同一片底色
+    cv.backgroundColor = [UIColor clearColor]; // 透出页面底色（和设置页同一色值）
     cv.alwaysBounceVertical = YES;
     cv.delegate = self;
     cv.dataSource = self;
@@ -1240,16 +1263,16 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     // 导航栏：和素材库页同一套（不透明灰 + 无阴影线）
     DD_ApplyNavigationBarAppearance(self);
 
-    // 页面底色：系统分组灰（和导航栏解耦）。不显式设的话，InsetGrouped 表格的 inset 空隙会露默认白底
-    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
-
+    // 分组底色不在这里设：沿用 WCTableViewManager 自带的那套（和 DD收款助手设置页完全一致）。
+    // 原来强行钉成 systemGroupedBackgroundColor，跟微信自己的主题色差一档，两页放一起看就不一样。
     [self ensureTableViewMgr];
     if (!_tableViewMgr) return;
     UITableView *tableView = [self.tableViewMgr getTableView];
     tableView.frame = self.view.bounds;
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
-    tableView.backgroundColor = [UIColor systemGroupedBackgroundColor]; // 分组灰；section 卡片是白
+    // tableView.backgroundColor 保持不动（交给 WCTableViewManager），卡片之间/四周的底色和收款助手同源；
+    // 卡片本身的颜色由微信的 cell 决定，本来两边就是一样的。
     [self.view addSubview:tableView];
 }
 
