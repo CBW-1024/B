@@ -717,11 +717,10 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 @end
 
 // 页面底色：用更深的系统灰兜底「偏白」。
-// systemGroupedBackgroundColor(#F2F2F7) / systemGray5/4/3 在不少屏上仍偏白，
-// 这里换成 systemGrayColor(#8E8E93)，中灰、明显是灰、不会读成白；
-// 导航栏和页面都引用它，一起变灰、仍保持同色。
+// systemGroupedBackgroundColor(#F2F2F7) / systemGray5/4 在不少屏上仍偏白，systemGrayColor(#8E8E93) 又偏深，
+// 这里用 systemGray3Color(#C7C7CC)，是灰但不会太暗；导航栏和页面都引用它，一起变灰、仍保持同色。
 static UIColor *DD_PageBackgroundColor(void) {
-    return [UIColor systemGrayColor];
+    return [UIColor systemGray3Color];
 }
 
 // 设置页和素材库页共用同一套导航栏外观：不透明 + 和页面底色同一个灰。
