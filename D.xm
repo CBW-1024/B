@@ -716,13 +716,6 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
 @end
 
-// 导航栏底色：和页面同一套 systemGroupedBackgroundColor(#F2F2F7)，
-// 导航栏不透明铺这块浅灰，和页面底色无缝接成一片（iOS 设置页就是这种整体延伸）。
-// 两者用同一个语义色，想要导航栏更深可改这里（比如 systemGray5Color）。
-static UIColor *DD_NavBarBackgroundColor(void) {
-    return [UIColor systemGroupedBackgroundColor];
-}
-
 // 分组底色：不写死色值，直接向设置页同一个来源要——现造一个同款 WCTableViewManager，
 // 读它 tableView 的底色。这样素材库页和设置页必然同色：微信换主题、改默认值两边一起变。
 // 已实测能读到色值，不做 nil 退回、不兜底。
@@ -741,23 +734,22 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     return color;
 }
 
+// 导航栏底色：直接复用分组底色（同一个来源），导航栏和页面底色永远一致，
+// 微信换主题时两边一起变，不会再出现一深一浅。
+// 想让导航栏独立成别的色，把下面这行换成写死色值即可，例如：
+//   return [UIColor colorWithRed:0xF2/255.0 green:0xF2/255.0 blue:0xF7/255.0 alpha:1.0]; // #F2F2F7
+static UIColor *DD_NavBarBackgroundColor(void) {
+    return DD_WCGroupBackgroundColor();
+}
+
 // 设置页和素材库页共用同一套导航栏外观：不透明 + 和页面底色同一个灰。
 // 不能用 configureWithDefaultBackground，那个是「默认半透明」，最终颜色会被导航栏背后的内容
 // 影响——设置页的表格延伸到导航栏底下（背后是灰），素材库页设了 UIRectEdgeNone（背后没内容），
 // 同一个外观会渲染出一深一浅两种灰。这里直接钉死不透明底色，两页一致，也不会有接缝。
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     if (!vc) return;
-
-    // 关键：从「当前已生效的」那份 appearance 拷贝，而不是 alloc init 一份空的。
-    // 空 alloc 的 UINavigationBarAppearance 里 buttonAppearance / backButtonAppearance 都是 UIKit 默认值，
-    // 赋给 navigationItem 后会覆盖微信在 UINavigationBar.appearance 上配的那套按钮外观，
-    // 返回箭头就被打回系统默认（默认 tint + 默认字号），和设置页那颗大小和颜色都对不上。
-    // 拷贝之后只改背景两项，按钮/返回箭头那一套原样继承，两页必然一致。
-    UINavigationBar *bar = vc.navigationController.navigationBar;
-    UINavigationBarAppearance *base = bar.standardAppearance ?: [[UINavigationBar appearance] standardAppearance];
-    UINavigationBarAppearance *appearance = [base copy] ?: [[UINavigationBarAppearance alloc] init];
-
-    [appearance configureWithOpaqueBackground]; // 只重置背景/阴影，不动按钮外观
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    [appearance configureWithOpaqueBackground]; // 不透明、不带毛玻璃（该方法本身已清空 backgroundEffect），不再受背后内容影响
     appearance.backgroundColor = DD_NavBarBackgroundColor();
     appearance.shadowColor = nil;               // 去掉底部那条阴影线
     vc.navigationItem.standardAppearance = appearance;
