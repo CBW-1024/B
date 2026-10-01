@@ -730,9 +730,8 @@ static UIColor *DD_PageBackgroundColor(void) {
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     if (!vc) return;
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
-    [appearance configureWithOpaqueBackground]; // 不透明，不再受背后内容影响
+    [appearance configureWithOpaqueBackground]; // 不透明、不带毛玻璃（该方法本身已清空 backgroundEffect），不再受背后内容影响
     appearance.backgroundColor = DD_PageBackgroundColor();
-    appearance.backgroundEffect = nil;           // 去掉导航栏默认的毛玻璃，否则会把背景色冲淡、显得比页面偏白
     appearance.shadowColor = nil;               // 去掉底部那条阴影线
     vc.navigationItem.standardAppearance = appearance;
     vc.navigationItem.scrollEdgeAppearance = appearance;
