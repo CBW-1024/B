@@ -130,19 +130,21 @@ static const NSTimeInterval kDDShellDelay = 1.0;
 
 #pragma mark - 模板目录
 
-// 模板根目录：Documents/DDShell/模板/
+// 模板根目录：Library/Preferences/DDShell/模板/
+// 不放 Documents：微信的「清理缓存」会清掉它，模板会丢；Preferences 不会被清。
 static NSString *DD_TplDir(void) {
     static NSString *dir;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        dir = [doc stringByAppendingPathComponent:@"DDShell/模板"];
+        NSString *lib  = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *pref = [lib stringByAppendingPathComponent:@"Preferences"];
+        dir = [pref stringByAppendingPathComponent:@"DDShell/模板"];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     });
     return dir;
 }
 
-// 单个模板的目录：Documents/DDShell/模板/<名称>/
+// 单个模板的目录：Library/Preferences/DDShell/模板/<名称>/
 static NSString *DD_TplFolder(NSString *name) {
     return name.length ? [DD_TplDir() stringByAppendingPathComponent:name] : nil;
 }
