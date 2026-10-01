@@ -754,7 +754,16 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.picked = [NSMutableSet set];
-    self.edgesForExtendedLayout = UIRectEdgeNone; // view 从导航栏底下开始，搜索栏才不会顶进状态栏
+
+    // 这里千万不要设 edgesForExtendedLayout = UIRectEdgeNone：
+    // UIRectEdgeNone 是靠改 view 的 safeAreaInsets 实现的，而微信 8.0.79 的
+    // WCCustomNavigationBarCoordinator 也有 applySafeAreaToViewController: / safeAreaDeltas /
+    // restoreSafeAreaForViewController:，会主动改写 VC 的 safeArea，还会拿另一个 VC 当参考去对齐
+    // （safeAreaReferenceViewControllerFromViewController:toViewController:）。两个一起改 safeArea：
+    // 转场时 from / to 两个 VC 算出来的结果不一致，Coordinator 就反复 apply 再 restore，导航栏跟着抖，
+    // 就是进素材库时那下闪烁；自定义导航栏渲染被打断，返回箭头也退化成系统默认的亮蓝粗 chevron。
+    // WCR / ZDY 的素材库和我们的设置页全都是默认全屏布局，靠 viewDidLayoutSubviews 里量
+    // safeAreaInsets.top 把搜索栏推到导航栏下面（见 viewDidLayoutSubviews），导航栏则保持微信原样。
 
     // 页面底色：取和设置页同一个来源（WCTableViewManager 表格的底色），两页必然同色
     self.view.backgroundColor = DD_WCGroupBackgroundColor();
@@ -798,7 +807,9 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
 // 布局跟 WCR 的 viewDidLayoutSubviews 一个算法：搜索条压在最上面，网格从它底下开始铺满剩余
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    CGFloat top = self.view.safeAreaInsets.top; // 上面设了 UIRectEdgeNone，正常就是 0
+    CGFloat top = self.view.safeAreaInsets.top; // 全屏布局，这个值就是导航栏底边（状态栏+导航栏）
+    if (top <= 0) top = 64.0; // 微信的 Coordinator 会改写 VC 的 safeArea，量出来可能是 0，
+                              // 这时回退到导航栏的标准总高，搜索条才不会顶进状态栏（WCR 同款兜底）
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
     self.searchBar.frame = CGRectMake(0, top, w, kDDShellSearchH);
