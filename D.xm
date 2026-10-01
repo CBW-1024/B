@@ -725,14 +725,15 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     return color;
 }
 
-// 设置页和素材库页共用同一套导航栏外观：从零建一个外观，只配背景（去毛玻璃 + 钉底色 + 去阴影线）。
-// 从零建的代价：标题和返回箭头不再沿用微信那套，会变成系统默认样式——先试效果，不行再改回
-// [navigationBar.standardAppearance copy]（那样标题和箭头就是微信原样）。
-// 不能用 configureWithDefaultBackground：那个是半透明的，底色会被导航栏背后的内容影响
+// 设置页和素材库页共用同一套导航栏外观：基于微信导航栏当前的外观来改，只覆盖背景四项
+// （去毛玻璃 + 去背景图 + 钉底色 + 去阴影线），标题、返回箭头、按钮基础样式全部沿用微信那套。
+// 不能从零 [[UINavigationBarAppearance alloc] init]：那样 backIndicatorImage 是 nil，
+// 返回箭头会退化成系统默认的亮蓝粗 chevron，跟微信自己的黑细箭头对不上。
+// 也不能用 configureWithDefaultBackground：那个是半透明的，底色会被导航栏背后的内容影响
 // （设置页背后是灰、素材库页 UIRectEdgeNone 背后没内容），同一个外观会渲染出一深一浅两种灰。
 // 按钮颜色不归这里管：那层压不过微信给 UIBarButtonItem 定的全局 appearance 代理，只能按 item 钉，见 navButton:。
 static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
-    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    UINavigationBarAppearance *appearance = [vc.navigationController.navigationBar.standardAppearance copy];
     appearance.backgroundEffect = nil;   // 去毛玻璃（效果等价于 opaque）
     appearance.backgroundImage = nil;
     appearance.backgroundColor = DD_WCGroupBackgroundColor(); // 导航栏底色沿用分组底色，和页面同一个来源
