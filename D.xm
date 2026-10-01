@@ -733,7 +733,10 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
         id mgrCls = objc_getClass("WCTableViewManager");
         WCTableViewManager *mgr = [[mgrCls alloc] initWithFrame:[UIScreen mainScreen].bounds
                                                           style:UITableViewStyleInsetGrouped];
-        color = [[mgr getTableView] backgroundColor];
+        // getTableView 返回 id，必须转成 UITableView *：否则编译器按 id 随便挑一个
+        // backgroundColor 声明（挑到了 CALayer 的，返回 CGColorRef），类型就对不上了
+        UITableView *tv = (UITableView *)[mgr getTableView];
+        color = tv.backgroundColor;
     });
     return color;
 }
