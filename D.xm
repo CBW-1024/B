@@ -1260,15 +1260,33 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     // backBarButtonItem，实测它的素材库返回箭头照样是蓝色的 —— 说明光设这个没用，
     // 微信只有在走它自己的 PushViewController: 时才会接管返回按钮（见 openLibraryTapped:）。
 
+    // 页面底色：和素材库同一个来源（WCTableViewManager 表格的底色），两页必然同色。
+    // 表格不再铺到导航栏底下（见 viewDidLayoutSubviews），导航栏那一块透出来的就是这层灰。
+    // 顺带把底色的首次计算放在本页：它第一次要建一个 WCTableViewManager 取色，放在这里算，
+    // 等下进素材库时就已经缓存好了，不会卡在转场动画里。
+    self.view.backgroundColor = DD_WCGroupBackgroundColor();
+
     // 分组底色不在这里设：沿用 WCTableViewManager 自带的那套（和 DD收款助手设置页完全一致）。
     // 原来强行钉成 systemGroupedBackgroundColor，跟微信自己的主题色差一档，两页放一起看就不一样。
     UITableView *tableView = [self.tableViewMgr getTableView];
-    tableView.frame = self.view.bounds;
-    tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     // tableView.backgroundColor 保持不动（交给 WCTableViewManager），卡片之间/四周的底色和收款助手同源；
     // 卡片本身的颜色由微信的 cell 决定，本来两边就是一样的。
+    // frame 交给 viewDidLayoutSubviews，不再用 autoresizingMask 顶满。
     [self.view addSubview:tableView];
+}
+
+// 表格从导航栏底下开始：全屏铺的话往上滚单元格会从导航栏底下穿过去 —— 微信自己那些页面是靠
+// 导航栏的毛玻璃把穿过去的内容糊住的，我们这层没有那层毛玻璃，就看得清清楚楚。
+// 所以跟素材库同一套算法（导航栏那块空出来留给页面底色，见 viewDidLoad）。
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat top = self.view.safeAreaInsets.top; // 全屏布局，这个值就是导航栏底边
+    if (top <= 0) top = 64.0; // 微信的 Coordinator 会改写 VC 的 safeArea，量出来可能是 0
+    UITableView *tableView = [self.tableViewMgr getTableView];
+    tableView.frame = CGRectMake(0, top,
+                                 self.view.bounds.size.width,
+                                 self.view.bounds.size.height - top);
 }
 
 // 从素材库返回时刷新「N 个 / 当前 X」
