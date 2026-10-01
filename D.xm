@@ -723,6 +723,21 @@ static UIColor *DD_NavBarBackgroundColor(void) {
     return [UIColor systemGroupedBackgroundColor];
 }
 
+// 分组底色：不写死色值，直接向设置页同一个来源要——现造一个同款 WCTableViewManager，
+// 读它 tableView 的底色。这样素材库页和设置页必然同色：微信换主题、改默认值两边一起变。
+// 已实测能读到色值，不做 nil 退回、不兜底。
+static UIColor *DD_WCGroupBackgroundColor(void) {
+    static UIColor *color;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        id mgrCls = objc_getClass("WCTableViewManager");
+        WCTableViewManager *mgr = [[mgrCls alloc] initWithFrame:[UIScreen mainScreen].bounds
+                                                          style:UITableViewStyleInsetGrouped];
+        color = [[mgr getTableView] backgroundColor];
+    });
+    return color;
+}
+
 // 设置页和素材库页共用同一套导航栏外观：不透明 + 和页面底色同一个灰。
 // 不能用 configureWithDefaultBackground，那个是「默认半透明」，最终颜色会被导航栏背后的内容
 // 影响——设置页的表格延伸到导航栏底下（背后是灰），素材库页设了 UIRectEdgeNone（背后没内容），
@@ -763,8 +778,8 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     // 导航栏：和设置页同一套（不透明灰 + 无阴影线）
     DD_ApplyNavigationBarAppearance(self);
 
-    // 页面底色不设，交给微信/UIKit 自己：素材库页只放搜索条 + 自定义 collectionView，
-    // 没有 WCTableViewManager 那层，硬写色值反而和设置页对不上。
+    // 页面底色：取和设置页同一个来源（WCTableViewManager 表格的底色），两页必然同色
+    self.view.backgroundColor = DD_WCGroupBackgroundColor();
 
     [self setupSearchBar];
     [self setupCollectionView];
@@ -793,7 +808,7 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
 
     // frame 交给 viewDidLayoutSubviews，这里先零尺寸占位
     UICollectionView *cv = [[UICollectionView alloc] initWithFrame:CGRectZero collectionViewLayout:layout];
-    cv.backgroundColor = [UIColor clearColor]; // 页面底色交给微信自己，网格透明即可
+    cv.backgroundColor = [UIColor clearColor]; // 透明，透出和设置页同色的页面底色
     cv.alwaysBounceVertical = YES;
     cv.delegate = self;
     cv.dataSource = self;
