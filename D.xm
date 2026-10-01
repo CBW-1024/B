@@ -726,7 +726,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 // updateRendererBackgroundForActiveTransition 打架：转场闪烁、按钮色被改、返回箭头退化成系统默认的
 // 亮蓝粗 chevron（微信那颗黑细箭头来自 defaultBackIndicator，会被 item 级 appearance 顶掉）。
 // WCR / ZDY 的素材库也都是一次都不设，导航栏保持微信原样。
-// 按钮颜色同样不钉，交给微信自己的 UIBarButtonItem appearance 代理，见 navButton:。
+// 按钮颜色照样要按 item 钉，实测删掉就会变色（原因见 navButton:）。
 
 // 独立的素材库页面，交互对齐 WCRefineScreenshotFrameLibraryViewController：
 //   双排网格列出模板，右上角常驻 导出 / 导入（导入最靠右），默认按名称排序；
@@ -903,7 +903,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
     if (self.isSelectMode) { // 选择态：点一下切换勾选
         if ([self.picked containsObject:n]) [self.picked removeObject:n]; else [self.picked addObject:n];
-        [self setupNavigationBar]; // 删除/导出的可用性跟着勾选数变
+        // 不用重建右上角了：按钮不再跟着勾选数禁用，标题和勾选态由下面两行负责
         [self updateTitle];
         [self.collectionView reloadItemsAtIndexPaths:@[ip]];
         return;
@@ -916,11 +916,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 #pragma mark 导航栏
 
-// 按钮颜色不钉：push 走微信自己的 PushViewController: 之后，导航栏由 WCCustomNavigationBar 接管，
-// 右键颜色交给微信自己的 UIBarButtonItem appearance 代理，跟微信其他页面必然一致。
-// 之前钉过 titleTextAttributes（取 navigationBar.tintColor），那是导航栏还没被接管时的补救措施。
-// 另外踩过的坑记一下，免得以后再绕回来：改 buttonAppearance 那一层完全没用（实测两版都无效），
-// 代理那层又读不到也改不动 —— 接管之后这些都不用管了。
+// 按钮颜色不钉，一个都不设 —— WCR 的 createNavigationBarButtonWithTitle:target:action: 就是
+// 只做 initWithTitle:style:target:action: + setEnabled:YES，没有任何颜色代码。
+// 钉过两版都失败了，两种失败方式记一下，别再回头试：
+//   1. setTitleTextAttributes:forState: 只能钉一个状态，disabled 会掉回系统默认色；
+//   2. 钉 tintColor 更糟：viewDidLoad 里读 navigationBar.tintColor 时微信的导航栏还没接管完，
+//      读到的是系统默认亮蓝 #007AFF，钉死之后转场结束微信才把按钮刷成它自己的色，
+//      肉眼就是「亮蓝 → 浅色」跳一下。钉得越死，这一下跳得越明显。
+// 按钮也不禁用（见 setupNavigationBar），所以不存在 disabled 状态，从头到尾只有微信给的那一个色。
 - (UIBarButtonItem *)navButton:(NSString *)title action:(SEL)action {
     return [[UIBarButtonItem alloc] initWithTitle:title
                                             style:UIBarButtonItemStylePlain
@@ -937,9 +940,12 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         right = [self navButton:@"取消" action:@selector(cancelExportSelectMode)];
         mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
         left  = [self navButton:@"删除" action:@selector(deleteSelectedFrames)];
-        BOOL has = self.picked.count > 0; // 一个都没勾上时导出和删除不可点
-        mid.enabled = has;
-        left.enabled = has;
+        // 这里不禁用按钮：一个都没勾时也保持可点，点下去由 exportSelectedFrames /
+        // deleteSelectedFrames 自己弹「请至少选择一个套壳」（两句提示本来就写好了）。
+        // WCR 也是这个做法 —— 它的按钮工厂里统一 setEnabled:YES，选择态刚进入、一个都没勾时
+        // 「删除 / 导出」照样可点，靠点击时的判断兜。
+        // 禁用会带来一个副作用：按钮在 enabled / disabled 之间来回跳，而 disabled 那一档
+        // 走的不是钉住的颜色，看上去就是「颜色会变」。
     } else {
         right = [self navButton:@"导入" action:@selector(uploadButtonTapped)];
         mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
