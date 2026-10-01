@@ -39,7 +39,6 @@
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
-@property (nonatomic, retain) id userInfo;
 @end
 
 @interface WCPluginsMgr : NSObject
@@ -713,6 +712,14 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 // 微信换主题、改默认值，两边跟着一起变，不会出现两页差一档的情况。
 static UIColor *DD_GroupBackgroundColor = nil;
 
+// 导航栏底边：全屏布局下 view 的 safeAreaInsets.top 就是它（状态栏 + 导航栏）。
+// 微信的 Coordinator 会改写 VC 的 safeArea，偶尔量出来是 0，那就回退到导航栏的标准总高，
+// 否则搜索栏 / 表格会顶进状态栏。WCR 的 viewDidLayoutSubviews 就是这个处理。
+static CGFloat DD_TopUnderNavBar(UIView *view) {
+    CGFloat top = view.safeAreaInsets.top;
+    return top > 0 ? top : 64.0;
+}
+
 // 导航栏外观完全不碰：8.0.79 用 WCCustomNavigationBar / WCCustomNavigationBarCoordinator 自己实现了
 // 整套导航栏（背景、标题、返回箭头、转场渲染），压根不走 UIKit 的 UINavigationBarAppearance。
 // 一旦给 navigationItem 设 appearance，就会跟微信的 applyNavigationItem: /
@@ -795,14 +802,11 @@ static UIColor *DD_GroupBackgroundColor = nil;
 // 布局跟 WCR 的 viewDidLayoutSubviews 一个算法：搜索条压在最上面，网格从它底下开始铺满剩余
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    CGFloat top = self.view.safeAreaInsets.top; // 全屏布局，这个值就是导航栏底边（状态栏+导航栏）
-    if (top <= 0) top = 64.0; // 微信的 Coordinator 会改写 VC 的 safeArea，量出来可能是 0，
-                              // 这时回退到导航栏的标准总高，搜索条才不会顶进状态栏（WCR 同款兜底）
+    CGFloat top = DD_TopUnderNavBar(self.view); // 全屏布局，这个值就是导航栏底边
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
     self.searchBar.frame = CGRectMake(0, top, w, kDDShellSearchH);
     self.collectionView.frame = CGRectMake(0, top + kDDShellSearchH, w, h - top - kDDShellSearchH);
-    [self.view bringSubviewToFront:self.searchBar];
 }
 
 // 返回按钮完全不自定义：箭头交给微信 WCCustomNavigationBarCoordinator 的 defaultBackIndicator 生成，
@@ -917,7 +921,9 @@ static UIColor *DD_GroupBackgroundColor = nil;
 // 优先级是「item 自己的 titleTextAttributes」>「微信全局给 UIBarButtonItem 定的 appearance 代理」
 // >「导航栏外观里的 buttonAppearance」。改 buttonAppearance 那一层完全没用（实测两版都无效），
 // 代理那层又读不到也改不动，所以直接钉在最上面那层。
-// 钉的是导航栏的 tintColor —— 也就是返回箭头用的那个色，两边必然一致。
+// 钉的颜色取导航栏的 tintColor：跟着微信主题走，不写死。
+// （原来注释写「也就是返回箭头用的那个色」，不对 —— 返回箭头是 Coordinator 的
+// defaultBackIndicator 画出来的，跟 tintColor 不是一回事，两者只是碰巧都是微信的主题色。）
 - (UIBarButtonItem *)navButton:(NSString *)title action:(SEL)action {
     UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:title
                                                              style:UIBarButtonItemStylePlain
@@ -1265,8 +1271,7 @@ static UIColor *DD_GroupBackgroundColor = nil;
 // 所以跟素材库同一套算法（导航栏那块空出来留给页面底色，见 viewDidLoad）。
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    CGFloat top = self.view.safeAreaInsets.top; // 全屏布局，这个值就是导航栏底边
-    if (top <= 0) top = 64.0; // 微信的 Coordinator 会改写 VC 的 safeArea，量出来可能是 0
+    CGFloat top = DD_TopUnderNavBar(self.view); // 全屏布局，这个值就是导航栏底边
     UITableView *tableView = [self.tableViewMgr getTableView];
     tableView.frame = CGRectMake(0, top,
                                  self.view.bounds.size.width,
@@ -1373,11 +1378,11 @@ static UIColor *DD_GroupBackgroundColor = nil;
         (void)[DDShellConfig shared];
         [DDShellWatcher shared]; // 挂载截图监听
 
+        // 不判空也不判断 respondsToSelector：取不到这个类时，整条链都是给 nil 发消息，
+        // ObjC 天然 no-op，不会崩；真取不到的话插件本来也没法工作，静默跳过反而更难发现。
         id mgr = objc_getClass("WCPluginsMgr");
-        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD模板套壳"
-                                                      version:@"1.0.0"
-                                                   controller:@"DDShellSettingsViewController"];
-        }
+        [[mgr sharedInstance] registerControllerWithTitle:@"DD模板套壳"
+                                                  version:@"1.0.0"
+                                               controller:@"DDShellSettingsViewController"];
     }
 }
