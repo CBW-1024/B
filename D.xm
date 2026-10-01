@@ -766,8 +766,8 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     self.picked = [NSMutableSet set];
     self.edgesForExtendedLayout = UIRectEdgeNone; // view 从导航栏底下开始，搜索栏才不会顶进状态栏
 
-    // 导航栏：和设置页同一套（不透明灰 + 无阴影线）
-    DD_ApplyNavigationBarAppearance(self);
+    // 验证用：先不设导航栏外观，看返回箭头是否恢复成微信的黑细样式
+    // DD_ApplyNavigationBarAppearance(self);
 
     // 页面底色：取和设置页同一个来源（WCTableViewManager 表格的底色），两页必然同色
     self.view.backgroundColor = DD_WCGroupBackgroundColor();
