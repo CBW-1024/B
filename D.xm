@@ -16,16 +16,6 @@
 
 #pragma mark - 微信类声明
 
-// 微信的 VC 基类。插件页必须继承它，不能继承裸 UIViewController：
-// 8.0.79 的导航栏（WCCustomNavigationBar + WCCustomNavigationBarCoordinator）只接管
-// 体系内的 VC —— 背景、标题、返回箭头、按钮配色全由微信按 MMNavigationBarConfig 渲染。
-// 裸 UIViewController 不在体系里，导航栏拿不到 config：背景不画（就是最早那个「设置页
-// 导航栏透明」）、tintColor 停在 UIKit 默认的 #007AFF，从这种页面 push 出去的下一级
-// 按钮就会先亮蓝、等微信接管完再被刷成微信色。
-// 这里只做前向声明，真正的类在微信主二进制里，加载时由 dyld 绑定过去。
-@interface MMUIViewController : UIViewController
-@end
-
 @interface MMContext : NSObject
 + (id)activeUserContext;
 + (id)rootContext;
@@ -56,8 +46,7 @@
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-// 微信原生弹层（WCR 同款）。编译期不引用类符号，运行时 NSClassFromString 取；
-// 方法签名挂在 NSObject 分类上只为通过编译，运行时不变。
+// 微信原生弹层。运行时按类名取，编译期不引用符号；方法签名挂在 NSObject 分类上只为通过编译。
 @interface NSObject (DDShellWCSheet)
 - (id)initWithTitle:(NSString *)title delegate:(id)delegate cancelButtonTitle:(NSString *)cancelButtonTitle
 destructiveButtonTitle:(NSString *)destructiveButtonTitle otherButtonTitles:(NSString *)otherButtonTitles;
@@ -128,7 +117,7 @@ static const NSTimeInterval kDDShellDelay = 1.0;
 - (BOOL)hasProcessed:(NSString *)lid {
     if (!lid.length) return NO;
     NSArray *arr = [[NSUserDefaults standardUserDefaults] arrayForKey:kDDShellProcessed];
-    return [arr containsObject:lid]; // 对 nil 发消息返回 NO，不用判空
+    return [arr containsObject:lid];
 }
 - (void)markProcessed:(NSString *)lid {
     if (!lid.length) return;
@@ -171,12 +160,12 @@ static NSString *DD_TplFolder(NSString *name) {
 @implementation DDShellTemplate
 @end
 
-// 在指定目录里找 name.ext，扩展名大小写不敏感。
-// iOS 文件系统大小写敏感，若直接拼小写扩展名，Name.PNG / Name.CFG 会被找不到。
+// 在指定目录里找 name.ext。扩展名大小写不敏感：iOS 文件系统大小写敏感，
+// 直接拼小写扩展名会漏掉 Name.PNG / Name.CFG。
 static NSString *DD_FileInFolder(NSString *dir, NSString *name, NSString *ext) {
     if (!dir.length || !name.length) return nil;
     NSString *want = [[name stringByAppendingPathExtension:ext] lowercaseString];
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil]; // 为 nil 时 for-in 不进循环
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
     for (NSString *f in files) {
         if ([f.lowercaseString isEqualToString:want]) return [dir stringByAppendingPathComponent:f];
     }
@@ -188,7 +177,7 @@ static NSString *DD_ActualFile(NSString *name, NSString *ext) {
     return DD_FileInFolder(DD_TplFolder(name), name, ext);
 }
 
-// 模板 cfg 路径：<模板目录>/<名称>/<名称>.cfg（大小写不敏感）
+// 模板 cfg 路径：<模板目录>/<名称>.cfg（扩展名大小写不敏感）
 static NSString *DD_CfgPath(NSString *name) {
     return DD_ActualFile(name, @"cfg");
 }
@@ -203,7 +192,7 @@ static NSDictionary *DD_LoadCfg(NSString *name) {
 // 枚举模板：根目录下每个子目录是一个模板，必须同时含 <名称>.png 与 <名称>.cfg
 static NSArray<NSString *> *DD_AllTemplateNames(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *items = [fm contentsOfDirectoryAtPath:DD_TplDir() error:nil]; // 为 nil 时 for-in 不进循环
+    NSArray *items = [fm contentsOfDirectoryAtPath:DD_TplDir() error:nil];
     NSMutableArray *out = [NSMutableArray array];
     for (NSString *item in items) {
         NSString *dir = [DD_TplDir() stringByAppendingPathComponent:item];
@@ -218,9 +207,9 @@ static NSArray<NSString *> *DD_AllTemplateNames(void) {
 
 static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     if (!name.length) return nil;
-    NSString *png = DD_ActualFile(name, @"png"); // 扩展名大小写不敏感
+    NSString *png = DD_ActualFile(name, @"png");
     NSData *d = png ? [NSData dataWithContentsOfFile:png] : nil;
-    if (!d.length) return nil; // 无 png 则模板无效
+    if (!d.length) return nil;
     UIImage *img = [UIImage imageWithData:d];
     if (!img) return nil;
 
@@ -228,11 +217,11 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     t.name = name;
     t.image = img;
 
-    // cfg 必须存在，否则模板不生效
+    // cfg 缺失则模板不生效
     NSDictionary *cfg = DD_LoadCfg(name);
     if (!cfg) return nil;
 
-    // 画布尺寸取 cfg 的 template_width / template_height；缺字段则 W/H 为 0，下方 W<1 拦截判模板无效
+    // 画布尺寸取 cfg 的 template_width / template_height
     double lw = [cfg[@"template_width"] doubleValue];
     double lh = [cfg[@"template_height"] doubleValue];
     CGSize canvas = CGSizeMake(lw, lh);
@@ -242,7 +231,7 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     for (NSUInteger i = 0; i < 4; i++) {
         id x = cfg[[keys[i] stringByAppendingString:@"_x"]];
         id y = cfg[[keys[i] stringByAppendingString:@"_y"]];
-        if (!x || !y) return nil; // 四角坐标缺失则模板不生效
+        if (!x || !y) return nil; // 四角缺一个则模板不生效
         pts[i] = CGPointMake([x doubleValue], [y doubleValue]);
     }
     t.canvasSize = canvas;
@@ -274,20 +263,19 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
     if (W < 1.0 || H < 1.0) return nil;
 
-    // 截图按实际像素尺寸计算（CGImageGetWidth/Height）
+    // 截图按实际像素尺寸参与计算
     CGFloat A = (CGFloat)CGImageGetWidth(shotCG);
     CGFloat B = (CGFloat)CGImageGetHeight(shotCG);
     if (A < 1.0 || B < 1.0) return nil;
 
-    // 输出画布固定 1 倍（1 单位 = 1 像素），保证输出尺寸严格等于模板尺寸；
-    // 不能用屏幕倍率（2x/3x），否则画布被放大、截图被拉伸变糊。
+    // 输出画布固定 1 倍（1 单位 = 1 像素），输出尺寸才严格等于模板尺寸；
+    // 用屏幕倍率（2x/3x）会把画布放大、截图拉伸变糊。
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(W, H), NO, 1.0);
 
-    // 使用 GPU 渲染 CoreImage
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
 
-    // 将整张截图透视映射到 cfg 四角围成的屏幕窗；
-    // inputExtent 用截图自身像素尺寸，四角点落在模板画布坐标系中，保证 1:1 贴合。
+    // 整张截图透视映射到 cfg 四角围成的屏幕窗；
+    // inputExtent 用截图自身像素尺寸，四角落在模板画布坐标系里，保证 1:1 贴合。
     CIImage *src = [CIImage imageWithCGImage:shotCG];
     CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
     [f setDefaults];
@@ -329,17 +317,16 @@ static void DD_LatestImageAsset(void (^done)(PHAsset *)) {
     o.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:NO]];
     o.fetchLimit = 1;
     PHFetchResult *r = [PHAsset fetchAssetsWithMediaType:PHAssetMediaTypeImage options:o];
-    if (done) done([r firstObject]);
+    done([r firstObject]);
 }
 
 static void DD_SaveImageToAlbum(UIImage *img) {
-    if (!img) return;
     __block PHObjectPlaceholder *ph = nil;
     [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
         PHAssetChangeRequest *req = [PHAssetChangeRequest creationRequestForAssetFromImage:img];
         ph = req.placeholderForCreatedAsset;
     } completionHandler:^(BOOL success, NSError *error) {
-        // 把套壳成品也标记为已处理，避免后续被当成未处理截图重复套壳
+        // 成品也标记为已处理，避免之后被当成未处理截图重复套壳
         if (success && ph.localIdentifier.length) {
             [[DDShellConfig shared] markProcessed:ph.localIdentifier];
         }
@@ -347,7 +334,6 @@ static void DD_SaveImageToAlbum(UIImage *img) {
 }
 
 static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
-    if (!assets.count) return;
     [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
         [PHAssetChangeRequest deleteAssets:assets];
     } completionHandler:nil];
@@ -355,7 +341,7 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 
 #pragma mark - 监听器
 
-// 微信内置提示控件，运行时通过类名获取，不在编译期链接。
+// 微信内置提示控件，运行时按类名获取，编译期不产生链接符号
 @interface WeToast : NSObject
 + (instancetype)toast;
 - (void)setLoadingStyle:(BOOL)style;
@@ -366,11 +352,10 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 
 static WeToast *gBusyToast = nil; // 进行中的「正在套壳」loading 提示，完成后收起
 
-// 连拍互斥：同一时刻只处理一张截图，处理中到达的截屏事件直接丢弃
+// 连拍互斥：同一时刻只处理一张，处理中到达的截屏事件直接丢弃
 static dispatch_queue_t gShellQueue = nil;
-static BOOL gShellBusy = NO; // 是否有任务正在处理（处理中则丢弃后续连拍）
+static BOOL gShellBusy = NO;
 
-// 微信原生提示（运行时按类名取 WeToast，编译期不产生链接符号）
 static WeToast *DD_Toast(void) {
     return [NSClassFromString(@"WeToast") toast];
 }
@@ -432,15 +417,15 @@ static void DD_ShowToast(NSString *text) {
 
 - (void)onScreenshot:(NSNotification *)n {
     if (![DDShellConfig shared].enabled || ![DDShellConfig shared].autoShell) return;
-    // 固定等待 1 秒，等系统把截图写入相册后再取
+    // 等系统把截图写入相册后再取
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDDShellDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gShellQueue) gShellQueue = dispatch_queue_create("com.ddshell.shell", DISPATCH_QUEUE_SERIAL);
         dispatch_async(gShellQueue, ^{
-            if (gShellBusy) return; // 连拍：已有任务在处理，本次直接丢弃
+            if (gShellBusy) return; // 连拍：已有任务在处理，本次丢弃
             gShellBusy = YES;
             [self shellLatestScreenshotWithCompletion:^{
                 dispatch_async(gShellQueue, ^{
-                    gShellBusy = NO; // 处理完解除互斥，放行下一次截屏
+                    gShellBusy = NO;
                 });
             }];
         });
@@ -449,31 +434,31 @@ static void DD_ShowToast(NSString *text) {
 
 - (void)shellLatestScreenshotWithCompletion:(void (^)(void))completion {
     DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
-    if (!t) { if (completion) completion(); return; }
+    if (!t) { completion(); return; }
     DD_LatestImageAsset(^(PHAsset *asset) {
-        if (!asset) { if (completion) completion(); return; }
-        if ([[DDShellConfig shared] hasProcessed:asset.localIdentifier]) { if (completion) completion(); return; } // 去重
+        if (!asset) { completion(); return; }
+        if ([[DDShellConfig shared] hasProcessed:asset.localIdentifier]) { completion(); return; } // 去重
         PHImageRequestOptions *ro = [PHImageRequestOptions new];
         ro.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
         ro.networkAccessAllowed = NO;
-        [self dd_showShelling]; // 开始：显示「正在套壳」转圈提示
+        [self dd_showShelling];
         [[PHImageManager defaultManager] requestImageForAsset:asset
                                                    targetSize:PHImageManagerMaximumSize
                                                   contentMode:PHImageContentModeDefault
                                                       options:ro
                                                 resultHandler:^(UIImage *img, NSDictionary *info) {
             UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
-            if (!outImg) { [self dd_hideShelling]; if (completion) completion(); return; } // 合成失败：静默收起提示
+            if (!outImg) { [self dd_hideShelling]; DD_ShowToast(@"套壳失败"); completion(); return; }
             DD_SaveImageToAlbum(outImg);
             [[DDShellConfig shared] markProcessed:asset.localIdentifier];
             if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
-            [self dd_showShellDone]; // 结束：显示「套壳成功」提示
-            if (completion) completion();
+            [self dd_showShellDone];
+            completion();
         }];
     });
 }
 
-// 微信原生提示的实例包装（转发到文件级静态函数，供截图路径调用）
+// 转发到文件级静态函数，供截图路径调用
 - (void)dd_showShelling { DD_ShowShelling(); }
 - (void)dd_hideShelling { DD_HideShelling(); }
 - (void)dd_showShellDone { DD_ShowShellDone(); }
@@ -483,22 +468,21 @@ static void DD_ShowToast(NSString *text) {
 
 #pragma mark - 导入导出
 
-// 微信自带的 zip 库（宿主类，运行时按类名取，编译期不产生链接符号）
+// 微信自带的 zip 库，运行时按类名取，编译期不产生链接符号
 @interface DDZipArchive : NSObject
 + (BOOL)createZipFileAtPath:(id)zipPath withContentsOfDirectory:(id)dir keepParentDirectory:(BOOL)keep;
 + (BOOL)unzipFileAtPath:(id)zipPath toDestination:(id)dest;
 @end
 
-// 系统文件选择器（运行时按类名取，编译期不产生链接符号）
+// 系统文件选择器，运行时按类名取，编译期不产生链接符号
 @interface DDFilePicker : UIViewController
 - (instancetype)initWithDocumentTypes:(NSArray<NSString *> *)types inMode:(NSInteger)mode;
 @property (nonatomic) BOOL allowsMultipleSelection;
 @property (nonatomic, weak) id delegate;
 @end
 
-// 打包整个目录，zip 内保留该目录名（同 WCR：顶层有个 WCRefine_frames/）
+// 打包整个目录，zip 内保留该目录名
 static BOOL DD_ZipDirectory(NSString *srcDir, NSString *zipPath) {
-    // 类不存在时 objc_getClass 返回 nil，对 nil 发消息返回 NO，不用额外判空
     return [objc_getClass("QSSZipArchive") createZipFileAtPath:zipPath
                                       withContentsOfDirectory:srcDir
                                           keepParentDirectory:YES];
@@ -513,7 +497,7 @@ static BOOL DD_UnzipToDirectory(NSString *zipPath, NSString *destDir) {
 // zip 内可能是 DDShell模板/xx/、xx/ 或别的层级，所以要下钻。
 static void DD_CollectTemplateFolders(NSString *dir, NSMutableArray<NSString *> *out) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil]; // 为 nil 时 for-in 不进循环
+    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
     for (NSString *item in items) {
         if ([item hasPrefix:@"."] || [item isEqualToString:@"__MACOSX"]) continue;
         NSString *p = [dir stringByAppendingPathComponent:item];
@@ -530,7 +514,7 @@ static void DD_CollectTemplateFolders(NSString *dir, NSMutableArray<NSString *> 
 // 递归收集 root 下所有普通文件（跳过隐藏项与 macOS 资源叉）
 static void DD_CollectFiles(NSString *dir, NSMutableArray<NSString *> *out) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil]; // 为 nil 时 for-in 不进循环
+    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
     for (NSString *item in items) {
         if ([item hasPrefix:@"."] || [item isEqualToString:@"__MACOSX"]) continue;
         NSString *p = [dir stringByAppendingPathComponent:item];
@@ -611,18 +595,17 @@ static NSString *DD_ExportTemplatesToZip(NSArray<NSString *> *names) {
 
 #pragma mark - 套壳素材库
 
-// 两个 sheet 的 tag 沿用 WCR 的值：套壳操作 0x5e9d、选择导出方式 0x5ea1。
+// 两个 sheet 的 tag：套壳操作 / 选择导出方式
 static const NSInteger DD_SHEET_TPL    = 0x5e9d;
 static const NSInteger DD_SHEET_EXPORT = 0x5ea1;
 
-// 网格排布：列数与间距。WCR 的算法是 itemW = (view宽 - gap*(列数+1)) / 列数，
-// 它用的是 3 列（(屏宽-40)/3）；这里按双排取 2 列，要跟 WCR 完全一致把下面的 2 改成 3。
+// 网格排布：列数与间距。格子宽 = (页面宽 - gap * (列数 + 1)) / 列数
 static const NSInteger kDDShellTplColumns = 2;
 static const CGFloat   kDDShellTplGap     = 10.0;
-static const CGFloat   kDDShellSearchH    = 44.0; // 搜索条高度，和 WCR 的 setupSearchBar 一致
+static const CGFloat   kDDShellSearchH    = 44.0;
 
-// 缩略图缓存：模板 png 是全尺寸图（可能上千像素），每格都整图解一次码滚动会卡，
-// 这里按格子边长解码一次后缓存，名字变了（重命名）路径也变，不会串图。
+// 缩略图缓存：模板 png 是全尺寸图（可能上千像素），每格都整图解一次码滚动会卡。
+// 按格子边长解码一次后缓存；key 里带路径，重命名后不会串图。
 static NSCache *DD_ThumbCache(void) {
     static NSCache *cache;
     static dispatch_once_t once;
@@ -644,7 +627,7 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
     UIImage *src = [UIImage imageWithContentsOfFile:path];
     if (!src || src.size.width <= 0 || src.size.height <= 0) return nil;
 
-    CGFloat rate = MIN(side / src.size.width, side / src.size.height); // 等比缩放，不拉伸变形
+    CGFloat rate = MIN(side / src.size.width, side / src.size.height); // 等比缩放
     CGSize draw = CGSizeMake(src.size.width * rate, src.size.height * rate);
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(side, side), NO, [UIScreen mainScreen].scale);
     [src drawInRect:CGRectMake((side - draw.width) / 2, (side - draw.height) / 2, draw.width, draw.height)];
@@ -669,7 +652,7 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
         UIColor *bg = [UIColor secondarySystemGroupedBackgroundColor]; // 灰页面上格子用白色，层次才对
         UIColor *fg = [UIColor labelColor];
         self.contentView.backgroundColor = bg;
-        self.contentView.layer.cornerRadius = 8.0;   // 同 WCR
+        self.contentView.layer.cornerRadius = 8.0;
         self.contentView.layer.masksToBounds = YES;
 
         _thumbView = [[UIImageView alloc] initWithFrame:CGRectZero];
@@ -716,41 +699,34 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
 @end
 
-// 分组底色：不写死色值，也不为了取色专门造对象 —— 设置页本来就有现成的 tableView
-// （WCTableViewManager 建的），它的 backgroundColor 就是这个灰，设置页加载时顺手存到这里。
-// 素材库的入口在设置页上，必然先经过设置页，所以到这里一定有值。
-// 微信换主题、改默认值，两边跟着一起变，不会出现两页差一档的情况。
+// 分组底色：直接取设置页 tableView 的底色，两页同源，微信换主题时跟着一起变。
+// 素材库入口在设置页上，必然先经过设置页，所以到这里一定有值。
 static UIColor *DD_GroupBackgroundColor = nil;
 
-// 导航栏底边：全屏布局下 view 的 safeAreaInsets.top 就是它（状态栏 + 导航栏）。
-// 微信的 Coordinator 会改写 VC 的 safeArea，偶尔量出来是 0，那就回退到导航栏的标准总高，
-// 否则搜索栏 / 表格会顶进状态栏。WCR 的 viewDidLayoutSubviews 就是这个处理。
+// 导航栏底边：全屏布局下 view.safeAreaInsets.top 就是它（状态栏 + 导航栏）。
+// 微信的 Coordinator 会改写 VC 的 safeArea，偶尔量出来是 0，回退到导航栏的标准总高。
 static CGFloat DD_TopUnderNavBar(UIView *view) {
     CGFloat top = view.safeAreaInsets.top;
     return top > 0 ? top : 64.0;
 }
 
-// 导航栏外观完全不碰：8.0.79 用 WCCustomNavigationBar / WCCustomNavigationBarCoordinator 自己实现了
-// 整套导航栏（背景、标题、返回箭头、转场渲染），压根不走 UIKit 的 UINavigationBarAppearance。
-// 一旦给 navigationItem 设 appearance，就会跟微信的 applyNavigationItem: /
-// updateRendererBackgroundForActiveTransition 打架：转场闪烁、按钮色被改、返回箭头退化成系统默认的
-// 亮蓝粗 chevron（微信那颗黑细箭头来自 defaultBackIndicator，会被 item 级 appearance 顶掉）。
-// WCR / ZDY 的素材库也都是一次都不设，导航栏保持微信原样。
-// 按钮只在 navButton: 里按 WCR 的工厂逐行对齐，颜色一个都不碰。
+// 导航栏外观不碰：8.0.79 由 WCCustomNavigationBar / WCCustomNavigationBarCoordinator
+// 自己实现整套导航栏（背景、标题、返回箭头、转场渲染），不走 UIKit 的 UINavigationBarAppearance。
+// 按钮颜色按 item 钉，见 navButton:。
 
-// 独立的素材库页面，交互对齐 WCRefineScreenshotFrameLibraryViewController：
+// 独立的素材库页面：
 //   双排网格列出模板，右上角常驻 导出 / 导入（导入最靠右），默认按名称排序；
 //   点「导出」用微信原生 WCActionSheet 弹「选择导出方式」：选择导出 / 全部导出（取消自带）；
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
 //   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择，选「选择」同样进选择态。
-@interface DDShellLibraryViewController : MMUIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
-@property (nonatomic, strong) UISearchBar *searchBar;                  // 自己贴 view 顶上的搜索框（不挂 navigationItem.searchController，避免撑高导航栏）
+@interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
+@property (nonatomic, strong) UISearchBar *searchBar;           // 自己贴在 view 顶上的搜索框（不挂 navigationItem.searchController，那个会撑高导航栏）
 @property (nonatomic, strong) UICollectionView *collectionView;
-@property (nonatomic, strong) NSArray<NSString *> *allNames;       // 排序后的全量，搜索只是过滤展示
-@property (nonatomic, strong) NSArray<NSString *> *names;          // 当前展示（可能是过滤结果）
-@property (nonatomic) BOOL isSelectMode;                          // 是否处于选择态
-@property (nonatomic, strong) NSMutableSet<NSString *> *picked;    // 选择态下勾选的模板
-@property (nonatomic, copy) NSString *tappedTpl;                   // 刚弹出操作菜单的那个模板
+@property (nonatomic, strong) NSArray<NSString *> *allNames;    // 排序后的全量，搜索只是过滤展示
+@property (nonatomic, strong) NSArray<NSString *> *names;       // 当前展示（可能是过滤结果）
+@property (nonatomic) BOOL isSelectMode;                        // 是否处于选择态
+@property (nonatomic, strong) NSMutableSet<NSString *> *picked; // 选择态下勾选的模板
+@property (nonatomic, copy) NSString *tappedTpl;                // 刚弹出操作菜单的那个模板
 @end
 
 @implementation DDShellLibraryViewController
@@ -759,33 +735,21 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [super viewDidLoad];
     self.picked = [NSMutableSet set];
 
-    // 这里千万不要设 edgesForExtendedLayout = UIRectEdgeNone：
-    // UIRectEdgeNone 是靠改 view 的 safeAreaInsets 实现的，而微信 8.0.79 的
-    // WCCustomNavigationBarCoordinator 也有 applySafeAreaToViewController: / safeAreaDeltas /
-    // restoreSafeAreaForViewController:，会主动改写 VC 的 safeArea，还会拿另一个 VC 当参考去对齐
-    // （safeAreaReferenceViewControllerFromViewController:toViewController:）。两个一起改 safeArea：
-    // 转场时 from / to 两个 VC 算出来的结果不一致，Coordinator 就反复 apply 再 restore，导航栏跟着抖，
-    // 就是进素材库时那下闪烁；自定义导航栏渲染被打断，返回箭头也退化成系统默认的亮蓝粗 chevron。
-    // WCR / ZDY 的素材库和我们的设置页全都是默认全屏布局，靠 viewDidLayoutSubviews 里量
-    // safeAreaInsets.top 把搜索栏推到导航栏下面（见 viewDidLayoutSubviews），导航栏则保持微信原样。
+    // 保持默认全屏布局：不设 edgesForExtendedLayout = UIRectEdgeNone —— 它靠改 view 的
+    // safeAreaInsets 实现，而微信的 Coordinator 转场时也在改同一块状态，两边一起改会对不齐。
+    // 导航栏底下的位置在 viewDidLayoutSubviews 里量 safeAreaInsets.top 推算（见下方）。
 
-    // 页面底色跟设置页同一个色（来源见 DD_GroupBackgroundColor 的注释）
+    // 与设置页同一个底色
     self.view.backgroundColor = DD_GroupBackgroundColor;
 
-    // 顺序跟 WCR 的 viewDidLoad 一致：先装配导航栏，再铺网格，最后搜索条。
-    // 导航栏排在最前面是有意义的 —— 微信的 WCCustomNavigationBar 会 KVO 监听
-    // navigationItem 的 rightBarButtonItems（barButtonItemObservationKeys /
-    // bindNavigationItemObservers:），越早把按钮挂上去，微信越早按它自己的配色渲染，
-    // 不会等到转场收尾才补一刀。放在最后就会看到按钮先进来是系统默认色、再被刷一遍。
-    [self setupNavigationBar];
-    [self setupCollectionView];
     [self setupSearchBar];
+    [self setupCollectionView];
+    [self setupNavigationBar];
     [self reloadList];
 }
 
-// 搜索条：和 WCR 一样自己贴在 view 顶上，不挂 navigationItem.searchController——
-// 那个会把导航栏撑高一截，跟设置页对不上。用 minimal 样式（没有自带灰底和分隔线），
-// 四周透出来的就是页面灰，看上去和导航栏连成一片。
+// 搜索条自己贴在 view 顶上，不挂 navigationItem.searchController（那个会撑高导航栏）。
+// minimal 样式没有自带的灰底和分隔线，四周透出页面底色，和导航栏连成一片。
 - (void)setupSearchBar {
     UISearchBar *sb = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, kDDShellSearchH)];
     sb.placeholder = @"搜索套壳名称";
@@ -804,7 +768,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
     // frame 交给 viewDidLayoutSubviews，这里先零尺寸占位
     UICollectionView *cv = [[UICollectionView alloc] initWithFrame:CGRectZero collectionViewLayout:layout];
-    cv.backgroundColor = [UIColor clearColor]; // 透明，透出和设置页同色的页面底色
+    cv.backgroundColor = [UIColor clearColor]; // 透明，透出页面底色
     cv.alwaysBounceVertical = YES;
     cv.delegate = self;
     cv.dataSource = self;
@@ -813,20 +777,19 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [self.view addSubview:cv];
 }
 
-// 布局跟 WCR 的 viewDidLayoutSubviews 一个算法：搜索条压在最上面，网格从它底下开始铺满剩余
+// 搜索条压在最上面，网格从它底下铺满剩余空间
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    CGFloat top = DD_TopUnderNavBar(self.view); // 全屏布局，这个值就是导航栏底边
+    CGFloat top = DD_TopUnderNavBar(self.view);
     CGFloat w = self.view.bounds.size.width;
     CGFloat h = self.view.bounds.size.height;
     self.searchBar.frame = CGRectMake(0, top, w, kDDShellSearchH);
     self.collectionView.frame = CGRectMake(0, top + kDDShellSearchH, w, h - top - kDDShellSearchH);
 }
 
-// 返回按钮完全不自定义：箭头交给微信 WCCustomNavigationBarCoordinator 的 defaultBackIndicator 生成，
-// 前提是 push 走的微信自己的 PushViewController:animated: —— 见 openLibraryTapped:。
-// 之前用 SF Symbol chevron.left 手搓过一个，跟 UIKit 画的系统箭头不是同一个尺寸；
-// 而且自定义 leftBarButtonItem 会把边缘侧滑返回弄失效，还得抢手势代理才能救回来。
+// 返回按钮不自定义：箭头由微信 Coordinator 的 defaultBackIndicator 生成，
+// 前提是 push 走微信自己的 PushViewController:animated:（见 openLibraryTapped:）。
+// 自定义 leftBarButtonItem 还会让边缘侧滑返回失效。
 
 // 默认按名称排序（本地化、数字感知：「模板2」排在「模板10」前面）
 - (void)reloadList {
@@ -913,12 +876,11 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 }
 
 - (void)collectionView:(UICollectionView *)cv didSelectItemAtIndexPath:(NSIndexPath *)ip {
-    if (ip.item >= (NSInteger)self.names.count) return;
     NSString *n = self.names[ip.item];
 
     if (self.isSelectMode) { // 选择态：点一下切换勾选
         if ([self.picked containsObject:n]) [self.picked removeObject:n]; else [self.picked addObject:n];
-        // 不用重建右上角了：按钮不再跟着勾选数禁用，标题和勾选态由下面两行负责
+        [self setupNavigationBar]; // 删除/导出的可用性跟着勾选数变
         [self updateTitle];
         [self.collectionView reloadItemsAtIndexPaths:@[ip]];
         return;
@@ -931,23 +893,17 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 #pragma mark 导航栏
 
-// 按钮颜色一个都不钉：WCR 的 createNavigationBarButtonWithTitle:target:action: 反汇编出来
-// 就只有两句 —— initWithTitle:style:target:action: 加 setEnabled:YES，没有任何颜色代码，
-// 它的素材库实测进页面时按钮颜色是不跳的。我们照抄这两句，连 setEnabled:YES 一起。
-// 钉过两版都失败了，两种失败方式记一下，别再回头试：
-//   1. setTitleTextAttributes:forState: 只能钉一个状态，disabled 会掉回系统默认色；
-//   2. 钉 tintColor 更糟：viewDidLoad 里读 navigationBar.tintColor 时微信的导航栏还没接管完，
-//      读到的是系统默认亮蓝 #007AFF，钉死之后微信再把自己的色刷上来，就是「亮蓝 → 浅色」。
-//      注意这一刷跟钉不钉色无关 —— 它是微信 WCCustomNavigationBar 自己 KVO 到
-//      rightBarButtonItems 之后的渲染，钉色只是让这一下更显眼（钉住的值被改，改完才回来）。
-//      要消掉它只能让微信早点渲染，见 viewDidLoad 里 setupNavigationBar 的排位。
+// 按钮颜色按 item 钉：优先级是「item 自己的 titleTextAttributes」
+// >「微信给 UIBarButtonItem 定的 appearance 代理」>「导航栏外观的 buttonAppearance」，
+// 只有最上面那层钉得住。钉的颜色取导航栏 tintColor，跟着微信主题走，不写死。
 - (UIBarButtonItem *)navButton:(NSString *)title action:(SEL)action {
-    UIBarButtonItem *b = [[UIBarButtonItem alloc] initWithTitle:title
-                                                          style:UIBarButtonItemStylePlain
-                                                         target:self
-                                                         action:action];
-    b.enabled = YES; // WCR 工厂里有这一句：永远可点，不跟着勾选数禁用
-    return b;
+    UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:title
+                                                             style:UIBarButtonItemStylePlain
+                                                            target:self
+                                                            action:action];
+    UIColor *tint = self.navigationController.navigationBar.tintColor;
+    [item setTitleTextAttributes:@{ NSForegroundColorAttributeName: tint } forState:UIControlStateNormal];
+    return item;
 }
 
 // 右上角按钮（数组首个最靠右）：
@@ -959,30 +915,25 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         right = [self navButton:@"取消" action:@selector(cancelExportSelectMode)];
         mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
         left  = [self navButton:@"删除" action:@selector(deleteSelectedFrames)];
-        // 这里不禁用按钮：一个都没勾时也保持可点，点下去由 exportSelectedFrames /
-        // deleteSelectedFrames 自己弹「请至少选择一个套壳」（两句提示本来就写好了）。
-        // WCR 也是这个做法 —— 它的按钮工厂里统一 setEnabled:YES，选择态刚进入、一个都没勾时
-        // 「删除 / 导出」照样可点，靠点击时的判断兜。
-        // 禁用会带来一个副作用：按钮在 enabled / disabled 之间来回跳，而 disabled 那一档
-        // 走的不是钉住的颜色，看上去就是「颜色会变」。
+        BOOL has = self.picked.count > 0; // 一个都没勾上时导出和删除不可点
+        mid.enabled = has;
+        left.enabled = has;
     } else {
         right = [self navButton:@"导入" action:@selector(uploadButtonTapped)];
         mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
         left  = nil;
     }
-    // rightBarButtonItems 数组首个显示在最靠屏幕边缘：取消 / 导入贴着右边缘，
-    // 左侧不动，系统返回箭头保持原位
+    // rightBarButtonItems 数组首个显示在最靠屏幕边缘：取消 / 导入贴着右边缘，左侧不动
     NSMutableArray *items = [NSMutableArray array];
     [items addObject:right];
     [items addObject:mid];
-    if (left) [items addObject:left]; // 普通态只有两个，addObject:nil 会崩，这个判空必须留
+    if (left) [items addObject:left]; // 普通态没有第三个，addObject:nil 会崩
     self.navigationItem.rightBarButtonItems = items;
 }
 
 #pragma mark 微信原生 WCActionSheet
 
-// WCR 同款用法：initWithTitle:delegate:cancelButtonTitle:... → 塞 WCActionSheetItem
-// → setValue:forKey:buttonTitleList → setValue:forKey:tag → showInView:
+// 构造微信原生 WCActionSheet：init → 塞 WCActionSheetItem → 设 buttonTitleList / tag → showInView:
 - (void)showWCActionSheet:(NSString *)title tag:(NSInteger)tag items:(NSArray<NSString *> *)items {
     Class sheetCls = NSClassFromString(@"WCActionSheet");
     Class itemCls  = NSClassFromString(@"WCActionSheetItem");
@@ -1004,7 +955,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 }
 
 // WCActionSheetDelegate 回调：按 tag 分发，buttonTitleList[0] 对应 index 0；
-// 点自带「取消」的 index 落在所有 item 之后，不会命中任何分支。
+// 自带「取消」的 index 落在所有 item 之后，不会命中任何分支。
 - (void)actionSheet:(id)sheet clickedButtonAtIndex:(NSInteger)idx {
     NSInteger tag = [sheet tag];
 
@@ -1015,8 +966,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         NSString *n = self.tappedTpl;
         if (idx == 0 && n.length) {
             [DDShellConfig shared].selectedTpl = n;
-            [self reloadList];
-            DD_ShowToast([NSString stringWithFormat:@"已应用模板：%@", n]);
+            [self reloadList]; // 绿框挪到新模板上就是反馈
         } else if (idx == 1 && n.length) {
             [self renameTemplateNamed:n];
         } else if (idx == 2) {
@@ -1031,14 +981,13 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 // 点「导出」：选择态直接导出勾选的；普通态先问「选择导出」还是「全部导出」
 - (void)exportButtonTapped {
     if (self.isSelectMode) { [self exportSelectedFrames]; return; }
-    if (!self.names.count) { DD_ShowToast(@"没有可导出的套壳"); return; }
+    if (!self.names.count) return; // 空素材库静默返回
 
     [self showWCActionSheet:@"选择导出方式" tag:DD_SHEET_EXPORT items:@[@"选择导出", @"全部导出"]];
 }
 
 // 进入选择态：勾选清空，右上角换成 删除 / 导出 / 取消
 - (void)enterExportSelectMode {
-    if (!self.names.count) { DD_ShowToast(@"没有可导出的套壳"); return; }
     self.isSelectMode = YES;
     [self.picked removeAllObjects];
     [self setupNavigationBar];
@@ -1046,7 +995,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [self.collectionView reloadData];
 }
 
-// 从「套壳操作 → 选择」进入：顺手把那一个勾上（对应 WCR 的 enterExportSelectModeFromLongPress）
+// 从「套壳操作 → 选择」进入：顺手把那一个勾上
 - (void)enterExportSelectModeWithName:(NSString *)name {
     [self enterExportSelectMode];
     if (!self.isSelectMode || !name.length) return;
@@ -1066,13 +1015,11 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 - (void)exportSelectedFrames {
     NSArray *names = [self.picked.allObjects sortedArrayUsingSelector:@selector(compare:)];
-    if (!names.count) { DD_ShowToast(@"请至少选择一个套壳"); return; }
     [self shareZipForNames:names];
 }
 
-// 「全部导出」= 全选后导出，WCR 用它代替全选按钮
+// 「全部导出」= 当前列表全量导出
 - (void)exportAllFrames {
-    if (!self.names.count) { DD_ShowToast(@"没有可导出的套壳"); return; }
     [self shareZipForNames:self.names];
 }
 
@@ -1119,7 +1066,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *srcDir = DD_TplFolder(oldName), *dstDir = DD_TplFolder(newName);
-    if (!srcDir.length || !dstDir.length) { DD_ShowToast(@"重命名失败"); return; }
+    if (!srcDir.length || !dstDir.length) return; // 挡 fileExistsAtPath:nil 的崩
     if ([fm fileExistsAtPath:dstDir]) { DD_ShowToast(@"已有同名模板"); return; }
 
     BOOL ok = YES;
@@ -1157,13 +1104,11 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 // 选择态点右上角「删除」：先确认再删
 - (void)deleteSelectedFrames {
     NSArray *names = [self.picked.allObjects sortedArrayUsingSelector:@selector(compare:)];
-    if (!names.count) { DD_ShowToast(@"请至少选择一个套壳"); return; }
     [self confirmDeleteNames:names];
 }
 
 // 删除确认，单个和批量共用
 - (void)confirmDeleteNames:(NSArray<NSString *> *)names {
-    if (!names.count) return;
     NSString *msg = names.count == 1
         ? [NSString stringWithFormat:@"确定要删除「%@」这个套壳模板吗？", names.firstObject]
         : [NSString stringWithFormat:@"确定要删除选中的 %ld 个套壳模板吗？", (long)names.count];
@@ -1194,7 +1139,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     NSMutableArray<NSURL *> *scoped = [NSMutableArray array];
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
     for (NSURL *u in urls) {
-        if (!u.isFileURL || !u.path.length) continue;
+        if (!u.path.length) continue; // 防 addObject:nil 崩
         if ([u startAccessingSecurityScopedResource]) [scoped addObject:u];
         [paths addObject:u.path];
     }
@@ -1218,7 +1163,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
                 if (DD_UnzipToDirectory(p, dest)) n += DD_ImportTemplatesFrom(dest);
             }
         }
-        if (!n) n = DD_ImportLooseFiles(paths); // 直接挑了 png + cfg
+        if (!n) n = DD_ImportLooseFiles(paths); // 直接挑了 png + cfg 的情况
 
         dispatch_async(dispatch_get_main_queue(), ^{
             for (NSURL *u in scoped) [u stopAccessingSecurityScopedResource];
@@ -1235,16 +1180,13 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 #pragma mark - 设置界面
 
-// 微信导航控制器上的私有 push（大写 P）。WCR 的素材库入口就是这么 push 的，实测返回箭头才是
-// 微信那颗黑细的；系统 pushViewController:animated: 不触发微信这套，返回按钮会退化成系统默认的
-// 亮蓝粗 chevron。头文件 dump 里没它（只在小程序的 WAUINavigationController 上有同签名方法），
-// 但真机上确实存在 —— 这里不写 respondsToSelector 兜底：万一某天没了，直接崩掉反而是明确信号，
-// 静默退回系统 push 只会又变成蓝箭头还查不出原因。
+// 微信私有的 push（大写 P）：只有走它，Coordinator 才会接管返回箭头。
+// 头文件 dump 里没有，真机存在；不判 respondsToSelector —— 取不到就直接崩，比静默退化好查。
 @interface UINavigationController (DDShellWCPush)
 - (void)PushViewController:(UIViewController *)viewController animated:(BOOL)animated;
 @end
 
-@interface DDShellSettingsViewController : MMUIViewController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@interface DDShellSettingsViewController : UIViewController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
 @end
 
@@ -1268,29 +1210,24 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [super viewDidLoad];
     self.title = @"模板套壳设置";
 
-    // 导航栏不设任何外观，保持微信原样（原因见文件上方「导航栏外观完全不碰」那段注释）。
-    // backBarButtonItem 也不要设：ZDY 在 11 个二级页的 viewDidLoad 里都设了空标题的
-    // backBarButtonItem，实测它的素材库返回箭头照样是蓝色的 —— 说明光设这个没用，
-    // 微信只有在走它自己的 PushViewController: 时才会接管返回按钮（见 openLibraryTapped:）。
+    // 导航栏不设任何外观，保持微信原样（见上方说明）。
+    // backBarButtonItem 也不设：微信只在走自己的 PushViewController: 时才接管返回按钮。
 
-    // 页面底色：直接拿现成 tableView 的底色（同一个来源，不必另外造对象取色），
-    // 顺便存进 DD_GroupBackgroundColor 给素材库用 —— 素材库入口就在本页，必然先走到这里。
+    // 页面底色直接取现成 tableView 的底色，顺手存进 DD_GroupBackgroundColor 给素材库用 ——
+    // 素材库入口就在本页，必然先走到这里。
     UITableView *tableView = [self.tableViewMgr getTableView];
     DD_GroupBackgroundColor = tableView.backgroundColor;
     self.view.backgroundColor = DD_GroupBackgroundColor;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
-    // tableView.backgroundColor 保持不动（交给 WCTableViewManager），卡片之间/四周的底色和收款助手同源；
-    // 卡片本身的颜色由微信的 cell 决定，本来两边就是一样的。
-    // frame 交给 viewDidLayoutSubviews，不再用 autoresizingMask 顶满。
+    // tableView 的底色交给 WCTableViewManager 不动；frame 交给 viewDidLayoutSubviews。
     [self.view addSubview:tableView];
 }
 
-// 表格从导航栏底下开始：全屏铺的话往上滚单元格会从导航栏底下穿过去 —— 微信自己那些页面是靠
-// 导航栏的毛玻璃把穿过去的内容糊住的，我们这层没有那层毛玻璃，就看得清清楚楚。
-// 所以跟素材库同一套算法（导航栏那块空出来留给页面底色，见 viewDidLoad）。
+// 表格从导航栏底下开始：全屏铺的话往上滚单元格会从导航栏底下穿过，
+// 微信自己的页面靠导航栏的毛玻璃糊住，我们这层没有，所以直接空出来（与素材库同一套算法）。
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    CGFloat top = DD_TopUnderNavBar(self.view); // 全屏布局，这个值就是导航栏底边
+    CGFloat top = DD_TopUnderNavBar(self.view);
     UITableView *tableView = [self.tableViewMgr getTableView];
     tableView.frame = CGRectMake(0, top,
                                  self.view.bounds.size.width,
@@ -1340,9 +1277,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 }
 
 - (void)openLibraryTapped:(id)sender {
-    // 用微信自己的 PushViewController:animated:（声明见设置页上方），系统 pushViewController:
-    // 不让 WCCustomNavigationBarCoordinator 接管，返回按钮就会是系统默认的亮蓝粗 chevron。
-    // WCR 的素材库入口就是这一句；ZDY 用的是系统 push，它的素材库实测同样是蓝箭头。
+    // 走微信自己的 PushViewController:animated:（声明见上方），返回箭头才归微信管
     [self.navigationController PushViewController:[DDShellLibraryViewController new] animated:YES];
 }
 
@@ -1363,7 +1298,8 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 // 从相册挑选一张图，套入当前模板后存回相册（不删除所选原图）
 - (void)pickFromAlbumTapped:(id)sender {
-    if (!DD_TemplateNamed(DD_ActiveTemplateName())) return; // 无可用模板则不开选择器
+    // 没有可用模板时给个提示，否则点了没反应
+    if (!DD_TemplateNamed(DD_ActiveTemplateName())) { DD_ShowToast(@"模板未选择"); return; }
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.delegate = self;
@@ -1375,10 +1311,9 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [picker dismissViewControllerAnimated:YES completion:^{
         UIImage *img = info[UIImagePickerControllerOriginalImage];
         DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
-        if (!img || !t) return;
         DD_ShowShelling();
         UIImage *outImg = DD_ComposeShellImage(img, t);
-        if (!outImg) { DD_HideShelling(); return; } // 合成失败：静默收起提示
+        if (!outImg) { DD_HideShelling(); DD_ShowToast(@"套壳失败"); return; }
         DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
         DD_ShowShellDone();
     }];
@@ -1397,8 +1332,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         (void)[DDShellConfig shared];
         [DDShellWatcher shared]; // 挂载截图监听
 
-        // 不判空也不判断 respondsToSelector：取不到这个类时，整条链都是给 nil 发消息，
-        // ObjC 天然 no-op，不会崩；真取不到的话插件本来也没法工作，静默跳过反而更难发现。
+        // 取不到类时整条链都是给 nil 发消息，ObjC 天然 no-op
         id mgr = objc_getClass("WCPluginsMgr");
         [[mgr sharedInstance] registerControllerWithTitle:@"DD模板套壳"
                                                   version:@"1.0.0"
