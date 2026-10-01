@@ -379,9 +379,9 @@ static void DD_ShowShellDone(void) {
         [DD_Toast() showDoneToastWithText:@"套壳成功"];
     });
 }
-static void DD_ShowShellError(NSString *text) {
+// 方形带错误图标的提示。loading 用的是同一个 WeToast 实例，先收起再弹
+static void DD_ShowError(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // loading 和这个是同一个 WeToast 实例，先收起再弹
         [gBusyToast hideWithAnimated:YES];
         gBusyToast = nil;
         [DD_Toast() showErrorToastWithText:text];
@@ -452,7 +452,7 @@ static void DD_ShowToast(NSString *text) {
                                                       options:ro
                                                 resultHandler:^(UIImage *img, NSDictionary *info) {
             UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
-            if (!outImg) { DD_ShowShellError(@"套壳失败"); completion(); return; }
+            if (!outImg) { DD_ShowError(@"套壳失败"); completion(); return; }
             DD_SaveImageToAlbum(outImg);
             [[DDShellConfig shared] markProcessed:asset.localIdentifier];
             if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
@@ -1092,9 +1092,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 #pragma mark 重命名
 
 - (void)renameTemplateNamed:(NSString *)name {
+    [self showRenameForName:name text:name message:name];
+}
+
+// 带输入框的重命名弹窗：输入框上方第一次显示模板原名，出错重弹时显示错误原因
+- (void)showRenameForName:(NSString *)name text:(NSString *)text message:(NSString *)message {
     self.renamingName = name;
-    WCUIAlertView *av = [[NSClassFromString(@"WCUIAlertView") alloc] initWithTitle:@"重命名" message:name];
-    [av setTextFieldDefaultText:name];
+    WCUIAlertView *av = [[NSClassFromString(@"WCUIAlertView") alloc] initWithTitle:@"重命名" message:message];
+    [av setTextFieldDefaultText:text];
     [av addBtnTitle:@"取消" target:self sel:@selector(ddAlertCancelled)];
     [av addBtnTitle:@"确定" target:self sel:@selector(ddRenameConfirmed)];
     [av showTextFieldWithMaxLen:32];
@@ -1107,20 +1112,30 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     NSString *oldName = self.renamingName;
     self.renameAlert = nil;
     self.renamingName = nil;
-    [self renameTemplate:oldName to:text];
+    NSString *err = [self renameTemplate:oldName to:text];
+    if (!err.length) return;
+    // 按钮回调里直接再 show 会和本次弹窗的收起动画撞上，等一帧再弹，填过的内容留在框里
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self showRenameForName:oldName text:text message:err];
+    });
 }
 
 // 目录和目录里的 png/cfg 一起改名；当前正在用的模板被改名则同步选中记录
-- (void)renameTemplate:(NSString *)oldName to:(NSString *)newName {
+// 返回 nil 表示改好了，有错返回原因
+- (NSString *)renameTemplate:(NSString *)oldName to:(NSString *)newName {
     newName = [newName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (!newName.length) { DD_ShowToast(@"名字不能为空"); return; }
-    if ([newName isEqualToString:oldName]) return;
-    if ([newName containsString:@"/"]) { DD_ShowToast(@"名字不能包含 /"); return; }
+    if (!newName.length) return @"名字不能为空";
+    if ([newName isEqualToString:oldName]) return nil;
+    // 名字直接当目录名用：/ 会被当成路径分隔符（模板藏进嵌套目录，列表读不到），
+    // . 和 .. 会指到别的目录（删除时连上级一起删掉）
+    if ([newName containsString:@"/"] || [newName isEqualToString:@"."] || [newName isEqualToString:@".."]) {
+        return @"重命名不允许特殊符号";
+    }
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *srcDir = DD_TplFolder(oldName), *dstDir = DD_TplFolder(newName);
-    if (!srcDir.length || !dstDir.length) return; // 挡 fileExistsAtPath:nil 的崩
-    if ([fm fileExistsAtPath:dstDir]) { DD_ShowToast(@"已有同名模板"); return; }
+    if (!srcDir.length || !dstDir.length) return nil; // 挡 fileExistsAtPath:nil 的崩
+    if ([fm fileExistsAtPath:dstDir]) return @"已有同名模板";
 
     BOOL ok = YES;
     for (NSString *ext in @[@"png", @"cfg"]) {
@@ -1130,11 +1145,11 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         if (![fm moveItemAtPath:src toPath:dst error:nil]) ok = NO;
     }
     if (ok) ok = [fm moveItemAtPath:srcDir toPath:dstDir error:nil];
-    if (!ok) { DD_ShowToast(@"重命名失败"); return; }
+    if (!ok) return @"重命名失败";
 
     if ([[DDShellConfig shared].selectedTpl isEqualToString:oldName]) [DDShellConfig shared].selectedTpl = newName;
-    [self reloadList];
-    DD_ShowToast([NSString stringWithFormat:@"已重命名为 %@", newName]);
+    [self reloadList]; // 列表里名字变了就是反馈，不用再弹回执
+    return nil;
 }
 
 #pragma mark 删除
@@ -1375,10 +1390,10 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [picker dismissViewControllerAnimated:YES completion:^{
         UIImage *img = info[UIImagePickerControllerOriginalImage];
         DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
-        if (!t) { DD_ShowShellError(@"套壳失败"); return; } // 选图这会儿模板没了
+        if (!t) { DD_ShowError(@"套壳失败"); return; } // 选图这会儿模板没了
         DD_ShowShelling();
         UIImage *outImg = DD_ComposeShellImage(img, t);
-        if (!outImg) { DD_ShowShellError(@"套壳失败"); return; }
+        if (!outImg) { DD_ShowError(@"套壳失败"); return; }
         DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
         DD_ShowShellDone();
     }];
