@@ -817,10 +817,10 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     [self.view bringSubviewToFront:self.searchBar];
 }
 
-// 返回按钮完全不自定义：交给微信 WCCustomNavigationBarCoordinator 的 defaultBackIndicator 生成，
-// 字形、大小、颜色都和微信自己的页面一致。之前用 SF Symbol chevron.left 手搓过一个，跟 UIKit 画的系统箭头
-// 不是同一个尺寸；而且自定义 leftBarButtonItem 会把边缘侧滑返回弄失效，还得抢手势代理才能救回来。
-// 同理也不能在 push 前塞空的 backBarButtonItem —— 那会把微信这颗黑细箭头顶掉（见 openLibraryTapped:）。
+// 返回按钮完全不自定义：箭头交给微信 WCCustomNavigationBarCoordinator 的 defaultBackIndicator 生成，
+// 前提是 push 走的微信自己的 PushViewController:animated: —— 见 openLibraryTapped:。
+// 之前用 SF Symbol chevron.left 手搓过一个，跟 UIKit 画的系统箭头不是同一个尺寸；
+// 而且自定义 leftBarButtonItem 会把边缘侧滑返回弄失效，还得抢手势代理才能救回来。
 
 // 默认按名称排序（本地化、数字感知：「模板2」排在「模板10」前面）
 - (void)reloadList {
@@ -1222,6 +1222,15 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
 
 #pragma mark - 设置界面
 
+// 微信导航控制器上的私有 push（大写 P）。WCR 的素材库入口就是这么 push 的，实测返回箭头才是
+// 微信那颗黑细的；系统 pushViewController:animated: 不触发微信这套，返回按钮会退化成系统默认的
+// 亮蓝粗 chevron。头文件 dump 里没它（只在小程序的 WAUINavigationController 上有同签名方法），
+// 但真机上确实存在 —— 这里不写 respondsToSelector 兜底：万一某天没了，直接崩掉反而是明确信号，
+// 静默退回系统 push 只会又变成蓝箭头还查不出原因。
+@interface UINavigationController (DDShellWCPush)
+- (void)PushViewController:(UIViewController *)viewController animated:(BOOL)animated;
+@end
+
 @interface DDShellSettingsViewController : UIViewController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
 @end
@@ -1247,6 +1256,9 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
     self.title = @"模板套壳设置";
 
     // 导航栏不设任何外观，保持微信原样（原因见文件上方「导航栏外观完全不碰」那段注释）。
+    // backBarButtonItem 也不要设：ZDY 在 11 个二级页的 viewDidLoad 里都设了空标题的
+    // backBarButtonItem，实测它的素材库返回箭头照样是蓝色的 —— 说明光设这个没用，
+    // 微信只有在走它自己的 PushViewController: 时才会接管返回按钮（见 openLibraryTapped:）。
 
     // 分组底色不在这里设：沿用 WCTableViewManager 自带的那套（和 DD收款助手设置页完全一致）。
     // 原来强行钉成 systemGroupedBackgroundColor，跟微信自己的主题色差一档，两页放一起看就不一样。
@@ -1302,12 +1314,10 @@ static UIColor *DD_WCGroupBackgroundColor(void) {
 }
 
 - (void)openLibraryTapped:(id)sender {
-    // 这里不要设 backBarButtonItem：微信 8.0.79 用 WCCustomNavigationBarCoordinator 自己生成返回按钮
-    // （defaultBackIndicator 那颗黑细箭头 + backButtonForNavigationItem:），并且会 KVO 监听上一个 VC 的
-    // backBarButtonItem（observedPreviousBackButton）。我们一旦塞一个，微信就放弃自己的箭头改用我们那个，
-    // 而 [[UIBarButtonItem alloc] initWithTitle:@""] 造出来的是没图没色的空 item，
-    // 渲染出来就是系统默认的亮蓝粗 chevron。交给微信自己生成即可。
-    [self.navigationController pushViewController:[DDShellLibraryViewController new] animated:YES];
+    // 用微信自己的 PushViewController:animated:（声明见设置页上方），系统 pushViewController:
+    // 不让 WCCustomNavigationBarCoordinator 接管，返回按钮就会是系统默认的亮蓝粗 chevron。
+    // WCR 的素材库入口就是这一句；ZDY 用的是系统 push，它的素材库实测同样是蓝箭头。
+    [self.navigationController PushViewController:[DDShellLibraryViewController new] animated:YES];
 }
 
 - (void)enabledSwitchChanged:(UISwitch *)sender {
