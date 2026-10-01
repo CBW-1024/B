@@ -735,8 +735,8 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 //   双排网格列出模板，右上角常驻 导出 / 导入（导入最靠右），默认按名称排序；
 //   点「导出」用微信原生 WCActionSheet 弹「选择导出方式」：选择导出 / 全部导出（取消自带）；
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
-//   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择 / 删除此模板，
-//   选「选择」同样进选择态。
+//   单点一个模板弹 WCActionSheet「套壳操作」：使用模板 / 重命名 / 选择/多选 / 删除此模板，
+//   选「选择/多选」同样进选择态。
 @interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;           // 贴在 view 顶上的搜索框
 @property (nonatomic, strong) UICollectionView *collectionView;
@@ -903,7 +903,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
     // 普通态：弹出模板操作菜单，取消按钮 WCActionSheet 自带
     self.tappedTpl = n;
-    [self showWCActionSheet:@"套壳操作" tag:DD_SHEET_TPL items:@[@"应用模板", @"重命名", @"选择", @"删除此模板"]];
+    [self showWCActionSheet:@"套壳操作" tag:DD_SHEET_TPL items:@[@"使用模板", @"重命名", @"选择/多选", @"删除此模板"]];
 }
 
 #pragma mark 导航栏
@@ -977,7 +977,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     if (tag == DD_SHEET_EXPORT) { // 选择导出方式：0=选择导出 1=全部导出
         if (idx == 0) [self enterExportSelectMode];
         else if (idx == 1) [self exportAllFrames];
-    } else if (tag == DD_SHEET_TPL) { // 套壳操作：0=应用模板 1=重命名 2=选择 3=删除此模板
+    } else if (tag == DD_SHEET_TPL) { // 套壳操作：0=使用模板 1=重命名 2=选择/多选 3=删除此模板
         NSString *n = self.tappedTpl;
         if (idx == 0 && n.length) {
             [DDShellConfig shared].selectedTpl = n;
@@ -1012,7 +1012,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [self.collectionView reloadData];
 }
 
-// 从「套壳操作 → 选择」进入：顺手把那一个勾上
+// 从「套壳操作 → 选择/多选」进入：顺手把那一个勾上
 - (void)enterExportSelectModeWithName:(NSString *)name {
     [self enterExportSelectMode];
     [self.picked addObject:name];
