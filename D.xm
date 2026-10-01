@@ -16,6 +16,16 @@
 
 #pragma mark - 微信类声明
 
+// 微信的 VC 基类。插件页必须继承它，不能继承裸 UIViewController：
+// 8.0.79 的导航栏（WCCustomNavigationBar + WCCustomNavigationBarCoordinator）只接管
+// 体系内的 VC —— 背景、标题、返回箭头、按钮配色全由微信按 MMNavigationBarConfig 渲染。
+// 裸 UIViewController 不在体系里，导航栏拿不到 config：背景不画（就是最早那个「设置页
+// 导航栏透明」）、tintColor 停在 UIKit 默认的 #007AFF，从这种页面 push 出去的下一级
+// 按钮就会先亮蓝、等微信接管完再被刷成微信色。
+// 这里只做前向声明，真正的类在微信主二进制里，加载时由 dyld 绑定过去。
+@interface MMUIViewController : UIViewController
+@end
+
 @interface MMContext : NSObject
 + (id)activeUserContext;
 + (id)rootContext;
@@ -733,7 +743,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 //   点「导出」用微信原生 WCActionSheet 弹「选择导出方式」：选择导出 / 全部导出（取消自带）；
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
 //   单点一个模板弹 WCActionSheet「套壳操作」：应用模板 / 重命名 / 选择，选「选择」同样进选择态。
-@interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
+@interface DDShellLibraryViewController : MMUIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;                  // 自己贴 view 顶上的搜索框（不挂 navigationItem.searchController，避免撑高导航栏）
 @property (nonatomic, strong) UICollectionView *collectionView;
 @property (nonatomic, strong) NSArray<NSString *> *allNames;       // 排序后的全量，搜索只是过滤展示
@@ -1234,7 +1244,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 - (void)PushViewController:(UIViewController *)viewController animated:(BOOL)animated;
 @end
 
-@interface DDShellSettingsViewController : UIViewController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@interface DDShellSettingsViewController : MMUIViewController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
 @end
 
