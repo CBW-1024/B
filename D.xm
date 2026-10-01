@@ -817,7 +817,6 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     self.allNames = all;
     self.activeName = DD_ActiveTemplateName();
     [self applySearchFilter];
-    [self updateEmptyState];
 }
 
 - (void)updateTitle {
@@ -848,23 +847,6 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 - (void)searchBarSearchButtonClicked:(UISearchBar *)sb {
     [sb resignFirstResponder];
-}
-
-// 空态用背景视图占满，不占一个格子
-- (void)updateEmptyState {
-    if (self.names.count) {
-        self.collectionView.backgroundView = nil;
-        return;
-    }
-    // 首次进来 collectionView 还没布局（frame 是零），靠 autoresizing 跟着撑开
-    UILabel *l = [[UILabel alloc] initWithFrame:self.collectionView.bounds];
-    l.text = @"（空：把 name.png + name.cfg 一起放 Documents/DDShell/模板/name/）";
-    l.numberOfLines = 0;
-    l.font = [UIFont systemFontOfSize:13.0];
-    l.textColor = [UIColor grayColor];
-    l.textAlignment = NSTextAlignmentCenter;
-    l.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.collectionView.backgroundView = l;
 }
 
 - (CGSize)collectionView:(UICollectionView *)cv layout:(UICollectionViewFlowLayout *)layout sizeForItemAtIndexPath:(NSIndexPath *)ip {
