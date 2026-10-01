@@ -716,11 +716,11 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
 
 @end
 
-// 页面底色：用系统灰兜底「偏白」。
-// systemGroupedBackgroundColor(#F2F2F7) 在不少屏上仍偏白、几乎读成白，systemGray5Color(#E5E5EA) 略深一点仍偏浅；
-// 这里用 systemGray5Color 作为当前取值，导航栏和页面都引用它，一起变灰、仍保持同色。
-static UIColor *DD_PageBackgroundColor(void) {
-    return [UIColor systemGray5Color];
+// 导航栏底色：和页面同一套 systemGroupedBackgroundColor(#F2F2F7)，
+// 导航栏不透明铺这块浅灰，和页面底色无缝接成一片（iOS 设置页就是这种整体延伸）。
+// 两者用同一个语义色，想要导航栏更深可改这里（比如 systemGray5Color）。
+static UIColor *DD_NavBarBackgroundColor(void) {
+    return [UIColor systemGroupedBackgroundColor];
 }
 
 // 设置页和素材库页共用同一套导航栏外观：不透明 + 和页面底色同一个灰。
@@ -731,7 +731,7 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     if (!vc) return;
     UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
     [appearance configureWithOpaqueBackground]; // 不透明、不带毛玻璃（该方法本身已清空 backgroundEffect），不再受背后内容影响
-    appearance.backgroundColor = DD_PageBackgroundColor();
+    appearance.backgroundColor = DD_NavBarBackgroundColor();
     appearance.shadowColor = nil;               // 去掉底部那条阴影线
     vc.navigationItem.standardAppearance = appearance;
     vc.navigationItem.scrollEdgeAppearance = appearance;
@@ -763,9 +763,8 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     // 导航栏：和设置页同一套（不透明灰 + 无阴影线）
     DD_ApplyNavigationBarAppearance(self);
 
-    // 页面底色：微信设置页那个分组灰（WCR 的 viewDidLoad 也是 view.backgroundColor = 表格灰），
-    // 和导航栏同一个色，整页连成一片
-    self.view.backgroundColor = DD_PageBackgroundColor();
+    // 页面底色：系统分组灰（iOS/微信设置页的标准浅灰），和导航栏解耦、各自独立。
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
 
     [self setupSearchBar];
     [self setupCollectionView];
@@ -1241,9 +1240,8 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     // 导航栏：和素材库页同一套（不透明灰 + 无阴影线）
     DD_ApplyNavigationBarAppearance(self);
 
-    // 页面底色：和素材库页、导航栏同一个灰（systemGroupedBackgroundColor）。
-    // 不显式设的话，InsetGrouped 表格的 inset 空隙会露默认白底，跟顶部灰导航栏对不上
-    self.view.backgroundColor = DD_PageBackgroundColor();
+    // 页面底色：系统分组灰（和导航栏解耦）。不显式设的话，InsetGrouped 表格的 inset 空隙会露默认白底
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
 
     [self ensureTableViewMgr];
     if (!_tableViewMgr) return;
@@ -1251,7 +1249,7 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     tableView.frame = self.view.bounds;
     tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
-    tableView.backgroundColor = DD_PageBackgroundColor(); // 分组灰，和页面/导航栏一致；section 卡片是白
+    tableView.backgroundColor = [UIColor systemGroupedBackgroundColor]; // 分组灰；section 卡片是白
     [self.view addSubview:tableView];
 }
 
