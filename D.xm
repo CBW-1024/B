@@ -819,10 +819,10 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     [self.view bringSubviewToFront:self.searchBar];
 }
 
-// 返回按钮不自定义：直接用系统那个返回指示器，字形、大小、颜色都跟设置页完全一致。
-// 之前用 SF Symbol chevron.left 手搓了一个，跟 UIKit 自己画的系统箭头不是同一个尺寸；
-// 而且自定义 leftBarButtonItem 会把边缘侧滑返回弄失效，还得抢手势代理才能救回来。
-// 箭头旁边不显示上一页标题，靠 push 前把上一页的 backBarButtonItem 标题置空（见 openLibraryTapped:）。
+// 返回按钮完全不自定义：交给微信 WCCustomNavigationBarCoordinator 的 defaultBackIndicator 生成，
+// 字形、大小、颜色都和微信自己的页面一致。之前用 SF Symbol chevron.left 手搓过一个，跟 UIKit 画的系统箭头
+// 不是同一个尺寸；而且自定义 leftBarButtonItem 会把边缘侧滑返回弄失效，还得抢手势代理才能救回来。
+// 同理也不能在 push 前塞空的 backBarButtonItem —— 那会把微信这颗黑细箭头顶掉（见 openLibraryTapped:）。
 
 // 默认按名称排序（本地化、数字感知：「模板2」排在「模板10」前面）
 - (void)reloadList {
@@ -1248,8 +1248,10 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
     [super viewDidLoad];
     self.title = @"模板套壳设置";
 
-    // 导航栏：和素材库页同一套（不透明灰 + 无阴影线）
-    DD_ApplyNavigationBarAppearance(self);
+    // 导航栏交给微信自己的 WCCustomNavigationBar：8.0.79 不用 UIKit 的 UINavigationBarAppearance，
+    // 设了会跟它的 applyNavigationItem: / updateRendererBackgroundForActiveTransition 打架
+    // （转场闪烁 + 按钮色被改 + 返回箭头退化）。两页都不设，导航栏才是微信原样、两页也才一致。
+    // DD_ApplyNavigationBarAppearance(self);
 
     // 分组底色不在这里设：沿用 WCTableViewManager 自带的那套（和 DD收款助手设置页完全一致）。
     // 原来强行钉成 systemGroupedBackgroundColor，跟微信自己的主题色差一档，两页放一起看就不一样。
@@ -1305,12 +1307,11 @@ static void DD_ApplyNavigationBarAppearance(UIViewController *vc) {
 }
 
 - (void)openLibraryTapped:(id)sender {
-    // push 前把上一页的返回标题清空，素材库页就只剩系统那个返回箭头，不会带「模板套壳设置」字样。
-    // 必须在 push 之前设，否则转场动画里会先闪一下旧标题。
-    self.navigationItem.backBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@""
-                                                                             style:UIBarButtonItemStylePlain
-                                                                            target:nil
-                                                                            action:nil];
+    // 这里不要设 backBarButtonItem：微信 8.0.79 用 WCCustomNavigationBarCoordinator 自己生成返回按钮
+    // （defaultBackIndicator 那颗黑细箭头 + backButtonForNavigationItem:），并且会 KVO 监听上一个 VC 的
+    // backBarButtonItem（observedPreviousBackButton）。我们一旦塞一个，微信就放弃自己的箭头改用我们那个，
+    // 而 [[UIBarButtonItem alloc] initWithTitle:@""] 造出来的是没图没色的空 item，
+    // 渲染出来就是系统默认的亮蓝粗 chevron。交给微信自己生成即可。
     [self.navigationController pushViewController:[DDShellLibraryViewController new] animated:YES];
 }
 
