@@ -392,10 +392,13 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
 
     CGFloat cw = t.canvasSize.width, ch = t.canvasSize.height;
     if (cw < 2.0 || ch < 2.0 || cw > 8192.0 || ch > 8192.0) return nil; // 画布尺寸同样卡上限
-    // H.264 要求宽高均为偶数；模板画布若非偶数，整体对齐到偶数（变化 ≤1px，无可见影响）
+    // H.264 宏块约束：宽高必须 16 对齐，否则部分设备硬件编码器直接拒编码
+    // （表现即“无法编码媒体”AVErrorCannotEncodeMedia）。向上对齐到 16 边界，
+    // 变化 ≤15px，CI 渲染时模板图按画布缩放，肉眼不可见。ZDY 仅做偶数对齐，这里
+    // 进一步对齐到 16 以覆盖其所有情况并消除超大 / 非对齐尺寸的编码风险。
     NSInteger W = (NSInteger)round(cw), H = (NSInteger)round(ch);
-    if (W % 2) W += 1;
-    if (H % 2) H += 1;
+    W = ((W + 15) / 16) * 16;
+    H = ((H + 15) / 16) * 16;
 
     NSString *outPath = [DD_TempRoot() stringByAppendingPathComponent:
                          [[NSUUID UUID].UUIDString stringByAppendingPathExtension:@"mp4"]];
@@ -418,12 +421,22 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     vout.alwaysCopiesSampleData = NO;
     [reader addOutput:vout];
 
-    // 写入端：显式 H.264 + 显式尺寸 + 显式封装，彻底受控
+    // 写入端：显式 H.264 + 显式尺寸 + 显式封装，彻底受控。
+    // 关键：ZDY 能稳定导出而不触发 “无法编码媒体” 的核心，是显式指定了
+    // profile level 与 compression properties（含 AllowFrameReordering=NO），而非只给
+    // 一个裸的 H264 codec。这里完整对齐 ZDY 的编码配置。
     AVAssetWriterInput *vIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
                                                                 outputSettings:@{
         AVVideoCodecKey: AVVideoCodecTypeH264,
         AVVideoWidthKey: @(W),
         AVVideoHeightKey: @(H),
+        AVVideoCompressionPropertiesKey: @{
+            AVVideoProfileLevelKey: AVVideoProfileLevelH264BaselineAutoLevel,
+            // 平均码率：约 2 bit/像素，4K 约 22Mbps，足够清晰且设备可承受
+            AVVideoAverageBitRateKey: @((long)W * H * 2),
+            AVVideoMaxKeyFrameIntervalKey: @(30),
+            AVVideoAllowFrameReorderingKey: @NO,
+        },
     }];
     vIn.expectsMediaDataInRealTime = NO;
     [writer addInput:vIn];
