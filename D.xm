@@ -487,7 +487,34 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
 
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
     if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
-    DD_Log(@"[Compose] 画布 W=%.0f H=%.0f", W, H);
+
+    // 画布超过相册可导入上限时等比缩小：避免导出成功、但 PHPhotosErrorDomain 3302 拒收。
+    // 经验安全上限：单边 ≤ 4096、总像素 ≤ 8294400（3840×2160），向下取偶对齐 H.264。
+    CGFloat capW = 4096.0, capH = 4096.0, capPx = 8294400.0;
+    CGFloat s = MIN(1.0, capW / W, capH / H, sqrt(capPx / (W * H)));
+    DDShellTemplate *st = t;
+    if (s < 1.0) {
+        CGFloat nW = floor((W * s) / 2.0) * 2.0;
+        CGFloat nH = floor((H * s) / 2.0) * 2.0;
+        if (nW < 2.0) nW = 2.0;
+        if (nH < 2.0) nH = 2.0;
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(nW, nH), NO, 1.0);
+        [t.image drawInRect:CGRectMake(0, 0, nW, nH)];
+        UIImage *sim = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        st = [DDShellTemplate new];
+        st.name = t.name;
+        st.image = sim ?: t.image;
+        st.canvasSize = CGSizeMake(nW, nH);
+        st.lt = CGPointMake(t.lt.x * s, t.lt.y * s);
+        st.rt = CGPointMake(t.rt.x * s, t.rt.y * s);
+        st.lb = CGPointMake(t.lb.x * s, t.lb.y * s);
+        st.rb = CGPointMake(t.rb.x * s, t.rb.y * s);
+        W = nW; H = nH;
+        DD_Log(@"[Compose] 画布超限，等比缩小 s=%.4f → renderSize=(%.0f x %.0f)", s, W, H);
+    } else {
+        DD_Log(@"[Compose] 画布 W=%.0f H=%.0f", W, H);
+    }
 
     NSString *outPath = [DD_TempRoot() stringByAppendingPathComponent:
                          [[NSUUID UUID].UUIDString stringByAppendingPathExtension:@"mp4"]];
@@ -504,7 +531,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     inst.enablePostProcessing = NO;
     inst.containsTweening = NO;
     inst.requiredSourceTrackIDs = @[ @(vt.trackID) ];
-    inst.tpl = t;
+    inst.tpl = st;
     inst.preferredTransform = vt.preferredTransform;
     vc.instructions = @[ inst ];
     vc.customVideoCompositorClass = [DDShellVideoCompositor class];
