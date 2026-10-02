@@ -479,6 +479,9 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
 // 逐帧合成器：每帧把源视频帧透视贴进模板窗口，再叠机身图，输出到像素缓冲
 @interface DDShellVideoCompositor : NSObject <AVVideoCompositing>
+@property (nonatomic, strong) dispatch_queue_t renderingQueue;
+@property (atomic, assign)   BOOL             shouldCancelAllRequests;
+- (void)_renderOneRequest:(AVAsynchronousVideoCompositionRequest *)req;
 @end
 
 @implementation DDShellVideoCompositor {
@@ -491,6 +494,7 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (self) {
         _ctx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
         _cs  = CGColorSpaceCreateDeviceRGB();
+        _renderingQueue = dispatch_queue_create("com.ddshell.video.compositor", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
@@ -507,8 +511,17 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
               (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
 }
-- (void)cancelAllPendingVideoCompositionRequests {}
+- (void)cancelAllPendingVideoCompositionRequests {
+    self.shouldCancelAllRequests = YES;
+}
 - (void)startVideoCompositionRequest:(AVAsynchronousVideoCompositionRequest *)req {
+    if (self.shouldCancelAllRequests) { [req finishCancelledRequest]; return; }
+    dispatch_async(self.renderingQueue, ^{
+        @autoreleasepool { [self _renderOneRequest:req]; }
+    });
+}
+
+- (void)_renderOneRequest:(AVAsynchronousVideoCompositionRequest *)req {
     @autoreleasepool {
         DDShellVideoInstruction *inst = (DDShellVideoInstruction *)req.videoCompositionInstruction;
         DDShellTemplate *t = inst.tpl;
@@ -556,9 +569,33 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         CIImage *warped = f.outputImage;
         if (!warped) { DD_Log(@"[Compositor] 透视结果为空 extent=(%.0f x %.0f)", re.size.width*sc, re.size.height*sc); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-4 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
+        // 两阶段渲染（对齐 WCR）：先单独把透视结果渲染到 8bit sRGB 中间缓冲，
+        // 斩断 HDR/宽色域源的 float 链路（避免整图一次求值内存暴涨被 jetsam 杀），
+        // 再与机身前景合成到目标缓冲。坐标与原来完全一致，仅多一次 8bit 化。
+        CVPixelBufferRef mid = NULL;
+        CVReturn cvr = CVPixelBufferCreate(kCFAllocatorDefault,
+                         (size_t)round(W), (size_t)round(H),
+                         kCVPixelFormatType_32BGRA,
+                         (__bridge CFDictionaryRef)@{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} },
+                         &mid);
+        if (cvr != kCVReturnSuccess || !mid) {
+            DD_Log(@"[Compositor] 中间缓冲创建失败 cvr=%d", cvr);
+            [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-7 userInfo:nil]];
+            CVPixelBufferRelease(dst); return;
+        }
+        @try {
+            [_ctx render:warped toCVPixelBuffer:mid bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
+        } @catch (NSException *e) {
+            DD_Log(@"[Compositor] 透视渲染抛异常 #%ld : %@", (long)inst.frameCount, e);
+            [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-8 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
+            CVPixelBufferRelease(mid); CVPixelBufferRelease(dst); return;
+        }
+        CIImage *warped8 = [CIImage imageWithCVPixelBuffer:mid]; // 已是 8bit sRGB
+        if (!warped8) { DD_Log(@"[Compositor] 中间图读回为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-9 userInfo:nil]]; CVPixelBufferRelease(mid); CVPixelBufferRelease(dst); return; }
+
         CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
-        CIImage *outImg = [frame imageByCompositingOverImage:warped]; // 机身图盖在最上层
-        if (!outImg) { DD_Log(@"[Compositor] 合成结果为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-5 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
+        CIImage *outImg = [frame imageByCompositingOverImage:warped8]; // 机身图盖在最上层
+        if (!outImg) { DD_Log(@"[Compositor] 合成结果为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-5 userInfo:nil]]; CVPixelBufferRelease(mid); CVPixelBufferRelease(dst); return; }
 
         @try {
             [_ctx render:outImg toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
@@ -566,11 +603,12 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
             DD_Log(@"[Compositor] render 抛异常 #%ld ext=(%.0f x %.0f) sc=%.4f : %@",
                    (long)inst.frameCount, W, H, sc, e);
             [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-6 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
-            CVPixelBufferRelease(dst);
+            CVPixelBufferRelease(mid); CVPixelBufferRelease(dst);
             return;
         }
 
         [req finishWithComposedVideoFrame:dst];
+        CVPixelBufferRelease(mid);
         CVPixelBufferRelease(dst);
     }
 }
