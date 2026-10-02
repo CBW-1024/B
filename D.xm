@@ -558,15 +558,38 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     return [NSURL fileURLWithPath:outPath];
 }
 
-// 视频存相册。临时文件**必须**在 performChanges 的 completion 之后才删：
-// photolibraryd 正是在这个过程中去读文件的，提前删掉就是 3302。
+// 视频存相册。改用 UISaveVideoAtPathToSavedPhotosAlbum（UIImageWrite 家族的 C API）。
+// 深挖 ZDY 确认它用的就是 creationRequestForAssetFromVideoAtFileURL: 且同样写在 tmp，
+// 但它能成——所以 3302 不是 save API 的问题，而是 photolibraryd 跨进程读我们那个
+// URL 时把文件判为无效资源(InvalidResource)。UISaveVideoAtPathToSavedPhotosAlbum 走的是
+// 把文件读进本进程、再拷/转进照片库托管存储的路线，从根本上绕开"直接交 URL 给 photolibraryd
+// 读"这一步，对路径访问 / 编码格式两类 3302 都更稳，也比 PHPhotoLibrary 的 change block 更简单。
+@interface DDVideoSaver : NSObject
+@property (nonatomic, copy) void (^done)(BOOL, NSError *);
+@property (nonatomic, copy) NSString *path;
+@end
+@implementation DDVideoSaver
+- (void)dd_saveVideo:(NSString *)p didFinishWithError:(NSError *)error contextInfo:(void *)ctx {
+    void (^cb)(BOOL, NSError *) = self.done;
+    if (cb) cb(error == nil, error);
+    if (error == nil) [[NSFileManager defaultManager] removeItemAtPath:self.path error:nil];
+    CFBridgingRelease(ctx);   // 回调里释放，避免异步期间被 ARC 回收
+}
+@end
+
 static void DD_SaveVideoToAlbum(NSURL *url, void (^done)(BOOL success, NSError *err)) {
-    [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
-        [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:url];
-    } completionHandler:^(BOOL success, NSError *error) {
-        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
-        if (done) done(success, error);
-    }];
+    NSString *path = url.path;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        if (done) done(NO, [NSError errorWithDomain:@"DDShell" code:-6
+                userInfo:@{NSLocalizedDescriptionKey : @"导出文件丢失，无法存入相册"}]);
+        return;
+    }
+    DDVideoSaver *saver = [[DDVideoSaver alloc] init];
+    saver.done = [done copy];
+    saver.path = path;
+    void *ctx = (void *)CFBridgingRetain(saver);   // 保活到回调
+    UISaveVideoAtPathToSavedPhotosAlbum(path,
+            saver, @selector(dd_saveVideo:didFinishWithError:contextInfo:), ctx);
 }
 
 #pragma mark - 相册
@@ -1700,9 +1723,13 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
             if (success) {
                 DD_ShowShellDone();
             } else {
-                // 带上 domain/code：不同的 code 指向完全不同的原因，光看中文描述区分不出来
+                // 带上 domain/code 与 underlying：不同的 code 指向完全不同的原因，
+                // 3302 几乎总伴随一个说明"为什么 photolibraryd 拒收"的底层错误，必须一起打出来
                 NSString *msg = err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败";
-                if (err) msg = [msg stringByAppendingFormat:@" [%@:%ld]", err.domain, (long)err.code];
+                msg = [msg stringByAppendingFormat:@" [%@:%ld]", err.domain, (long)err.code];
+                NSError *under = err.userInfo[NSUnderlyingErrorKey];
+                if (under) msg = [msg stringByAppendingFormat:@" ← %@:%ld %@",
+                                  under.domain, (long)under.code, under.localizedDescription];
                 DD_ShowError(msg);
             }
         });
