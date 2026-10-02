@@ -356,18 +356,33 @@ static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
     CGFloat sW = re.size.width, sH = re.size.height;
     if (sW < 1.0 || sH < 1.0) return NO;
 
+    // 旋转后 extent 原点常不为 0（preferredTransform 带位移），先归零再缩放
+    CIImage *rot0 = [rot imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
+
     // contain 预缩到屏幕窗（对齐 ZDY 先预缩放再透视，避免大分辨率直接透视导致投影退化）
     CGRect wb = DD_WindowBBox(t);
     CGFloat sc = MIN(wb.size.width / sW, wb.size.height / sH);
     if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-    CGAffineTransform norm = CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y);
-    norm = CGAffineTransformConcat(norm, CGAffineTransformMakeScale(sc, sc));
-    CIImage *srcImg = [rot imageByApplyingTransform:norm];
+    // ZDY 用 CILanczosScaleTransform 做预缩放（高质量重采样），对齐它
+    CIFilter *sf = [CIFilter filterWithName:@"CILanczosScaleTransform"];
+    [sf setDefaults];
+    [sf setValue:rot0 forKey:kCIInputImageKey];
+    [sf setValue:@(sc) forKey:@"inputScale"];
+    [sf setValue:@(1.0) forKey:@"inputAspectRatio"];
+    CIImage *scaled = sf.outputImage;
+    if (!scaled) scaled = [rot0 imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
+    // 缩放后 extent 原点可能仍有偏移，再归零一次，保证喂进透视的输入干净
+    CGRect se = scaled.extent;
+    CIImage *srcImg = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(-se.origin.x, -se.origin.y)];
 
-    CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
+    // 对齐 ZDY：ZDY 用的是 CIPerspectiveTransform（不带 WithExtent），由 CI 自己取
+    // 输入图像的 extent 做透视。带 WithExtent 的版本需要手动传 inputExtent，在
+    // “大画布 + 极小屏幕窗”这类极端几何下，一旦 inputExtent 与实际 extent 有任何
+    // 偏差，透视输出就会退化 / 异常 → 帧内容坏掉 → 编码器拒（“无法编码媒体”），
+    // 或产出被照片库判为 InvalidResource 的资源（3302）。去掉 inputExtent 更稳健。
+    CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransform"];
     [f setDefaults];
     [f setValue:srcImg forKey:kCIInputImageKey];
-    [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, sW * sc, sH * sc)] forKey:@"inputExtent"];
     [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
     [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
     [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
