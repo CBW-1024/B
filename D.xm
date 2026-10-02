@@ -433,6 +433,9 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
         dispatch_semaphore_signal(sem);
     }];
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    if (!result) { // 导出失败，半截 mp4 回收，避免留在临时目录
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+    }
     return result;
 }
 
@@ -724,7 +727,9 @@ static NSString *DD_ExportTemplatesToZip(NSArray<NSString *> *names) {
         [fm copyItemAtPath:DD_TplFolder(name) toPath:[stage stringByAppendingPathComponent:name] error:nil];
     }
     NSString *zip = [tmp stringByAppendingPathComponent:@"DDShell_套壳模板.zip"];
-    return DD_ZipDirectory(stage, zip) ? zip : nil;
+    if (DD_ZipDirectory(stage, zip)) return zip;
+    [fm removeItemAtPath:tmp error:nil]; // 打包失败，临时暂存目录回收（调用方提前 return 来不及清）
+    return nil;
 }
 
 #pragma mark - 套壳素材库
