@@ -513,7 +513,14 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     self.shouldCancelAllRequests = YES;
 }
 - (void)startVideoCompositionRequest:(AVAsynchronousVideoCompositionRequest *)req {
-    if (self.shouldCancelAllRequests) { [req finishCancelledRequest]; return; }
+    if (self.shouldCancelAllRequests) {
+        // 框架会在每次导出结束/释放时调用 cancelAllPendingVideoCompositionRequests
+        // 把本标志置 YES，且倾向于复用同一合成器实例；若不在此复位，后续所有导出都会
+        // 在入口被 finishCancelledRequest 早退、一帧不画，导致“空白视频”。
+        self.shouldCancelAllRequests = NO;
+        [req finishCancelledRequest];
+        return;
+    }
     // 注意：AVAssetExportSession 的自定义合成器必须同步完成（start 返回前调用
     // finish*），否则延迟到自建队列提交的帧不会被导出管线泵送，最终导出“成功”
     // 但画面全黑（空白视频）。AVPlayerItem 播放链路才支持真正的异步合成。
