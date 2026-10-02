@@ -365,9 +365,19 @@ static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
     // 旋转后 extent 原点常不为 0（preferredTransform 带位移），先归零再缩放
     CIImage *rot0 = [rot imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
 
-    // contain 预缩到屏幕窗（对齐 ZDY 先预缩放再透视，避免大分辨率直接透视导致投影退化）
+    // contain 预缩到屏幕窗 ×1.5（对齐 ZDY @0xd7de8 的核心几何策略）。
+    // ZDY 先算窗口四边形四边长的平均值（顶+底)/2、(左+右)/2，再把源帧 contain 缩放到
+    // 该尺寸的 1.5 倍，最后才做透视。这步是它“任何模板都不翻车”的关键：透视的输入
+    // 尺寸被拉到与输出窗口同量级（缩放比接近 1:1），CoreImage 无需在极端比例下重采样；
+    // 而我们此前是把源帧直接透视到整个画布，在“大画布 + 极小屏幕窗”（如 2840×3840
+    // 画布配 288×629 窗口，仅占 1.7%）这类几何下投影极易退化 → 帧内容异常 →
+    // 编码器拒（“无法编码媒体”）或产出被照片库判无效的资源（3302）。
+    // 顺带解释“有的模板正常”：窗口占比大的模板缩放比本就接近 1，恰好没踩到退化区。
     CGRect wb = DD_WindowBBox(t);
-    CGFloat sc = MIN(wb.size.width / sW, wb.size.height / sH);
+    CGFloat winW = wb.size.width, winH = wb.size.height;
+    if (!(winW > 1.0)) winW = (CGFloat)W;  // 窗口退化时用画布尺寸兜底（同 ZDY）
+    if (!(winH > 1.0)) winH = (CGFloat)H;
+    CGFloat sc = MIN(winW * 1.5 / sW, winH * 1.5 / sH);
     if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
     // ZDY 用 CILanczosScaleTransform 做预缩放（高质量重采样），对齐它
     CIFilter *sf = [CIFilter filterWithName:@"CILanczosScaleTransform"];
@@ -399,19 +409,6 @@ static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
     CIImage *outImg = [frame imageByCompositingOverImage:warped]; // 机身图盖在最上层
     [ci render:outImg toCVPixelBuffer:outBuf bounds:CGRectMake(0, 0, W, H) colorSpace:cs];
     return YES;
-}
-
-// AAC 编码器只接受有限的采样率；源视频的采样率可能不在其列（如 22050、24k 等），
-// 直接透传给 writer 会让音频编码会话初始化失败，表现为“无法编码媒体”
-// （AVErrorCannotEncodeMedia）。这里把采样率归到最接近的受支持值。
-static double DD_ClampAACRate(double r) {
-    static const double rates[] = {8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000};
-    double best = 44100.0, bestd = 1e18;
-    for (size_t i = 0; i < sizeof(rates)/sizeof(rates[0]); i++) {
-        double d = fabs(rates[i] - r);
-        if (d < bestd) { bestd = d; best = rates[i]; }
-    }
-    return best;
 }
 
 // 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）。
@@ -455,83 +452,116 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     vout.alwaysCopiesSampleData = NO;
     [reader addOutput:vout];
 
-    // 写入端：显式 H.264 + 显式尺寸 + 显式封装，彻底受控。
-    // 关键：ZDY 能稳定导出而不触发 “无法编码媒体” 的核心，是显式指定了
-    // profile level 与 compression properties（含 AllowFrameReordering=NO），而非只给
-    // 一个裸的 H264 codec。这里完整对齐 ZDY 的编码配置。
-    AVAssetWriterInput *vIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
-                                                                outputSettings:@{
+    // 写入端：对齐 ZDY 1.3.8 @0xcaa48-0xcae00 的实测配置。
+    // fps 取源轨 nominalFrameRate，<1 时兜底 30；码率 = 宽×高×fps×0.1，下限 2.5Mbps
+    // （常量 0x414312D000000000 = 2500000.0，系数 0x27F248 = 0.1，均为反汇编实测值）。
+    float fps = vt.nominalFrameRate;
+    if (!(fps > 1.0f) || !isfinite(fps)) fps = 30.0f;
+    double bitrate = (double)W * (double)H * (double)fps * 0.1;
+    if (!(bitrate > 2500000.0) || !isfinite(bitrate)) bitrate = 2500000.0;
+    NSInteger kfi = (NSInteger)llround((double)fps * 2.0);
+    if (kfi < 1) kfi = 1;
+
+    // compressionProperties 用可变字典：ZDY 在 canAddInput 失败时会把 profile 从
+    // Main 降到 Baseline 再重建 input（@0xcac44-0xcacdc）。这是它能适配不同视频的
+    // 关键——不同源/尺寸下 Main profile 未必被编码器接受，硬用一种就会初始化失败，
+    // 表现正是“无法编码媒体”(AVErrorCannotEncodeMedia)。
+    NSMutableDictionary *comp = [NSMutableDictionary dictionaryWithDictionary:@{
+        AVVideoAverageBitRateKey: @((NSInteger)bitrate),
+        AVVideoProfileLevelKey: AVVideoProfileLevelH264MainAutoLevel,
+        AVVideoMaxKeyFrameIntervalKey: @(kfi),
+        AVVideoAllowFrameReorderingKey: @NO,
+    }];
+    NSDictionary *vset = @{
         AVVideoCodecKey: AVVideoCodecTypeH264,
         AVVideoWidthKey: @(W),
         AVVideoHeightKey: @(H),
-        AVVideoCompressionPropertiesKey: @{
-            AVVideoProfileLevelKey: AVVideoProfileLevelH264BaselineAutoLevel,
-            // 平均码率：约 2 bit/像素，4K 约 22Mbps，足够清晰且设备可承受
-            AVVideoAverageBitRateKey: @((long)W * H * 2),
-            AVVideoMaxKeyFrameIntervalKey: @(30),
-            AVVideoAllowFrameReorderingKey: @NO,
-        },
-    }];
+        AVVideoCompressionPropertiesKey: comp,
+    };
+    AVAssetWriterInput *vIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                                                outputSettings:vset];
+    if (![writer canAddInput:vIn]) {
+        // 降级 1：Main → Baseline（与 ZDY 完全一致的兜底路径）
+        comp[AVVideoProfileLevelKey] = AVVideoProfileLevelH264BaselineAutoLevel;
+        vIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:vset];
+        if (![writer canAddInput:vIn]) {
+            // 降级 2：去掉 profile level 约束，只保留码率与无帧重排
+            [comp removeObjectForKey:AVVideoProfileLevelKey];
+            vIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:vset];
+        }
+    }
     vIn.expectsMediaDataInRealTime = NO;
     [writer addInput:vIn];
 
     // 官方 PixelBufferAdaptor（注意拼写 appendPixelBuffer:withPresentationTime:，
-    // 不带 Stamp；ZDY 即此路线，iOS26 仍在）。由 Adaptor 自己管理像素缓冲池与格式，
-    // 避免手动建 CMSampleBuffer 时 format description 与编码会话期望不符导致
-    // “无法编码媒体”(AVErrorCannotEncodeMedia)。
+    // 不带 Stamp；ZDY 即此路线，iOS26 仍在）。
+    // sourcePixelBufferAttributes 严格对齐 ZDY @0xcacec-0xcad88：只有像素格式 +
+    // 宽 + 高 三项。ZDY 不设 CGImageCompatibility / CGBitmapContextCompatibility /
+    // OpenGLESCompatibility / IOSurfaceProperties —— 多加这些键会让缓冲池的缓冲类型
+    // 偏离编码器期望，反而是隐患。
     AVAssetWriterInputPixelBufferAdaptor *adaptor =
         [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:vIn
                                                    sourcePixelBufferAttributes:@{
             (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
             (id)kCVPixelBufferWidthKey : @(W),
             (id)kCVPixelBufferHeightKey : @(H),
-            // 对齐 ZDY：ZDY 的缓冲属性是 CGImageCompatibility +
-            // CGBitmapContextCompatibility，走 CPU 可访问内存（配合 CoreGraphics
-            // 直接用 CGBitmapContext 写入缓冲）。若改成 OpenGLESCompatibility，
-            // 缓冲会变成 IOSurface / GPU 内存，H.264 编码器在 4K 等大尺寸上
-            // 可能无法读取 → 编码会话初始化失败（“无法编码媒体”），或产出照片库
-            // 判为 InvalidResource 的资源（3302）。
-            (id)kCVPixelBufferCGImageCompatibilityKey : @YES,
-            (id)kCVPixelBufferCGBitmapContextCompatibilityKey : @YES,
         }];
 
-    // 音频：读取端解压成 PCM，写入端重新编码为 AAC；源无音频则跳过（视频仍可正常导入）
+    // 音频：对齐 ZDY @0xcae78-0xcb160 的双保险策略，这是它“任何源视频都能过”的关键。
+    //   1) 首选 passthrough：reader outputSettings=nil，writer outputSettings=nil +
+    //      sourceFormatHint=源格式描述 —— 直接拷贝源压缩样本，不经过任何重编码，
+    //      因此永远不会因采样率/声道不合法而初始化失败。
+    //   2) 仅当 canAddOutput/canAddInput 任一失败时，才降级为 LinearPCM 解码 +
+    //      显式 AAC 编码（采样率取源 ASBD，非法则 44100；声道取源，0 则 2）。
+    //   3) 仍失败则整条音频轨不加（视频照常导出），绝不硬加导致编码会话失败。
+    // 之前我们是「上来就 PCM+AAC 且无任何检查」，源采样率非标时音频编码会话初始化
+    // 直接失败，表现就是选完视频立刻弹“无法编码媒体”。
     AVAssetTrack *at = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
     AVAssetReaderTrackOutput *aout = nil;
     AVAssetWriterInput *aIn = nil;
-    double aRate = 44100.0, aCh = 2.0;
     if (at) {
         CMFormatDescriptionRef fd = (__bridge CMFormatDescriptionRef)(at.formatDescriptions.firstObject);
-        if (fd) {
-            const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
-            if (asbd) {
-                double r = asbd->mSampleRate;
-                double c = asbd->mChannelsPerFrame;
-                // 采样率归到 AAC 受支持值；声道限 1~2（AAC 不支持更多声道）。
-                // 否则部分源视频会让音频编码会话初始化失败 → “无法编码媒体”。
-                aRate = DD_ClampAACRate(r > 0.0 ? r : 44100.0);
-                aCh = (c >= 1.0 && c <= 2.0) ? c : 2.0;
+        aout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at outputSettings:nil];
+        aout.alwaysCopiesSampleData = NO;
+        aIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
+                                                 outputSettings:nil
+                                              sourceFormatHint:fd];
+        aIn.expectsMediaDataInRealTime = NO;
+        if (![reader canAddOutput:aout] || ![writer canAddInput:aIn]) {
+            // 降级：显式解码 + 重编码
+            aout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at outputSettings:@{
+                AVFormatIDKey: @(kAudioFormatLinearPCM),
+                AVLinearPCMBitDepthKey: @16,
+                AVLinearPCMIsBigEndianKey: @NO,
+                AVLinearPCMIsFloatKey: @NO,
+                AVLinearPCMIsNonInterleavedKey: @NO,
+            }];
+            aout.alwaysCopiesSampleData = NO;
+            double rate = 44100.0;
+            NSUInteger ch = 2;
+            if (fd) {
+                const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+                if (asbd) {
+                    if (asbd->mSampleRate > 0.0) rate = asbd->mSampleRate;
+                    if (asbd->mChannelsPerFrame > 0) ch = (NSUInteger)asbd->mChannelsPerFrame;
+                }
+            }
+            if (ch < 1) ch = 1; else if (ch > 2) ch = 2; // AAC 最多 2 声道
+            aIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:@{
+                AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+                AVNumberOfChannelsKey: @(ch),
+                AVSampleRateKey: @(rate),
+                AVEncoderBitRateKey: @(128000),
+            }];
+            aIn.expectsMediaDataInRealTime = NO;
+            if (![reader canAddOutput:aout] || ![writer canAddInput:aIn]) {
+                aout = nil; aIn = nil; // 放弃音频轨，不影响视频
             }
         }
-        aout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at outputSettings:@{
-            AVFormatIDKey: @(kAudioFormatLinearPCM),
-            AVSampleRateKey: @(aRate),
-            AVNumberOfChannelsKey: @(aCh),
-            AVLinearPCMBitDepthKey: @16,
-            AVLinearPCMIsBigEndianKey: @NO,
-            AVLinearPCMIsFloatKey: @NO,
-            AVLinearPCMIsNonInterleavedKey: @NO,
-        }];
-        aout.alwaysCopiesSampleData = NO;
-        [reader addOutput:aout];
-        aIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:@{
-            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: @(aRate),
-            AVNumberOfChannelsKey: @(aCh),
-            AVEncoderBitRateKey: @(128000),
-        }];
-        aIn.expectsMediaDataInRealTime = NO;
-        [writer addInput:aIn];
+        if (aout && aIn) {
+            [reader addOutput:aout];
+            [writer addInput:aIn];
+        }
     }
 
     // 对齐 ZDY：渲染走 CPU（软件）路线。ZDY 用 CoreGraphics + CGBitmapContext 直接
@@ -540,7 +570,16 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @YES }];
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
 
-    // 输出像素缓冲交由上面的 Adaptor 统一管理（CPU 可访问内存），此处无需自建。
+    // 对齐 ZDY @0x11cd78-0x11ceec：每帧用 CVPixelBufferCreate 新建缓冲，
+    // 属性为 BGRA + CGImageCompatibility + CGBitmapContextCompatibility（CPU 可访问），
+    // 渲染完立即 Release。ZDY 刻意不用 adaptor.pixelBufferPool——池化缓冲的类型由
+    // Adaptor 决定且被复用，在部分设备/尺寸上取不到或与编码器期望不符（pool 为 NULL
+    // 时 CVPixelBufferPoolCreatePixelBuffer 直接失败 → 写帧失败 → 导出中止）。
+    NSDictionary *pbAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferCGImageCompatibilityKey : @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey : @YES,
+    };
 
     if (![reader startReading] || ![writer startWriting]) {
         if (error) *error = writer.error ?: reader.error ?: [NSError errorWithDomain:@"DDShell" code:-3 userInfo:@{NSLocalizedDescriptionKey : @"启动读写失败"}];
@@ -554,9 +593,8 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     __block BOOL ok = YES;
     dispatch_group_t grp = dispatch_group_create();
 
-    // 视频轨：逐帧透视套壳后写入。缓冲从 Adaptor 的像素缓冲池取，渲染后直接交给
-    // Adaptor 写——只传 PTS，duration 由 AVAssetWriter 内部按后续帧推断，末帧无需
-    // 特殊处理（ZDY 即此手法，从不出末帧时长问题）。
+    // 视频轨：逐帧透视套壳后写入。缓冲每帧新建（对齐 ZDY），渲染后交给 Adaptor 写
+    // ——只传 PTS，duration 由 AVAssetWriter 内部按后续帧推断，末帧无需特殊处理。
     dispatch_queue_t vq = dispatch_queue_create("com.ddshell.vreader", DISPATCH_QUEUE_SERIAL);
     dispatch_group_enter(grp);
     [vIn requestMediaDataWhenReadyOnQueue:vq usingBlock:^{
@@ -567,8 +605,10 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
                 CVPixelBufferRef srcPB = CMSampleBufferGetImageBuffer(sb);
                 CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
                 CVPixelBufferRef outPB = NULL;
-                if (srcPB && adaptor.pixelBufferPool
-                    && CVPixelBufferPoolCreatePixelBuffer(NULL, adaptor.pixelBufferPool, &outPB) == kCVReturnSuccess) {
+                if (srcPB && CVPixelBufferCreate(kCFAllocatorDefault, (size_t)W, (size_t)H,
+                                                 kCVPixelFormatType_32BGRA,
+                                                 (__bridge CFDictionaryRef)pbAttrs,
+                                                 &outPB) == kCVReturnSuccess && outPB) {
                     if (DD_RenderShellFrame(srcPB, t, W, H, pref, ci, cs, outPB)) {
                         if (![adaptor appendPixelBuffer:outPB withPresentationTime:pts]) ok = NO;
                     } else {
