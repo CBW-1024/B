@@ -150,6 +150,17 @@ static NSString *DD_TplFolder(NSString *name) {
     return name.length ? [DD_TplDir() stringByAppendingPathComponent:name] : nil;
 }
 
+#pragma mark - 临时目录
+
+// DDShell 专用临时目录：NSTemporaryDirectory()/DDShell/
+// 与微信原生 tmp 隔离，便于在崩溃/强退/被杀后于下次启动统一清理，避免残骸堆积。
+static NSString *DD_TempRoot(void) {
+    NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDShell"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:root
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return root;
+}
+
 #pragma mark - 模板模型
 
 @interface DDShellTemplate : NSObject
@@ -403,7 +414,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
     if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
 
-    NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+    NSString *outPath = [DD_TempRoot() stringByAppendingPathComponent:
                          [[NSUUID UUID].UUIDString stringByAppendingPathExtension:@"mp4"]];
 
     AVMutableVideoComposition *vc = [AVMutableVideoComposition videoComposition];
@@ -720,7 +731,7 @@ static NSInteger DD_ImportTemplatesFrom(NSString *root) {
 // 把指定模板打包成一个 zip，返回 zip 路径（打包失败返回 nil）
 static NSString *DD_ExportTemplatesToZip(NSArray<NSString *> *names) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *tmp   = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+    NSString *tmp   = [DD_TempRoot() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
     NSString *stage = [tmp stringByAppendingPathComponent:@"DDShell模板"];
     [fm createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
     for (NSString *name in names) {
@@ -1340,7 +1351,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         return;
     }
 
-    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+    NSString *tmp = [DD_TempRoot() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
     [[NSFileManager defaultManager] createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -1561,6 +1572,12 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     @autoreleasepool {
         (void)[DDShellConfig shared];
         [DDShellWatcher shared]; // 挂载截图监听
+
+        // 清理上次会话（崩溃/强退/被杀）残留的临时文件；任务中途被杀时 in-flow 清理来不及跑，靠这里兜底
+        NSString *tmpRoot = DD_TempRoot();
+        for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpRoot error:nil]) {
+            [[NSFileManager defaultManager] removeItemAtPath:[tmpRoot stringByAppendingPathComponent:item] error:nil];
+        }
 
         // 取不到类时整条链都是给 nil 发消息，ObjC 天然 no-op
         id mgr = objc_getClass("WCPluginsMgr");
