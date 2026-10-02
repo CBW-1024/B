@@ -350,36 +350,29 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 // 把一帧源像素缓冲套壳成画布大小，渲染进 outBuf。
 // 与图片路径一致：源先按 contain 预缩到屏幕窗、再做透视映射，机身图盖最上层。
 // 源自带旋转由 pref（视频轨 preferredTransform）在这里摆正，再归一化原点后参与透视。
-static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
-                               NSInteger W, NSInteger H, CGAffineTransform pref,
-                               CIContext *ci, CGColorSpaceRef cs, CVPixelBufferRef outBuf) {
-    if (!srcPB || !outBuf) return NO;
-    CIImage *raw = [CIImage imageWithCVPixelBuffer:srcPB];
-    // 按视频自带旋转摆正；preferredTransform 常带位移把旋转后的帧挪回正位，其 extent 原点
-    // 往往不为 0。先归一化原点再量尺寸，避免把巨大坐标直接喂进透视导致投影退化。
+// 单帧套壳：源帧 CIImage → 合成后的 CIImage（供 AVMutableVideoComposition 的
+// CIFilter handler 逐帧调用）。几何逻辑与原来完全一致（contain 预缩放 ×1.5 →
+// CIPerspectiveTransform → 机身图盖上层），只是不再往 CVPixelBuffer 里渲染。
+static CIImage *DD_ShellImageForFrame(CIImage *raw, DDShellTemplate *t,
+                                      NSInteger W, NSInteger H,
+                                      CGAffineTransform pref, CIImage *shellImg) {
+    if (!raw || !shellImg) return nil;
     CIImage *rot = [raw imageByApplyingTransform:pref];
     CGRect re = rot.extent;
     CGFloat sW = re.size.width, sH = re.size.height;
-    if (sW < 1.0 || sH < 1.0) return NO;
+    if (sW < 1.0 || sH < 1.0) return nil;
 
     // 旋转后 extent 原点常不为 0（preferredTransform 带位移），先归零再缩放
     CIImage *rot0 = [rot imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
 
-    // contain 预缩到屏幕窗 ×1.5（对齐 ZDY @0xd7de8 的核心几何策略）。
-    // ZDY 先算窗口四边形四边长的平均值（顶+底)/2、(左+右)/2，再把源帧 contain 缩放到
-    // 该尺寸的 1.5 倍，最后才做透视。这步是它“任何模板都不翻车”的关键：透视的输入
-    // 尺寸被拉到与输出窗口同量级（缩放比接近 1:1），CoreImage 无需在极端比例下重采样；
-    // 而我们此前是把源帧直接透视到整个画布，在“大画布 + 极小屏幕窗”（如 2840×3840
-    // 画布配 288×629 窗口，仅占 1.7%）这类几何下投影极易退化 → 帧内容异常 →
-    // 编码器拒（“无法编码媒体”）或产出被照片库判无效的资源（3302）。
-    // 顺带解释“有的模板正常”：窗口占比大的模板缩放比本就接近 1，恰好没踩到退化区。
+    // contain 预缩到屏幕窗 ×1.5（对齐 ZDY @0xd7de8 的核心几何策略）：把透视的缩放比
+    // 拉到接近 1:1，避免"大画布 + 极小屏幕窗"这类几何下投影退化。
     CGRect wb = DD_WindowBBox(t);
     CGFloat winW = wb.size.width, winH = wb.size.height;
     if (!(winW > 1.0)) winW = (CGFloat)W;  // 窗口退化时用画布尺寸兜底（同 ZDY）
     if (!(winH > 1.0)) winH = (CGFloat)H;
     CGFloat sc = MIN(winW * 1.5 / sW, winH * 1.5 / sH);
     if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-    // ZDY 用 CILanczosScaleTransform 做预缩放（高质量重采样），对齐它
     CIFilter *sf = [CIFilter filterWithName:@"CILanczosScaleTransform"];
     [sf setDefaults];
     [sf setValue:rot0 forKey:kCIInputImageKey];
@@ -387,15 +380,11 @@ static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
     [sf setValue:@(1.0) forKey:@"inputAspectRatio"];
     CIImage *scaled = sf.outputImage;
     if (!scaled) scaled = [rot0 imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
-    // 缩放后 extent 原点可能仍有偏移，再归零一次，保证喂进透视的输入干净
     CGRect se = scaled.extent;
     CIImage *srcImg = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(-se.origin.x, -se.origin.y)];
 
-    // 对齐 ZDY：ZDY 用的是 CIPerspectiveTransform（不带 WithExtent），由 CI 自己取
-    // 输入图像的 extent 做透视。带 WithExtent 的版本需要手动传 inputExtent，在
-    // “大画布 + 极小屏幕窗”这类极端几何下，一旦 inputExtent 与实际 extent 有任何
-    // 偏差，透视输出就会退化 / 异常 → 帧内容坏掉 → 编码器拒（“无法编码媒体”），
-    // 或产出被照片库判为 InvalidResource 的资源（3302）。去掉 inputExtent 更稳健。
+    // CIPerspectiveTransform（不带 WithExtent）：由 CI 自己取输入 extent 做透视，
+    // 比手动传 inputExtent 稳健，极端几何下不会退化。
     CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransform"];
     [f setDefaults];
     [f setValue:srcImg forKey:kCIInputImageKey];
@@ -404,32 +393,19 @@ static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
     [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
     [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
     CIImage *warped = f.outputImage;
-
-    CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
-    CIImage *outImg = [frame imageByCompositingOverImage:warped]; // 机身图盖在最上层
-    [ci render:outImg toCVPixelBuffer:outBuf bounds:CGRectMake(0, 0, W, H) colorSpace:cs];
-    return YES;
+    if (!warped) return nil;
+    return [shellImg imageByCompositingOverImage:warped]; // 机身图盖在最上层
 }
 
-// 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）。
-// 走 AVAssetReader + AVAssetWriter 手动管线（对齐 ZDY @0xc9b98 的视频套壳主路径），
-// 输出尺寸 / 编码 / 封装 / 音频全部显式指定。
-// 注意：ZDY 的手动管线能稳定，靠的不是管线本身，而是配套的三道闸——
-//   ① @0xc9bf0 先 loadValuesAsynchronouslyForKeys(@"tracks",@"duration") + 30s 超时等待；
-//   ② @0xcb4bc finishWritingWithCompletionHandler + 60s 超时；
-//   ③ @0xcb360 任何一步超时/失败 → cancelWriting + removeItemAtPath，绝不留半成品。
-// 缺任何一道都会退化成"无法编码媒体"或照片库 3302 InvalidResource。
 // —— 对齐 ZDY @0xe37b0-0xe38cc：把系统给的 mediaURL 先复制成自己的本地副本 ——
 // UIImagePickerControllerMediaURL 指向的是系统转码目录里的临时文件，picker 一旦
 // dismiss，系统随时可能回收它。ZDY 的做法是在回调里**同步**先把文件落到自己的
 // 临时目录（ss_pick_<uuid>.<ext>），之后再 dismiss、之后再丢后台处理。
-// 少了这一步，等到 AVAssetReader 真正去读时文件可能已经被删/被截断/还没写完：
+// 少了这一步，等到导出真正去读源文件时它已经被删/被截断/还没写完：
 //   · 一开始就读不到 → writer 建 input / 写首帧即失败 → "无法编码媒体"(AVErrorCannotEncodeMedia)，
 //     表现正是"选完视频立刻弹错"；
 //   · 读到一半失效 → 产出时长异常或残缺的 mp4，fileExists 仍然通过，但照片库
 //     判为无效资源 → PHPhotosErrorDomain 3302，表现正是"转一会儿才失败"。
-// 另外 ZDY 在 copyItemAtURL: 失败时还会降级为 NSData 读入 + writeToFile:，
-// 说明它明确知道这个 URL 有可能读不出来。这里两条路都保留。
 // 对齐 ZDY：导出产物与暂存文件**必须落在 NSTemporaryDirectory()**（@0xca9d0 调 _NSTemporaryDirectory，
 // 文件名 ss_shell_<UUID>.mp4；暂存同理 @0xe37e4 也是 _NSTemporaryDirectory + ss_pick_<UUID>.<ext>）。
 // 不能用 Library/Caches 的子目录：creationRequestForAssetFromVideoAtFileURL: 是交给照片库守护进程
@@ -463,43 +439,40 @@ static NSURL *DD_StageSourceVideo(NSURL *mediaURL) {
     return nil;
 }
 
+// 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）。
+//
+// 走 AVAssetExportSession + AVMutableVideoComposition(applyingCIFiltersWithHandler:)，
+// 对齐 ScreenshotShell @0xb4e8 的路线，不再用 ZDY 的 AVAssetReader/AVAssetWriter 手工管线。
+// 换路线是两轮反汇编之后的结构性结论，不是拍脑袋：
+//   · ZDY 那条手工管线我们已经逐参数对齐到头（H.264、BGRA、adaptor 只有三键、
+//     码率 W*H*fps*0.1 下限 2.5M、kfi=fps*2、音频 passthrough→LPCM+AAC 双策略、
+//     30s/600s/60s 三级超时、尺寸 fcvtzs 截断），仍然稳定复现 3302；
+//     并且已确认 ZDY 自己的 AVAssetExportSession 只用于抽音频
+//     （输出名 temp_video_audio_%ld.m4a），不用于视频套壳——无从再借鉴。
+//   · 两个报错对这条手工管线是**结构性**的：AVErrorCannotEncodeMedia("无法编码媒体")
+//     只能由 AVAssetWriter 抛出；3302 则来自 writer 留下的半成品 mp4
+//     （缺 moov / 时长 0 / 样本表不全）。交给系统导出会话后两者都不再可能存在：
+//     没有 writer，文件由系统整体生成，且只在 status==Completed 时才交出去。
 static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **error) {
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:srcURL options:@{
-        // 对齐 ZDY @0xc9f3c-0xc9f90：必须带 AVURLAssetPreferPreciseDurationAndTimingKey。
-        // 不带时系统会走"快速估算"路径，duration / 帧时间戳是近似值：
-        //   · 时间轴不准 → 写出的片段时长与 moov 索引对不上，照片库按无效资源拒收（3302）；
-        //   · 部分源文件在估算路径下轨信息不完整 → 编码器初始化即失败（无法编码媒体）。
         AVURLAssetPreferPreciseDurationAndTimingKey : @YES,
     }];
-
-    // 对齐 ZDY @0xc9b0c-0xc9b20：源文件不存在（iCloud 未下载 / 已被清理）就立刻失败，
-    // 不要等后面加载超时。
     if (![[NSFileManager defaultManager] fileExistsAtPath:srcURL.path]) {
         if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
                 userInfo:@{NSLocalizedDescriptionKey : @"源文件不存在（可能尚未从 iCloud 下载）"}];
         return nil;
     }
-
-    // —— 对齐 ZDY @0xc9bf0-0xc9ca0：tracks / duration 必须先异步加载并等待就绪 ——
-    // AVAsset 的 tracks / duration / naturalSize / preferredTransform / nominalFrameRate
-    // 都是惰性异步属性。不显式加载就直接读取，拿到的可能是 0 / 未初始化值：
-    //   · fps = 0 或 naturalSize = 0 → 下面算出的码率 / 关键帧间隔非法，或轨根本还没
-    //     解析出来 → AVAssetWriter 建 input 或写首帧就被编码器拒收，表现正是"选完视频
-    //     立刻弹无法编码媒体"(AVErrorCannotEncodeMedia)；
-    //   · duration 不准 → 写出时长/索引错误的片段，被照片库判为无效资源（3302）。
-    // 这也解释了"有的视频一选就失败、有的要转一会儿才失败"：解析耗时随源文件而异。
-    {
+    {   // tracks / duration 是惰性异步属性，不加载就读取会拿到未初始化值
         dispatch_semaphore_t ls = dispatch_semaphore_create(0);
         [asset loadValuesAsynchronouslyForKeys:@[ @"tracks", @"duration" ]
                             completionHandler:^{ dispatch_semaphore_signal(ls); }];
-        // ZDY 实测超时 0x6FC23AC00 ns = 30s。超时就放弃，绝不带着未就绪的属性往下走。
         if (dispatch_semaphore_wait(ls, dispatch_time(DISPATCH_TIME_NOW,
                                     (int64_t)(30.0 * NSEC_PER_SEC))) != 0) {
             if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
                     userInfo:@{NSLocalizedDescriptionKey : @"视频信息加载超时"}];
             return nil;
         }
-        NSError *stErr = nil; // 加载完成 ≠ 加载成功，再确认一次状态
+        NSError *stErr = nil;
         if ([asset statusOfValueForKey:@"tracks" error:&stErr] != AVKeyValueStatusLoaded) {
             if (error) *error = stErr ?: [NSError errorWithDomain:@"DDShell" code:-1
                     userInfo:@{NSLocalizedDescriptionKey : @"视频轨加载失败"}];
@@ -513,332 +486,85 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
                 userInfo:@{NSLocalizedDescriptionKey : @"未找到视频轨"}];
         return nil;
     }
-    CGSize natSize = vt.naturalSize;
-    if (!(natSize.width > 1.0f) || !(natSize.height > 1.0f)) {
+    CGAffineTransform pref = vt.preferredTransform; // 源自带旋转，逐帧摆正
+
+    // 画布尺寸取**模板图的实际像素尺寸**（对齐 ScreenshotShell：renderSize = 模板图尺寸），
+    // 不用 cfg 里声明的 template_width/height：透视四角坐标本就按模板图像素定义，
+    // 两者一旦不一致（再叠加之前那步 16 向上对齐）坐标会整体错位。
+    // 只补到偶数——H.264 要求宽高为偶。
+    NSInteger W = (NSInteger)CGImageGetWidth(t.image.CGImage);
+    NSInteger H = (NSInteger)CGImageGetHeight(t.image.CGImage);
+    if (W < 2 || H < 2) {
         if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
-                userInfo:@{NSLocalizedDescriptionKey : @"视频尺寸无效"}];
+                userInfo:@{NSLocalizedDescriptionKey : @"模板尺寸无效"}];
         return nil;
     }
-    CGAffineTransform pref = vt.preferredTransform; // 源自带旋转，在合成时摆正
+    W += (W & 1);
+    H += (H & 1);
 
-    CGFloat cw = t.canvasSize.width, ch = t.canvasSize.height;
-    if (cw < 2.0 || ch < 2.0 || cw > 8192.0 || ch > 8192.0) return nil; // 画布尺寸同样卡上限
-    // H.264 宏块约束：宽高必须 16 对齐，否则部分设备硬件编码器直接拒编码
-    // （表现即“无法编码媒体”AVErrorCannotEncodeMedia）。向上对齐到 16 边界，
-    // 变化 ≤15px，CI 渲染时模板图按画布缩放，肉眼不可见。ZDY 仅做偶数对齐，这里
-    // 进一步对齐到 16 以覆盖其所有情况并消除超大 / 非对齐尺寸的编码风险。
-    NSInteger W = (NSInteger)round(cw), H = (NSInteger)round(ch);
-    W = ((W + 15) / 16) * 16;
-    H = ((H + 15) / 16) * 16;
-
-    // 对齐 ZDY @0xca9d0-0xcaa10：tmp 根目录 + ss_shell_<UUID>.mp4
-    NSString *outPath = [DD_ShellTmpRoot() stringByAppendingPathComponent:
-                         [NSString stringWithFormat:@"ss_shell_%@.mp4", [NSUUID UUID].UUIDString]];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:outPath])
-        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-
-    NSError *err = nil;
-    AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
-    if (!reader) return nil;
-    AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:outPath]
-                                                     fileType:AVFileTypeMPEG4 error:&err];
-    if (!writer) { [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil]; return nil; }
-
-    // 读取端：直读像素。旋转摆正放在合成函数里手动处理 preferredTransform，
-    // 避开 iOS17+ 已移除的 AVAssetReaderTrackOutput.appliesPreferredTrackTransform 属性。
-    AVAssetReaderTrackOutput *vout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:vt
-                                                                              outputSettings:@{
-        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-    }];
-    vout.alwaysCopiesSampleData = NO;
-    // 对齐 ZDY @0xca994-0xca9b0：加输出前先问 canAddOutput，不能加就整体放弃，
-    // 绝不带一个"没接上"的 output 去 startReading（那样读出来全是 NULL 帧，
-    // 最终产出 0 帧的 mp4 → 照片库 3302）。
-    if (![reader canAddOutput:vout]) {
-        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-2
-                userInfo:@{NSLocalizedDescriptionKey : @"视频读取通道不可用"}];
-        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-        return nil;
-    }
-    [reader addOutput:vout];
-
-    // 写入端：对齐 ZDY 1.3.8 @0xcaa48-0xcae00 的实测配置。
-    // fps 取源轨 nominalFrameRate，<1 时兜底 30；码率 = 宽×高×fps×0.1，下限 2.5Mbps
-    // （常量 0x414312D000000000 = 2500000.0，系数 0x27F248 = 0.1，均为反汇编实测值）。
     float fps = vt.nominalFrameRate;
     if (!(fps > 1.0f) || !isfinite(fps)) fps = 30.0f;
-    double bitrate = (double)W * (double)H * (double)fps * 0.1;
-    if (!(bitrate > 2500000.0) || !isfinite(bitrate)) bitrate = 2500000.0;
-    NSInteger kfi = (NSInteger)llround((double)fps * 2.0);
-    if (kfi < 1) kfi = 1;
 
-    // compressionProperties 用可变字典：ZDY 在 canAddInput 失败时会把 profile 从
-    // Main 降到 Baseline 再重建 input（@0xcac44-0xcacdc）。这是它能适配不同视频的
-    // 关键——不同源/尺寸下 Main profile 未必被编码器接受，硬用一种就会初始化失败，
-    // 表现正是“无法编码媒体”(AVErrorCannotEncodeMedia)。
-    NSMutableDictionary *comp = [NSMutableDictionary dictionaryWithDictionary:@{
-        AVVideoAverageBitRateKey: @((NSInteger)bitrate),
-        AVVideoProfileLevelKey: AVVideoProfileLevelH264MainAutoLevel,
-        AVVideoMaxKeyFrameIntervalKey: @(kfi),
-        AVVideoAllowFrameReorderingKey: @NO,
-    }];
-    NSDictionary *vset = @{
-        AVVideoCodecKey: AVVideoCodecTypeH264,
-        AVVideoWidthKey: @(W),
-        AVVideoHeightKey: @(H),
-        AVVideoCompressionPropertiesKey: comp,
-    };
-    AVAssetWriterInput *vIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
-                                                                outputSettings:vset];
-    if (![writer canAddInput:vIn]) {
-        // 降级 1：Main → Baseline（与 ZDY 完全一致的兜底路径）
-        comp[AVVideoProfileLevelKey] = AVVideoProfileLevelH264BaselineAutoLevel;
-        vIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:vset];
-        if (![writer canAddInput:vIn]) {
-            // 降级 2：去掉 profile level 约束，只保留码率与无帧重排
-            [comp removeObjectForKey:AVVideoProfileLevelKey];
-            vIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:vset];
-        }
+    CIImage *shellImg = [CIImage imageWithCGImage:t.image.CGImage];
+    if (!shellImg) {
+        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
+                userInfo:@{NSLocalizedDescriptionKey : @"模板图读取失败"}];
+        return nil;
     }
-    vIn.expectsMediaDataInRealTime = NO;
-    // 对齐 ZDY @0xcad94-0xcae68：三次尝试后仍 canAddInput:NO 就直接放弃，
-    // 不能硬 addInput —— 硬加的 input 不会被编码器接住，startWriting 之后
-    // 第一次写帧就失败，表现正是"无法编码媒体"。
-    if (![writer canAddInput:vIn]) {
+
+    AVMutableVideoComposition *comp =
+        [AVMutableVideoComposition videoCompositionWithAsset:asset
+                              applyingCIFiltersWithHandler:^(AVAsynchronousCIImageFilteringRequest *req) {
+            CIImage *out = DD_ShellImageForFrame(req.sourceImage, t, W, H, pref, shellImg);
+            // 单帧合成失败也**必须** finish，否则整条导出会卡住；退化成原帧保证不丢帧。
+            [req finishWithImage:(out ?: req.sourceImage) context:nil];
+        }];
+    comp.renderSize    = CGSizeMake((CGFloat)W, (CGFloat)H);
+    comp.frameDuration = CMTimeMake(1, (int32_t)llround(fps));
+
+    NSString *outPath = [DD_ShellTmpRoot() stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"ss_shell_%@.mp4", [NSUUID UUID].UUIDString]];
+    [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+
+    AVAssetExportSession *ex = [AVAssetExportSession exportSessionWithAsset:asset
+                                                               presetName:AVAssetExportPresetHighestQuality];
+    if (!ex) {
         if (error) *error = [NSError errorWithDomain:@"DDShell" code:-2
-                userInfo:@{NSLocalizedDescriptionKey : @"视频编码通道不可用（尺寸/码率不被支持）"}];
-        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+                userInfo:@{NSLocalizedDescriptionKey : @"无法创建导出会话"}];
         return nil;
     }
-    [writer addInput:vIn];
-
-    // 官方 PixelBufferAdaptor（注意拼写 appendPixelBuffer:withPresentationTime:，
-    // 不带 Stamp；ZDY 即此路线，iOS26 仍在）。
-    // sourcePixelBufferAttributes 严格对齐 ZDY @0xcacec-0xcad88：只有像素格式 +
-    // 宽 + 高 三项。ZDY 不设 CGImageCompatibility / CGBitmapContextCompatibility /
-    // OpenGLESCompatibility / IOSurfaceProperties —— 多加这些键会让缓冲池的缓冲类型
-    // 偏离编码器期望，反而是隐患。
-    AVAssetWriterInputPixelBufferAdaptor *adaptor =
-        [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:vIn
-                                                   sourcePixelBufferAttributes:@{
-            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-            (id)kCVPixelBufferWidthKey : @(W),
-            (id)kCVPixelBufferHeightKey : @(H),
-        }];
-
-    // 音频：对齐 ZDY @0xcae78-0xcb160 的双保险策略，这是它“任何源视频都能过”的关键。
-    //   1) 首选 passthrough：reader outputSettings=nil，writer outputSettings=nil +
-    //      sourceFormatHint=源格式描述 —— 直接拷贝源压缩样本，不经过任何重编码，
-    //      因此永远不会因采样率/声道不合法而初始化失败。
-    //   2) 仅当 canAddOutput/canAddInput 任一失败时，才降级为 LinearPCM 解码 +
-    //      显式 AAC 编码（采样率取源 ASBD，非法则 44100；声道取源，0 则 2）。
-    //   3) 仍失败则整条音频轨不加（视频照常导出），绝不硬加导致编码会话失败。
-    // 之前我们是「上来就 PCM+AAC 且无任何检查」，源采样率非标时音频编码会话初始化
-    // 直接失败，表现就是选完视频立刻弹“无法编码媒体”。
-    AVAssetTrack *at = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
-    AVAssetReaderTrackOutput *aout = nil;
-    AVAssetWriterInput *aIn = nil;
-    if (at) {
-        CMFormatDescriptionRef fd = (__bridge CMFormatDescriptionRef)(at.formatDescriptions.firstObject);
-        aout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at outputSettings:nil];
-        aout.alwaysCopiesSampleData = NO;
-        aIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
-                                                 outputSettings:nil
-                                              sourceFormatHint:fd];
-        aIn.expectsMediaDataInRealTime = NO;
-        if (![reader canAddOutput:aout] || ![writer canAddInput:aIn]) {
-            // 降级：显式解码 + 重编码
-            aout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at outputSettings:@{
-                AVFormatIDKey: @(kAudioFormatLinearPCM),
-                AVLinearPCMBitDepthKey: @16,
-                AVLinearPCMIsBigEndianKey: @NO,
-                AVLinearPCMIsFloatKey: @NO,
-                AVLinearPCMIsNonInterleavedKey: @NO,
-            }];
-            aout.alwaysCopiesSampleData = NO;
-            double rate = 44100.0;
-            NSUInteger ch = 2;
-            if (fd) {
-                const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
-                if (asbd) {
-                    if (asbd->mSampleRate > 0.0) rate = asbd->mSampleRate;
-                    if (asbd->mChannelsPerFrame > 0) ch = (NSUInteger)asbd->mChannelsPerFrame;
-                }
-            }
-            if (ch < 1) ch = 1; else if (ch > 2) ch = 2; // AAC 最多 2 声道
-            aIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:@{
-                AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-                AVNumberOfChannelsKey: @(ch),
-                AVSampleRateKey: @(rate),
-                AVEncoderBitRateKey: @(128000),
-            }];
-            aIn.expectsMediaDataInRealTime = NO;
-            if (![reader canAddOutput:aout] || ![writer canAddInput:aIn]) {
-                aout = nil; aIn = nil; // 放弃音频轨，不影响视频
-            }
-        }
-        if (aout && aIn) {
-            [reader addOutput:aout];
-            [writer addInput:aIn];
-        }
-    }
-
-    // 对齐 ZDY：渲染走 CPU（软件）路线。ZDY 用 CoreGraphics + CGBitmapContext 直接
-    // 把像素写进 CPU 可访问的缓冲；我们把缓冲改成 CPU 内存后，渲染也必须走 CPU，
-    // 保证像素真正落到 CPU 可见内存、编码器能读到，避免 GPU/IOSurface 的同步问题。
-    CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @YES }];
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-
-    // 对齐 ZDY @0x11cd78-0x11ceec：每帧用 CVPixelBufferCreate 新建缓冲，
-    // 属性为 BGRA + CGImageCompatibility + CGBitmapContextCompatibility（CPU 可访问），
-    // 渲染完立即 Release。ZDY 刻意不用 adaptor.pixelBufferPool——池化缓冲的类型由
-    // Adaptor 决定且被复用，在部分设备/尺寸上取不到或与编码器期望不符（pool 为 NULL
-    // 时 CVPixelBufferPoolCreatePixelBuffer 直接失败 → 写帧失败 → 导出中止）。
-    NSDictionary *pbAttrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-        (id)kCVPixelBufferCGImageCompatibilityKey : @YES,
-        (id)kCVPixelBufferCGBitmapContextCompatibilityKey : @YES,
-    };
-
-    if (![reader startReading] || ![writer startWriting]) {
-        if (error) *error = writer.error ?: reader.error ?: [NSError errorWithDomain:@"DDShell" code:-3 userInfo:@{NSLocalizedDescriptionKey : @"启动读写失败"}];
-        if (cs) CGColorSpaceRelease(cs);
-        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-        return nil;
-    }
-    // 会话时间轴从 0 起算：源样本 PTS 均 ≥0，保证不会落在会话起点之前被丢弃 / 报错
-    [writer startSessionAtSourceTime:kCMTimeZero];
-
-    __block BOOL ok = YES;
-    __block NSInteger framesWritten = 0;   // 真正写进去的帧数，最终校验用
-    dispatch_group_t grp = dispatch_group_create();
-
-    // 视频轨：逐帧透视套壳后写入。缓冲每帧新建（对齐 ZDY），渲染后交给 Adaptor 写
-    // ——只传 PTS，duration 由 AVAssetWriter 内部按后续帧推断，末帧无需特殊处理。
-    dispatch_queue_t vq = dispatch_queue_create("com.ddshell.vreader", DISPATCH_QUEUE_SERIAL);
-    dispatch_group_enter(grp);
-    [vIn requestMediaDataWhenReadyOnQueue:vq usingBlock:^{
-        while ([vIn isReadyForMoreMediaData]) {
-            CMSampleBufferRef sb = [vout copyNextSampleBuffer];
-            if (!sb) { [vIn markAsFinished]; dispatch_group_leave(grp); return; }
-            @autoreleasepool {
-                CVPixelBufferRef srcPB = CMSampleBufferGetImageBuffer(sb);
-                CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
-                CVPixelBufferRef outPB = NULL;
-                if (srcPB && CVPixelBufferCreate(kCFAllocatorDefault, (size_t)W, (size_t)H,
-                                                 kCVPixelFormatType_32BGRA,
-                                                 (__bridge CFDictionaryRef)pbAttrs,
-                                                 &outPB) == kCVReturnSuccess && outPB) {
-                    if (DD_RenderShellFrame(srcPB, t, W, H, pref, ci, cs, outPB)) {
-                        if ([adaptor appendPixelBuffer:outPB withPresentationTime:pts]) {
-                            framesWritten++;
-                        } else {
-                            ok = NO;   // 停止继续喂帧（ZDY @0x11cef4：append 失败即收尾，不重试）
-                        }
-                    } else {
-                        ok = NO;
-                    }
-                    CVPixelBufferRelease(outPB);
-                } else {
-                    ok = NO;
-                }
-            }
-            CFRelease(sb);
-            if (!ok) { [vIn markAsFinished]; dispatch_group_leave(grp); return; }
-        }
-    }];
-
-    // 音频轨：透传 PCM，由写入端编码为 AAC（时间戳自带，保证与视频同步）
-    if (aout && aIn) {
-        dispatch_queue_t aq = dispatch_queue_create("com.ddshell.areader", DISPATCH_QUEUE_SERIAL);
-        dispatch_group_enter(grp);
-        [aIn requestMediaDataWhenReadyOnQueue:aq usingBlock:^{
-            while ([aIn isReadyForMoreMediaData]) {
-                CMSampleBufferRef sb = [aout copyNextSampleBuffer];
-                if (!sb) { [aIn markAsFinished]; dispatch_group_leave(grp); return; }
-                // 对齐 ZDY @0x11d1f0-0x11d21c：音频 append 失败**只丢弃音频轨**，
-                // 不把整次导出判失败。
-                // 源音频不是 MP4 可直接承载的编码（非 AAC / 非常规采样率）时，
-                // passthrough 的 appendSampleBuffer: 会失败并让 writer 报
-                // AVErrorCannotEncodeMedia —— 这正是"有的视频一选就弹无法编码媒体"
-                // 的高频来源。ZDY 遇到这种情况只是 markAsFinished 收掉音频，
-                // 视频照常导出、照常存相册。之前我们是 ok=NO 让整单失败，
-                // 于是明明能出片的视频被音频拖垮。
-                if (![aIn appendSampleBuffer:sb]) {
-                    [aIn markAsFinished];   // 丢音频，不置 ok
-                    CFRelease(sb);
-                    dispatch_group_leave(grp); return;
-                }
-                CFRelease(sb);
-            }
-        }];
-    }
-
-    // 对齐 ZDY @0xcb33c-0xcb35c：主帧泵等待 600s（实测 0x8BB2C97000 ns = 600s）。
-    // 不能用 DISPATCH_TIME_FOREVER —— 帧泵回调不来就永久卡死，UI 一直转圈无任何提示。
-    BOOL pumped = (dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW,
-                                       (int64_t)(600.0 * NSEC_PER_SEC))) == 0);
-    if (!pumped) {
-        // 对齐 ZDY @0xcb360-0xcb3ec：超时也要把两条轨 markAsFinished 后 cancel，
-        // 并删掉半成品，绝不把它交给照片库（那是 3302 的直接来源）。
-        [vIn markAsFinished];
-        if (aIn) [aIn markAsFinished];
-        [reader cancelReading];
-        [writer cancelWriting];
-        if (cs) CGColorSpaceRelease(cs);
-        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-5
-                userInfo:@{NSLocalizedDescriptionKey : @"导出处理超时"}];
-        return nil;
-    }
+    ex.outputURL        = [NSURL fileURLWithPath:outPath];
+    ex.outputFileType   = AVFileTypeMPEG4;
+    ex.videoComposition = comp;   // 音频由 preset 自动处理，不需要自己搭轨
 
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-    // 对齐 ZDY @0xcb4bc-0xcb4dc：60s 超时（实测 0xDF8475800 ns）。
-    // 不能用 DISPATCH_TIME_FOREVER——收尾回调不来就永久卡住，UI 一直转圈没有任何提示。
-    BOOL finished = (dispatch_semaphore_wait(sem,
-                        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC))) == 0);
-
-    if (cs) CGColorSpaceRelease(cs);
-
-    if (!finished) {
-        // 对齐 ZDY @0xcb360-0xcb3ec：取消读写 + 删掉半成品，绝不把它交给照片库
-        [reader cancelReading];
-        [writer cancelWriting];
+    [ex exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                (int64_t)(600.0 * NSEC_PER_SEC))) != 0) {
+        [ex cancelExport];
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
         if (error) *error = [NSError errorWithDomain:@"DDShell" code:-5
-                userInfo:@{NSLocalizedDescriptionKey : @"导出收尾超时"}];
+                userInfo:@{NSLocalizedDescriptionKey : @"导出超时"}];
         return nil;
     }
-
-    // 对齐 ZDY @0xcb530-0xcb57c：ZDY 最终**只**看 writer.status == Completed(2) + 文件存在，
-    // 不看单帧 append 的成败（@0x11cfa4：append 失败也只是 markAsFinished 两条轨然后收尾，
-    // 让 finishWriting 的 status 说话）。
-    // 我们比 ZDY 只多一条底线：一帧都没写进去就一定判失败——0 帧的 mp4 才是 3302 的真凶。
-    // 之前用 "|| !ok" 只要中途有一帧失败就整单失败，比 ZDY 严格得多，
-    // 于是明明能出片的视频被判死，报出来的就是 writer.error = "无法编码媒体"。
-    if (writer.status != AVAssetWriterStatusCompleted || framesWritten == 0) {
-        if (error) *error = writer.error ?: [NSError errorWithDomain:@"DDShell" code:-4 userInfo:@{NSLocalizedDescriptionKey : (framesWritten == 0 ? @"视频帧写入失败" : @"视频写入未完成")}];
-        [writer cancelWriting]; // 对齐 ZDY：失败也显式取消（会一并清理已写入的文件）
-        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil]; // 半截 mp4 回收
-        return nil;
-    }
-    // 对齐 ZDY @0xcb540-0xcb55c：成功也要确认产物真的落在磁盘上，
-    // 避免拿一个不存在的路径去存相册（那正是 3302 InvalidResource 的典型诱因）。
-    if (![[NSFileManager defaultManager] fileExistsAtPath:outPath]) {
-        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-6
-                userInfo:@{NSLocalizedDescriptionKey : @"导出产物缺失"}];
+    if (ex.status != AVAssetExportSessionStatusCompleted ||
+        ![[NSFileManager defaultManager] fileExistsAtPath:outPath]) {
+        NSError *e = ex.error;
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+        if (error) *error = e ?: [NSError errorWithDomain:@"DDShell" code:-4
+                userInfo:@{NSLocalizedDescriptionKey : @"导出失败"}];
         return nil;
     }
     return [NSURL fileURLWithPath:outPath];
 }
 
-// 视频存相册，存完回调（成功才删临时文件，失败保留以便排查，下次启动会清理）
+// 视频存相册。临时文件**必须**在 performChanges 的 completion 之后才删：
+// photolibraryd 正是在这个过程中去读文件的，提前删掉就是 3302。
 static void DD_SaveVideoToAlbum(NSURL *url, void (^done)(BOOL success, NSError *err)) {
     [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
         [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:url];
     } completionHandler:^(BOOL success, NSError *error) {
-        if (success) [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
         if (done) done(success, error);
     }];
 }
@@ -1974,7 +1700,10 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
             if (success) {
                 DD_ShowShellDone();
             } else {
-                DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
+                // 带上 domain/code：不同的 code 指向完全不同的原因，光看中文描述区分不出来
+                NSString *msg = err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败";
+                if (err) msg = [msg stringByAppendingFormat:@" [%@:%ld]", err.domain, (long)err.code];
+                DD_ShowError(msg);
             }
         });
     });
