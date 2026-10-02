@@ -265,6 +265,20 @@ static CIVector *DD_CIVec(CGPoint p, CGFloat canvasH) {
     return [CIVector vectorWithCGPoint:CGPointMake(p.x, canvasH - p.y)];
 }
 
+// 模板四角在画布里围出的屏幕窗包围盒（用来把源按 contain 预缩到窗口尺寸）
+static CGRect DD_WindowBBox(DDShellTemplate *t) {
+    CGFloat xs[4] = { t.lt.x, t.rt.x, t.rb.x, t.lb.x };
+    CGFloat ys[4] = { t.lt.y, t.rt.y, t.rb.y, t.lb.y };
+    CGFloat minX = xs[0], maxX = xs[0], minY = ys[0], maxY = ys[0];
+    for (int i = 1; i < 4; i++) {
+        if (xs[i] < minX) minX = xs[i];
+        if (xs[i] > maxX) maxX = xs[i];
+        if (ys[i] < minY) minY = ys[i];
+        if (ys[i] > maxY) maxY = ys[i];
+    }
+    return CGRectMake(minX, minY, maxX - minX, maxY - minY);
+}
+
 static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (!shot || !t) return nil;
     UIImage *frameImg = t.image;
@@ -286,13 +300,16 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
 
-    // 整张截图透视映射到 cfg 四角围成的屏幕窗；
-    // inputExtent 用截图自身像素尺寸，四角落在模板画布坐标系里，保证 1:1 贴合。
-    CIImage *src = [CIImage imageWithCGImage:shotCG];
+    // 源先按 contain 预缩到屏幕窗尺寸，再做透视映射。直接把大图整张透视，中间图会被
+    // 拉得过大、逐帧合成容易卡死或被相册拒收（ZDY 即先预缩放再透视）。
+    CGRect wb = DD_WindowBBox(t);
+    CGFloat sc = MIN(wb.size.width / A, wb.size.height / B);
+    if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
+    CIImage *src = [[CIImage imageWithCGImage:shotCG] imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
     CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
     [f setDefaults];
     [f setValue:src forKey:kCIInputImageKey];
-    [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, A, B)] forKey:@"inputExtent"];
+    [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, A * sc, B * sc)] forKey:@"inputExtent"];
     [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
     [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
     [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
@@ -375,6 +392,7 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         DDShellVideoInstruction *inst = (DDShellVideoInstruction *)req.videoCompositionInstruction;
         DDShellTemplate *t = inst.tpl;
         CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
+        CGRect wb = DD_WindowBBox(t);
 
         CMPersistentTrackID tid = [(NSNumber *)inst.requiredSourceTrackIDs.firstObject intValue];
         CVPixelBufferRef src = [req sourceFrameByTrackID:tid];
@@ -383,12 +401,23 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         CVPixelBufferRef dst = [req.renderContext newPixelBuffer];
         if (!dst) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-2 userInfo:nil]]; return; }
 
-        // 源帧先按视频自带旋转摆正，再整张透视映射到模板四角围成的窗口（与图片套壳同一套透视）
-        CIImage *srcImg = [[CIImage imageWithCVPixelBuffer:src] imageByApplyingTransform:inst.preferredTransform];
+        // 源帧先按视频自带旋转摆正；preferredTransform 常带位移把旋转后的帧挪回正位，
+        // 其 extent 原点往往不为 0。先把原点归零再按 contain 预缩到屏幕窗尺寸，最后透视
+        // 映射到窗口——避免把巨大坐标 / 大分辨率直接喂进透视导致中间图过大、投影退化，
+        // 导出失败或相册拒收（ZDY 即先预缩放再透视）。
+        CIImage *raw = [CIImage imageWithCVPixelBuffer:src];
+        CIImage *rot = [raw imageByApplyingTransform:inst.preferredTransform];
+        CGRect re = rot.extent;
+        CGFloat sc = MIN(wb.size.width / re.size.width, wb.size.height / re.size.height);
+        if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
+        CGAffineTransform norm = CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y);
+        norm = CGAffineTransformConcat(norm, CGAffineTransformMakeScale(sc, sc));
+        CIImage *srcImg = [rot imageByApplyingTransform:norm];
+
         CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
         [f setDefaults];
         [f setValue:srcImg forKey:kCIInputImageKey];
-        [f setValue:[CIVector vectorWithCGRect:srcImg.extent] forKey:@"inputExtent"];
+        [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, re.size.width * sc, re.size.height * sc)] forKey:@"inputExtent"];
         [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
         [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
         [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
@@ -450,12 +479,13 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     return result;
 }
 
-// 视频存相册，存完删临时文件（视频不会被自动套壳逻辑误读，无需标记已处理）
-static void DD_SaveVideoToAlbum(NSURL *url) {
+// 视频存相册，存完回调（成功才删临时文件，失败保留以便排查，下次启动会清理）
+static void DD_SaveVideoToAlbum(NSURL *url, void (^done)(BOOL success, NSError *err)) {
     [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
         [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:url];
     } completionHandler:^(BOOL success, NSError *error) {
-        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        if (success) [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        if (done) done(success, error);
     }];
 }
 
@@ -1555,8 +1585,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSURL *outURL = DD_ComposeShellVideo(url, t);
         if (!outURL) { DD_ShowError(@"套壳失败"); return; }
-        DD_SaveVideoToAlbum(outURL); // 相册选视频套壳不删除原视频
-        DD_ShowShellDone();
+        // 相册选视频套壳不删除原视频；成功提示必须等相册真正存好再弹，避免存失败也报成功
+        DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
+            if (success) {
+                DD_ShowShellDone();
+            } else {
+                DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
+            }
+        });
     });
 }
 
