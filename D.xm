@@ -479,7 +479,6 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
 // 逐帧合成器：每帧把源视频帧透视贴进模板窗口，再叠机身图，输出到像素缓冲
 @interface DDShellVideoCompositor : NSObject <AVVideoCompositing>
-@property (nonatomic, strong) dispatch_queue_t renderingQueue;
 @property (atomic, assign)   BOOL             shouldCancelAllRequests;
 - (void)_renderOneRequest:(AVAsynchronousVideoCompositionRequest *)req;
 @end
@@ -494,7 +493,6 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (self) {
         _ctx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
         _cs  = CGColorSpaceCreateDeviceRGB();
-        _renderingQueue = dispatch_queue_create("com.ddshell.video.compositor", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
@@ -516,9 +514,10 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 }
 - (void)startVideoCompositionRequest:(AVAsynchronousVideoCompositionRequest *)req {
     if (self.shouldCancelAllRequests) { [req finishCancelledRequest]; return; }
-    dispatch_async(self.renderingQueue, ^{
-        @autoreleasepool { [self _renderOneRequest:req]; }
-    });
+    // 注意：AVAssetExportSession 的自定义合成器必须同步完成（start 返回前调用
+    // finish*），否则延迟到自建队列提交的帧不会被导出管线泵送，最终导出“成功”
+    // 但画面全黑（空白视频）。AVPlayerItem 播放链路才支持真正的异步合成。
+    [self _renderOneRequest:req];
 }
 
 - (void)_renderOneRequest:(AVAsynchronousVideoCompositionRequest *)req {
