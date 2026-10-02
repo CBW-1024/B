@@ -500,7 +500,7 @@ static void DD_LatestImageAsset(void (^done)(PHAsset *)) {
     done([r firstObject]);
 }
 
-static void DD_SaveImageToAlbum(UIImage *img) {
+static void DD_SaveImageToAlbum(UIImage *img, void (^done)(BOOL success, NSError *err)) {
     __block PHObjectPlaceholder *ph = nil;
     [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
         PHAssetChangeRequest *req = [PHAssetChangeRequest creationRequestForAssetFromImage:img];
@@ -510,6 +510,7 @@ static void DD_SaveImageToAlbum(UIImage *img) {
         if (success && ph.localIdentifier.length) {
             [[DDShellConfig shared] markProcessed:ph.localIdentifier];
         }
+        if (done) done(success, error);   // 真正存好/失败后才回调
     }];
 }
 
@@ -633,11 +634,17 @@ static void DD_ShowToast(NSString *text) {
                                                 resultHandler:^(UIImage *img, NSDictionary *info) {
             UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
             if (!outImg) { DD_ShowError(@"套壳失败"); completion(); return; }
-            DD_SaveImageToAlbum(outImg);
-            [[DDShellConfig shared] markProcessed:asset.localIdentifier];
-            if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
-            DD_ShowShellDone();
-            completion();
+            // 成功提示必须等相册真正存好再弹，避免存失败也报成功；
+            // 删除原图也放在成功分支，存失败时不删，避免原图丢失
+            DD_SaveImageToAlbum(outImg, ^(BOOL success, NSError *err) {
+                if (success) {
+                    if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
+                    DD_ShowShellDone();
+                } else {
+                    DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
+                }
+                completion();
+            });
         }];
     });
 }
@@ -1570,8 +1577,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         UIImage *outImg = DD_ComposeShellImage(img, t);
         if (!outImg) { DD_ShowError(@"套壳失败"); return; }
-        DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
-        DD_ShowShellDone();
+        // 相册选图套壳不删除原图；成功提示必须等相册真正存好再弹，避免存失败也报成功
+        DD_SaveImageToAlbum(outImg, ^(BOOL success, NSError *err) {
+            if (success) {
+                DD_ShowShellDone();
+            } else {
+                DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
+            }
+        });
     });
 }
 
