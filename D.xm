@@ -491,7 +491,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     // 画布超过相册可导入上限时等比缩小：避免导出成功、但 PHPhotosErrorDomain 3302 拒收。
     // 经验安全上限：单边 ≤ 4096、总像素 ≤ 8294400（3840×2160），向下取偶对齐 H.264。
     CGFloat capW = 4096.0, capH = 4096.0, capPx = 8294400.0;
-    CGFloat s = MIN(1.0, capW / W, capH / H, sqrt(capPx / (W * H)));
+    CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
     if (s < 1.0) {
         CGFloat nW = floor((W * s) / 2.0) * 2.0;
