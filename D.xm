@@ -10,6 +10,7 @@
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
 #import <CoreImage/CoreImage.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -307,6 +308,139 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     return img;
+}
+
+#pragma mark - 视频套壳（相册选视频，逐帧透视合成后导出）
+
+// 套壳指令：把模板和源视频的旋转信息带进自定义合成器。
+// customVideoCompositorClass 只认类、由框架自己实例化，参数没法从外部传实例，
+// 只能挂在 instruction 上，合成器每帧从 request 里取回来。
+@interface DDShellVideoInstruction : NSObject <AVVideoCompositionInstruction>
+@property (nonatomic)         CMTimeRange         timeRange;
+@property (nonatomic)         BOOL                enablePostProcessing;
+@property (nonatomic)         BOOL                containsTweening;
+@property (nonatomic, copy)   NSArray<NSValue *> *requiredSourceTrackIDs;
+@property (nonatomic)         CMPersistentTrackID passthroughTrackID;
+@property (nonatomic, strong) DDShellTemplate    *tpl;
+@property (nonatomic)         CGAffineTransform   preferredTransform;
+@end
+
+@implementation DDShellVideoInstruction
+@end
+
+// 逐帧合成器：每帧把源视频帧透视贴进模板窗口，再叠机身图，输出到像素缓冲
+@interface DDShellVideoCompositor : NSObject <AVVideoCompositing>
+@end
+
+@implementation DDShellVideoCompositor {
+    CIContext      *_ctx;
+    CGColorSpaceRef _cs;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _ctx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
+        _cs  = CGColorSpaceCreateDeviceRGB();
+    }
+    return self;
+}
+- (void)dealloc {
+    if (_cs) CGColorSpaceRelease(_cs);
+}
+- (NSDictionary *)requiredPixelBufferAttributesForRenderContext {
+    return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+              (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
+}
+- (NSDictionary *)sourcePixelBufferAttributes {
+    return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+              (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
+}
+- (void)cancelAllPendingVideoCompositionRequests {}
+- (void)startVideoCompositionRequest:(AVAsynchronousVideoCompositionRequest *)req {
+    @autoreleasepool {
+        DDShellVideoInstruction *inst = (DDShellVideoInstruction *)req.videoCompositionInstruction;
+        DDShellTemplate *t = inst.tpl;
+        CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
+
+        CMPersistentTrackID tid = [(NSNumber *)inst.requiredSourceTrackIDs.firstObject intValue];
+        CVPixelBufferRef src = [req sourceFrameByTrackID:tid];
+        if (!src) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-1 userInfo:nil]]; return; }
+
+        CVPixelBufferRef dst = [req.renderContext newPixelBuffer];
+        if (!dst) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-2 userInfo:nil]]; return; }
+
+        // 源帧先按视频自带旋转摆正，再整张透视映射到模板四角围成的窗口（与图片套壳同一套透视）
+        CIImage *srcImg = [[CIImage imageWithCVPixelBuffer:src] imageByApplyingTransform:inst.preferredTransform];
+        CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
+        [f setDefaults];
+        [f setValue:srcImg forKey:kCIInputImageKey];
+        [f setValue:[CIVector vectorWithCGRect:srcImg.extent] forKey:@"inputExtent"];
+        [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
+        [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
+        [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
+        [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
+        CIImage *warped = f.outputImage;
+
+        CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
+        CIImage *outImg = [frame imageByCompositingOverImage:warped]; // 机身图盖在最上层
+        [_ctx render:outImg toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
+
+        [req finishWithComposedVideoFrame:dst];
+        CVPixelBufferRelease(dst);
+    }
+}
+@end
+
+// 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）
+static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
+    AVURLAsset *asset = [AVURLAsset assetWithURL:srcURL];
+    AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+    if (!vt) return nil;
+
+    CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
+    if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
+
+    NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [[NSUUID UUID].UUIDString stringByAppendingPathExtension:@"mp4"]];
+
+    AVMutableVideoComposition *vc = [AVMutableVideoComposition videoComposition];
+    vc.renderSize = CGSizeMake(W, H);
+    CMTime fd = vt.minFrameDuration;
+    vc.frameDuration = (fd.timescale && fd.value) ? fd : CMTimeMake(1, 30);
+
+    DDShellVideoInstruction *inst = [DDShellVideoInstruction new];
+    inst.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
+    inst.enablePostProcessing = NO;
+    inst.containsTweening = NO;
+    inst.requiredSourceTrackIDs = @[ @(vt.trackID) ];
+    inst.tpl = t;
+    inst.preferredTransform = vt.preferredTransform;
+    vc.instructions = @[ inst ];
+    vc.customVideoCompositorClass = [DDShellVideoCompositor class];
+
+    __block NSURL *result = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
+                                                            presetName:AVAssetExportPresetHighestQuality];
+    ex.outputURL = [NSURL fileURLWithPath:outPath];
+    ex.outputFileType = AVFileTypeMPEG4;
+    ex.videoComposition = vc;
+    [ex exportAsynchronouslyWithCompletionHandler:^{
+        result = (ex.status == AVAssetExportSessionStatusCompleted) ? ex.outputURL : nil;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    return result;
+}
+
+// 视频存相册，存完删临时文件（视频不会被自动套壳逻辑误读，无需标记已处理）
+static void DD_SaveVideoToAlbum(NSURL *url) {
+    [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
+        [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:url];
+    } completionHandler:^(BOOL success, NSError *error) {
+        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+    }];
 }
 
 #pragma mark - 相册
@@ -1316,6 +1450,10 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         [section addCell:[cellCls normalCellForSel:@selector(pickFromAlbumTapped:)
                                             target:self title:@"↳相册选图套壳"
                                          rightValue:nil]];
+
+        [section addCell:[cellCls normalCellForSel:@selector(pickVideoFromAlbumTapped:)
+                                            target:self title:@"↳相册视频套壳"
+                                         rightValue:nil]];
     }
 
     [self.tableViewMgr addSection:section];
@@ -1340,11 +1478,10 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [self buildTable];
 }
 
-#pragma mark - 相册选图套壳
+#pragma mark - 相册选图/选视频套壳
 
 // 从相册挑选一张图，套入当前模板后存回相册（不删除所选原图）
 - (void)pickFromAlbumTapped:(id)sender {
-    // 没有可用模板就挡住，不让用户白挑一张图
     if (!DD_TemplateNamed(DD_ActiveTemplateName())) { DD_ShowToast(@"模板未选择"); return; }
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
@@ -1353,20 +1490,56 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [self presentViewController:picker animated:YES completion:nil];
 }
 
+// 从相册挑选一段视频，套入当前模板后导出存回相册（不删除所选原视频）
+- (void)pickVideoFromAlbumTapped:(id)sender {
+    if (!DD_TemplateNamed(DD_ActiveTemplateName())) { DD_ShowToast(@"模板未选择"); return; }
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.mediaTypes = @[ @"public.movie" ];   // 只挑视频
+    picker.delegate = self;
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
     [picker dismissViewControllerAnimated:YES completion:^{
-        UIImage *img = info[UIImagePickerControllerOriginalImage];
-        DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
-        if (!t) { DD_ShowError(@"套壳失败"); return; } // 选图期间模板可能已经被删了
-        // 合成要开全尺寸画布，丢后台跑，主线程留着转 loading
-        DD_ShowLoading(@"正在套壳");
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            UIImage *outImg = DD_ComposeShellImage(img, t);
-            if (!outImg) { DD_ShowError(@"套壳失败"); return; }
-            DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
-            DD_ShowShellDone();
-        });
+        // 图片与视频共用一个回调，按媒体类型分流
+        if ([info[UIImagePickerControllerMediaType] isEqualToString:@"public.movie"]) {
+            [self handlePickedVideo:info];
+        } else {
+            [self handlePickedImage:info];
+        }
     }];
+}
+
+// 相册选图套壳：单张图透视贴入模板，存回相册
+- (void)handlePickedImage:(NSDictionary *)info {
+    UIImage *img = info[UIImagePickerControllerOriginalImage];
+    DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
+    if (!t) { DD_ShowError(@"套壳失败"); return; } // 选图期间模板可能已经被删了
+    // 合成要开全尺寸画布，丢后台跑，主线程留着转 loading
+    DD_ShowLoading(@"正在套壳");
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        UIImage *outImg = DD_ComposeShellImage(img, t);
+        if (!outImg) { DD_ShowError(@"套壳失败"); return; }
+        DD_SaveImageToAlbum(outImg); // 相册选图套壳不删除原图
+        DD_ShowShellDone();
+    });
+}
+
+// 相册选视频套壳：逐帧透视合成后导出 mp4，存回相册
+- (void)handlePickedVideo:(NSDictionary *)info {
+    NSURL *url = info[UIImagePickerControllerMediaURL];
+    DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
+    if (!url || !t) { DD_ShowError(@"套壳失败"); return; } // 选视频期间模板可能已经被删了
+    // 逐帧合成 + 导出是重活，丢后台跑，主线程留着转 loading
+    DD_ShowLoading(@"正在套壳");
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSURL *outURL = DD_ComposeShellVideo(url, t);
+        if (!outURL) { DD_ShowError(@"套壳失败"); return; }
+        DD_SaveVideoToAlbum(outURL); // 相册选视频套壳不删除原视频
+        DD_ShowShellDone();
+    });
 }
 
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
