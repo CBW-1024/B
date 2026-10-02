@@ -11,6 +11,7 @@
 #import <Photos/Photos.h>
 #import <CoreImage/CoreImage.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -340,143 +341,198 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
 #pragma mark - 视频套壳（相册选视频，逐帧透视合成后导出）
 
-// 套壳指令：把模板和源视频的旋转信息带进自定义合成器。
-// customVideoCompositorClass 只认类、由框架自己实例化，参数没法从外部传实例，
-// 只能挂在 instruction 上，合成器每帧从 request 里取回来。
-@interface DDShellVideoInstruction : NSObject <AVVideoCompositionInstruction>
-@property (nonatomic)         CMTimeRange         timeRange;
-@property (nonatomic)         BOOL                enablePostProcessing;
-@property (nonatomic)         BOOL                containsTweening;
-@property (nonatomic)         NSArray<NSValue *> *requiredSourceTrackIDs;
-@property (nonatomic)         CMPersistentTrackID passthroughTrackID;
-@property (nonatomic, strong) DDShellTemplate    *tpl;
-@property (nonatomic)         CGAffineTransform   preferredTransform;
-@end
+// 把一帧源像素缓冲套壳成画布大小，渲染进 outBuf。
+// 与图片路径一致：源先按 contain 预缩到屏幕窗、再做透视映射，机身图盖最上层。
+// 旋转摆正交给读取端（AVAssetReaderTrackOutput.appliesPreferredTrackTransform），
+// 这里拿到的已经是标准方向、原点为 0 的帧，无需再处理 preferredTransform。
+static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
+                               NSInteger W, NSInteger H,
+                               CIContext *ci, CGColorSpaceRef cs, CVPixelBufferRef outBuf) {
+    if (!srcPB || !outBuf) return NO;
+    CIImage *raw = [CIImage imageWithCVPixelBuffer:srcPB];
+    CGFloat sW = (CGFloat)CVPixelBufferGetWidth(srcPB);
+    CGFloat sH = (CGFloat)CVPixelBufferGetHeight(srcPB);
+    if (sW < 1.0 || sH < 1.0) return NO;
 
-@implementation DDShellVideoInstruction
-@end
+    // contain 预缩到屏幕窗（对齐 ZDY 先预缩放再透视，避免大分辨率直接透视导致投影退化）
+    CGRect wb = DD_WindowBBox(t);
+    CGFloat sc = MIN(wb.size.width / sW, wb.size.height / sH);
+    if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
+    CIImage *srcImg = [raw imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
 
-// 逐帧合成器：每帧把源视频帧透视贴进模板窗口，再叠机身图，输出到像素缓冲
-@interface DDShellVideoCompositor : NSObject <AVVideoCompositing>
-@end
+    CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
+    [f setDefaults];
+    [f setValue:srcImg forKey:kCIInputImageKey];
+    [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, sW * sc, sH * sc)] forKey:@"inputExtent"];
+    [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
+    [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
+    [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
+    [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
+    CIImage *warped = f.outputImage;
 
-@implementation DDShellVideoCompositor {
-    CIContext      *_ctx;
-    CGColorSpaceRef _cs;
+    CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
+    CIImage *outImg = [frame imageByCompositingOverImage:warped]; // 机身图盖在最上层
+    [ci render:outImg toCVPixelBuffer:outBuf bounds:CGRectMake(0, 0, W, H) colorSpace:cs];
+    return YES;
 }
 
-- (instancetype)init {
-    self = [super init];
-    if (self) {
-        _ctx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
-        _cs  = CGColorSpaceCreateDeviceRGB();
-    }
-    return self;
-}
-- (void)dealloc {
-    if (_cs) CGColorSpaceRelease(_cs);
-}
-// 渲染上下文变化（尺寸/像素格式等），本合成器每帧直接从 request 取 renderContext，无需缓存
-- (void)renderContextChanged:(AVVideoCompositionRenderContext *)newRenderContext {}
-- (NSDictionary *)requiredPixelBufferAttributesForRenderContext {
-    return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-              (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
-}
-- (NSDictionary *)sourcePixelBufferAttributes {
-    return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-              (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
-}
-- (void)cancelAllPendingVideoCompositionRequests {}
-- (void)startVideoCompositionRequest:(AVAsynchronousVideoCompositionRequest *)req {
-    @autoreleasepool {
-        DDShellVideoInstruction *inst = (DDShellVideoInstruction *)req.videoCompositionInstruction;
-        DDShellTemplate *t = inst.tpl;
-        CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
-        CGRect wb = DD_WindowBBox(t);
-
-        CMPersistentTrackID tid = [(NSNumber *)inst.requiredSourceTrackIDs.firstObject intValue];
-        CVPixelBufferRef src = [req sourceFrameByTrackID:tid];
-        if (!src) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-1 userInfo:nil]]; return; }
-
-        CVPixelBufferRef dst = [req.renderContext newPixelBuffer];
-        if (!dst) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-2 userInfo:nil]]; return; }
-
-        // 源帧先按视频自带旋转摆正；preferredTransform 常带位移把旋转后的帧挪回正位，
-        // 其 extent 原点往往不为 0。先把原点归零再按 contain 预缩到屏幕窗尺寸，最后透视
-        // 映射到窗口——避免把巨大坐标 / 大分辨率直接喂进透视导致中间图过大、投影退化，
-        // 导出失败或相册拒收（ZDY 即先预缩放再透视）。
-        CIImage *raw = [CIImage imageWithCVPixelBuffer:src];
-        CIImage *rot = [raw imageByApplyingTransform:inst.preferredTransform];
-        CGRect re = rot.extent;
-        CGFloat sc = MIN(wb.size.width / re.size.width, wb.size.height / re.size.height);
-        if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-        CGAffineTransform norm = CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y);
-        norm = CGAffineTransformConcat(norm, CGAffineTransformMakeScale(sc, sc));
-        CIImage *srcImg = [rot imageByApplyingTransform:norm];
-
-        CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
-        [f setDefaults];
-        [f setValue:srcImg forKey:kCIInputImageKey];
-        [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, re.size.width * sc, re.size.height * sc)] forKey:@"inputExtent"];
-        [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
-        [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
-        [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
-        [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
-        CIImage *warped = f.outputImage;
-
-        CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
-        CIImage *outImg = [frame imageByCompositingOverImage:warped]; // 机身图盖在最上层
-        [_ctx render:outImg toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
-
-        [req finishWithComposedVideoFrame:dst];
-        CVPixelBufferRelease(dst);
-    }
-}
-@end
-
-// 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）
+// 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）。
+// 走 AVAssetReader + AVAssetWriter 手动管线（对齐 ZDY），输出尺寸 / 编码 / 封装 / 音频全部
+// 显式指定，彻底受控——规避系统 AVAssetExportSession 自动决策在大尺寸 / 非对齐模板上
+// 产出被照片库判为 InvalidResource（PHPhotosErrorDomain 3302）的 mp4。
 static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     AVURLAsset *asset = [AVURLAsset assetWithURL:srcURL];
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
     if (!vt) return nil;
 
-    CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
-    if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
+    CGFloat cw = t.canvasSize.width, ch = t.canvasSize.height;
+    if (cw < 2.0 || ch < 2.0 || cw > 8192.0 || ch > 8192.0) return nil; // 画布尺寸同样卡上限
+    // H.264 要求宽高均为偶数；模板画布若非偶数，整体对齐到偶数（变化 ≤1px，无可见影响）
+    NSInteger W = (NSInteger)round(cw), H = (NSInteger)round(ch);
+    if (W % 2) W += 1;
+    if (H % 2) H += 1;
 
     NSString *outPath = [DD_TempRoot() stringByAppendingPathComponent:
                          [[NSUUID UUID].UUIDString stringByAppendingPathExtension:@"mp4"]];
-
-    AVMutableVideoComposition *vc = [AVMutableVideoComposition videoComposition];
-    vc.renderSize = CGSizeMake(W, H);
-    CMTime fd = vt.minFrameDuration;
-    vc.frameDuration = (fd.timescale && fd.value) ? fd : CMTimeMake(1, 30);
-
-    DDShellVideoInstruction *inst = [DDShellVideoInstruction new];
-    inst.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
-    inst.enablePostProcessing = NO;
-    inst.containsTweening = NO;
-    inst.requiredSourceTrackIDs = @[ @(vt.trackID) ];
-    inst.tpl = t;
-    inst.preferredTransform = vt.preferredTransform;
-    vc.instructions = @[ inst ];
-    vc.customVideoCompositorClass = [DDShellVideoCompositor class];
-
-    __block NSURL *result = nil;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
-                                                            presetName:AVAssetExportPresetHighestQuality];
-    ex.outputURL = [NSURL fileURLWithPath:outPath];
-    ex.outputFileType = AVFileTypeMPEG4;
-    ex.videoComposition = vc;
-    [ex exportAsynchronouslyWithCompletionHandler:^{
-        result = (ex.status == AVAssetExportSessionStatusCompleted) ? ex.outputURL : nil;
-        dispatch_semaphore_signal(sem);
-    }];
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-    if (!result) { // 导出失败，半截 mp4 回收，避免留在临时目录
+    if ([[NSFileManager defaultManager] fileExistsAtPath:outPath])
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+
+    NSError *err = nil;
+    AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
+    if (!reader) return nil;
+    AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:outPath]
+                                                     fileType:AVFileTypeMPEG4 error:&err];
+    if (!writer) { [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil]; return nil; }
+
+    // 读取端：直读像素，并在读取时按视频自带旋转摆正（与 ZDY setAppliesPreferredTrackTransform 一致）
+    AVAssetReaderTrackOutput *vout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:vt
+                                                                              outputSettings:@{
+        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+    }];
+    vout.alwaysCopiesSampleData = NO;
+    vout.appliesPreferredTrackTransform = YES;
+    [reader addOutput:vout];
+
+    // 写入端：显式 H.264 + 显式尺寸 + 显式封装，彻底受控
+    AVAssetWriterInput *vIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                                                outputSettings:@{
+        AVVideoCodecKey: AVVideoCodecTypeH264,
+        AVVideoWidthKey: @(W),
+        AVVideoHeightKey: @(H),
+        AVVideoScalingModeKey: AVVideoScalingModeResizeAspectFill,
+    }];
+    vIn.expectsMediaDataInRealTime = NO;
+    AVAssetWriterInputPixelBufferAdaptor *adaptor =
+        [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:vIn
+                                                                   sourcePixelBufferAttributes:@{
+            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey : @(W),
+            (id)kCVPixelBufferHeightKey : @(H),
+            (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES,
+        }];
+    [writer addInput:vIn];
+
+    // 音频：读取端解压成 PCM，写入端重新编码为 AAC；源无音频则跳过（视频仍可正常导入）
+    AVAssetTrack *at = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+    AVAssetReaderTrackOutput *aout = nil;
+    AVAssetWriterInput *aIn = nil;
+    double aRate = 44100.0, aCh = 2.0;
+    if (at) {
+        CMFormatDescriptionRef fd = (__bridge CMFormatDescriptionRef)(at.formatDescriptions.firstObject);
+        if (fd) {
+            const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+            if (asbd) { aRate = asbd->mSampleRate ?: 44100.0; aCh = asbd->mChannelsPerFrame ?: 2.0; }
+        }
+        aout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at outputSettings:@{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVSampleRateKey: @(aRate),
+            AVNumberOfChannelsKey: @(aCh),
+            AVLinearPCMBitDepthKey: @16,
+            AVLinearPCMIsBigEndianKey: @NO,
+            AVLinearPCMIsFloatKey: @NO,
+            AVLinearPCMIsNonInterleavedKey: @NO,
+        }];
+        aout.alwaysCopiesSampleData = NO;
+        [reader addOutput:aout];
+        aIn = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:@{
+            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: @(aRate),
+            AVNumberOfChannelsKey: @(aCh),
+            AVEncoderBitRateKey: @(128000),
+        }];
+        aIn.expectsMediaDataInRealTime = NO;
+        [writer addInput:aIn];
     }
-    return result;
+
+    CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+
+    if (![reader startReading] || ![writer startWriting]) {
+        if (cs) CGColorSpaceRelease(cs);
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+        return nil;
+    }
+    // 会话时间轴从 0 起算：源样本 PTS 均 ≥0，保证不会落在会话起点之前被丢弃 / 报错
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    __block BOOL ok = YES;
+    dispatch_group_t grp = dispatch_group_create();
+
+    // 视频轨：逐帧透视套壳后写入
+    dispatch_queue_t vq = dispatch_queue_create("com.ddshell.vreader", DISPATCH_QUEUE_SERIAL);
+    dispatch_group_enter(grp);
+    [vIn requestMediaDataWhenReadyOnQueue:vq usingBlock:^{
+        while ([vIn isReadyForMoreMediaData]) {
+            CMSampleBufferRef sb = [vout copyNextSampleBuffer];
+            if (!sb) { [vIn markAsFinished]; dispatch_group_leave(grp); return; }
+            @autoreleasepool {
+                CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+                CVPixelBufferRef srcPB = CMSampleBufferGetImageBuffer(sb);
+                CVPixelBufferRef outPB = NULL;
+                if (srcPB && CVPixelBufferPoolCreatePixelBuffer(NULL, adaptor.pixelBufferPool, &outPB) == kCVReturnSuccess) {
+                    if (DD_RenderShellFrame(srcPB, t, W, H, ci, cs, outPB)) {
+                        if (![adaptor appendPixelBuffer:outPB withPresentationTimeStamp:pts]) ok = NO;
+                    } else {
+                        ok = NO;
+                    }
+                    CVPixelBufferRelease(outPB);
+                } else {
+                    ok = NO;
+                }
+            }
+            CFRelease(sb);
+            if (!ok) { [vIn markAsFinished]; dispatch_group_leave(grp); return; }
+        }
+    }];
+
+    // 音频轨：透传 PCM，由写入端编码为 AAC（时间戳自带，保证与视频同步）
+    if (aout && aIn) {
+        dispatch_queue_t aq = dispatch_queue_create("com.ddshell.areader", DISPATCH_QUEUE_SERIAL);
+        dispatch_group_enter(grp);
+        [aIn requestMediaDataWhenReadyOnQueue:aq usingBlock:^{
+            while ([aIn isReadyForMoreMediaData]) {
+                CMSampleBufferRef sb = [aout copyNextSampleBuffer];
+                if (!sb) { [aIn markAsFinished]; dispatch_group_leave(grp); return; }
+                if (![aIn appendSampleBuffer:sb]) ok = NO;
+                CFRelease(sb);
+                if (!ok) { [aIn markAsFinished]; dispatch_group_leave(grp); return; }
+            }
+        }];
+    }
+
+    dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+
+    if (cs) CGColorSpaceRelease(cs);
+
+    if (writer.status != AVAssetWriterStatusCompleted || !ok) {
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil]; // 半截 mp4 回收
+        return nil;
+    }
+    return [NSURL fileURLWithPath:outPath];
 }
 
 // 视频存相册，存完回调（成功才删临时文件，失败保留以便排查，下次启动会清理）
