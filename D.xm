@@ -343,22 +343,26 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
 // 把一帧源像素缓冲套壳成画布大小，渲染进 outBuf。
 // 与图片路径一致：源先按 contain 预缩到屏幕窗、再做透视映射，机身图盖最上层。
-// 旋转摆正交给读取端（AVAssetReaderTrackOutput.appliesPreferredTrackTransform），
-// 这里拿到的已经是标准方向、原点为 0 的帧，无需再处理 preferredTransform。
+// 源自带旋转由 pref（视频轨 preferredTransform）在这里摆正，再归一化原点后参与透视。
 static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
-                               NSInteger W, NSInteger H,
+                               NSInteger W, NSInteger H, CGAffineTransform pref,
                                CIContext *ci, CGColorSpaceRef cs, CVPixelBufferRef outBuf) {
     if (!srcPB || !outBuf) return NO;
     CIImage *raw = [CIImage imageWithCVPixelBuffer:srcPB];
-    CGFloat sW = (CGFloat)CVPixelBufferGetWidth(srcPB);
-    CGFloat sH = (CGFloat)CVPixelBufferGetHeight(srcPB);
+    // 按视频自带旋转摆正；preferredTransform 常带位移把旋转后的帧挪回正位，其 extent 原点
+    // 往往不为 0。先归一化原点再量尺寸，避免把巨大坐标直接喂进透视导致投影退化。
+    CIImage *rot = [raw imageByApplyingTransform:pref];
+    CGRect re = rot.extent;
+    CGFloat sW = re.size.width, sH = re.size.height;
     if (sW < 1.0 || sH < 1.0) return NO;
 
     // contain 预缩到屏幕窗（对齐 ZDY 先预缩放再透视，避免大分辨率直接透视导致投影退化）
     CGRect wb = DD_WindowBBox(t);
     CGFloat sc = MIN(wb.size.width / sW, wb.size.height / sH);
     if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-    CIImage *srcImg = [raw imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
+    CGAffineTransform norm = CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y);
+    norm = CGAffineTransformConcat(norm, CGAffineTransformMakeScale(sc, sc));
+    CIImage *srcImg = [rot imageByApplyingTransform:norm];
 
     CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
     [f setDefaults];
@@ -384,6 +388,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     AVURLAsset *asset = [AVURLAsset assetWithURL:srcURL];
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
     if (!vt) return nil;
+    CGAffineTransform pref = vt.preferredTransform; // 源自带旋转，在合成时摆正
 
     CGFloat cw = t.canvasSize.width, ch = t.canvasSize.height;
     if (cw < 2.0 || ch < 2.0 || cw > 8192.0 || ch > 8192.0) return nil; // 画布尺寸同样卡上限
@@ -404,13 +409,13 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
                                                      fileType:AVFileTypeMPEG4 error:&err];
     if (!writer) { [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil]; return nil; }
 
-    // 读取端：直读像素，并在读取时按视频自带旋转摆正（与 ZDY setAppliesPreferredTrackTransform 一致）
+    // 读取端：直读像素。旋转摆正放在合成函数里手动处理 preferredTransform，
+    // 避开 iOS17+ 已移除的 AVAssetReaderTrackOutput.appliesPreferredTrackTransform 属性。
     AVAssetReaderTrackOutput *vout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:vt
                                                                               outputSettings:@{
         (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
     }];
     vout.alwaysCopiesSampleData = NO;
-    vout.appliesPreferredTrackTransform = YES;
     [reader addOutput:vout];
 
     // 写入端：显式 H.264 + 显式尺寸 + 显式封装，彻底受控
@@ -422,14 +427,6 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
         AVVideoScalingModeKey: AVVideoScalingModeResizeAspectFill,
     }];
     vIn.expectsMediaDataInRealTime = NO;
-    AVAssetWriterInputPixelBufferAdaptor *adaptor =
-        [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:vIn
-                                                                   sourcePixelBufferAttributes:@{
-            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-            (id)kCVPixelBufferWidthKey : @(W),
-            (id)kCVPixelBufferHeightKey : @(H),
-            (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES,
-        }];
     [writer addInput:vIn];
 
     // 音频：读取端解压成 PCM，写入端重新编码为 AAC；源无音频则跳过（视频仍可正常导入）
@@ -467,6 +464,26 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
 
+    // 自建输出像素缓冲池，绕开 iOS17+ 已废弃的 AVAssetWriterInputPixelBufferAdaptor
+    CVPixelBufferPoolRef pbPool = NULL;
+    NSDictionary *poolAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferWidthKey : @(W),
+        (id)kCVPixelBufferHeightKey : @(H),
+        (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+    };
+    CVPixelBufferPoolCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttrs, &pbPool);
+    // 由一张样例缓冲推导输出格式描述，供后续把每帧包成 CMSampleBuffer 写入
+    CMVideoFormatDescriptionRef vfmt = NULL;
+    if (pbPool) {
+        CVPixelBufferRef probe = NULL;
+        if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pbPool, &probe) == kCVReturnSuccess) {
+            CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, probe, &vfmt);
+            CVPixelBufferRelease(probe);
+        }
+    }
+
     if (![reader startReading] || ![writer startWriting]) {
         if (cs) CGColorSpaceRelease(cs);
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
@@ -489,12 +506,19 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
                 CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
                 CVPixelBufferRef srcPB = CMSampleBufferGetImageBuffer(sb);
                 CVPixelBufferRef outPB = NULL;
-                if (srcPB && CVPixelBufferPoolCreatePixelBuffer(NULL, adaptor.pixelBufferPool, &outPB) == kCVReturnSuccess) {
-                    if (DD_RenderShellFrame(srcPB, t, W, H, ci, cs, outPB)) {
-                        if (![adaptor appendPixelBuffer:outPB withPresentationTimeStamp:pts]) ok = NO;
+                CMSampleBufferRef outSB = NULL;
+                if (srcPB && pbPool && CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pbPool, &outPB) == kCVReturnSuccess) {
+                    if (DD_RenderShellFrame(srcPB, t, W, H, pref, ci, cs, outPB) && vfmt) {
+                        CMSampleTimingInfo timing;
+                        timing.duration = kCMTimeInvalid;
+                        timing.presentationTimeStamp = pts;
+                        timing.decodeTimeStamp = kCMTimeInvalid;
+                        if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, outPB, vfmt, &timing, &outSB) == 0
+                            && outSB && ![vIn appendSampleBuffer:outSB]) ok = NO;
                     } else {
                         ok = NO;
                     }
+                    if (outSB) CFRelease(outSB);
                     CVPixelBufferRelease(outPB);
                 } else {
                     ok = NO;
@@ -527,6 +551,8 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
 
     if (cs) CGColorSpaceRelease(cs);
+    if (vfmt) CFRelease(vfmt);
+    if (pbPool) CVPixelBufferPoolRelease(pbPool);
 
     if (writer.status != AVAssetWriterStatusCompleted || !ok) {
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil]; // 半截 mp4 回收
