@@ -384,7 +384,7 @@ static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
 // 走 AVAssetReader + AVAssetWriter 手动管线（对齐 ZDY），输出尺寸 / 编码 / 封装 / 音频全部
 // 显式指定，彻底受控——规避系统 AVAssetExportSession 自动决策在大尺寸 / 非对齐模板上
 // 产出被照片库判为 InvalidResource（PHPhotosErrorDomain 3302）的 mp4。
-static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
+static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **error) {
     AVURLAsset *asset = [AVURLAsset assetWithURL:srcURL];
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
     if (!vt) return nil;
@@ -496,6 +496,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     }
 
     if (![reader startReading] || ![writer startWriting]) {
+        if (error) *error = writer.error ?: reader.error ?: [NSError errorWithDomain:@"DDShell" code:-3 userInfo:@{NSLocalizedDescriptionKey : @"启动读写失败"}];
         if (cs) CGColorSpaceRelease(cs);
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
         return nil;
@@ -514,16 +515,17 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
             CMSampleBufferRef sb = [vout copyNextSampleBuffer];
             if (!sb) { [vIn markAsFinished]; dispatch_group_leave(grp); return; }
             @autoreleasepool {
-                CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
                 CVPixelBufferRef srcPB = CMSampleBufferGetImageBuffer(sb);
                 CVPixelBufferRef outPB = NULL;
                 CMSampleBufferRef outSB = NULL;
                 if (srcPB && pbPool && CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pbPool, &outPB) == kCVReturnSuccess) {
                     if (DD_RenderShellFrame(srcPB, t, W, H, pref, ci, cs, outPB) && vfmt) {
+                        // 沿用源样本的完整 timing（含有效的 duration）。若手设
+                        // duration=kCMTimeInvalid，末帧没有“下一帧”可反推时长，
+                        // AVAssetWriter 在 finishWriting 会判时间轴无效而失败，
+                        // 表现即整段导出失败（outURL 为 nil）。这是手动管线的必现坑。
                         CMSampleTimingInfo timing;
-                        timing.duration = kCMTimeInvalid;
-                        timing.presentationTimeStamp = pts;
-                        timing.decodeTimeStamp = kCMTimeInvalid;
+                        CMSampleBufferGetSampleTimingInfo(sb, 0, &timing);
                         if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, outPB, vfmt, &timing, &outSB) == 0
                             && outSB && ![vIn appendSampleBuffer:outSB]) ok = NO;
                     } else {
@@ -566,6 +568,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     if (pbPool) CVPixelBufferPoolRelease(pbPool);
 
     if (writer.status != AVAssetWriterStatusCompleted || !ok) {
+        if (error) *error = writer.error ?: [NSError errorWithDomain:@"DDShell" code:-4 userInfo:@{NSLocalizedDescriptionKey : (ok ? @"视频写入未完成" : @"视频帧写入失败")}];
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil]; // 半截 mp4 回收
         return nil;
     }
@@ -1689,8 +1692,12 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     // 逐帧合成 + 导出是重活，丢后台跑，主线程留着转 loading
     DD_ShowLoading(@"正在套壳");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSURL *outURL = DD_ComposeShellVideo(url, t);
-        if (!outURL) { DD_ShowError(@"套壳失败"); return; }
+        NSError *compErr = nil;
+        NSURL *outURL = DD_ComposeShellVideo(url, t, &compErr);
+        if (!outURL) {
+            DD_ShowError(compErr.localizedDescription.length ? compErr.localizedDescription : @"套壳失败");
+            return;
+        }
         // 相册选视频套壳不删除原视频；成功提示必须等相册真正存好再弹，避免存失败也报成功
         DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
             if (success) {
