@@ -412,13 +412,113 @@ static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
 }
 
 // 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）。
-// 走 AVAssetReader + AVAssetWriter 手动管线（对齐 ZDY），输出尺寸 / 编码 / 封装 / 音频全部
-// 显式指定，彻底受控——规避系统 AVAssetExportSession 自动决策在大尺寸 / 非对齐模板上
-// 产出被照片库判为 InvalidResource（PHPhotosErrorDomain 3302）的 mp4。
+// 走 AVAssetReader + AVAssetWriter 手动管线（对齐 ZDY @0xc9b98 的视频套壳主路径），
+// 输出尺寸 / 编码 / 封装 / 音频全部显式指定。
+// 注意：ZDY 的手动管线能稳定，靠的不是管线本身，而是配套的三道闸——
+//   ① @0xc9bf0 先 loadValuesAsynchronouslyForKeys(@"tracks",@"duration") + 30s 超时等待；
+//   ② @0xcb4bc finishWritingWithCompletionHandler + 60s 超时；
+//   ③ @0xcb360 任何一步超时/失败 → cancelWriting + removeItemAtPath，绝不留半成品。
+// 缺任何一道都会退化成"无法编码媒体"或照片库 3302 InvalidResource。
+// —— 对齐 ZDY @0xe37b0-0xe38cc：把系统给的 mediaURL 先复制成自己的本地副本 ——
+// UIImagePickerControllerMediaURL 指向的是系统转码目录里的临时文件，picker 一旦
+// dismiss，系统随时可能回收它。ZDY 的做法是在回调里**同步**先把文件落到自己的
+// 临时目录（ss_pick_<uuid>.<ext>），之后再 dismiss、之后再丢后台处理。
+// 少了这一步，等到 AVAssetReader 真正去读时文件可能已经被删/被截断/还没写完：
+//   · 一开始就读不到 → writer 建 input / 写首帧即失败 → "无法编码媒体"(AVErrorCannotEncodeMedia)，
+//     表现正是"选完视频立刻弹错"；
+//   · 读到一半失效 → 产出时长异常或残缺的 mp4，fileExists 仍然通过，但照片库
+//     判为无效资源 → PHPhotosErrorDomain 3302，表现正是"转一会儿才失败"。
+// 另外 ZDY 在 copyItemAtURL: 失败时还会降级为 NSData 读入 + writeToFile:，
+// 说明它明确知道这个 URL 有可能读不出来。这里两条路都保留。
+// 对齐 ZDY：导出产物与暂存文件**必须落在 NSTemporaryDirectory()**（@0xca9d0 调 _NSTemporaryDirectory，
+// 文件名 ss_shell_<UUID>.mp4；暂存同理 @0xe37e4 也是 _NSTemporaryDirectory + ss_pick_<UUID>.<ext>）。
+// 不能用 Library/Caches 的子目录：creationRequestForAssetFromVideoAtFileURL: 是交给照片库守护进程
+// (photolibraryd / mediaserverd) 去真正打开并摄取这个文件的，系统只对 app 的 tmp 目录
+// 放行跨进程读取；放到 Caches 子目录时守护进程打不开文件 → PHPhotosErrorDomain 3302
+// (InvalidResource)。这正是"转一会儿才失败"的那一路。
+static NSString *DD_ShellTmpRoot(void) {
+    NSString *p = NSTemporaryDirectory();
+    return p.length ? p : DD_TempRoot();
+}
+
+static NSURL *DD_StageSourceVideo(NSURL *mediaURL) {
+    if (!mediaURL) return nil;
+    NSString *ext = mediaURL.pathExtension;
+    if (ext.length == 0) ext = @"mp4";                       // ZDY @0xe37dc：扩展名为空兜底 mp4
+    NSString *dst = [DD_ShellTmpRoot() stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"ss_pick_%@.%@", [NSUUID UUID].UUIDString, ext]];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:dst error:nil];                     // ZDY @0xe3840：先清目标
+
+    NSError *e = nil;
+    if ([fm copyItemAtURL:mediaURL toURL:[NSURL fileURLWithPath:dst] error:&e] &&
+        [fm fileExistsAtPath:dst]) {
+        return [NSURL fileURLWithPath:dst];
+    }
+    // 降级：整体读入内存再原子写出（ZDY @0xe3898，options:1 = NSDataReadingMappedIfSafe）
+    NSData *d = [NSData dataWithContentsOfURL:mediaURL options:NSDataReadingMappedIfSafe error:NULL];
+    if (d.length > 0 && [d writeToFile:dst atomically:YES]) return [NSURL fileURLWithPath:dst];
+
+    [fm removeItemAtPath:dst error:nil];
+    return nil;
+}
+
 static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **error) {
-    AVURLAsset *asset = [AVURLAsset assetWithURL:srcURL];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:srcURL options:@{
+        // 对齐 ZDY @0xc9f3c-0xc9f90：必须带 AVURLAssetPreferPreciseDurationAndTimingKey。
+        // 不带时系统会走"快速估算"路径，duration / 帧时间戳是近似值：
+        //   · 时间轴不准 → 写出的片段时长与 moov 索引对不上，照片库按无效资源拒收（3302）；
+        //   · 部分源文件在估算路径下轨信息不完整 → 编码器初始化即失败（无法编码媒体）。
+        AVURLAssetPreferPreciseDurationAndTimingKey : @YES,
+    }];
+
+    // 对齐 ZDY @0xc9b0c-0xc9b20：源文件不存在（iCloud 未下载 / 已被清理）就立刻失败，
+    // 不要等后面加载超时。
+    if (![[NSFileManager defaultManager] fileExistsAtPath:srcURL.path]) {
+        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
+                userInfo:@{NSLocalizedDescriptionKey : @"源文件不存在（可能尚未从 iCloud 下载）"}];
+        return nil;
+    }
+
+    // —— 对齐 ZDY @0xc9bf0-0xc9ca0：tracks / duration 必须先异步加载并等待就绪 ——
+    // AVAsset 的 tracks / duration / naturalSize / preferredTransform / nominalFrameRate
+    // 都是惰性异步属性。不显式加载就直接读取，拿到的可能是 0 / 未初始化值：
+    //   · fps = 0 或 naturalSize = 0 → 下面算出的码率 / 关键帧间隔非法，或轨根本还没
+    //     解析出来 → AVAssetWriter 建 input 或写首帧就被编码器拒收，表现正是"选完视频
+    //     立刻弹无法编码媒体"(AVErrorCannotEncodeMedia)；
+    //   · duration 不准 → 写出时长/索引错误的片段，被照片库判为无效资源（3302）。
+    // 这也解释了"有的视频一选就失败、有的要转一会儿才失败"：解析耗时随源文件而异。
+    {
+        dispatch_semaphore_t ls = dispatch_semaphore_create(0);
+        [asset loadValuesAsynchronouslyForKeys:@[ @"tracks", @"duration" ]
+                            completionHandler:^{ dispatch_semaphore_signal(ls); }];
+        // ZDY 实测超时 0x6FC23AC00 ns = 30s。超时就放弃，绝不带着未就绪的属性往下走。
+        if (dispatch_semaphore_wait(ls, dispatch_time(DISPATCH_TIME_NOW,
+                                    (int64_t)(30.0 * NSEC_PER_SEC))) != 0) {
+            if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
+                    userInfo:@{NSLocalizedDescriptionKey : @"视频信息加载超时"}];
+            return nil;
+        }
+        NSError *stErr = nil; // 加载完成 ≠ 加载成功，再确认一次状态
+        if ([asset statusOfValueForKey:@"tracks" error:&stErr] != AVKeyValueStatusLoaded) {
+            if (error) *error = stErr ?: [NSError errorWithDomain:@"DDShell" code:-1
+                    userInfo:@{NSLocalizedDescriptionKey : @"视频轨加载失败"}];
+            return nil;
+        }
+    }
+
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
-    if (!vt) return nil;
+    if (!vt) {
+        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
+                userInfo:@{NSLocalizedDescriptionKey : @"未找到视频轨"}];
+        return nil;
+    }
+    CGSize natSize = vt.naturalSize;
+    if (!(natSize.width > 1.0f) || !(natSize.height > 1.0f)) {
+        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
+                userInfo:@{NSLocalizedDescriptionKey : @"视频尺寸无效"}];
+        return nil;
+    }
     CGAffineTransform pref = vt.preferredTransform; // 源自带旋转，在合成时摆正
 
     CGFloat cw = t.canvasSize.width, ch = t.canvasSize.height;
@@ -431,8 +531,9 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     W = ((W + 15) / 16) * 16;
     H = ((H + 15) / 16) * 16;
 
-    NSString *outPath = [DD_TempRoot() stringByAppendingPathComponent:
-                         [[NSUUID UUID].UUIDString stringByAppendingPathExtension:@"mp4"]];
+    // 对齐 ZDY @0xca9d0-0xcaa10：tmp 根目录 + ss_shell_<UUID>.mp4
+    NSString *outPath = [DD_ShellTmpRoot() stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"ss_shell_%@.mp4", [NSUUID UUID].UUIDString]];
     if ([[NSFileManager defaultManager] fileExistsAtPath:outPath])
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
 
@@ -450,6 +551,15 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
         (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
     }];
     vout.alwaysCopiesSampleData = NO;
+    // 对齐 ZDY @0xca994-0xca9b0：加输出前先问 canAddOutput，不能加就整体放弃，
+    // 绝不带一个"没接上"的 output 去 startReading（那样读出来全是 NULL 帧，
+    // 最终产出 0 帧的 mp4 → 照片库 3302）。
+    if (![reader canAddOutput:vout]) {
+        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-2
+                userInfo:@{NSLocalizedDescriptionKey : @"视频读取通道不可用"}];
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+        return nil;
+    }
     [reader addOutput:vout];
 
     // 写入端：对齐 ZDY 1.3.8 @0xcaa48-0xcae00 的实测配置。
@@ -491,6 +601,15 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
         }
     }
     vIn.expectsMediaDataInRealTime = NO;
+    // 对齐 ZDY @0xcad94-0xcae68：三次尝试后仍 canAddInput:NO 就直接放弃，
+    // 不能硬 addInput —— 硬加的 input 不会被编码器接住，startWriting 之后
+    // 第一次写帧就失败，表现正是"无法编码媒体"。
+    if (![writer canAddInput:vIn]) {
+        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-2
+                userInfo:@{NSLocalizedDescriptionKey : @"视频编码通道不可用（尺寸/码率不被支持）"}];
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+        return nil;
+    }
     [writer addInput:vIn];
 
     // 官方 PixelBufferAdaptor（注意拼写 appendPixelBuffer:withPresentationTime:，
@@ -591,6 +710,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     [writer startSessionAtSourceTime:kCMTimeZero];
 
     __block BOOL ok = YES;
+    __block NSInteger framesWritten = 0;   // 真正写进去的帧数，最终校验用
     dispatch_group_t grp = dispatch_group_create();
 
     // 视频轨：逐帧透视套壳后写入。缓冲每帧新建（对齐 ZDY），渲染后交给 Adaptor 写
@@ -610,7 +730,11 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
                                                  (__bridge CFDictionaryRef)pbAttrs,
                                                  &outPB) == kCVReturnSuccess && outPB) {
                     if (DD_RenderShellFrame(srcPB, t, W, H, pref, ci, cs, outPB)) {
-                        if (![adaptor appendPixelBuffer:outPB withPresentationTime:pts]) ok = NO;
+                        if ([adaptor appendPixelBuffer:outPB withPresentationTime:pts]) {
+                            framesWritten++;
+                        } else {
+                            ok = NO;   // 停止继续喂帧（ZDY @0x11cef4：append 失败即收尾，不重试）
+                        }
                     } else {
                         ok = NO;
                     }
@@ -632,24 +756,78 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
             while ([aIn isReadyForMoreMediaData]) {
                 CMSampleBufferRef sb = [aout copyNextSampleBuffer];
                 if (!sb) { [aIn markAsFinished]; dispatch_group_leave(grp); return; }
-                if (![aIn appendSampleBuffer:sb]) ok = NO;
+                // 对齐 ZDY @0x11d1f0-0x11d21c：音频 append 失败**只丢弃音频轨**，
+                // 不把整次导出判失败。
+                // 源音频不是 MP4 可直接承载的编码（非 AAC / 非常规采样率）时，
+                // passthrough 的 appendSampleBuffer: 会失败并让 writer 报
+                // AVErrorCannotEncodeMedia —— 这正是"有的视频一选就弹无法编码媒体"
+                // 的高频来源。ZDY 遇到这种情况只是 markAsFinished 收掉音频，
+                // 视频照常导出、照常存相册。之前我们是 ok=NO 让整单失败，
+                // 于是明明能出片的视频被音频拖垮。
+                if (![aIn appendSampleBuffer:sb]) {
+                    [aIn markAsFinished];   // 丢音频，不置 ok
+                    CFRelease(sb);
+                    dispatch_group_leave(grp); return;
+                }
                 CFRelease(sb);
-                if (!ok) { [aIn markAsFinished]; dispatch_group_leave(grp); return; }
             }
         }];
     }
 
-    dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
+    // 对齐 ZDY @0xcb33c-0xcb35c：主帧泵等待 600s（实测 0x8BB2C97000 ns = 600s）。
+    // 不能用 DISPATCH_TIME_FOREVER —— 帧泵回调不来就永久卡死，UI 一直转圈无任何提示。
+    BOOL pumped = (dispatch_group_wait(grp, dispatch_time(DISPATCH_TIME_NOW,
+                                       (int64_t)(600.0 * NSEC_PER_SEC))) == 0);
+    if (!pumped) {
+        // 对齐 ZDY @0xcb360-0xcb3ec：超时也要把两条轨 markAsFinished 后 cancel，
+        // 并删掉半成品，绝不把它交给照片库（那是 3302 的直接来源）。
+        [vIn markAsFinished];
+        if (aIn) [aIn markAsFinished];
+        [reader cancelReading];
+        [writer cancelWriting];
+        if (cs) CGColorSpaceRelease(cs);
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-5
+                userInfo:@{NSLocalizedDescriptionKey : @"导出处理超时"}];
+        return nil;
+    }
 
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    // 对齐 ZDY @0xcb4bc-0xcb4dc：60s 超时（实测 0xDF8475800 ns）。
+    // 不能用 DISPATCH_TIME_FOREVER——收尾回调不来就永久卡住，UI 一直转圈没有任何提示。
+    BOOL finished = (dispatch_semaphore_wait(sem,
+                        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC))) == 0);
 
     if (cs) CGColorSpaceRelease(cs);
 
-    if (writer.status != AVAssetWriterStatusCompleted || !ok) {
-        if (error) *error = writer.error ?: [NSError errorWithDomain:@"DDShell" code:-4 userInfo:@{NSLocalizedDescriptionKey : (ok ? @"视频写入未完成" : @"视频帧写入失败")}];
+    if (!finished) {
+        // 对齐 ZDY @0xcb360-0xcb3ec：取消读写 + 删掉半成品，绝不把它交给照片库
+        [reader cancelReading];
+        [writer cancelWriting];
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-5
+                userInfo:@{NSLocalizedDescriptionKey : @"导出收尾超时"}];
+        return nil;
+    }
+
+    // 对齐 ZDY @0xcb530-0xcb57c：ZDY 最终**只**看 writer.status == Completed(2) + 文件存在，
+    // 不看单帧 append 的成败（@0x11cfa4：append 失败也只是 markAsFinished 两条轨然后收尾，
+    // 让 finishWriting 的 status 说话）。
+    // 我们比 ZDY 只多一条底线：一帧都没写进去就一定判失败——0 帧的 mp4 才是 3302 的真凶。
+    // 之前用 "|| !ok" 只要中途有一帧失败就整单失败，比 ZDY 严格得多，
+    // 于是明明能出片的视频被判死，报出来的就是 writer.error = "无法编码媒体"。
+    if (writer.status != AVAssetWriterStatusCompleted || framesWritten == 0) {
+        if (error) *error = writer.error ?: [NSError errorWithDomain:@"DDShell" code:-4 userInfo:@{NSLocalizedDescriptionKey : (framesWritten == 0 ? @"视频帧写入失败" : @"视频写入未完成")}];
+        [writer cancelWriting]; // 对齐 ZDY：失败也显式取消（会一并清理已写入的文件）
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil]; // 半截 mp4 回收
+        return nil;
+    }
+    // 对齐 ZDY @0xcb540-0xcb55c：成功也要确认产物真的落在磁盘上，
+    // 避免拿一个不存在的路径去存相册（那正是 3302 InvalidResource 的典型诱因）。
+    if (![[NSFileManager defaultManager] fileExistsAtPath:outPath]) {
+        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-6
+                userInfo:@{NSLocalizedDescriptionKey : @"导出产物缺失"}];
         return nil;
     }
     return [NSURL fileURLWithPath:outPath];
@@ -1733,10 +1911,20 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 }
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    NSString *mediaType = info[UIImagePickerControllerMediaType];
+    NSURL    *mediaURL  = info[UIImagePickerControllerMediaURL];
+
+    // —— 关键顺序（对齐 ZDY @0xe37b0 → @0xe38d0 → @0xe392c）——
+    // 先**同步**把系统 mediaURL 复制成自己的本地副本，再 dismiss，再丢后台。
+    // 顺序反了就会踩同一个坑：picker 一消失系统就开始回收它转码目录里的临时文件，
+    // 等后台真正去读时文件已经没了 / 被截断 → "无法编码媒体" 或照片库 3302。
+    NSURL *staged = nil;
+    if ([mediaType isEqualToString:@"public.movie"]) staged = DD_StageSourceVideo(mediaURL);
+
     [picker dismissViewControllerAnimated:YES completion:^{
         // 图片与视频共用一个回调，按媒体类型分流
-        if ([info[UIImagePickerControllerMediaType] isEqualToString:@"public.movie"]) {
-            [self handlePickedVideo:info];
+        if ([mediaType isEqualToString:@"public.movie"]) {
+            [self handlePickedVideo:staged ?: mediaURL];
         } else {
             [self handlePickedImage:info];
         }
@@ -1765,15 +1953,18 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 }
 
 // 相册选视频套壳：逐帧透视合成后导出 mp4，存回相册
-- (void)handlePickedVideo:(NSDictionary *)info {
-    NSURL *url = info[UIImagePickerControllerMediaURL];
+// srcURL 必须是已在自己临时目录里的本地副本（见 DD_StageSourceVideo）。
+- (void)handlePickedVideo:(NSURL *)srcURL {
     DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
-    if (!url || !t) { DD_ShowError(@"套壳失败"); return; } // 选视频期间模板可能已经被删了
+    if (!srcURL || !t) { DD_ShowError(@"读取视频失败"); return; } // 选视频期间模板可能已经被删了
     // 逐帧合成 + 导出是重活，丢后台跑，主线程留着转 loading
     DD_ShowLoading(@"正在套壳");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSError *compErr = nil;
-        NSURL *outURL = DD_ComposeShellVideo(url, t, &compErr);
+        NSURL *outURL = DD_ComposeShellVideo(srcURL, t, &compErr);
+        // 对齐 ZDY @0xe3d60-0xe3d70：中转副本用完即删，成功失败都删。
+        if (srcURL != nil && [srcURL.path.lastPathComponent hasPrefix:@"ss_pick_"])
+            [[NSFileManager defaultManager] removeItemAtPath:srcURL.path error:nil];
         if (!outURL) {
             DD_ShowError(compErr.localizedDescription.length ? compErr.localizedDescription : @"套壳失败");
             return;
@@ -1806,6 +1997,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         NSString *tmpRoot = DD_TempRoot();
         for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpRoot error:nil]) {
             [[NSFileManager defaultManager] removeItemAtPath:[tmpRoot stringByAppendingPathComponent:item] error:nil];
+        }
+        // 导出产物/暂存文件现在落在系统 tmp 根目录（对齐 ZDY），同样要兜底清理。
+        // 注意：只删我们自己 ss_shell_ / ss_pick_ 前缀的文件，绝不动 tmp 里其他内容。
+        NSString *sysTmp = NSTemporaryDirectory();
+        for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:sysTmp error:nil]) {
+            if ([item hasPrefix:@"ss_shell_"] || [item hasPrefix:@"ss_pick_"]) {
+                [[NSFileManager defaultManager] removeItemAtPath:[sysTmp stringByAppendingPathComponent:item] error:nil];
+            }
         }
 
         // 取不到类时整条链都是给 nil 发消息，ObjC 天然 no-op
