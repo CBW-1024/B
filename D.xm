@@ -486,18 +486,26 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 @implementation DDShellVideoCompositor {
     CIContext      *_ctx;
     CGColorSpaceRef _cs;
+    CVPixelBufferRef _mid;   // 复用的 8bit 中间缓冲：按画布尺寸只建一次，避免逐帧分配
+                            // 2160² 的 IOSurface 导致扩展内存持续攀升被 jetsam 强杀（长视频必崩）
+    CGSize           _midSize;
 }
 
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _ctx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
         _cs  = CGColorSpaceCreateDeviceRGB();
+        // 钉死 working/output 色彩空间为 sRGB：防止宽色域/P3 源把 Core Image 推到
+        // float 扩展范围中间缓冲（内存翻倍甚至数倍），叠加逐帧累积直接被 jetsam 杀。
+        _ctx = [CIContext contextWithOptions:@{ (id)kCIContextUseSoftwareRenderer : @NO,
+                                                (id)kCIContextWorkingColorSpace  : (__bridge id)_cs,
+                                                (id)kCIContextOutputColorSpace   : (__bridge id)_cs }];
     }
     return self;
 }
 - (void)dealloc {
     if (_cs) CGColorSpaceRelease(_cs);
+    if (_mid) CVPixelBufferRelease(_mid);   // 合成器实例常被框架复用，析构时回收中间缓冲
 }
 // 渲染上下文变化（尺寸/像素格式等），本合成器每帧直接从 request 取 renderContext，无需缓存
 - (void)renderContextChanged:(AVVideoCompositionRenderContext *)newRenderContext {}
@@ -575,33 +583,37 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         CIImage *warped = f.outputImage;
         if (!warped) { DD_Log(@"[Compositor] 透视结果为空 extent=(%.0f x %.0f)", re.size.width*sc, re.size.height*sc); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-4 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
-        // 两阶段渲染（对齐 WCR）：先单独把透视结果渲染到 8bit sRGB 中间缓冲，
-        // 斩断 HDR/宽色域源的 float 链路（避免整图一次求值内存暴涨被 jetsam 杀），
-        // 再与机身前景合成到目标缓冲。坐标与原来完全一致，仅多一次 8bit 化。
-        CVPixelBufferRef mid = NULL;
-        CVReturn cvr = CVPixelBufferCreate(kCFAllocatorDefault,
-                         (size_t)round(W), (size_t)round(H),
-                         kCVPixelFormatType_32BGRA,
-                         (__bridge CFDictionaryRef)@{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} },
-                         &mid);
-        if (cvr != kCVReturnSuccess || !mid) {
-            DD_Log(@"[Compositor] 中间缓冲创建失败 cvr=%d", cvr);
-            [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-7 userInfo:nil]];
-            CVPixelBufferRelease(dst); return;
+        // 两阶段渲染（对齐 WCR）：先把透视结果渲染到 8bit sRGB 中间缓冲，斩断宽色域源的
+        // float 链路；中间缓冲复用同一实例、按画布尺寸只建一次——逐帧重建 2160² 的 IOSurface
+        // 会让扩展内存持续攀升直至被 jetsam 强杀（长视频必崩）。坐标与原来完全一致，仅多一次 8bit 化。
+        if (!_mid || (size_t)_midSize.width != (size_t)round(W) || (size_t)_midSize.height != (size_t)round(H)) {
+            if (_mid) { CVPixelBufferRelease(_mid); _mid = NULL; }
+            CVReturn cvr = CVPixelBufferCreate(kCFAllocatorDefault,
+                             (size_t)round(W), (size_t)round(H),
+                             kCVPixelFormatType_32BGRA,
+                             (__bridge CFDictionaryRef)@{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} },
+                             &_mid);
+            if (cvr != kCVReturnSuccess || !_mid) {
+                DD_Log(@"[Compositor] 中间缓冲创建失败 cvr=%d", cvr);
+                [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-7 userInfo:nil]];
+                CVPixelBufferRelease(dst); return;
+            }
+            _midSize = CGSizeMake(round(W), round(H));
         }
+
         @try {
-            [_ctx render:warped toCVPixelBuffer:mid bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
+            [_ctx render:warped toCVPixelBuffer:_mid bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
         } @catch (NSException *e) {
             DD_Log(@"[Compositor] 透视渲染抛异常 #%ld : %@", (long)inst.frameCount, e);
             [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-8 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
-            CVPixelBufferRelease(mid); CVPixelBufferRelease(dst); return;
+            CVPixelBufferRelease(dst); return;
         }
-        CIImage *warped8 = [CIImage imageWithCVPixelBuffer:mid]; // 已是 8bit sRGB
-        if (!warped8) { DD_Log(@"[Compositor] 中间图读回为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-9 userInfo:nil]]; CVPixelBufferRelease(mid); CVPixelBufferRelease(dst); return; }
+        CIImage *warped8 = [CIImage imageWithCVPixelBuffer:_mid]; // 已是 8bit sRGB
+        if (!warped8) { DD_Log(@"[Compositor] 中间图读回为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-9 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
         CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
         CIImage *outImg = [frame imageByCompositingOverImage:warped8]; // 机身图盖在最上层
-        if (!outImg) { DD_Log(@"[Compositor] 合成结果为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-5 userInfo:nil]]; CVPixelBufferRelease(mid); CVPixelBufferRelease(dst); return; }
+        if (!outImg) { DD_Log(@"[Compositor] 合成结果为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-5 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
         @try {
             [_ctx render:outImg toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
@@ -609,12 +621,11 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
             DD_Log(@"[Compositor] render 抛异常 #%ld ext=(%.0f x %.0f) sc=%.4f : %@",
                    (long)inst.frameCount, W, H, sc, e);
             [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-6 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
-            CVPixelBufferRelease(mid); CVPixelBufferRelease(dst);
+            CVPixelBufferRelease(dst);
             return;
         }
 
         [req finishWithComposedVideoFrame:dst];
-        CVPixelBufferRelease(mid);
         CVPixelBufferRelease(dst);
     }
 }
