@@ -319,7 +319,7 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 @property (nonatomic)         CMTimeRange         timeRange;
 @property (nonatomic)         BOOL                enablePostProcessing;
 @property (nonatomic)         BOOL                containsTweening;
-@property (nonatomic, copy)   NSArray<NSValue *> *requiredSourceTrackIDs;
+@property (nonatomic)         NSArray<NSValue *> *requiredSourceTrackIDs;
 @property (nonatomic)         CMPersistentTrackID passthroughTrackID;
 @property (nonatomic, strong) DDShellTemplate    *tpl;
 @property (nonatomic)         CGAffineTransform   preferredTransform;
@@ -348,6 +348,8 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 - (void)dealloc {
     if (_cs) CGColorSpaceRelease(_cs);
 }
+// 渲染上下文变化（尺寸/像素格式等），本合成器每帧直接从 request 取 renderContext，无需缓存
+- (void)renderContextChanged:(AVVideoCompositionRenderContext *)newRenderContext {}
 - (NSDictionary *)requiredPixelBufferAttributesForRenderContext {
     return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
               (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
