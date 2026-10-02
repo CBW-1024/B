@@ -198,6 +198,88 @@ static void DD_Log(NSString *fmt, ...) {
     });
 }
 
+#pragma mark - 崩溃捕获（写入日志文件，可导出查看）
+
+#include <signal.h>
+#include <execinfo.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+// 崩溃日志路径缓存成 C 字符串：信号处理函数里不能安全调用 ObjC/dispatch，
+// 必须用具异步信号安全的 open/write/close 直接落盘。
+static char gDDLogPathC[1024] = {0};
+
+static void DD_CrashAppend(const char *text) {
+    if (!text || !*text || gDDLogPathC[0] == '\0') return;
+    int fd = open(gDDLogPathC, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    size_t len = strlen(text);
+    write(fd, text, len);
+    write(fd, "\n", 1);
+    close(fd);
+}
+
+static void DD_SignalHandler(int sig) {
+    const char *name = "?";
+    if (sig == SIGSEGV) name = "SIGSEGV 段错误/野指针";
+    else if (sig == SIGBUS) name = "SIGBUS 总线错误/对齐";
+    else if (sig == SIGABRT) name = "SIGABRT abort";
+    else if (sig == SIGILL) name = "SIGILL 非法指令";
+    else if (sig == SIGTRAP) name = "SIGTRAP";
+    else if (sig == SIGFPE) name = "SIGFPE 浮点异常";
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr), "[CRASH] signal %s (%d) epoch=%ld", name, sig, (long)time(NULL));
+    DD_CrashAppend(hdr);
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    char **syms = backtrace_symbols(frames, n);
+    if (syms) {
+        for (int i = 0; i < n; i++) {
+            char line[1024];
+            snprintf(line, sizeof(line), "  %s", syms[i]);
+            DD_CrashAppend(line);
+        }
+        free(syms);
+    }
+    // 还原默认处理并重新触发，让系统仍生成标准崩溃报告
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void DD_UncaughtExceptionHandler(NSException *e) {
+    NSMutableString *s = [NSMutableString stringWithFormat:
+        @"[CRASH] uncaught exception: %@\nreason: %@\n", e.name, e.reason];
+    for (NSString *sym in e.callStackSymbols) [s appendFormat:@"  %@\n", sym];
+    DD_CrashAppend(s.UTF8String);
+}
+
+static void DD_InstallCrashHandlers(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *p = DD_LogPath();
+        if (p) strncpy(gDDLogPathC, p.fileSystemRepresentation, sizeof(gDDLogPathC) - 1);
+        NSSetUncaughtExceptionHandler(DD_UncaughtExceptionHandler);
+        int sigs[] = { SIGABRT, SIGBUS, SIGSEGV, SIGILL, SIGTRAP, SIGFPE };
+        for (size_t i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++)
+            signal(sigs[i], DD_SignalHandler);
+        // 内存压力日志：扩展被 jetsam(SIGKILL) 杀前常先收到警告，SIGKILL 无法捕获，靠这条预警
+        dispatch_source_t ps = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+            DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+            dispatch_get_main_queue());
+        dispatch_source_set_event_handler(ps, ^{
+            unsigned lvl = (unsigned)dispatch_source_get_data(ps);
+            NSString *d = (lvl & DISPATCH_MEMORYPRESSURE_CRITICAL) ? @"CRITICAL" : @"WARN";
+            DD_Log(@"[内存压力] %@ —— 扩展可能即将被 jetsam 杀掉（SIGKILL 无法被捕获）", d);
+        });
+        dispatch_resume(ps);
+    });
+}
+
 #pragma mark - 模板模型
 
 @interface DDShellTemplate : NSObject
@@ -388,6 +470,8 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 @property (nonatomic)         CMPersistentTrackID passthroughTrackID;
 @property (nonatomic, strong) DDShellTemplate    *tpl;
 @property (nonatomic)         CGAffineTransform   preferredTransform;
+@property (nonatomic)         BOOL                firstFrameLogged;
+@property (nonatomic)         NSInteger           frameCount;
 @end
 
 @implementation DDShellVideoInstruction
@@ -450,13 +534,18 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         CGAffineTransform norm = CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y);
         norm = CGAffineTransformConcat(norm, CGAffineTransformMakeScale(sc, sc));
         CIImage *srcImg = [rot imageByApplyingTransform:norm];
-        static BOOL sFirstFrame = NO;
-        if (!sFirstFrame) { sFirstFrame = YES;
-            DD_Log(@"[Compositor] 首帧 srcExtent=(%.0f x %.0f) sc=%.4f renderSize=(%.0f x %.0f)",
-                   re.size.width, re.size.height, sc, W, H);
+        inst.frameCount++;
+        if (!inst.firstFrameLogged) {
+            inst.firstFrameLogged = YES;
+            DD_Log(@"[Compositor] 首帧 srcExtent=(%.0f x %.0f) sc=%.4f renderSize=(%.0f x %.0f) tid=%d",
+                   re.size.width, re.size.height, sc, W, H, tid);
+        } else if (inst.frameCount % 30 == 0) {
+            CFStringRef d = CMTimeCopyDescription(NULL, req.compositionTime);
+            DD_Log(@"[Compositor] 进度 #%ld t=%@", (long)inst.frameCount, d ? CFBridgingRelease(d) : @"?");
         }
 
         CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
+        if (!f) { DD_Log(@"[Compositor] 透视滤镜不可用"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-3 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
         [f setDefaults];
         [f setValue:srcImg forKey:kCIInputImageKey];
         [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, re.size.width * sc, re.size.height * sc)] forKey:@"inputExtent"];
@@ -465,10 +554,21 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
         [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
         CIImage *warped = f.outputImage;
+        if (!warped) { DD_Log(@"[Compositor] 透视结果为空 extent=(%.0f x %.0f)", re.size.width*sc, re.size.height*sc); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-4 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
         CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
         CIImage *outImg = [frame imageByCompositingOverImage:warped]; // 机身图盖在最上层
-        [_ctx render:outImg toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
+        if (!outImg) { DD_Log(@"[Compositor] 合成结果为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-5 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
+
+        @try {
+            [_ctx render:outImg toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
+        } @catch (NSException *e) {
+            DD_Log(@"[Compositor] render 抛异常 #%ld ext=(%.0f x %.0f) sc=%.4f : %@",
+                   (long)inst.frameCount, W, H, sc, e);
+            [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-6 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
+            CVPixelBufferRelease(dst);
+            return;
+        }
 
         [req finishWithComposedVideoFrame:dst];
         CVPixelBufferRelease(dst);
@@ -544,7 +644,12 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     ex.outputFileType = AVFileTypeMPEG4;
     ex.videoComposition = vc;
     [ex exportAsynchronouslyWithCompletionHandler:^{
-        result = (ex.status == AVAssetExportSessionStatusCompleted) ? ex.outputURL : nil;
+        if (ex.status == AVAssetExportSessionStatusCompleted) {
+            DD_Log(@"[Compose] 导出成功 outPath=%@", outPath);
+            result = ex.outputURL;
+        } else {
+            DD_Log(@"[Compose] 导出失败 status=%ld error=%@", (long)ex.status, [ex error]);
+        }
         dispatch_semaphore_signal(sem);
     }];
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
@@ -1743,6 +1848,8 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpRoot error:nil]) {
             [[NSFileManager defaultManager] removeItemAtPath:[tmpRoot stringByAppendingPathComponent:item] error:nil];
         }
+
+        DD_InstallCrashHandlers(); // 崩溃捕获写入日志文件，供设置页导出查看
 
         // 取不到类时整条链都是给 nil 发消息，ObjC 天然 no-op
         id mgr = objc_getClass("WCPluginsMgr");
