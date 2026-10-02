@@ -464,16 +464,27 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
 
-    // 自建输出像素缓冲池，绕开 iOS17+ 已废弃的 AVAssetWriterInputPixelBufferAdaptor
+    // 自建输出像素缓冲池，绕开 iOS17+ 已废弃的 AVAssetWriterInputPixelBufferAdaptor。
+    // CVPixelBufferPoolCreate 固定 4 参数：allocator / 池级属性 / 像素缓冲级属性 / 输出。
+    // 像素格式、宽高属于“像素缓冲级”，必须放在第三个参数，不能混进第二个池级字典。
     CVPixelBufferPoolRef pbPool = NULL;
     NSDictionary *poolAttrs = @{
+        (id)kCVPixelBufferPoolMinimumBufferCountKey : @(3),
+    };
+    NSDictionary *pbAttrs = @{
         (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
         (id)kCVPixelBufferWidthKey : @(W),
         (id)kCVPixelBufferHeightKey : @(H),
-        (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES,
         (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
     };
-    CVPixelBufferPoolCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttrs, &pbPool);
+    if (CVPixelBufferPoolCreate(kCFAllocatorDefault,
+                               (__bridge CFDictionaryRef)poolAttrs,
+                               (__bridge CFDictionaryRef)pbAttrs,
+                               &pbPool) != kCVReturnSuccess || !pbPool) {
+        if (cs) CGColorSpaceRelease(cs);
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+        return nil;
+    }
     // 由一张样例缓冲推导输出格式描述，供后续把每帧包成 CMSampleBuffer 写入
     CMVideoFormatDescriptionRef vfmt = NULL;
     if (pbPool) {
