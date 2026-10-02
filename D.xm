@@ -153,10 +153,16 @@ static NSString *DD_TplFolder(NSString *name) {
 
 #pragma mark - 临时目录
 
-// DDShell 专用临时目录：NSTemporaryDirectory()/DDShell/
-// 与微信原生 tmp 隔离，便于在崩溃/强退/被杀后于下次启动统一清理，避免残骸堆积。
+// DDShell 专用临时目录：<Caches>/DDShell/
+// 关键：视频存相册时，照片库进程 photolibraryd 需要跨进程读取这个文件；tmp 目录
+// 跨进程访问受限且会被系统随时回收，读取失败就会被判 InvalidResource（3302）。
+// 改用 Caches：同在沙盒内、系统存储压力下仍可清理，但跨进程可读、更持久。
+// （图片路径走内存 UIImage，不碰文件，所以从不受此影响——这也印证了 3302 只在视频出现。）
+// 与微信原生目录隔离，便于崩溃/强退/被杀后于下次启动统一清理，避免残骸堆积。
 static NSString *DD_TempRoot(void) {
-    NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDShell"];
+    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    NSString *base = dirs.firstObject ?: NSTemporaryDirectory();
+    NSString *root = [base stringByAppendingPathComponent:@"DDShell"];
     [[NSFileManager defaultManager] createDirectoryAtPath:root
                               withIntermediateDirectories:YES attributes:nil error:nil];
     return root;
@@ -395,6 +401,19 @@ static BOOL DD_RenderShellFrame(CVPixelBufferRef srcPB, DDShellTemplate *t,
     return YES;
 }
 
+// AAC 编码器只接受有限的采样率；源视频的采样率可能不在其列（如 22050、24k 等），
+// 直接透传给 writer 会让音频编码会话初始化失败，表现为“无法编码媒体”
+// （AVErrorCannotEncodeMedia）。这里把采样率归到最接近的受支持值。
+static double DD_ClampAACRate(double r) {
+    static const double rates[] = {8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000};
+    double best = 44100.0, bestd = 1e18;
+    for (size_t i = 0; i < sizeof(rates)/sizeof(rates[0]); i++) {
+        double d = fabs(rates[i] - r);
+        if (d < bestd) { bestd = d; best = rates[i]; }
+    }
+    return best;
+}
+
 // 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）。
 // 走 AVAssetReader + AVAssetWriter 手动管线（对齐 ZDY），输出尺寸 / 编码 / 封装 / 音频全部
 // 显式指定，彻底受控——规避系统 AVAssetExportSession 自动决策在大尺寸 / 非对齐模板上
@@ -485,7 +504,14 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
         CMFormatDescriptionRef fd = (__bridge CMFormatDescriptionRef)(at.formatDescriptions.firstObject);
         if (fd) {
             const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
-            if (asbd) { aRate = asbd->mSampleRate ?: 44100.0; aCh = asbd->mChannelsPerFrame ?: 2.0; }
+            if (asbd) {
+                double r = asbd->mSampleRate;
+                double c = asbd->mChannelsPerFrame;
+                // 采样率归到 AAC 受支持值；声道限 1~2（AAC 不支持更多声道）。
+                // 否则部分源视频会让音频编码会话初始化失败 → “无法编码媒体”。
+                aRate = DD_ClampAACRate(r > 0.0 ? r : 44100.0);
+                aCh = (c >= 1.0 && c <= 2.0) ? c : 2.0;
+            }
         }
         aout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at outputSettings:@{
             AVFormatIDKey: @(kAudioFormatLinearPCM),
