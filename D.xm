@@ -451,7 +451,14 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
             (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
             (id)kCVPixelBufferWidthKey : @(W),
             (id)kCVPixelBufferHeightKey : @(H),
-            (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES,
+            // 对齐 ZDY：ZDY 的缓冲属性是 CGImageCompatibility +
+            // CGBitmapContextCompatibility，走 CPU 可访问内存（配合 CoreGraphics
+            // 直接用 CGBitmapContext 写入缓冲）。若改成 OpenGLESCompatibility，
+            // 缓冲会变成 IOSurface / GPU 内存，H.264 编码器在 4K 等大尺寸上
+            // 可能无法读取 → 编码会话初始化失败（“无法编码媒体”），或产出照片库
+            // 判为 InvalidResource 的资源（3302）。
+            (id)kCVPixelBufferCGImageCompatibilityKey : @YES,
+            (id)kCVPixelBufferCGBitmapContextCompatibilityKey : @YES,
         }];
 
     // 音频：读取端解压成 PCM，写入端重新编码为 AAC；源无音频则跳过（视频仍可正常导入）
@@ -486,10 +493,13 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
         [writer addInput:aIn];
     }
 
-    CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
+    // 对齐 ZDY：渲染走 CPU（软件）路线。ZDY 用 CoreGraphics + CGBitmapContext 直接
+    // 把像素写进 CPU 可访问的缓冲；我们把缓冲改成 CPU 内存后，渲染也必须走 CPU，
+    // 保证像素真正落到 CPU 可见内存、编码器能读到，避免 GPU/IOSurface 的同步问题。
+    CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @YES }];
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
 
-    // 输出像素缓冲交由上面的 Adaptor 统一管理（含格式与 IOSurface 属性），此处无需自建。
+    // 输出像素缓冲交由上面的 Adaptor 统一管理（CPU 可访问内存），此处无需自建。
 
     if (![reader startReading] || ![writer startWriting]) {
         if (error) *error = writer.error ?: reader.error ?: [NSError errorWithDomain:@"DDShell" code:-3 userInfo:@{NSLocalizedDescriptionKey : @"启动读写失败"}];
