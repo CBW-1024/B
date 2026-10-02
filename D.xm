@@ -11,7 +11,6 @@
 #import <Photos/Photos.h>
 #import <CoreImage/CoreImage.h>
 #import <AVFoundation/AVFoundation.h>
-#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -153,19 +152,50 @@ static NSString *DD_TplFolder(NSString *name) {
 
 #pragma mark - 临时目录
 
-// DDShell 专用临时目录：<Caches>/DDShell/
-// 关键：视频存相册时，照片库进程 photolibraryd 需要跨进程读取这个文件；tmp 目录
-// 跨进程访问受限且会被系统随时回收，读取失败就会被判 InvalidResource（3302）。
-// 改用 Caches：同在沙盒内、系统存储压力下仍可清理，但跨进程可读、更持久。
-// （图片路径走内存 UIImage，不碰文件，所以从不受此影响——这也印证了 3302 只在视频出现。）
-// 与微信原生目录隔离，便于崩溃/强退/被杀后于下次启动统一清理，避免残骸堆积。
+// DDShell 专用临时目录：NSTemporaryDirectory()/DDShell/
+// 与微信原生 tmp 隔离，便于在崩溃/强退/被杀后于下次启动统一清理，避免残骸堆积。
 static NSString *DD_TempRoot(void) {
-    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
-    NSString *base = dirs.firstObject ?: NSTemporaryDirectory();
-    NSString *root = [base stringByAppendingPathComponent:@"DDShell"];
+    NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDShell"];
     [[NSFileManager defaultManager] createDirectoryAtPath:root
                               withIntermediateDirectories:YES attributes:nil error:nil];
     return root;
+}
+
+#pragma mark - 调试日志
+
+#include <stdarg.h>
+// 调试日志写进文件（非越狱设备看不到 NSLog，靠导出日志文件定位问题）。
+// 位置放在 DDShell 数据目录（Library/Preferences/DDShell/），不会被 %ctor 清临时目录误删。
+static NSString *DD_LogPath(void) {
+    NSString *base = [DD_TplDir() stringByDeletingLastPathComponent]; // .../DDShell
+    return [base stringByAppendingPathComponent:@"ddshell_debug.log"];
+}
+
+static void DD_Log(NSString *fmt, ...) {
+    if (!fmt) return;
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("ddshell.log", DISPATCH_QUEUE_SERIAL); });
+    dispatch_sync(q, ^{
+        NSString *path = DD_LogPath();
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:path]) {
+            NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+            if (attr && [attr[NSFileSize] unsignedLongLongValue] > 2ULL * 1024 * 1024) {
+                [fm removeItemAtPath:path error:nil];
+            }
+        }
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) { [fm createFileAtPath:path contents:data attributes:nil]; return; }
+        @try { [fh seekToEndOfFile]; [fh writeData:data]; }
+        @catch (NSException *e) {}
+        [fh closeFile];
+    });
 }
 
 #pragma mark - 模板模型
@@ -347,249 +377,168 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
 #pragma mark - 视频套壳（相册选视频，逐帧透视合成后导出）
 
-// 把一帧源像素缓冲套壳成画布大小，渲染进 outBuf。
-// 与图片路径一致：源先按 contain 预缩到屏幕窗、再做透视映射，机身图盖最上层。
-// 源自带旋转由 pref（视频轨 preferredTransform）在这里摆正，再归一化原点后参与透视。
-// 单帧套壳：源帧 CIImage → 合成后的 CIImage（供 AVMutableVideoComposition 的
-// CIFilter handler 逐帧调用）。几何逻辑与原来完全一致（contain 预缩放 ×1.5 →
-// CIPerspectiveTransform → 机身图盖上层），只是不再往 CVPixelBuffer 里渲染。
-static CIImage *DD_ShellImageForFrame(CIImage *raw, DDShellTemplate *t,
-                                      NSInteger W, NSInteger H,
-                                      CGAffineTransform pref, CIImage *shellImg) {
-    if (!raw || !shellImg) return nil;
-    CIImage *rot = [raw imageByApplyingTransform:pref];
-    CGRect re = rot.extent;
-    CGFloat sW = re.size.width, sH = re.size.height;
-    if (sW < 1.0 || sH < 1.0) return nil;
+// 套壳指令：把模板和源视频的旋转信息带进自定义合成器。
+// customVideoCompositorClass 只认类、由框架自己实例化，参数没法从外部传实例，
+// 只能挂在 instruction 上，合成器每帧从 request 里取回来。
+@interface DDShellVideoInstruction : NSObject <AVVideoCompositionInstruction>
+@property (nonatomic)         CMTimeRange         timeRange;
+@property (nonatomic)         BOOL                enablePostProcessing;
+@property (nonatomic)         BOOL                containsTweening;
+@property (nonatomic)         NSArray<NSValue *> *requiredSourceTrackIDs;
+@property (nonatomic)         CMPersistentTrackID passthroughTrackID;
+@property (nonatomic, strong) DDShellTemplate    *tpl;
+@property (nonatomic)         CGAffineTransform   preferredTransform;
+@end
 
-    // 旋转后 extent 原点常不为 0（preferredTransform 带位移），先归零再缩放
-    CIImage *rot0 = [rot imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
+@implementation DDShellVideoInstruction
+@end
 
-    // contain 预缩到屏幕窗 ×1.5（对齐 ZDY @0xd7de8 的核心几何策略）：把透视的缩放比
-    // 拉到接近 1:1，避免"大画布 + 极小屏幕窗"这类几何下投影退化。
-    CGRect wb = DD_WindowBBox(t);
-    CGFloat winW = wb.size.width, winH = wb.size.height;
-    if (!(winW > 1.0)) winW = (CGFloat)W;  // 窗口退化时用画布尺寸兜底（同 ZDY）
-    if (!(winH > 1.0)) winH = (CGFloat)H;
-    CGFloat sc = MIN(winW * 1.5 / sW, winH * 1.5 / sH);
-    if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-    CIFilter *sf = [CIFilter filterWithName:@"CILanczosScaleTransform"];
-    [sf setDefaults];
-    [sf setValue:rot0 forKey:kCIInputImageKey];
-    [sf setValue:@(sc) forKey:@"inputScale"];
-    [sf setValue:@(1.0) forKey:@"inputAspectRatio"];
-    CIImage *scaled = sf.outputImage;
-    if (!scaled) scaled = [rot0 imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
-    CGRect se = scaled.extent;
-    CIImage *srcImg = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(-se.origin.x, -se.origin.y)];
+// 逐帧合成器：每帧把源视频帧透视贴进模板窗口，再叠机身图，输出到像素缓冲
+@interface DDShellVideoCompositor : NSObject <AVVideoCompositing>
+@end
 
-    // CIPerspectiveTransform（不带 WithExtent）：由 CI 自己取输入 extent 做透视，
-    // 比手动传 inputExtent 稳健，极端几何下不会退化。
-    CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransform"];
-    [f setDefaults];
-    [f setValue:srcImg forKey:kCIInputImageKey];
-    [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
-    [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
-    [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
-    [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
-    CIImage *warped = f.outputImage;
-    if (!warped) return nil;
-    return [shellImg imageByCompositingOverImage:warped]; // 机身图盖在最上层
+@implementation DDShellVideoCompositor {
+    CIContext      *_ctx;
+    CGColorSpaceRef _cs;
 }
 
-// —— 对齐 ZDY @0xe37b0-0xe38cc：把系统给的 mediaURL 先复制成自己的本地副本 ——
-// UIImagePickerControllerMediaURL 指向的是系统转码目录里的临时文件，picker 一旦
-// dismiss，系统随时可能回收它。ZDY 的做法是在回调里**同步**先把文件落到自己的
-// 临时目录（ss_pick_<uuid>.<ext>），之后再 dismiss、之后再丢后台处理。
-// 少了这一步，等到导出真正去读源文件时它已经被删/被截断/还没写完：
-//   · 一开始就读不到 → writer 建 input / 写首帧即失败 → "无法编码媒体"(AVErrorCannotEncodeMedia)，
-//     表现正是"选完视频立刻弹错"；
-//   · 读到一半失效 → 产出时长异常或残缺的 mp4，fileExists 仍然通过，但照片库
-//     判为无效资源 → PHPhotosErrorDomain 3302，表现正是"转一会儿才失败"。
-// 对齐 ZDY：导出产物与暂存文件**必须落在 NSTemporaryDirectory()**（@0xca9d0 调 _NSTemporaryDirectory，
-// 文件名 ss_shell_<UUID>.mp4；暂存同理 @0xe37e4 也是 _NSTemporaryDirectory + ss_pick_<UUID>.<ext>）。
-// 不能用 Library/Caches 的子目录：creationRequestForAssetFromVideoAtFileURL: 是交给照片库守护进程
-// (photolibraryd / mediaserverd) 去真正打开并摄取这个文件的，系统只对 app 的 tmp 目录
-// 放行跨进程读取；放到 Caches 子目录时守护进程打不开文件 → PHPhotosErrorDomain 3302
-// (InvalidResource)。这正是"转一会儿才失败"的那一路。
-static NSString *DD_ShellTmpRoot(void) {
-    NSString *p = NSTemporaryDirectory();
-    return p.length ? p : DD_TempRoot();
-}
-
-static NSURL *DD_StageSourceVideo(NSURL *mediaURL) {
-    if (!mediaURL) return nil;
-    NSString *ext = mediaURL.pathExtension;
-    if (ext.length == 0) ext = @"mp4";                       // ZDY @0xe37dc：扩展名为空兜底 mp4
-    NSString *dst = [DD_ShellTmpRoot() stringByAppendingPathComponent:
-                     [NSString stringWithFormat:@"ss_pick_%@.%@", [NSUUID UUID].UUIDString, ext]];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm removeItemAtPath:dst error:nil];                     // ZDY @0xe3840：先清目标
-
-    NSError *e = nil;
-    if ([fm copyItemAtURL:mediaURL toURL:[NSURL fileURLWithPath:dst] error:&e] &&
-        [fm fileExistsAtPath:dst]) {
-        return [NSURL fileURLWithPath:dst];
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _ctx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
+        _cs  = CGColorSpaceCreateDeviceRGB();
     }
-    // 降级：整体读入内存再原子写出（ZDY @0xe3898，options:1 = NSDataReadingMappedIfSafe）
-    NSData *d = [NSData dataWithContentsOfURL:mediaURL options:NSDataReadingMappedIfSafe error:NULL];
-    if (d.length > 0 && [d writeToFile:dst atomically:YES]) return [NSURL fileURLWithPath:dst];
-
-    [fm removeItemAtPath:dst error:nil];
-    return nil;
+    return self;
 }
+- (void)dealloc {
+    if (_cs) CGColorSpaceRelease(_cs);
+}
+// 渲染上下文变化（尺寸/像素格式等），本合成器每帧直接从 request 取 renderContext，无需缓存
+- (void)renderContextChanged:(AVVideoCompositionRenderContext *)newRenderContext {}
+- (NSDictionary *)requiredPixelBufferAttributesForRenderContext {
+    return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+              (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
+}
+- (NSDictionary *)sourcePixelBufferAttributes {
+    return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+              (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
+}
+- (void)cancelAllPendingVideoCompositionRequests {}
+- (void)startVideoCompositionRequest:(AVAsynchronousVideoCompositionRequest *)req {
+    @autoreleasepool {
+        DDShellVideoInstruction *inst = (DDShellVideoInstruction *)req.videoCompositionInstruction;
+        DDShellTemplate *t = inst.tpl;
+        CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
+        CGRect wb = DD_WindowBBox(t);
 
-// 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）。
-//
-// 走 AVAssetExportSession + AVMutableVideoComposition(applyingCIFiltersWithHandler:)，
-// 对齐 ScreenshotShell @0xb4e8 的路线，不再用 ZDY 的 AVAssetReader/AVAssetWriter 手工管线。
-// 换路线是两轮反汇编之后的结构性结论，不是拍脑袋：
-//   · ZDY 那条手工管线我们已经逐参数对齐到头（H.264、BGRA、adaptor 只有三键、
-//     码率 W*H*fps*0.1 下限 2.5M、kfi=fps*2、音频 passthrough→LPCM+AAC 双策略、
-//     30s/600s/60s 三级超时、尺寸 fcvtzs 截断），仍然稳定复现 3302；
-//     并且已确认 ZDY 自己的 AVAssetExportSession 只用于抽音频
-//     （输出名 temp_video_audio_%ld.m4a），不用于视频套壳——无从再借鉴。
-//   · 两个报错对这条手工管线是**结构性**的：AVErrorCannotEncodeMedia("无法编码媒体")
-//     只能由 AVAssetWriter 抛出；3302 则来自 writer 留下的半成品 mp4
-//     （缺 moov / 时长 0 / 样本表不全）。交给系统导出会话后两者都不再可能存在：
-//     没有 writer，文件由系统整体生成，且只在 status==Completed 时才交出去。
-static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **error) {
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:srcURL options:@{
-        AVURLAssetPreferPreciseDurationAndTimingKey : @YES,
-    }];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:srcURL.path]) {
-        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
-                userInfo:@{NSLocalizedDescriptionKey : @"源文件不存在（可能尚未从 iCloud 下载）"}];
-        return nil;
-    }
-    {   // tracks / duration 是惰性异步属性，不加载就读取会拿到未初始化值
-        dispatch_semaphore_t ls = dispatch_semaphore_create(0);
-        [asset loadValuesAsynchronouslyForKeys:@[ @"tracks", @"duration" ]
-                            completionHandler:^{ dispatch_semaphore_signal(ls); }];
-        if (dispatch_semaphore_wait(ls, dispatch_time(DISPATCH_TIME_NOW,
-                                    (int64_t)(30.0 * NSEC_PER_SEC))) != 0) {
-            if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
-                    userInfo:@{NSLocalizedDescriptionKey : @"视频信息加载超时"}];
-            return nil;
+        CMPersistentTrackID tid = [(NSNumber *)inst.requiredSourceTrackIDs.firstObject intValue];
+        CVPixelBufferRef src = [req sourceFrameByTrackID:tid];
+        if (!src) { DD_Log(@"[Compositor] 取源帧失败 tid=%d", tid); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-1 userInfo:nil]]; return; }
+
+        CVPixelBufferRef dst = [req.renderContext newPixelBuffer];
+        if (!dst) { DD_Log(@"[Compositor] 取目标缓冲失败"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-2 userInfo:nil]]; return; }
+
+        // 源帧先按视频自带旋转摆正；preferredTransform 常带位移把旋转后的帧挪回正位，
+        // 其 extent 原点往往不为 0。先把原点归零再按 contain 预缩到屏幕窗尺寸，最后透视
+        // 映射到窗口——避免把巨大坐标 / 大分辨率直接喂进透视导致中间图过大、投影退化，
+        // 导出失败或相册拒收（ZDY 即先预缩放再透视）。
+        CIImage *raw = [CIImage imageWithCVPixelBuffer:src];
+        CIImage *rot = [raw imageByApplyingTransform:inst.preferredTransform];
+        CGRect re = rot.extent;
+        CGFloat sc = MIN(wb.size.width / re.size.width, wb.size.height / re.size.height);
+        if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
+        CGAffineTransform norm = CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y);
+        norm = CGAffineTransformConcat(norm, CGAffineTransformMakeScale(sc, sc));
+        CIImage *srcImg = [rot imageByApplyingTransform:norm];
+        static BOOL sFirstFrame = NO;
+        if (!sFirstFrame) { sFirstFrame = YES;
+            DD_Log(@"[Compositor] 首帧 srcExtent=(%.0f x %.0f) sc=%.4f renderSize=(%.0f x %.0f)",
+                   re.size.width, re.size.height, sc, W, H);
         }
-        NSError *stErr = nil;
-        if ([asset statusOfValueForKey:@"tracks" error:&stErr] != AVKeyValueStatusLoaded) {
-            if (error) *error = stErr ?: [NSError errorWithDomain:@"DDShell" code:-1
-                    userInfo:@{NSLocalizedDescriptionKey : @"视频轨加载失败"}];
-            return nil;
-        }
-    }
 
+        CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
+        [f setDefaults];
+        [f setValue:srcImg forKey:kCIInputImageKey];
+        [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, re.size.width * sc, re.size.height * sc)] forKey:@"inputExtent"];
+        [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
+        [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
+        [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
+        [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
+        CIImage *warped = f.outputImage;
+
+        CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
+        CIImage *outImg = [frame imageByCompositingOverImage:warped]; // 机身图盖在最上层
+        [_ctx render:outImg toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
+
+        [req finishWithComposedVideoFrame:dst];
+        CVPixelBufferRelease(dst);
+    }
+}
+@end
+
+// 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）
+static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
+    AVURLAsset *asset = [AVURLAsset assetWithURL:srcURL];
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
-    if (!vt) {
-        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
-                userInfo:@{NSLocalizedDescriptionKey : @"未找到视频轨"}];
-        return nil;
-    }
-    CGAffineTransform pref = vt.preferredTransform; // 源自带旋转，逐帧摆正
+    if (!vt) { DD_Log(@"[Compose] 无视频轨"); return nil; }
+    DD_Log(@"[Compose] 视频轨 naturalSize=(%.0f x %.0f) fps=%.2f transform=%@",
+           vt.naturalSize.width, vt.naturalSize.height, vt.nominalFrameRate,
+           NSStringFromCGAffineTransform(vt.preferredTransform));
 
-    // 画布尺寸取**模板图的实际像素尺寸**（对齐 ScreenshotShell：renderSize = 模板图尺寸），
-    // 不用 cfg 里声明的 template_width/height：透视四角坐标本就按模板图像素定义，
-    // 两者一旦不一致（再叠加之前那步 16 向上对齐）坐标会整体错位。
-    // 只补到偶数——H.264 要求宽高为偶。
-    NSInteger W = (NSInteger)CGImageGetWidth(t.image.CGImage);
-    NSInteger H = (NSInteger)CGImageGetHeight(t.image.CGImage);
-    if (W < 2 || H < 2) {
-        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
-                userInfo:@{NSLocalizedDescriptionKey : @"模板尺寸无效"}];
-        return nil;
-    }
-    W += (W & 1);
-    H += (H & 1);
+    CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
+    if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
+    DD_Log(@"[Compose] 画布 W=%.0f H=%.0f", W, H);
 
-    float fps = vt.nominalFrameRate;
-    if (!(fps > 1.0f) || !isfinite(fps)) fps = 30.0f;
+    NSString *outPath = [DD_TempRoot() stringByAppendingPathComponent:
+                         [[NSUUID UUID].UUIDString stringByAppendingPathExtension:@"mp4"]];
 
-    CIImage *shellImg = [CIImage imageWithCGImage:t.image.CGImage];
-    if (!shellImg) {
-        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-1
-                userInfo:@{NSLocalizedDescriptionKey : @"模板图读取失败"}];
-        return nil;
-    }
+    AVMutableVideoComposition *vc = [AVMutableVideoComposition videoComposition];
+    vc.renderSize = CGSizeMake(W, H);
+    CMTime fd = vt.minFrameDuration;
+    vc.frameDuration = (fd.timescale && fd.value) ? fd : CMTimeMake(1, 30);
+    DD_Log(@"[Compose] renderSize=(%.0f x %.0f) frameDuration=%lld/%d preset=HighestQuality",
+           W, H, (long long)vc.frameDuration.value, vc.frameDuration.timescale);
 
-    AVMutableVideoComposition *comp =
-        [AVMutableVideoComposition videoCompositionWithAsset:asset
-                              applyingCIFiltersWithHandler:^(AVAsynchronousCIImageFilteringRequest *req) {
-            CIImage *out = DD_ShellImageForFrame(req.sourceImage, t, W, H, pref, shellImg);
-            // 单帧合成失败也**必须** finish，否则整条导出会卡住；退化成原帧保证不丢帧。
-            [req finishWithImage:(out ?: req.sourceImage) context:nil];
-        }];
-    comp.renderSize    = CGSizeMake((CGFloat)W, (CGFloat)H);
-    comp.frameDuration = CMTimeMake(1, (int32_t)llround(fps));
+    DDShellVideoInstruction *inst = [DDShellVideoInstruction new];
+    inst.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
+    inst.enablePostProcessing = NO;
+    inst.containsTweening = NO;
+    inst.requiredSourceTrackIDs = @[ @(vt.trackID) ];
+    inst.tpl = t;
+    inst.preferredTransform = vt.preferredTransform;
+    vc.instructions = @[ inst ];
+    vc.customVideoCompositorClass = [DDShellVideoCompositor class];
 
-    NSString *outPath = [DD_ShellTmpRoot() stringByAppendingPathComponent:
-                         [NSString stringWithFormat:@"ss_shell_%@.mp4", [NSUUID UUID].UUIDString]];
-    [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-
-    AVAssetExportSession *ex = [AVAssetExportSession exportSessionWithAsset:asset
-                                                               presetName:AVAssetExportPresetHighestQuality];
-    if (!ex) {
-        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-2
-                userInfo:@{NSLocalizedDescriptionKey : @"无法创建导出会话"}];
-        return nil;
-    }
-    ex.outputURL        = [NSURL fileURLWithPath:outPath];
-    ex.outputFileType   = AVFileTypeMPEG4;
-    ex.videoComposition = comp;   // 音频由 preset 自动处理，不需要自己搭轨
-
+    __block NSURL *result = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [ex exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
-                                (int64_t)(600.0 * NSEC_PER_SEC))) != 0) {
-        [ex cancelExport];
+    AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
+                                                            presetName:AVAssetExportPresetHighestQuality];
+    ex.outputURL = [NSURL fileURLWithPath:outPath];
+    ex.outputFileType = AVFileTypeMPEG4;
+    ex.videoComposition = vc;
+    [ex exportAsynchronouslyWithCompletionHandler:^{
+        result = (ex.status == AVAssetExportSessionStatusCompleted) ? ex.outputURL : nil;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    if (!result) { // 导出失败，半截 mp4 回收，避免留在临时目录
+        DD_Log(@"[Compose] 导出失败 status=%ld error=%@ outPath=%@",
+               (long)ex.status, [ex error], outPath);
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-        if (error) *error = [NSError errorWithDomain:@"DDShell" code:-5
-                userInfo:@{NSLocalizedDescriptionKey : @"导出超时"}];
-        return nil;
     }
-    if (ex.status != AVAssetExportSessionStatusCompleted ||
-        ![[NSFileManager defaultManager] fileExistsAtPath:outPath]) {
-        NSError *e = ex.error;
-        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-        if (error) *error = e ?: [NSError errorWithDomain:@"DDShell" code:-4
-                userInfo:@{NSLocalizedDescriptionKey : @"导出失败"}];
-        return nil;
-    }
-    return [NSURL fileURLWithPath:outPath];
+    return result;
 }
 
-// 视频存相册。改用 UISaveVideoAtPathToSavedPhotosAlbum（UIImageWrite 家族的 C API）。
-// 深挖 ZDY 确认它用的就是 creationRequestForAssetFromVideoAtFileURL: 且同样写在 tmp，
-// 但它能成——所以 3302 不是 save API 的问题，而是 photolibraryd 跨进程读我们那个
-// URL 时把文件判为无效资源(InvalidResource)。UISaveVideoAtPathToSavedPhotosAlbum 走的是
-// 把文件读进本进程、再拷/转进照片库托管存储的路线，从根本上绕开"直接交 URL 给 photolibraryd
-// 读"这一步，对路径访问 / 编码格式两类 3302 都更稳，也比 PHPhotoLibrary 的 change block 更简单。
-@interface DDVideoSaver : NSObject
-@property (nonatomic, copy) void (^done)(BOOL, NSError *);
-@property (nonatomic, copy) NSString *path;
-@end
-@implementation DDVideoSaver
-- (void)dd_saveVideo:(NSString *)p didFinishWithError:(NSError *)error contextInfo:(void *)ctx {
-    void (^cb)(BOOL, NSError *) = self.done;
-    if (cb) cb(error == nil, error);
-    if (error == nil) [[NSFileManager defaultManager] removeItemAtPath:self.path error:nil];
-    CFBridgingRelease(ctx);   // 回调里释放，避免异步期间被 ARC 回收
-}
-@end
-
+// 视频存相册，存完回调（成功才删临时文件，失败保留以便排查，下次启动会清理）
 static void DD_SaveVideoToAlbum(NSURL *url, void (^done)(BOOL success, NSError *err)) {
-    NSString *path = url.path;
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        if (done) done(NO, [NSError errorWithDomain:@"DDShell" code:-6
-                userInfo:@{NSLocalizedDescriptionKey : @"导出文件丢失，无法存入相册"}]);
-        return;
-    }
-    DDVideoSaver *saver = [[DDVideoSaver alloc] init];
-    saver.done = [done copy];
-    saver.path = path;
-    void *ctx = (void *)CFBridgingRetain(saver);   // 保活到回调
-    UISaveVideoAtPathToSavedPhotosAlbum(path,
-            saver, @selector(dd_saveVideo:didFinishWithError:contextInfo:), ctx);
+    [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
+        [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:url];
+    } completionHandler:^(BOOL success, NSError *error) {
+        DD_Log(@"[存相册] success=%d error=%@ (%@:%ld) url=%@",
+               success, error.localizedDescription, error.domain, (long)error.code, url);
+        if (success) [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        if (done) done(success, error);
+    }];
 }
 
 #pragma mark - 相册
@@ -1612,6 +1561,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         [section addCell:[cellCls normalCellForSel:@selector(pickVideoFromAlbumTapped:)
                                             target:self title:@"↳相册视频套壳"
                                          rightValue:nil]];
+
+        [section addCell:[cellCls normalCellForSel:@selector(exportLogTapped:)
+                                            target:self title:@"↳导出调试日志"
+                                         rightValue:nil]];
+
+        [section addCell:[cellCls normalCellForSel:@selector(clearLogTapped:)
+                                            target:self title:@"↳清空调试日志"
+                                         rightValue:nil]];
     }
 
     [self.tableViewMgr addSection:section];
@@ -1660,20 +1617,10 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 }
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
-    NSString *mediaType = info[UIImagePickerControllerMediaType];
-    NSURL    *mediaURL  = info[UIImagePickerControllerMediaURL];
-
-    // —— 关键顺序（对齐 ZDY @0xe37b0 → @0xe38d0 → @0xe392c）——
-    // 先**同步**把系统 mediaURL 复制成自己的本地副本，再 dismiss，再丢后台。
-    // 顺序反了就会踩同一个坑：picker 一消失系统就开始回收它转码目录里的临时文件，
-    // 等后台真正去读时文件已经没了 / 被截断 → "无法编码媒体" 或照片库 3302。
-    NSURL *staged = nil;
-    if ([mediaType isEqualToString:@"public.movie"]) staged = DD_StageSourceVideo(mediaURL);
-
     [picker dismissViewControllerAnimated:YES completion:^{
         // 图片与视频共用一个回调，按媒体类型分流
-        if ([mediaType isEqualToString:@"public.movie"]) {
-            [self handlePickedVideo:staged ?: mediaURL];
+        if ([info[UIImagePickerControllerMediaType] isEqualToString:@"public.movie"]) {
+            [self handlePickedVideo:info];
         } else {
             [self handlePickedImage:info];
         }
@@ -1702,35 +1649,23 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 }
 
 // 相册选视频套壳：逐帧透视合成后导出 mp4，存回相册
-// srcURL 必须是已在自己临时目录里的本地副本（见 DD_StageSourceVideo）。
-- (void)handlePickedVideo:(NSURL *)srcURL {
+- (void)handlePickedVideo:(NSDictionary *)info {
+    NSURL *url = info[UIImagePickerControllerMediaURL];
     DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
-    if (!srcURL || !t) { DD_ShowError(@"读取视频失败"); return; } // 选视频期间模板可能已经被删了
+    if (!url || !t) { DD_ShowError(@"套壳失败"); return; } // 选视频期间模板可能已经被删了
     // 逐帧合成 + 导出是重活，丢后台跑，主线程留着转 loading
     DD_ShowLoading(@"正在套壳");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSError *compErr = nil;
-        NSURL *outURL = DD_ComposeShellVideo(srcURL, t, &compErr);
-        // 对齐 ZDY @0xe3d60-0xe3d70：中转副本用完即删，成功失败都删。
-        if (srcURL != nil && [srcURL.path.lastPathComponent hasPrefix:@"ss_pick_"])
-            [[NSFileManager defaultManager] removeItemAtPath:srcURL.path error:nil];
-        if (!outURL) {
-            DD_ShowError(compErr.localizedDescription.length ? compErr.localizedDescription : @"套壳失败");
-            return;
-        }
+        DD_Log(@"[视频套壳] 开始 name=%@ canvas=(%.0f x %.0f) url=%@",
+               t.name, t.canvasSize.width, t.canvasSize.height, url);
+        NSURL *outURL = DD_ComposeShellVideo(url, t);
+        if (!outURL) { DD_ShowError(@"套壳失败"); return; }
         // 相册选视频套壳不删除原视频；成功提示必须等相册真正存好再弹，避免存失败也报成功
         DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
             if (success) {
                 DD_ShowShellDone();
             } else {
-                // 带上 domain/code 与 underlying：不同的 code 指向完全不同的原因，
-                // 3302 几乎总伴随一个说明"为什么 photolibraryd 拒收"的底层错误，必须一起打出来
-                NSString *msg = err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败";
-                msg = [msg stringByAppendingFormat:@" [%@:%ld]", err.domain, (long)err.code];
-                NSError *under = err.userInfo[NSUnderlyingErrorKey];
-                if (under) msg = [msg stringByAppendingFormat:@" ← %@:%ld %@",
-                                  under.domain, (long)under.code, under.localizedDescription];
-                DD_ShowError(msg);
+                DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
             }
         });
     });
@@ -1738,6 +1673,33 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
     [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
+#pragma mark - 调试日志导出/清空
+
+- (void)exportLogTapped:(id)sender {
+    NSString *path = DD_LogPath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+    if (!attr || [attr[NSFileSize] unsignedLongLongValue] == 0) {
+        DD_ShowToast(@"还没有调试日志");
+        return;
+    }
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url]
+                                                                     applicationActivities:nil];
+    if ([avc respondsToSelector:@selector(popoverPresentationController)]) {
+        avc.popoverPresentationController.sourceView = self.view;
+        avc.popoverPresentationController.sourceRect =
+            CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height - 60.0, 0, 0);
+        avc.popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionDown;
+    }
+    [self presentViewController:avc animated:YES completion:nil];
+}
+
+- (void)clearLogTapped:(id)sender {
+    [[NSFileManager defaultManager] removeItemAtPath:DD_LogPath() error:nil];
+    DD_ShowToast(@"调试日志已清空");
 }
 
 @end
@@ -1753,14 +1715,6 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         NSString *tmpRoot = DD_TempRoot();
         for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpRoot error:nil]) {
             [[NSFileManager defaultManager] removeItemAtPath:[tmpRoot stringByAppendingPathComponent:item] error:nil];
-        }
-        // 导出产物/暂存文件现在落在系统 tmp 根目录（对齐 ZDY），同样要兜底清理。
-        // 注意：只删我们自己 ss_shell_ / ss_pick_ 前缀的文件，绝不动 tmp 里其他内容。
-        NSString *sysTmp = NSTemporaryDirectory();
-        for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:sysTmp error:nil]) {
-            if ([item hasPrefix:@"ss_shell_"] || [item hasPrefix:@"ss_pick_"]) {
-                [[NSFileManager defaultManager] removeItemAtPath:[sysTmp stringByAppendingPathComponent:item] error:nil];
-            }
         }
 
         // 取不到类时整条链都是给 nil 发消息，ObjC 天然 no-op
