@@ -424,10 +424,22 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
         AVVideoCodecKey: AVVideoCodecTypeH264,
         AVVideoWidthKey: @(W),
         AVVideoHeightKey: @(H),
-        AVVideoScalingModeKey: AVVideoScalingModeResizeAspectFill,
     }];
     vIn.expectsMediaDataInRealTime = NO;
     [writer addInput:vIn];
+
+    // 官方 PixelBufferAdaptor（注意拼写 appendPixelBuffer:withPresentationTime:，
+    // 不带 Stamp；ZDY 即此路线，iOS26 仍在）。由 Adaptor 自己管理像素缓冲池与格式，
+    // 避免手动建 CMSampleBuffer 时 format description 与编码会话期望不符导致
+    // “无法编码媒体”(AVErrorCannotEncodeMedia)。
+    AVAssetWriterInputPixelBufferAdaptor *adaptor =
+        [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:vIn
+                                                   sourcePixelBufferAttributes:@{
+            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey : @(W),
+            (id)kCVPixelBufferHeightKey : @(H),
+            (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES,
+        }];
 
     // 音频：读取端解压成 PCM，写入端重新编码为 AAC；源无音频则跳过（视频仍可正常导入）
     AVAssetTrack *at = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
@@ -464,36 +476,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
 
-    // 自建输出像素缓冲池，绕开 iOS17+ 已废弃的 AVAssetWriterInputPixelBufferAdaptor。
-    // CVPixelBufferPoolCreate 固定 4 参数：allocator / 池级属性 / 像素缓冲级属性 / 输出。
-    // 像素格式、宽高属于“像素缓冲级”，必须放在第三个参数，不能混进第二个池级字典。
-    CVPixelBufferPoolRef pbPool = NULL;
-    NSDictionary *poolAttrs = @{
-        (id)kCVPixelBufferPoolMinimumBufferCountKey : @(3),
-    };
-    NSDictionary *pbAttrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-        (id)kCVPixelBufferWidthKey : @(W),
-        (id)kCVPixelBufferHeightKey : @(H),
-        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
-    };
-    if (CVPixelBufferPoolCreate(kCFAllocatorDefault,
-                               (__bridge CFDictionaryRef)poolAttrs,
-                               (__bridge CFDictionaryRef)pbAttrs,
-                               &pbPool) != kCVReturnSuccess || !pbPool) {
-        if (cs) CGColorSpaceRelease(cs);
-        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-        return nil;
-    }
-    // 由一张样例缓冲推导输出格式描述，供后续把每帧包成 CMSampleBuffer 写入
-    CMVideoFormatDescriptionRef vfmt = NULL;
-    if (pbPool) {
-        CVPixelBufferRef probe = NULL;
-        if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pbPool, &probe) == kCVReturnSuccess) {
-            CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, probe, &vfmt);
-            CVPixelBufferRelease(probe);
-        }
-    }
+    // 输出像素缓冲交由上面的 Adaptor 统一管理（含格式与 IOSurface 属性），此处无需自建。
 
     if (![reader startReading] || ![writer startWriting]) {
         if (error) *error = writer.error ?: reader.error ?: [NSError errorWithDomain:@"DDShell" code:-3 userInfo:@{NSLocalizedDescriptionKey : @"启动读写失败"}];
@@ -507,7 +490,9 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     __block BOOL ok = YES;
     dispatch_group_t grp = dispatch_group_create();
 
-    // 视频轨：逐帧透视套壳后写入
+    // 视频轨：逐帧透视套壳后写入。缓冲从 Adaptor 的像素缓冲池取，渲染后直接交给
+    // Adaptor 写——只传 PTS，duration 由 AVAssetWriter 内部按后续帧推断，末帧无需
+    // 特殊处理（ZDY 即此手法，从不出末帧时长问题）。
     dispatch_queue_t vq = dispatch_queue_create("com.ddshell.vreader", DISPATCH_QUEUE_SERIAL);
     dispatch_group_enter(grp);
     [vIn requestMediaDataWhenReadyOnQueue:vq usingBlock:^{
@@ -516,22 +501,15 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
             if (!sb) { [vIn markAsFinished]; dispatch_group_leave(grp); return; }
             @autoreleasepool {
                 CVPixelBufferRef srcPB = CMSampleBufferGetImageBuffer(sb);
+                CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
                 CVPixelBufferRef outPB = NULL;
-                CMSampleBufferRef outSB = NULL;
-                if (srcPB && pbPool && CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pbPool, &outPB) == kCVReturnSuccess) {
-                    if (DD_RenderShellFrame(srcPB, t, W, H, pref, ci, cs, outPB) && vfmt) {
-                        // 沿用源样本的完整 timing（含有效的 duration）。若手设
-                        // duration=kCMTimeInvalid，末帧没有“下一帧”可反推时长，
-                        // AVAssetWriter 在 finishWriting 会判时间轴无效而失败，
-                        // 表现即整段导出失败（outURL 为 nil）。这是手动管线的必现坑。
-                        CMSampleTimingInfo timing;
-                        CMSampleBufferGetSampleTimingInfo(sb, 0, &timing);
-                        if (CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, outPB, vfmt, &timing, &outSB) == 0
-                            && outSB && ![vIn appendSampleBuffer:outSB]) ok = NO;
+                if (srcPB && adaptor.pixelBufferPool
+                    && CVPixelBufferPoolCreatePixelBuffer(NULL, adaptor.pixelBufferPool, &outPB) == kCVReturnSuccess) {
+                    if (DD_RenderShellFrame(srcPB, t, W, H, pref, ci, cs, outPB)) {
+                        if (![adaptor appendPixelBuffer:outPB withPresentationTime:pts]) ok = NO;
                     } else {
                         ok = NO;
                     }
-                    if (outSB) CFRelease(outSB);
                     CVPixelBufferRelease(outPB);
                 } else {
                     ok = NO;
@@ -564,8 +542,6 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t, NSError **
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
 
     if (cs) CGColorSpaceRelease(cs);
-    if (vfmt) CFRelease(vfmt);
-    if (pbPool) CVPixelBufferPoolRelease(pbPool);
 
     if (writer.status != AVAssetWriterStatusCompleted || !ok) {
         if (error) *error = writer.error ?: [NSError errorWithDomain:@"DDShell" code:-4 userInfo:@{NSLocalizedDescriptionKey : (ok ? @"视频写入未完成" : @"视频帧写入失败")}];
