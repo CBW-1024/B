@@ -527,13 +527,17 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
               (id)kCVPixelBufferOpenGLESCompatibilityKey  : @YES };
 }
 - (NSDictionary *)sourcePixelBufferAttributes {
-    // 对齐 WCRefine（WCRefinePerspectiveVideoCompositor）：源帧字典与 required 对称，
-    // 均为 BGRA + IOSurface + OpenGLES 兼容。反汇编其 init 确认源/目标字典都用
-    // kCVPixelFormatType_32BGRA（0x42475241 = BGRA）且带 IOSurfaceProperties /
-    // OpenGLESCompatibility。必须含 kCVPixelBufferPixelFormatTypeKey 否则 AVFCore 直接抛
-    // NSInvalidArgumentException。BGRA 源在 WCR 与我们的 BGRA+1080 实测里均正确出图；
-    // IOSurface 让源帧常驻 GPU 显存、与 CI 渲染零拷贝，正是 WCR 抗内存压力的节奏来源。
-    return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelFormatType_32BGRA),
+    // 源帧格式：420YUV（420 YpCbCr 8-bit BiPlanar VideoRange）而非对齐 WCR 的 BGRA。
+    // 理由：H.264/H.265 解码器原生输出就是 YUV，写 BGRA 会让系统额外做“解码→BGRA 转换”
+    // 且每帧多占 ~2.6× 内存（5.3MB→2MB/帧 @1036×1280）；写 420YUV 则零转换、源解码内存
+    // 直接砍到最低。Core Image 的 imageWithCVPixelBuffer: 对标准 420YUV 会自动转 RGB，
+    // 合成逻辑无需改动；输出缓冲（required）仍是 BGRA+IOSurface（编码器需要，不可动）。
+    // 这是“降分辨率/对齐 WCR 仍中段停摆”之后的低成本减负尝试：源解码是导出链路里我们
+    // 唯一能砍的大头内存。实测 BGRA/YUV 在 1080 下停摆同为 ~44s，故本改动预期只小幅缓解、
+    // 不保证消除停摆；真正治本是换 Photo Editing 扩展拿高数倍内存预算。
+    // 必须含 kCVPixelBufferPixelFormatTypeKey（否则 AVFCore 直接抛 NSInvalidArgumentException）；
+    // IOSurface 让源帧常驻 GPU 显存、与 CI 渲染零拷贝。
+    return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelBufferPixelFormatType_420YpCbCr8BiPlanarVideoRange),
               (id)kCVPixelBufferIOSurfacePropertiesKey    : @{},
               (id)kCVPixelBufferOpenGLESCompatibilityKey  : @YES };
 }
@@ -674,15 +678,19 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
 
     // 工作分辨率上限（长边 DD_WORK_CAP）：三重作用——
-    // ① 相册导入 3302 拒收：输出压在 4K(8294400) 以内即安全，720 远低于此；
+    // ① 相册导入 3302 拒收：输出压在 4K(8294400) 以内即安全，1080 远低于此；
     // ② 分享扩展内存：满画布 IOSurface 缓冲 + GPU CIContext 显存 + 源解码缓冲在扩展里
     //    会顶到 jetsam 上限。实测同一模板下，仅源视频更宽（1036 vs 720）就让本就贴着
     //    上限的基线再抬高、提前 5 秒触顶被杀；降工作分辨率把整体水位拉离悬崖，宽源那
     //    点偏移自然被吸收。③ 提速：像素量越少 GPU 合成越快。
-    // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩；本 tweak
-    // 在分享扩展里必须主动降分辨率才能既快又不崩。设备内存充裕可上调到 1080/1280，但 1080
-    // 对宽源/长视频偏贴边，2160 必崩。
-    static const CGFloat DD_WORK_CAP = 720.0;
+    // 注意：实测把 DD_WORK_CAP 从 1080 降到 720，导出中段 CRITICAL 停摆（#360→#390 约
+    // 48s）几乎没缩短（1080 版约 44s），且画质下降——证明停摆来自导出链路（解码器+
+    // 编码器+AVAssetExportSession 内部缓冲）的固定内存开销，不随合成分辨率变化；合成
+    // 缓冲占比极小，降它杯水车薪。真正治本要削减源/编码内存（见源格式 420YUV）或换
+    // Photo Editing 扩展（内存预算高数倍）。默认 1080 是画质与稳定的折中。
+    // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩。
+    // 设备内存充裕可上调到 1280/1440，但 1440 对宽源/长视频偏贴边，2160 必崩。
+    static const CGFloat DD_WORK_CAP = 1080.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
