@@ -486,26 +486,32 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 @implementation DDShellVideoCompositor {
     CIContext      *_ctx;
     CGColorSpaceRef _cs;
+    CVPixelBufferRef _mid;   // 复用的满画布 8bit 中间缓冲：先把透视结果“烘焙”成位图，
+                            // 再与机身前景合成。对齐 WCRefine 的 bake→composite 流程
+                            // （它从不让渲染器直接合成“滤镜图”，而是先烘焙）；由框架复用的
+                            // 同一合成器实例持有、dealloc 释放，逐帧零分配，内存打平防 jetsam。
+    CGSize           _midSize;
 }
 
 - (instancetype)init {
     self = [super init];
     if (self) {
         _cs  = CGColorSpaceCreateDeviceRGB();
-        // 钉死 working/output 色彩空间为 sRGB：防止宽色域/P3 源把 Core Image 推到
-        // float 扩展范围中间缓冲（内存翻倍甚至数倍），叠加逐帧累积直接被 jetsam 杀。
-        // 用软件渲染（CPU）：经反汇编 WCRefine 的 WCRefinePerspectiveVideoCompositor 确认，
-        // 微信套壳走的也是 kCIContextUseSoftwareRenderer——分享扩展里 GPU 显存/纹理缓存
-        // 上限极紧，GPU CIContext 逐帧渲染大图会把缓冲累积到 jetsam 强杀；软件渲染只走
-        // CPU RAM（余量充足），彻底消除“逐帧大纹理缓存增长”这一类崩溃。
-        _ctx = [CIContext contextWithOptions:@{ (id)kCIContextUseSoftwareRenderer : @YES,
-                                                (id)kCIContextWorkingColorSpace  : (__bridge id)_cs,
-                                                (id)kCIContextOutputColorSpace   : (__bridge id)_cs }];
+        // 走 GPU 渲染（默认，不强制软件渲染）。软件渲染器在分享扩展里会把
+        // CIPerspectiveTransform 滤镜输出渲空——表现为“有声音、模板在、视频没进模版”
+        // （模板来自静态 CGImage 能正常渲，唯独 warped 那层空）。经反汇编 WCRefine 确认
+        // 其合成路径是“先烘焙 warped 到满画布 IOSurface 中间缓冲、再读回位图与前景合成”，
+        // 且 GPU 路径原本就能正确渲出 warped。为防宽色域/P3 源把 Core Image 推到 float
+        // 扩展范围缓冲（内存翻倍），钉死 working/output 为 sRGB；中间缓冲 _mid 复用单张
+        // 满画布 IOSurface、不逐帧分配，内存打平以规避 jetsam。
+        _ctx = [CIContext contextWithOptions:@{ (id)kCIContextWorkingColorSpace : (__bridge id)_cs,
+                                                (id)kCIContextOutputColorSpace  : (__bridge id)_cs }];
     }
     return self;
 }
 - (void)dealloc {
     if (_cs) CGColorSpaceRelease(_cs);
+    if (_mid) CVPixelBufferRelease(_mid);   // 合成器实例常被框架复用，析构时回收中间缓冲
 }
 // 渲染上下文变化（尺寸/像素格式等），本合成器每帧直接从 request 取 renderContext，无需缓存
 - (void)renderContextChanged:(AVVideoCompositionRenderContext *)newRenderContext {}
@@ -583,14 +589,41 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         CIImage *warped = f.outputImage;
         if (!warped) { DD_Log(@"[Compositor] 透视结果为空 extent=(%.0f x %.0f)", re.size.width*sc, re.size.height*sc); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-4 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
-        // 直接把透视结果与机身前景合成到目标缓冲。
-        // 说明：之前的两阶段“包围盒小缓冲”在软件渲染器下会把透视结果渲空——重新反汇编
-        // WCRefine 的 WCRefinePerspectiveVideoCompositor 确认它走的是“满画布 IOSurface 中间
-        // 缓冲 + 直接合成”，且其最终合成（滤镜结果 → IOSurface 目标缓冲）在软件渲染下可靠；
-        // 出问题的是我们这套包围盒+平移。故去掉中间缓冲，逐帧零额外分配，既修好
-        // “视频没进模版”，也比每帧建大缓冲更省内存。
+        // 对齐 WCRefine 的 bake→composite 流程（已反汇编 0x1137770 / 0x1137db4 确认）：
+        // ① 先把透视滤镜结果“烘焙”进一张满画布 8bit IOSurface 中间缓冲 _mid（复用、不逐帧
+        //    分配）；GPU 渲染能正确写入并读回，软件渲染器则会把滤镜输出渲空。
+        // ② 把 _mid 读回成普通位图 warpedBaked（已是 8bit sRGB，几何位置同画布），再与机身
+        //    前景 frame 合成。先烘焙再合成，避免直接把“滤镜图+位图”的图交给渲染器合成
+        //    （软件渲染下会渲空，正是之前“视频没进模版”的根因）。
+        if (!_mid || (size_t)_midSize.width != (size_t)W || (size_t)_midSize.height != (size_t)H) {
+            if (_mid) { CVPixelBufferRelease(_mid); _mid = NULL; }
+            CVReturn cvr = CVPixelBufferCreate(kCFAllocatorDefault,
+                             (size_t)W, (size_t)H,
+                             kCVPixelFormatType_32BGRA,
+                             (__bridge CFDictionaryRef)@{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+                                                          (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES },
+                             &_mid);
+            if (cvr != kCVReturnSuccess || !_mid) {
+                DD_Log(@"[Compositor] 中间缓冲创建失败 cvr=%d", cvr);
+                [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-7 userInfo:nil]];
+                CVPixelBufferRelease(dst); return;
+            }
+            _midSize = CGSizeMake(W, H);
+            DD_Log(@"[Compositor] 中间缓冲 (%d x %d) 重建（满画布，复用）", (int)W, (int)H);
+        }
+
+        @try {
+            [_ctx render:warped toCVPixelBuffer:_mid bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
+        } @catch (NSException *e) {
+            DD_Log(@"[Compositor] 透视烘焙抛异常 #%ld : %@", (long)inst.frameCount, e);
+            [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-8 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
+            CVPixelBufferRelease(dst); return;
+        }
+        CIImage *warpedBaked = [CIImage imageWithCVPixelBuffer:_mid]; // 已是 8bit sRGB，几何同画布
+        if (!warpedBaked) { DD_Log(@"[Compositor] 烘焙图读回为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-9 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
+
         CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
-        CIImage *outImg = [frame imageByCompositingOverImage:warped]; // 机身图盖在最上层（与预览同序）
+        CIImage *outImg = [frame imageByCompositingOverImage:warpedBaked]; // 机身图盖在最上层（与预览同序）
         if (!outImg) { DD_Log(@"[Compositor] 合成结果为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-5 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
         @try {
