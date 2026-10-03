@@ -582,9 +582,21 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         CGRect re = rot.extent;
         CGFloat sc = MIN(wb.size.width / re.size.width, wb.size.height / re.size.height);
         if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-        CGAffineTransform norm = CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y);
-        norm = CGAffineTransformConcat(norm, CGAffineTransformMakeScale(sc, sc));
-        CIImage *srcImg = [rot imageByApplyingTransform:norm];
+        // 先平移归零（仅移 origin，不改采样），再用 Lanczos 高质量缩小——相比仿射双线性，
+        // Lanczos 抗混叠更好，可显著减轻套入视频细密纹理缩小后产生的摩尔纹/波纹。
+        // 仅缩小时走 Lanczos；放大（sc>=1）不产生混叠，双线性即可。
+        CIImage *centered = [rot imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
+        CIImage *srcImg = nil;
+        if (sc < 1.0) {
+            CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
+            if (lz) {
+                [lz setDefaults];
+                [lz setValue:centered forKey:kCIInputImageKey];
+                [lz setValue:@(sc) forKey:kCIInputScaleKey];
+                srcImg = lz.outputImage;
+            }
+        }
+        if (!srcImg) srcImg = [centered imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
         inst.frameCount++;
         if (!inst.firstFrameLogged) {
             inst.firstFrameLogged = YES;
