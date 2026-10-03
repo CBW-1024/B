@@ -421,6 +421,10 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
     // 画布按 1 倍开（1 单位 = 1 像素），成品尺寸才严格等于 cfg 写的模板尺寸
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(W, H), NO, 1.0);
+    // 透视结果的 extent 未必是整数（四角来自 cfg，可能带小数），drawInRect 落地时会发生
+    // 非整数倍的二次重采样。显式开最高质量插值，免得这最后一公里被默认的中等插值抹糊。
+    CGContextRef uctx = UIGraphicsGetCurrentContext();
+    if (uctx) CGContextSetInterpolationQuality(uctx, kCGInterpolationHigh);
 
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
 
@@ -433,6 +437,13 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     CGRect wb = DD_WindowBBox(t);
     CGFloat sc = MIN(wb.size.width / A, wb.size.height / B);
     if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
+    // 诊断：cfg 画布尺寸 vs 模板 PNG 实际像素。canvasSize 只认 cfg，与 PNG 无关，若 PNG 更大
+    // 说明没用满真实像素（cfg 写逻辑点/设计稿尺寸、PNG 按 @2x/@3x 导出时就会这样）——机身图
+    // 被降采样、窗口物理尺寸同步变小，属白丢的清晰度。据此决定要不要改用 PNG 实际尺寸。
+    DD_Log(@"[图片套壳] name=%@ 画布=(%.0fx%.0f) PNG=(%.0fx%.0f) 窗口=(%.1fx%.1f) 源=(%.0fx%.0f) sc=%.4f(源宽的%.1f%%)",
+           t.name, W, H,
+           (CGFloat)CGImageGetWidth(frameCG), (CGFloat)CGImageGetHeight(frameCG),
+           wb.size.width, wb.size.height, A, B, sc, sc * 100.0);
     CIImage *srcImg = nil;
     if (sc < 1.0) {
         CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
