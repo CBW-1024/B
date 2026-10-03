@@ -702,11 +702,14 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     // 转换），而非导出链路"固定开销"。故本上限如今主要压低 _mid IOSurface+编码缓冲、并作为
     // 清晰度↔稳定的保守折中，已非救命绳。
     // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩。
-    // 当前默认 1440：与 HighestQuality 编码配合，1440 实测零 [内存压力] WARN，给 Highest 的
-    // 编码缓冲增量留足余量，稳定优先。若求极限清晰（模版/套入视频都更锐且视频窗更大）可上
-    // 2160+Highest：4K 长边顶配（输出约 1596×2160，仍低于 4K/相册 3302 上限 8.29M 故存相册
-    // 安全），但分享扩展进程内存贴边（实测曾触发一次 jetsam WARN、余量极小），需实测验证。
-    static const CGFloat DD_WORK_CAP = 1440.0;
+    // 当前默认 1280：与 HighestQuality 编码配合。背景——AVFoundation 画质预设只有
+    // Low/Medium/Highest 三档（无中间 "High" 档），1440+Highest 在导出中段必触发 [内存压力]
+    // WARN（编码器缓冲累积贴边，虽暂未崩但有 SIGKILL 风险）；为保 Highest 锐度同时削掉 WARN，
+    // 只能降输出分辨率（唯一能压 _mid IOSurface+编码缓冲的旋钮）：1280 比 1440 像素少约 21%
+    // （(1280/1440)²），套入视频窗略小但 Highest 编码保证不块效应，清晰度仍远胜 Medium。若 1280
+    // 仍 WARN 则再降到 1080；若发糊则回 1440+Highest（接受 WARN）。2160+Highest 为极限清晰档
+    // （输出约 1596×2160，4K 安全）但内存贴边，仅作备选。
+    static const CGFloat DD_WORK_CAP = 1280.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
@@ -740,7 +743,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     vc.renderSize = CGSizeMake(W, H);
     CMTime fd = vt.minFrameDuration;
     vc.frameDuration = (fd.timescale && fd.value) ? fd : CMTimeMake(1, 30);
-    NSString *ddPreset = AVAssetExportPresetHighQuality;
+    NSString *ddPreset = AVAssetExportPresetHighestQuality;
     DD_Log(@"[Compose] renderSize=(%.0f x %.0f) frameDuration=%lld/%d preset=%@",
            W, H, (long long)vc.frameDuration.value, vc.frameDuration.timescale, ddPreset);
 
@@ -756,11 +759,12 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
 
     __block NSURL *result = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    // 导出质量用 HighQuality（清晰与稳定折中）：① Highest 在 1440 下每次导出中段必触发 [内存压力]
-    // WARN（编码器缓冲累积贴边，虽暂未崩但有 SIGKILL 风险）；② Medium 虽零 WARN 但把套入视频压出
-    // 明显块效应发糊（用户否决）；③ High 保 1440 全分辨率（视频窗口不缩小）仅削编码比特率/缓冲，
-    // 清晰度高於 Medium、内存低於 Highest，是消 WARN 的首选。波纹已由 CILanczosScaleTransform
-    // 独立解决，与编码档无关。若 High 仍 WARN 则降 DD_WORK_CAP 到 1280；若仍发糊则回 HighestQuality。
+    // 导出质量用 HighestQuality（清晰优先）：AVFoundation 画质预设仅有 Low/Medium/Highest 三档，
+    // 无中间 "High" 档。Highest 在 1440 下每次导出中段必触发 [内存压力] WARN（编码器缓冲累积贴边，
+    // 虽暂未崩但有 SIGKILL 风险）；为保 Highest 锐度同时削 WARN，改降输出分辨率 DD_WORK_CAP
+    // （1280，非编码档）压 _mid IOSurface+编码缓冲。Medium 虽零 WARN 但把套入视频压出明显块效应
+    // 发糊（用户否决）。波纹已由 CILanczosScaleTransform 独立解决，与编码档无关。若 1280+Highest
+    // 仍 WARN 则降 DD_WORK_CAP 到 1080；若发糊则回 1440+Highest（接受 WARN）。
     AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
                                                             presetName:ddPreset];
     ex.outputURL = [NSURL fileURLWithPath:outPath];
