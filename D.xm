@@ -519,19 +519,23 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 // 渲染上下文变化（尺寸/像素格式等），本合成器每帧直接从 request 取 renderContext，无需缓存
 - (void)renderContextChanged:(AVVideoCompositionRenderContext *)newRenderContext {}
 - (NSDictionary *)requiredPixelBufferAttributesForRenderContext {
-    return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-              (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
+    // 对齐 WCRefine：目标缓冲同样 BGRA + IOSurface + OpenGLES（与 source 对称）。
+    // IOSurface 让渲染目标常驻 GPU 显存、CI 渲染零拷贝，规避“逐帧 CPU 缓冲”的内存与
+    // 拷贝开销——这正是 WCR 在导出链路里既快又不崩的底层原因之一。
+    return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelFormatType_32BGRA),
+              (id)kCVPixelBufferIOSurfacePropertiesKey    : @{},
+              (id)kCVPixelBufferOpenGLESCompatibilityKey  : @YES };
 }
 - (NSDictionary *)sourcePixelBufferAttributes {
-    // 不强制 BGRA：让导出管线用解码器原生格式（通常 420 YUV）直送合成器，省掉
-    // “解码→BGRA 转换/拷贝”这一层，源帧内存直接减半（~4B/px → ~2B/px）且零拷贝。
-    // 这是消除 CRITICAL 内存峰值、进而消除导出中段 50+ 秒卡顿的关键杠杆——
-    // 之前“仅源更宽(1036 vs 720)就更易崩”的峰值正是来自 BGRA 解码缓冲。
-    // WCR 在源属性里也强制 BGRA，但它跑在微信主进程、内存上限宽松近 10 倍故无所谓；
-    // 本 tweak 在分享扩展里必须把解码内存压到最低。输出缓冲（required…）仍保持
-    // BGRA+IOSurface（那是合成器产出的目标格式、编码器需要，不可动）；Core Image 的
-    // imageWithCVPixelBuffer: 对标准 YUV 格式会自动转换，无需手动处理。
-    return @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+    // 对齐 WCRefine（WCRefinePerspectiveVideoCompositor）：源帧字典与 required 对称，
+    // 均为 BGRA + IOSurface + OpenGLES 兼容。反汇编其 init 确认源/目标字典都用
+    // kCVPixelFormatType_32BGRA（0x42475241 = BGRA）且带 IOSurfaceProperties /
+    // OpenGLESCompatibility。必须含 kCVPixelBufferPixelFormatTypeKey 否则 AVFCore 直接抛
+    // NSInvalidArgumentException。BGRA 源在 WCR 与我们的 BGRA+1080 实测里均正确出图；
+    // IOSurface 让源帧常驻 GPU 显存、与 CI 渲染零拷贝，正是 WCR 抗内存压力的节奏来源。
+    return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelFormatType_32BGRA),
+              (id)kCVPixelBufferIOSurfacePropertiesKey    : @{},
+              (id)kCVPixelBufferOpenGLESCompatibilityKey  : @YES };
 }
 - (void)cancelAllPendingVideoCompositionRequests {
     self.shouldCancelAllRequests = YES;
