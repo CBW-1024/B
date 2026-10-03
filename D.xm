@@ -523,8 +523,15 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
               (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
 }
 - (NSDictionary *)sourcePixelBufferAttributes {
-    return @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-              (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES };
+    // 不强制 BGRA：让导出管线用解码器原生格式（通常 420 YUV）直送合成器，省掉
+    // “解码→BGRA 转换/拷贝”这一层，源帧内存直接减半（~4B/px → ~2B/px）且零拷贝。
+    // 这是消除 CRITICAL 内存峰值、进而消除导出中段 50+ 秒卡顿的关键杠杆——
+    // 之前“仅源更宽(1036 vs 720)就更易崩”的峰值正是来自 BGRA 解码缓冲。
+    // WCR 在源属性里也强制 BGRA，但它跑在微信主进程、内存上限宽松近 10 倍故无所谓；
+    // 本 tweak 在分享扩展里必须把解码内存压到最低。输出缓冲（required…）仍保持
+    // BGRA+IOSurface（那是合成器产出的目标格式、编码器需要，不可动）；Core Image 的
+    // imageWithCVPixelBuffer: 对标准 YUV 格式会自动转换，无需手动处理。
+    return @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
 }
 - (void)cancelAllPendingVideoCompositionRequests {
     self.shouldCancelAllRequests = YES;
@@ -705,7 +712,7 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     vc.renderSize = CGSizeMake(W, H);
     CMTime fd = vt.minFrameDuration;
     vc.frameDuration = (fd.timescale && fd.value) ? fd : CMTimeMake(1, 30);
-    DD_Log(@"[Compose] renderSize=(%.0f x %.0f) frameDuration=%lld/%d preset=HighestQuality",
+    DD_Log(@"[Compose] renderSize=(%.0f x %.0f) frameDuration=%lld/%d preset=MediumQuality",
            W, H, (long long)vc.frameDuration.value, vc.frameDuration.timescale);
 
     DDShellVideoInstruction *inst = [DDShellVideoInstruction new];
@@ -720,8 +727,12 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
 
     __block NSURL *result = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    // 导出质量用 MediumQuality 而非 HighestQuality：① 编码器内部缓冲大幅缩小，直接压低
+    // 分享扩展里的常驻内存峰值（HighestQuality 在 798×1080 下会把编码缓冲撑大，叠加源/合成
+    // 缓冲更易触顶 CRITICAL、引发中段数十秒卡顿）；② 编码更快。798×1080 已是下采样输出，
+    // Medium 与 Highest 视觉几乎无差。若设备内存充裕且追求极限画质，可改回 HighestQuality。
     AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
-                                                            presetName:AVAssetExportPresetHighestQuality];
+                                                            presetName:AVAssetExportPresetMediumQuality];
     ex.outputURL = [NSURL fileURLWithPath:outPath];
     ex.outputFileType = AVFileTypeMPEG4;
     ex.videoComposition = vc;
