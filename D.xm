@@ -1338,6 +1338,10 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     UICollectionView *cv = [[UICollectionView alloc] initWithFrame:CGRectZero collectionViewLayout:layout];
     cv.backgroundColor = [UIColor clearColor]; // 透明，透出页面底色
     cv.alwaysBounceVertical = YES;
+    // 一滚列表就收起搜索键盘。OnDrag = 开始拖动立刻收（干脆）；
+    // 想要"键盘跟手往下走、拖回去还能取消"的细腻手感，可换 Interactive。
+    // 注意：模板少、列表滚不动时这招不生效（没有拖动手势），靠下面那个 tap 手势兜底。
+    cv.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     cv.delegate = self;
     cv.dataSource = self;
     [cv registerClass:[DDShellTplCell class] forCellWithReuseIdentifier:@"DDShellTplCell"];
@@ -1348,6 +1352,15 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
                                         initWithTarget:self action:@selector(onLongPressTpl:)];
     lp.minimumPressDuration = 0.5;                 // 系统默认时长，与常见"长按唤菜单"一致
     [cv addGestureRecognizer:lp];
+
+    // 点列表任意位置（格子、格子间空白都算）收起搜索键盘。
+    // cancelsTouchesInView 必须设 NO：默认 YES 会在手势成立后取消整条 touch 序列，
+    // collectionView 就再也收不到这次点击，didSelectItemAtIndexPath 不触发（点不动模板）。
+    // 这个手势是模板少、列表滚不动时唯一的收起出口（keyboardDismissMode 靠滚动触发，会失效）。
+    UITapGestureRecognizer *tp = [[UITapGestureRecognizer alloc]
+                                  initWithTarget:self action:@selector(onTapList:)];
+    tp.cancelsTouchesInView = NO;
+    [cv addGestureRecognizer:tp];
 
     self.collectionView = cv;
     [self.view addSubview:cv];
@@ -1461,6 +1474,13 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
     self.tappedTpl = n;
     [self showWCActionSheet:@"套壳操作" tag:DD_SHEET_TPL items:@[@"使用模板", @"重命名", @"选择/多选", @"删除此模板"]];
+}
+
+// 点列表任意位置收起搜索键盘。搜索框是第一响应者时，除了点键盘上的「搜索」键，
+// 这是另一个收起出口——「滚动列表收起」那种做法在模板少、列表滚不动时不生效。
+// 加了 cancelsTouchesInView=NO，本手势与「点格子选模板」「长按弹菜单」互不干扰。
+- (void)onTapList:(UITapGestureRecognizer *)g {
+    if (self.searchBar.isFirstResponder) [self.searchBar resignFirstResponder];
 }
 
 - (void)collectionView:(UICollectionView *)cv didSelectItemAtIndexPath:(NSIndexPath *)ip {
