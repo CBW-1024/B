@@ -1,9 +1,9 @@
 // ============================================================================
 //  DDShell.xm —— 截图模板套壳插件
 //
-//  功能：截图后自动把截图套入模板，并保存回相册；也可以从相册挑图手动套。
-//  流程：监听系统截屏通知 → 从相册取最新截图 → 透视贴入模板窗口 → 存回相册。
-//  cfg 为 JSON，字段：template_width / template_height 与四个屏幕窗角点坐标。
+//  功能：截图后自动把截图套入模板存回相册；也能从相册挑图或挑视频手动套。
+//  流程：监听截屏通知 → 取相册最新一张 → 透视贴进模板的屏幕窗 → 盖机身图 → 存回相册。
+//  模板：每个模板一个目录，含 <名字>.png（机身前景图）+ <名字>.cfg（画布尺寸与四角坐标）。
 //  素材库：设置页入口，模板的导入导出（zip）、应用、重命名、删除都在这一页。
 // ============================================================================
 
@@ -15,12 +15,6 @@
 #import <objc/message.h>
 
 #pragma mark - 微信类声明
-
-@interface MMContext : NSObject
-+ (id)activeUserContext;
-+ (id)rootContext;
-- (id)getService:(Class)arg1;
-@end
 
 @interface WCTableViewManager : NSObject
 - (instancetype)initWithFrame:(CGRect)frame style:(NSInteger)style;
@@ -50,7 +44,6 @@
 @interface NSObject (DDShellWCSheet)
 - (id)initWithTitle:(NSString *)title delegate:(id)delegate cancelButtonTitle:(NSString *)cancelButtonTitle
 destructiveButtonTitle:(NSString *)destructiveButtonTitle otherButtonTitles:(NSString *)otherButtonTitles;
-- (id)initWithTitle:(NSString *)title;
 - (NSInteger)tag;
 - (void)showInView:(id)view;
 @end
@@ -63,7 +56,7 @@ static NSString *const kDDShellSelectedTpl = @"DDShellSelectedTpl";
 static NSString *const kDDShellDeleteSrc   = @"DDShellDeleteOriginal";
 static NSString *const kDDShellProcessed   = @"DDShellProcessedIds";
 
-// 截图后固定等待 1 秒，等系统把截图写入相册后再取
+// 截图后固定等 1 秒，等系统把截图写进相册再取
 static const NSTimeInterval kDDShellDelay = 1.0;
 
 @interface DDShellConfig : NSObject
@@ -113,7 +106,7 @@ static const NSTimeInterval kDDShellDelay = 1.0;
     [[NSUserDefaults standardUserDefaults] setBool:v forKey:k];
 }
 
-// 已处理过的截图去重，避免重复套壳
+// 已处理过的图记下来，避免同一张被反复套壳
 - (BOOL)hasProcessed:(NSString *)lid {
     if (!lid.length) return NO;
     NSArray *arr = [[NSUserDefaults standardUserDefaults] arrayForKey:kDDShellProcessed];
@@ -152,137 +145,13 @@ static NSString *DD_TplFolder(NSString *name) {
 
 #pragma mark - 临时目录
 
-// DDShell 专用临时目录：NSTemporaryDirectory()/DDShell/
-// 与微信原生 tmp 隔离，便于在崩溃/强退/被杀后于下次启动统一清理，避免残骸堆积。
+// 插件专用临时目录：NSTemporaryDirectory()/DDShell/
+// 与微信原生 tmp 隔开，方便下次启动时整目录清掉，不留残骸。
 static NSString *DD_TempRoot(void) {
     NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDShell"];
     [[NSFileManager defaultManager] createDirectoryAtPath:root
                               withIntermediateDirectories:YES attributes:nil error:nil];
     return root;
-}
-
-#pragma mark - 调试日志
-
-#include <stdarg.h>
-// 调试日志写进文件（非越狱设备看不到 NSLog，靠导出日志文件定位问题）。
-// 位置放在 DDShell 数据目录（Library/Preferences/DDShell/），不会被 %ctor 清临时目录误删。
-static NSString *DD_LogPath(void) {
-    NSString *base = [DD_TplDir() stringByDeletingLastPathComponent]; // .../DDShell
-    return [base stringByAppendingPathComponent:@"ddshell_debug.log"];
-}
-
-static void DD_Log(NSString *fmt, ...) {
-    if (!fmt) return;
-    va_list ap; va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
-    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-    static dispatch_queue_t q;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("ddshell.log", DISPATCH_QUEUE_SERIAL); });
-    dispatch_sync(q, ^{
-        NSString *path = DD_LogPath();
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if ([fm fileExistsAtPath:path]) {
-            NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
-            if (attr && [attr[NSFileSize] unsignedLongLongValue] > 2ULL * 1024 * 1024) {
-                [fm removeItemAtPath:path error:nil];
-            }
-        }
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (!fh) { [fm createFileAtPath:path contents:data attributes:nil]; return; }
-        @try { [fh seekToEndOfFile]; [fh writeData:data]; }
-        @catch (NSException *e) {}
-        [fh closeFile];
-    });
-}
-
-#pragma mark - 崩溃捕获（写入日志文件，可导出查看）
-
-#include <signal.h>
-#include <execinfo.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <time.h>
-#include <string.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-
-// 崩溃日志路径缓存成 C 字符串：信号处理函数里不能安全调用 ObjC/dispatch，
-// 必须用具异步信号安全的 open/write/close 直接落盘。
-static char gDDLogPathC[1024] = {0};
-
-static void DD_CrashAppend(const char *text) {
-    if (!text || !*text || gDDLogPathC[0] == '\0') return;
-    int fd = open(gDDLogPathC, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) return;
-    size_t len = strlen(text);
-    write(fd, text, len);
-    write(fd, "\n", 1);
-    close(fd);
-}
-
-static void DD_SignalHandler(int sig) {
-    const char *name = "?";
-    if (sig == SIGSEGV) name = "SIGSEGV 段错误/野指针";
-    else if (sig == SIGBUS) name = "SIGBUS 总线错误/对齐";
-    else if (sig == SIGABRT) name = "SIGABRT abort";
-    else if (sig == SIGILL) name = "SIGILL 非法指令";
-    else if (sig == SIGTRAP) name = "SIGTRAP";
-    else if (sig == SIGFPE) name = "SIGFPE 浮点异常";
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr), "[CRASH] signal %s (%d) epoch=%ld", name, sig, (long)time(NULL));
-    DD_CrashAppend(hdr);
-    void *frames[64];
-    int n = backtrace(frames, 64);
-    char **syms = backtrace_symbols(frames, n);
-    if (syms) {
-        for (int i = 0; i < n; i++) {
-            char line[1024];
-            snprintf(line, sizeof(line), "  %s", syms[i]);
-            DD_CrashAppend(line);
-        }
-        free(syms);
-    }
-    // 还原默认处理并重新触发，让系统仍生成标准崩溃报告
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
-
-static void DD_UncaughtExceptionHandler(NSException *e) {
-    NSMutableString *s = [NSMutableString stringWithFormat:
-        @"[CRASH] uncaught exception: %@\nreason: %@\n", e.name, e.reason];
-    for (NSString *sym in e.callStackSymbols) [s appendFormat:@"  %@\n", sym];
-    DD_CrashAppend(s.UTF8String);
-}
-
-static void DD_InstallCrashHandlers(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *p = DD_LogPath();
-        if (p) strncpy(gDDLogPathC, p.fileSystemRepresentation, sizeof(gDDLogPathC) - 1);
-        NSSetUncaughtExceptionHandler(DD_UncaughtExceptionHandler);
-        int sigs[] = { SIGABRT, SIGBUS, SIGSEGV, SIGILL, SIGTRAP, SIGFPE };
-        for (size_t i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++)
-            signal(sigs[i], DD_SignalHandler);
-        // 内存压力日志。注意区分两档：WARN 是最低档（系统内存偏紧，正常导出也可能触发），
-        // CRITICAL 才是 jetsam(SIGKILL) 前兆（无法捕获）。实测各档（直至 3200+Highest）
-        // 只打 WARN、从未 CRITICAL，且每次导出都成功——WARN 属可接受的轻度告警。
-        // CRITICAL，且每次导出都成功——WARN 属可接受的轻度告警，不必按"即将被杀"处理。
-        dispatch_source_t ps = dispatch_source_create(
-            DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
-            DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
-            dispatch_get_main_queue());
-        dispatch_source_set_event_handler(ps, ^{
-            unsigned lvl = (unsigned)dispatch_source_get_data(ps);
-            BOOL critical = (lvl & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0;
-            DD_Log(@"[内存压力] %@ —— %@", critical ? @"CRITICAL" : @"WARN",
-                   critical ? @"jetsam(SIGKILL) 前兆，进程随时可能被杀且无法捕获"
-                            : @"轻度告警（最低档），高码率编码期常见，通常不影响导出");
-        });
-        dispatch_resume(ps);
-    });
 }
 
 #pragma mark - 模板模型
@@ -314,7 +183,7 @@ static NSString *DD_ActualFile(NSString *name, NSString *ext) {
     return DD_FileInFolder(DD_TplFolder(name), name, ext);
 }
 
-// 模板 cfg 路径：<模板目录>/<名称>.cfg（扩展名大小写不敏感）
+// 模板 cfg 路径：<模板目录>/<名称>.cfg
 static NSString *DD_CfgPath(NSString *name) {
     return DD_ActualFile(name, @"cfg");
 }
@@ -389,7 +258,7 @@ static CIVector *DD_CIVec(CGPoint p, CGFloat canvasH) {
     return [CIVector vectorWithCGPoint:CGPointMake(p.x, canvasH - p.y)];
 }
 
-// 模板四角在画布里围出的屏幕窗包围盒（用来把源按 contain 预缩到窗口尺寸）
+// 模板四角围出的屏幕窗包围盒（用来把源按 contain 预缩到窗口大小）
 static CGRect DD_WindowBBox(DDShellTemplate *t) {
     CGFloat xs[4] = { t.lt.x, t.rt.x, t.rb.x, t.lb.x };
     CGFloat ys[4] = { t.lt.y, t.rt.y, t.rb.y, t.lb.y };
@@ -403,6 +272,7 @@ static CGRect DD_WindowBBox(DDShellTemplate *t) {
     return CGRectMake(minX, minY, maxX - minX, maxY - minY);
 }
 
+// 把一张图透视贴进模板的屏幕窗，再盖上机身前景图，得到成品
 static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (!shot || !t) return nil;
     UIImage *frameImg = t.image;
@@ -411,11 +281,7 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (!frameCG || !shotCG) return nil;
 
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
-    // 尺寸取自 cfg，按 CoreGraphics 的纹理上限卡一道，超了就放弃这次合成。
-    // （曾试过【整体放大画布】做超采样来提升"被套的图"的清晰度：画布与四角同比放大，窗口
-    //  跟着变大、被套图像素量随倍率平方增长——1.5× 时被套图 296×640→444×961。但代价是机身
-    //  PNG 从 1:1 无损变成被放大、内存与成品体积同步平方增长，而各模板窗口占比差异很大
-    //  （本例窗口仅占画布宽 11%），收益不稳定、复杂度不划算，已回退为直接用 cfg 尺寸。）
+    // 尺寸来自 cfg，按 CoreGraphics 的纹理上限卡一道，超了就放弃这次合成
     if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil;
 
     // 截图按实际像素尺寸参与计算
@@ -423,30 +289,25 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     CGFloat B = (CGFloat)CGImageGetHeight(shotCG);
     if (A < 1.0 || B < 1.0) return nil;
 
+    // 滤镜在这里先建好再判空：下面开了图形上下文，中途 return 会漏掉 EndImageContext
+    CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
+    if (!f) return nil;
+
     // 画布按 1 倍开（1 单位 = 1 像素），成品尺寸才严格等于 cfg 写的模板尺寸
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(W, H), NO, 1.0);
-    // 透视结果的 extent 未必是整数（四角来自 cfg，可能带小数），drawInRect 落地时会发生
-    // 非整数倍的二次重采样。显式开最高质量插值，免得这最后一公里被默认的中等插值抹糊。
+    // 透视结果的 extent 未必是整数（四角来自 cfg，可能带小数），落地时会再重采样一次，
+    // 显式开最高质量插值，免得最后一公里被默认插值抹糊
     CGContextRef uctx = UIGraphicsGetCurrentContext();
     if (uctx) CGContextSetInterpolationQuality(uctx, kCGInterpolationHigh);
 
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
 
-    // 源先按 contain 预缩到屏幕窗尺寸，再做透视映射——避免把大分辨率直接喂进透视导致
-    // 中间图过大、投影退化（ZDY 即先预缩放再透视）。
-    // 缩小这一步必须用 Lanczos：截图到窗口是 4× 量级的缩小（实测 1242px 源 → 296px，
-    // 仅剩 23.8%），仿射双线性的抗混叠不足，文字/列表分割线/图标细边会出摩尔纹与发虚
-    // ——与视频链曾经"套入视频有波纹"完全同源（那里改 Lanczos 后消失）。放大(sc>=1)
-    // 不产生混叠，仍走仿射即可。
+    // 先把源按 contain 预缩到屏幕窗大小，再做透视：直接把大分辨率喂进透视会让中间图过大、
+    // 投影退化。缩小这一步用 Lanczos——截图到窗口通常要缩好几倍，双线性的抗混叠不够，
+    // 文字、分割线、图标细边会出摩尔纹；放大不产生混叠，走仿射就够了。
     CGRect wb = DD_WindowBBox(t);
     CGFloat sc = MIN(wb.size.width / A, wb.size.height / B);
     if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-    // 诊断：窗口物理尺寸 = 被套图的清晰度硬上限（各模板窗口占比差异很大，本例仅占画布宽
-    // 11%）；PNG 比画布小说明机身在被放大，比画布大则说明 cfg 写小了、浪费了真实像素。
-    DD_Log(@"[图片套壳] name=%@ 画布=(%.0fx%.0f) PNG=(%.0fx%.0f) 窗口=(%.1fx%.1f) 源=(%.0fx%.0f) sc=%.4f(源宽的%.1f%%) 被套图=(%.0fx%.0f)",
-           t.name, W, H,
-           (CGFloat)CGImageGetWidth(frameCG), (CGFloat)CGImageGetHeight(frameCG),
-           wb.size.width, wb.size.height, A, B, sc, sc * 100.0, A * sc, B * sc);
     CIImage *srcImg = nil;
     if (sc < 1.0) {
         CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
@@ -458,7 +319,6 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         }
     }
     if (!srcImg) srcImg = [[CIImage imageWithCGImage:shotCG] imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
-    CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
     [f setDefaults];
     [f setValue:srcImg forKey:kCIInputImageKey];
     [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, A * sc, B * sc)] forKey:@"inputExtent"];
@@ -503,8 +363,6 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 @property (nonatomic)         CMPersistentTrackID passthroughTrackID;
 @property (nonatomic, strong) DDShellTemplate    *tpl;
 @property (nonatomic)         CGAffineTransform   preferredTransform;
-@property (nonatomic)         BOOL                firstFrameLogged;
-@property (nonatomic)         NSInteger           frameCount;
 @end
 
 @implementation DDShellVideoInstruction
@@ -519,10 +377,8 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 @implementation DDShellVideoCompositor {
     CIContext      *_ctx;
     CGColorSpaceRef _cs;
-    CVPixelBufferRef _mid;   // 复用的满画布 8bit 中间缓冲：先把透视结果“烘焙”成位图，
-                            // 再与机身前景合成。对齐 WCRefine 的 bake→composite 流程
-                            // （它从不让渲染器直接合成“滤镜图”，而是先烘焙）；由框架复用的
-                            // 同一合成器实例持有、dealloc 释放，逐帧零分配，内存打平防 jetsam。
+    CVPixelBufferRef _mid;   // 满画布中间缓冲：透视结果先烘焙进来，再与机身合成。
+                            // 复用同一张、不逐帧分配，内存打平；在 dealloc 里释放。
     CGSize           _midSize;
 }
 
@@ -530,47 +386,32 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     self = [super init];
     if (self) {
         _cs  = CGColorSpaceCreateDeviceRGB();
-        // 走 GPU 渲染（默认，不强制软件渲染）。软件渲染器会把 CIPerspectiveTransform
-        // 滤镜输出渲空——表现为“有声音、模板在、视频没进模版”（模板来自静态 CGImage 能正常
-        // 渲，唯独 warped 那层空）。经反汇编 WCRefine 确认其合成路径是“先烘焙 warped 到满
-        // 画布 IOSurface 中间缓冲、再读回位图与前景合成”，且 GPU 路径原本就能正确渲出 warped。
-        // 为防宽色域/P3 源把 Core Image 推到 float 扩展范围缓冲（内存翻倍），钉死 working/
-        // output 为 sRGB；中间缓冲 _mid 复用单张满画布 IOSurface、不逐帧分配，内存打平。
+        // 钉死 working/output 为 sRGB：宽色域 / P3 源会把 Core Image 推到浮点扩展范围
+        // 缓冲，内存翻倍。
+        // 不缓存中间结果：逐帧渲染的循环里不让显存跟着帧数累积。
         _ctx = [CIContext contextWithOptions:@{ (id)kCIContextWorkingColorSpace : (__bridge id)_cs,
                                                 (id)kCIContextOutputColorSpace  : (__bridge id)_cs,
-                                                // 不缓存中间结果：防止逐帧渲染循环里 GPU 显存随
-                                                // 帧数累积（大分辨率长视频下会显著推高内存峰值）。
                                                 (id)kCIContextCacheIntermediates : @NO }];
     }
     return self;
 }
 - (void)dealloc {
     if (_cs) CGColorSpaceRelease(_cs);
-    if (_mid) CVPixelBufferRelease(_mid);   // 合成器实例常被框架复用，析构时回收中间缓冲
+    if (_mid) CVPixelBufferRelease(_mid);
 }
 // 渲染上下文变化（尺寸/像素格式等），本合成器每帧直接从 request 取 renderContext，无需缓存
 - (void)renderContextChanged:(AVVideoCompositionRenderContext *)newRenderContext {}
 - (NSDictionary *)requiredPixelBufferAttributesForRenderContext {
-    // 对齐 WCRefine：目标缓冲同样 BGRA + IOSurface + OpenGLES（与 source 对称）。
-    // IOSurface 让渲染目标常驻 GPU 显存、CI 渲染零拷贝，规避“逐帧 CPU 缓冲”的内存与
-    // 拷贝开销——这正是 WCR 在导出链路里既快又不崩的底层原因之一。
+    // 输出缓冲要 BGRA + IOSurface：编码器需要 BGRA，IOSurface 让它常驻 GPU 显存、
+    // CI 渲染零拷贝，省掉逐帧 CPU 缓冲的内存与拷贝开销。
     return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelFormatType_32BGRA),
               (id)kCVPixelBufferIOSurfacePropertiesKey    : @{},
               (id)kCVPixelBufferOpenGLESCompatibilityKey  : @YES };
 }
 - (NSDictionary *)sourcePixelBufferAttributes {
-    // 源帧格式：420YUV（420 YpCbCr 8-bit BiPlanar VideoRange）而非对齐 WCR 的 BGRA。
-    // 理由：H.264/H.265 解码器原生输出就是 YUV，写 BGRA 会让系统额外做“解码→BGRA 转换”
-    // 且每帧多占 ~2.6× 内存（5.3MB→2MB/帧 @1036×1280）；写 420YUV 则零转换、源解码内存
-    // 直接砍到最低。Core Image 的 imageWithCVPixelBuffer: 对标准 420YUV 会自动转 RGB，
-    // 合成逻辑无需改动；输出缓冲（required）仍是 BGRA+IOSurface（编码器需要，不可动）。
-    // 这是“降分辨率/对齐 WCR 仍中段停摆”之后的减负改动：源解码是导出链路里我们能砍的
-    // 最大一块内存。事后实测证明它才是根治——同一 1036 宽源从 BGRA 的 44s 中段停摆变为
-    // 7s 匀速无停摆（此前误判为“仅小幅缓解”，实为完全消除）。
-    // （备注：曾提议换 Photo Editing 扩展拿高内存预算作治本，后经日志证实本就跑在微信
-    //  主进程、内存充裕，该方案已废弃，代码未保留。）
-    // 必须含 kCVPixelBufferPixelFormatTypeKey（否则 AVFCore 直接抛 NSInvalidArgumentException）；
-    // IOSurface 让源帧常驻 GPU 显存、与 CI 渲染零拷贝。
+    // 源帧直接要 420YUV：解码器原生输出就是这个，写 BGRA 会多一次转换、每帧内存也翻倍。
+    // Core Image 会自动把 420YUV 转 RGB，合成部分不用为此改动；输出缓冲仍是 BGRA。
+    // 必须带 PixelFormatTypeKey，否则 AVFoundation 直接抛 NSInvalidArgumentException。
     return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
               (id)kCVPixelBufferIOSurfacePropertiesKey    : @{},
               (id)kCVPixelBufferOpenGLESCompatibilityKey  : @YES };
@@ -580,16 +421,15 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 }
 - (void)startVideoCompositionRequest:(AVAsynchronousVideoCompositionRequest *)req {
     if (self.shouldCancelAllRequests) {
-        // 框架会在每次导出结束/释放时调用 cancelAllPendingVideoCompositionRequests
-        // 把本标志置 YES，且倾向于复用同一合成器实例；若不在此复位，后续所有导出都会
-        // 在入口被 finishCancelledRequest 早退、一帧不画，导致“空白视频”。
+        // 框架每次导出结束都会把这个标志置 YES，且倾向于复用同一个合成器实例；
+        // 不在这里复位的话，之后每次导出都会在入口被 finishCancelledRequest 早退、一帧不画。
         self.shouldCancelAllRequests = NO;
         [req finishCancelledRequest];
         return;
     }
-    // 注意：AVAssetExportSession 的自定义合成器必须同步完成（start 返回前调用
-    // finish*），否则延迟到自建队列提交的帧不会被导出管线泵送，最终导出“成功”
-    // 但画面全黑（空白视频）。AVPlayerItem 播放链路才支持真正的异步合成。
+    // 导出用的自定义合成器必须同步完成（start 返回前调用 finish*）：帧若被丢到自建队列
+    // 异步提交，导出管线不会泵送它们，结果导出“成功”但画面全黑。
+    // 只有 AVPlayerItem 的播放链路才支持真正的异步合成。
     [self _renderOneRequest:req];
 }
 
@@ -602,23 +442,21 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
         CMPersistentTrackID tid = [(NSNumber *)inst.requiredSourceTrackIDs.firstObject intValue];
         CVPixelBufferRef src = [req sourceFrameByTrackID:tid];
-        if (!src) { DD_Log(@"[Compositor] 取源帧失败 tid=%d", tid); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-1 userInfo:nil]]; return; }
+        if (!src) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-1 userInfo:nil]]; return; }
 
         CVPixelBufferRef dst = [req.renderContext newPixelBuffer];
-        if (!dst) { DD_Log(@"[Compositor] 取目标缓冲失败"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-2 userInfo:nil]]; return; }
+        if (!dst) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-2 userInfo:nil]]; return; }
 
-        // 源帧先按视频自带旋转摆正；preferredTransform 常带位移把旋转后的帧挪回正位，
-        // 其 extent 原点往往不为 0。先把原点归零再按 contain 预缩到屏幕窗尺寸，最后透视
-        // 映射到窗口——避免把巨大坐标 / 大分辨率直接喂进透视导致中间图过大、投影退化，
-        // 导出失败或相册拒收（ZDY 即先预缩放再透视）。
+        // 源帧先按视频自带旋转摆正。preferredTransform 常带位移把旋转后的帧挪回正位，
+        // extent 原点往往不为 0，所以先把原点归零，再按 contain 预缩到屏幕窗大小，
+        // 最后透视映射到窗口——避免把巨大坐标 / 大分辨率直接喂进透视。
         CIImage *raw = [CIImage imageWithCVPixelBuffer:src];
         CIImage *rot = [raw imageByApplyingTransform:inst.preferredTransform];
         CGRect re = rot.extent;
         CGFloat sc = MIN(wb.size.width / re.size.width, wb.size.height / re.size.height);
         if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-        // 先平移归零（仅移 origin，不改采样），再用 Lanczos 高质量缩小——相比仿射双线性，
-        // Lanczos 抗混叠更好，可显著减轻套入视频细密纹理缩小后产生的摩尔纹/波纹。
-        // 仅缩小时走 Lanczos；放大（sc>=1）不产生混叠，双线性即可。
+        // 先平移归零（只动 origin，不改采样），再缩小。缩小走 Lanczos 抗混叠，
+        // 细密纹理才不会出摩尔纹；放大不产生混叠，走仿射即可。
         CIImage *centered = [rot imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
         CIImage *srcImg = nil;
         if (sc < 1.0) {
@@ -631,18 +469,9 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
             }
         }
         if (!srcImg) srcImg = [centered imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
-        inst.frameCount++;
-        if (!inst.firstFrameLogged) {
-            inst.firstFrameLogged = YES;
-            DD_Log(@"[Compositor] 首帧 srcExtent=(%.0f x %.0f) sc=%.4f renderSize=(%.0f x %.0f) tid=%d",
-                   re.size.width, re.size.height, sc, W, H, tid);
-        } else if (inst.frameCount % 30 == 0) {
-            CFStringRef d = CMTimeCopyDescription(NULL, req.compositionTime);
-            DD_Log(@"[Compositor] 进度 #%ld t=%@", (long)inst.frameCount, d ? CFBridgingRelease(d) : @"?");
-        }
 
         CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
-        if (!f) { DD_Log(@"[Compositor] 透视滤镜不可用"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-3 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
+        if (!f) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-3 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
         [f setDefaults];
         [f setValue:srcImg forKey:kCIInputImageKey];
         [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, re.size.width * sc, re.size.height * sc)] forKey:@"inputExtent"];
@@ -651,14 +480,11 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
         [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
         CIImage *warped = f.outputImage;
-        if (!warped) { DD_Log(@"[Compositor] 透视结果为空 extent=(%.0f x %.0f)", re.size.width*sc, re.size.height*sc); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-4 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
+        if (!warped) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-4 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
-        // 对齐 WCRefine 的 bake→composite 流程（已反汇编 0x1137770 / 0x1137db4 确认）：
-        // ① 先把透视滤镜结果“烘焙”进一张满画布 8bit IOSurface 中间缓冲 _mid（复用、不逐帧
-        //    分配）；GPU 渲染能正确写入并读回，软件渲染器则会把滤镜输出渲空。
-        // ② 把 _mid 读回成普通位图 warpedBaked（已是 8bit sRGB，几何位置同画布），再与机身
-        //    前景 frame 合成。先烘焙再合成，避免直接把“滤镜图+位图”的图交给渲染器合成
-        //    （软件渲染下会渲空，正是之前“视频没进模版”的根因）。
+        // 先烘焙再合成：① 把透视结果渲进 _mid（满画布 IOSurface，复用、不逐帧分配）；
+        // ② 读回成普通位图 warpedBaked（已是 8bit sRGB，几何位置同画布），再与机身前景合成。
+        // 不这么绕、直接把“滤镜图 + 位图”交出去合成，某些渲染路径下滤镜那层会渲空。
         if (!_mid || (size_t)_midSize.width != (size_t)W || (size_t)_midSize.height != (size_t)H) {
             if (_mid) { CVPixelBufferRelease(_mid); _mid = NULL; }
             CVReturn cvr = CVPixelBufferCreate(kCFAllocatorDefault,
@@ -668,43 +494,35 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
                                                           (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES },
                              &_mid);
             if (cvr != kCVReturnSuccess || !_mid) {
-                DD_Log(@"[Compositor] 中间缓冲创建失败 cvr=%d", cvr);
                 [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-7 userInfo:nil]];
                 CVPixelBufferRelease(dst); return;
             }
             _midSize = CGSizeMake(W, H);
-            DD_Log(@"[Compositor] 中间缓冲 (%d x %d) 重建（满画布，复用）", (int)W, (int)H);
         }
 
         @try {
             [_ctx render:warped toCVPixelBuffer:_mid bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
         } @catch (NSException *e) {
-            DD_Log(@"[Compositor] 透视烘焙抛异常 #%ld : %@", (long)inst.frameCount, e);
             [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-8 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
             CVPixelBufferRelease(dst); return;
         }
         CIImage *warpedBaked = [CIImage imageWithCVPixelBuffer:_mid]; // 已是 8bit sRGB，几何同画布
-        if (!warpedBaked) { DD_Log(@"[Compositor] 烘焙图读回为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-9 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
+        if (!warpedBaked) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-9 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
         CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
         CIImage *outImg = [frame imageByCompositingOverImage:warpedBaked]; // 机身图盖在最上层（与预览同序）
-        if (!outImg) { DD_Log(@"[Compositor] 合成结果为空"); [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-5 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
+        if (!outImg) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-5 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
         @try {
             [_ctx render:outImg toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
         } @catch (NSException *e) {
-            DD_Log(@"[Compositor] render 抛异常 #%ld ext=(%.0f x %.0f) sc=%.4f : %@",
-                   (long)inst.frameCount, W, H, sc, e);
             [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-6 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
             CVPixelBufferRelease(dst);
             return;
         }
 
-        // 注意：iOS 的 CIContext 没有 reclaimResources（该方法仅 macOS 可用，
-        // CIContext.h 标注 NS_AVAILABLE_MAC(10_4)，编译期即 unavailable on iOS），不能调用。
-        // iOS 端改用 init 里的 kCIContextCacheIntermediates:@NO 来斩断逐帧显存累积——
-        // 它让 CI 不缓存中间纹理、每帧渲染后即回收，等价于“每帧 reclaim”。本 tweak 跑在
-        // 微信主进程（内存远宽于扩展），但 3200 档 7.57MP 画布下显存累积仍可观，保留此设置。
+        // iOS 的 CIContext 没有 reclaimResources（该方法仅 macOS 可用）；逐帧回收显存
+        // 由上面 init 里的 kCIContextCacheIntermediates:@NO 负责。
         [req finishWithComposedVideoFrame:dst];
         CVPixelBufferRelease(dst);
     }
@@ -715,39 +533,20 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     AVURLAsset *asset = [AVURLAsset assetWithURL:srcURL];
     AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
-    if (!vt) { DD_Log(@"[Compose] 无视频轨"); return nil; }
-    DD_Log(@"[Compose] 视频轨 naturalSize=(%.0f x %.0f) fps=%.2f transform=%@",
-           vt.naturalSize.width, vt.naturalSize.height, vt.nominalFrameRate,
-           NSStringFromCGAffineTransform(vt.preferredTransform));
+    if (!vt) return nil;
 
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
     if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
 
-    // ── 工作分辨率上限（长边 DD_WORK_CAP）────────────────────────────────
-    // 【硬天花板】相册 4K 像素 8,294,400：超过即 3302 存不进相册。画布原始 2840×3840
-    // =10.9MP 是上限的 131%，故"用原始分辨率"不可行。本算法 s=C/3840（高度恒为长边约束），
-    // C=3348 时正好 8.29MP 触顶；C=3200 用掉 91%（余量 9%），C=2160 用掉 41.6%。
-    // 【当前默认 3200】输出约 2366×3200（7.57MP）。实测（944 宽源 / 16s 视频）：主进程，
-    // 全程 #30→#480 匀速无停摆，2 次 [内存压力] WARN（均最低档、非 CRITICAL），约 27s
-    // 导出成功、存相册 success=1（无 3302）。再上探到 3348 仅多 +12px 视频窗宽
-    // （260→272px），却要贴 4K 硬线，收益/风险不划算，故定为最终档。
-    // 【历史教训·勿回退】① 源格式改 420YUV(NV12) 是治"慢"的关键：此前 BGRA 源需每帧
-    // NV12→BGRA 转换、源缓冲 2.6×，同一 1036 宽源从 44s 中段停摆变为 7s 匀速无停摆——
-    // 停摆主因是【源内存】而非合成分辨率，所以降分辨率治不了停摆（曾实测 720 反而更慢）。
-    // ② 曾误判合成跑在分享扩展(appex)（因输入 trim.MOV 落在 PluginKitPlugin 容器），实为
-    // 证书注入主二进制 → 只跑在【微信主进程】：输出 mp4 落在 Containers/Data/Application/…，
-    // DD_IsExtensionProcess() 恒 NO；trim.MOV 只是系统视频选择器/裁剪插件所写并授权主进程
-    // 读取。③ 因此"为避 appex 内存墙而降分辨率"的前提不成立（2160/1440/1280/1080 各档
-    // 实测都只 WARN、都成功），故把分辨率提回 3200 拿回清晰度。
-    // 【降级链】更长视频/老设备若出现 CRITICAL 或 3302：2880 → 2560 → 2160（2160 已验证稳）。
-    // 【模版几何上限】本模版视频框仅占画布宽约 11%，即便顶到 3348 窗口也仅约 272px 宽 ≈
-    // 源宽 944px 的 29%——视频到不了源原生清晰度，属模版设计所限，非 tweak 可解。
+    // 工作分辨率上限：模板画布常常比相册能收的 4K 像素还大，超限会被相册直接拒收，
+    // 所以先按长边等比缩到上限内，再拿缩过的画布和四角去合成。
+    // 老设备或更长视频若出现内存告警、导出失败，把 DD_WORK_CAP 往下调一档即可。
     static const CGFloat DD_WORK_CAP = 3200.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
     if (s < 1.0) {
-        CGFloat nW = floor((W * s) / 2.0) * 2.0;
+        CGFloat nW = floor((W * s) / 2.0) * 2.0;   // 取偶数，编码器要求
         CGFloat nH = floor((H * s) / 2.0) * 2.0;
         if (nW < 2.0) nW = 2.0;
         if (nH < 2.0) nH = 2.0;
@@ -764,9 +563,6 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
         st.lb = CGPointMake(t.lb.x * s, t.lb.y * s);
         st.rb = CGPointMake(t.rb.x * s, t.rb.y * s);
         W = nW; H = nH;
-        DD_Log(@"[Compose] 画布超限，等比缩小 s=%.4f → renderSize=(%.0f x %.0f)", s, W, H);
-    } else {
-        DD_Log(@"[Compose] 画布 W=%.0f H=%.0f", W, H);
     }
 
     NSString *outPath = [DD_TempRoot() stringByAppendingPathComponent:
@@ -776,9 +572,6 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     vc.renderSize = CGSizeMake(W, H);
     CMTime fd = vt.minFrameDuration;
     vc.frameDuration = (fd.timescale && fd.value) ? fd : CMTimeMake(1, 30);
-    NSString *ddPreset = AVAssetExportPresetHighestQuality;
-    DD_Log(@"[Compose] renderSize=(%.0f x %.0f) frameDuration=%lld/%d preset=%@",
-           W, H, (long long)vc.frameDuration.value, vc.frameDuration.timescale, ddPreset);
 
     DDShellVideoInstruction *inst = [DDShellVideoInstruction new];
     inst.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
@@ -792,44 +585,31 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
 
     __block NSURL *result = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    // 导出质量用 HighestQuality（清晰优先）：AVFoundation 画质预设仅有 Low/Medium/Highest
-    // 三档，无中间 "High" 档。Medium 虽零 WARN 但把套入视频压出明显块效应发糊（用户否决）；
-    // Highest 的代价只是中段偶发 [内存压力] WARN——已澄清那是 DISPATCH_MEMORYPRESSURE_WARN
-    // （最低档，非 CRITICAL 前兆），主进程下实测每次都正常导出，可接受。
-    // 波纹已由 CILanczosScaleTransform 独立解决，与编码档无关（回退 Medium 也不会复发）。
-    // 若更长视频/老设备真出现 CRITICAL 或 3302，优先降 DD_WORK_CAP（3200→2880→2560→2160），
-    // 编码档最后才考虑回 Medium（会发糊）。
+    // 画质预设只有 Low / Medium / Highest 三档，取 Highest 保清晰度
     AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
-                                                            presetName:ddPreset];
+                                                            presetName:AVAssetExportPresetHighestQuality];
     ex.outputURL = [NSURL fileURLWithPath:outPath];
     ex.outputFileType = AVFileTypeMPEG4;
     ex.videoComposition = vc;
     [ex exportAsynchronouslyWithCompletionHandler:^{
-        if (ex.status == AVAssetExportSessionStatusCompleted) {
-            DD_Log(@"[Compose] 导出成功 outPath=%@", outPath);
-            result = ex.outputURL;
-        } else {
-            DD_Log(@"[Compose] 导出失败 status=%ld error=%@", (long)ex.status, [ex error]);
-        }
+        if (ex.status == AVAssetExportSessionStatusCompleted) result = ex.outputURL;
         dispatch_semaphore_signal(sem);
     }];
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-    if (!result) { // 导出失败，半截 mp4 回收，避免留在临时目录
-        DD_Log(@"[Compose] 导出失败 status=%ld error=%@ outPath=%@",
-               (long)ex.status, [ex error], outPath);
+    if (!result) { // 导出失败，半截 mp4 不留
         [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
     }
     return result;
 }
 
-// 视频存相册，存完回调（成功才删临时文件，失败保留以便排查，下次启动会清理）
+// 视频存相册。临时 mp4 无论成败都回收：失败时尤其要删——没相册权限或磁盘满这两种失败
+// 会连着发生，留着只会让磁盘更紧，而下次启动才跑的整目录清理未必来得及。
+// 导出失败那条路径在上面已经删过了，两条失败路径都不留残骸。
 static void DD_SaveVideoToAlbum(NSURL *url, void (^done)(BOOL success, NSError *err)) {
     [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
         [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:url];
     } completionHandler:^(BOOL success, NSError *error) {
-        DD_Log(@"[存相册] success=%d error=%@ (%@:%ld) url=%@",
-               success, error.localizedDescription, error.domain, (long)error.code, url);
-        if (success) [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
         if (done) done(success, error);
     }];
 }
@@ -851,7 +631,7 @@ static void DD_SaveImageToAlbum(UIImage *img, void (^done)(BOOL success, NSError
         PHAssetChangeRequest *req = [PHAssetChangeRequest creationRequestForAssetFromImage:img];
         ph = req.placeholderForCreatedAsset;
     } completionHandler:^(BOOL success, NSError *error) {
-        // 成品也标记为已处理，避免之后被当成未处理截图重复套壳
+        // 成品也记一笔，避免之后被当成未处理的截图重复套壳
         if (success && ph.localIdentifier.length) {
             [[DDShellConfig shared] markProcessed:ph.localIdentifier];
         }
@@ -863,19 +643,6 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
     [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
         [PHAssetChangeRequest deleteAssets:assets];
     } completionHandler:nil];
-}
-
-#pragma mark - 进程识别与视频套壳合成
-
-// 当前 tweak 所在进程是否 App 扩展(appex)。判定依据：扩展的可执行路径/bundle 路径带
-// PluginKitPlugin 或 .appex；微信主 App 走 Containers/Data|Bundle/Application，均无这两者。
-// 实测（日志佐证）：证书注入主二进制时合成跑在【微信主进程】——输出 mp4 落在
-// Containers/Data/Application/.../tmp/DDShell/，而输入 trim.MOV 虽在 PluginKitPlugin
-// 容器（系统视频选择器/裁剪插件所写），只是授权给主进程读取，并不代表我们跑在扩展里。
-static BOOL DD_IsExtensionProcess(void) {
-    NSString *exe = [[NSBundle mainBundle] executablePath] ?: @"";
-    NSString *bp  = [[NSBundle mainBundle] bundlePath]    ?: @"";
-    return [exe containsString:@"PluginKitPlugin"] || [bp containsString:@".appex"];
 }
 
 #pragma mark - 监听器
@@ -890,10 +657,18 @@ static BOOL DD_IsExtensionProcess(void) {
 - (void)hideWithAnimated:(BOOL)animated;
 @end
 
-static WeToast *gBusyToast = nil; // 进行中的 loading 提示（套壳 / 导出），完成后收起
+static WeToast *gBusyToast = nil; // 进行中的 loading 提示（套壳 / 导入 / 导出），完成后收起
+
+// 套壳任务排队：自动截图、相册选图、相册选视频都排在同一条串行队列上，同一时刻只跑
+// 一个。这样两个任务不会同时弹 loading 互相抢（提示串台），内存峰值也不会叠加。
+static dispatch_queue_t DD_ShellQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("com.ddshell.shell", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
 
 // 连拍互斥：同一时刻只处理一张，处理中到达的截屏事件直接丢弃
-static dispatch_queue_t gShellQueue = nil;
 static BOOL gShellBusy = NO;
 
 static WeToast *DD_Toast(void) {
@@ -901,19 +676,23 @@ static WeToast *DD_Toast(void) {
 }
 
 // loading / 成功 / 失败 / 纯文字四种提示，都用微信的 WeToast
-// 开始 loading，实例存下来给后面收起用
+// 收起 loading：调用方都在主线程
+static void DD_HideLoading(void) {
+    [gBusyToast hideWithAnimated:YES];
+    gBusyToast = nil;
+}
+// 开始 loading，实例存下来给后面收起用。
+// 上一个若还没收（自动套壳转着的时候用户又点了相册选图），先收掉它再起新的：
+// gBusyToast 只留一个实例，直接覆盖会让上一个转圈永远停在屏幕上——它自己那次收起
+// 调用只会收到新的这个。
 static void DD_ShowLoading(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (gBusyToast) DD_HideLoading();
         WeToast *toast = DD_Toast();
         [toast setLoadingStyle:YES];
         [toast showToastWithText:text];
         gBusyToast = toast;
     });
-}
-// 收起 loading：调用方都在主线程
-static void DD_HideLoading(void) {
-    [gBusyToast hideWithAnimated:YES];
-    gBusyToast = nil;
 }
 static void DD_ShowShellDone(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -962,12 +741,15 @@ static void DD_ShowToast(NSString *text) {
     if (![DDShellConfig shared].enabled || ![DDShellConfig shared].autoShell) return;
     // 等系统把截图写入相册后再取
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDDShellDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!gShellQueue) gShellQueue = dispatch_queue_create("com.ddshell.shell", DISPATCH_QUEUE_SERIAL);
-        dispatch_async(gShellQueue, ^{
+        CFAbsoluteTime queuedAt = CFAbsoluteTimeGetCurrent();
+        dispatch_async(DD_ShellQueue(), ^{
             if (gShellBusy) return; // 已有任务在跑，本次丢弃
+            // 排队等太久说明前面压着别的套壳任务（比如一段长视频正在导出）。等到那时候
+            // 相册最新一张早就不是刚截的那张了，再套就是套错图，直接丢弃。
+            if (CFAbsoluteTimeGetCurrent() - queuedAt > 3.0) return;
             gShellBusy = YES;
             [self shellLatestScreenshotWithCompletion:^{
-                dispatch_async(gShellQueue, ^{
+                dispatch_async(DD_ShellQueue(), ^{
                     gShellBusy = NO;
                 });
             }];
@@ -999,7 +781,7 @@ static void DD_ShowToast(NSString *text) {
                     if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
                     DD_ShowShellDone();
                 } else {
-                    DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
+                    DD_ShowError(@"套壳失败");
                 }
                 completion();
             });
@@ -1011,9 +793,9 @@ static void DD_ShowToast(NSString *text) {
 
 #pragma mark - 导入导出
 
-// 只用来给这两个类方法提供 selector 声明：objc_getClass() 的返回值是 Class 类型的
-// 接收者，clang 要见到同名 selector 的声明才放行。类名本身不参与，实际取的是微信里的
-// QSSZipArchive，编译期不产生链接符号。别当死代码删。
+// 这两个类只为提供 selector 声明：objc_getClass() 的返回值是 Class 类型的接收者，
+// clang 要见到同名 selector 的声明才放行。实际取的是微信里的 QSSZipArchive，
+// 编译期不产生链接符号。
 @interface DDZipArchive : NSObject
 + (BOOL)createZipFileAtPath:(id)zipPath withContentsOfDirectory:(id)dir keepParentDirectory:(BOOL)keep;
 + (BOOL)unzipFileAtPath:(id)zipPath toDestination:(id)dest;
@@ -1161,21 +943,31 @@ static const NSInteger kDDShellTplColumns = 2;
 static const CGFloat   kDDShellTplGap     = 10.0;
 static const CGFloat   kDDShellSearchH    = 44.0;
 
-// 缩略图缓存：模板 png 是全尺寸图（可能上千像素），每格都整图解一次码滚动会卡。
-// 按格子边长解码一次后缓存；key 里带路径，重命名后不会串图。
+// 缩略图缓存：模板 png 是全尺寸图，每格都整图解一次码滚动会卡，按格子边长解码一次后缓存
 static NSCache *DD_ThumbCache(void) {
     static NSCache *cache;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         cache = [[NSCache alloc] init];
         cache.countLimit = 80;
+        // 条数之外再卡一层字节数：80 条全占满约 93MB，64MB 够铺好几屏，峰值压得住。
+        // （NSCache 本身会在系统内存告警时自动清空，这里只是让平时也不至于堆那么高。）
+        cache.totalCostLimit = 64 * 1024 * 1024;
     });
     return cache;
 }
 
+// key = 模板名 + 格子边长。用名字就够：模板路径本来就是按名字拼出来的，
+// 名字一变路径必然跟着变，不存在“同名不同路径”。
 static NSString *DD_ThumbKey(NSString *name, CGFloat side) {
-    NSString *path = DD_ActualFile(name, @"png");
-    return (path.length && side > 0) ? [NSString stringWithFormat:@"%@|%d", path, (int)side] : nil;
+    return (name.length && side > 0) ? [NSString stringWithFormat:@"%@|%d", name, (int)side] : nil;
+}
+
+// 模板内容或名字发生变化后清空缩略图缓存：导入同名模板时是整目录覆盖，png 换成了新图
+// 但路径一字未变、key 也就完全一样，不清缓存格子会继续显示上一张缩略图。
+// 改名 / 删除时 key 会跟着变（不会串图），但旧条目白占内存，一并清掉。
+static void DD_ThumbCachePurge(void) {
+    [DD_ThumbCache() removeAllObjects];
 }
 
 // 只查缓存，读不到就返回 nil：主线程调这个，不解码
@@ -1201,7 +993,13 @@ static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
     [src drawInRect:CGRectMake((side - draw.width) / 2, (side - draw.height) / 2, draw.width, draw.height)];
     UIImage *out = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
-    if (out) [DD_ThumbCache() setObject:out forKey:key];
+    // cost 必须显式给：totalCostLimit 只对 setObject:forKey:cost: 的条目起作用，
+    // 不传 cost（默认 0）的话上面那条上限形同虚设。按位图实际占的字节算：
+    // 画布是 side×side（pt），乘屏幕 scale 得像素边长，再乘 4 字节（RGBA）。
+    if (out) {
+        NSUInteger px = (NSUInteger)(side * [UIScreen mainScreen].scale + 0.5);
+        [DD_ThumbCache() setObject:out forKey:key cost:px * px * 4];
+    }
     return out;
 }
 
@@ -1275,14 +1073,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     return view.safeAreaInsets.top;
 }
 
-// 导航栏外观不碰：8.0.79 由 WCCustomNavigationBar / WCCustomNavigationBarCoordinator
-// 自己实现整套导航栏（背景、标题、返回箭头、转场渲染），不走 UIKit 的 UINavigationBarAppearance。
+// 导航栏外观不碰：微信自己实现整套导航栏（背景、标题、返回箭头、转场渲染），
+// 不走 UIKit 的 UINavigationBarAppearance。
 
 // 独立的素材库页面：
 //   双排网格列出模板，右上角常驻 导出 / 导入（导入最靠右），默认按名称排序；
 //   点「导出」用微信原生 WCActionSheet 弹「选择导出方式」：选择导出 / 全部导出（取消自带）；
 //   「选择导出」进入选择态，右上角换成 删除 / 导出 / 取消；
-//   长按一个模板弹 WCActionSheet「套壳操作」：使用模板 / 重命名 / 选择/多选 / 删除此模板，
+//   长按一个模板弹 WCActionSheet「套壳操作」：使用模板 / 重命名 / 选择·多选 / 删除此模板，
 //   选「选择/多选」同样进选择态；单击一个模板则直接把它设为当前生效（绿框挪过去即反馈）。
 @interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;           // 贴在 view 顶上的搜索框
@@ -1339,8 +1137,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     cv.backgroundColor = [UIColor clearColor]; // 透明，透出页面底色
     cv.alwaysBounceVertical = YES;
     // 一滚列表就收起搜索键盘。OnDrag = 开始拖动立刻收（干脆）；
-    // 想要"键盘跟手往下走、拖回去还能取消"的细腻手感，可换 Interactive。
-    // 注意：模板少、列表滚不动时这招不生效（没有拖动手势），靠下面那个 tap 手势兜底。
+    // 想要“键盘跟手往下走、拖回去还能取消”的细腻手感，可换 Interactive。
     cv.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     cv.delegate = self;
     cv.dataSource = self;
@@ -1350,13 +1147,12 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     // 单击则由 didSelectItemAtIndexPath 直接把该模板设为当前生效。
     UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
                                         initWithTarget:self action:@selector(onLongPressTpl:)];
-    lp.minimumPressDuration = 0.5;                 // 系统默认时长，与常见"长按唤菜单"一致
+    lp.minimumPressDuration = 0.5;                 // 系统默认时长，与常见“长按唤菜单”一致
     [cv addGestureRecognizer:lp];
 
     // 点列表任意位置（格子、格子间空白都算）收起搜索键盘。
     // cancelsTouchesInView 必须设 NO：默认 YES 会在手势成立后取消整条 touch 序列，
     // collectionView 就再也收不到这次点击，didSelectItemAtIndexPath 不触发（点不动模板）。
-    // 这个手势是模板少、列表滚不动时唯一的收起出口（keyboardDismissMode 靠滚动触发，会失效）。
     UITapGestureRecognizer *tp = [[UITapGestureRecognizer alloc]
                                   initWithTarget:self action:@selector(onTapList:)];
     tp.cancelsTouchesInView = NO;
@@ -1476,8 +1272,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [self showWCActionSheet:@"套壳操作" tag:DD_SHEET_TPL items:@[@"使用模板", @"重命名", @"选择/多选", @"删除此模板"]];
 }
 
-// 点列表任意位置收起搜索键盘。搜索框是第一响应者时，除了点键盘上的「搜索」键，
-// 这是另一个收起出口——「滚动列表收起」那种做法在模板少、列表滚不动时不生效。
+// 点列表任意位置收起搜索键盘：模板少、列表滚不动时，滚动收起那招不生效，这里是兜底出口。
 // 加了 cancelsTouchesInView=NO，本手势与「点格子选模板」「长按弹菜单」互不干扰。
 - (void)onTapList:(UITapGestureRecognizer *)g {
     if (self.searchBar.isFirstResponder) [self.searchBar resignFirstResponder];
@@ -1494,8 +1289,8 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         return;
     }
 
-    // 普通态：点一下直接把这个模板设为当前生效（即原菜单里的「使用模板」），
-    // 完整操作菜单改由长按唤出。反馈沿用原逻辑：reloadList 后绿框挪到新模板上。
+    // 普通态：点一下直接把这个模板设为当前生效（即菜单里的「使用模板」），
+    // 完整操作菜单改由长按唤出。反馈沿用同一套：reloadList 后绿框挪到新模板上。
     [DDShellConfig shared].selectedTpl = n;
     [self reloadList];
 }
@@ -1717,6 +1512,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     if (!ok) return @"重命名失败";
 
     if ([[DDShellConfig shared].selectedTpl isEqualToString:oldName]) [DDShellConfig shared].selectedTpl = newName;
+    DD_ThumbCachePurge(); // 名字变了，旧 key 的条目留着只会白占内存
     [self reloadList]; // 列表里名字变了就是反馈，不用再弹回执
     return nil;
 }
@@ -1733,6 +1529,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     if ([names containsObject:[DDShellConfig shared].selectedTpl]) {
         [DDShellConfig shared].selectedTpl = @"";
     }
+    DD_ThumbCachePurge(); // 清掉已删模板的残留条目（同名模板以后重新导入时也靠它避免串旧图）
 }
 
 // 选择态点右上角「删除」：先确认再删
@@ -1744,7 +1541,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 // 删除确认，单个和批量共用
 - (void)confirmDeleteNames:(NSArray<NSString *> *)names {
     NSString *msg = names.count == 1
-        ? [NSString stringWithFormat:@"已选：「%@」", names.firstObject]
+        ? [NSString stringWithFormat:@"已选：%@", names.firstObject]
         : [NSString stringWithFormat:@"已选：%ld 个模板", (long)names.count];
 
     self.pendingDelete = names;
@@ -1796,6 +1593,8 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     NSString *tmp = [DD_TempRoot() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
     [[NSFileManager defaultManager] createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
 
+    // 解压 zip、整批拷模板都要在后台跑，模板多时好几秒没动静，先转上 loading 再走
+    DD_ShowLoading(@"正在导入");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSInteger n = 0;
         for (NSString *p in paths) {
@@ -1813,7 +1612,9 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         dispatch_async(dispatch_get_main_queue(), ^{
             for (NSURL *u in scoped) [u stopAccessingSecurityScopedResource];
             [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+            DD_HideLoading();
             if (!n) DD_ShowToast(@"没有找到可导入的模板"); // 导入成功靠列表多出来的格子反馈
+            DD_ThumbCachePurge();   // 同名模板是被覆盖安装的，不清缓存会显示上一张缩略图
             [self reloadList];
         });
     });
@@ -1825,8 +1626,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 #pragma mark - 设置界面
 
-// 微信私有的 push（大写 P）：只有走它，Coordinator 才会接管返回箭头。
-// 头文件 dump 里没有，真机存在。
+// 微信私有的 push（大写 P）：只有走它，Coordinator 才会接管返回箭头
 @interface UINavigationController (DDShellWCPush)
 - (void)PushViewController:(UIViewController *)viewController animated:(BOOL)animated;
 @end
@@ -1914,14 +1714,6 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         [section addCell:[cellCls normalCellForSel:@selector(pickVideoFromAlbumTapped:)
                                             target:self title:@"↳相册视频套壳"
                                          rightValue:nil]];
-
-        [section addCell:[cellCls normalCellForSel:@selector(exportLogTapped:)
-                                            target:self title:@"↳导出调试日志"
-                                         rightValue:nil]];
-
-        [section addCell:[cellCls normalCellForSel:@selector(clearLogTapped:)
-                                            target:self title:@"↳清空调试日志"
-                                         rightValue:nil]];
     }
 
     [self.tableViewMgr addSection:section];
@@ -1987,7 +1779,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     if (!t) { DD_ShowError(@"套壳失败"); return; } // 选图期间模板可能已经被删了
     // 合成要开全尺寸画布，丢后台跑，主线程留着转 loading
     DD_ShowLoading(@"正在套壳");
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    dispatch_async(DD_ShellQueue(), ^{
         UIImage *outImg = DD_ComposeShellImage(img, t);
         if (!outImg) { DD_ShowError(@"套壳失败"); return; }
         // 相册选图套壳不删除原图；成功提示必须等相册真正存好再弹，避免存失败也报成功
@@ -1995,23 +1787,19 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
             if (success) {
                 DD_ShowShellDone();
             } else {
-                DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
+                DD_ShowError(@"套壳失败");
             }
         });
     });
 }
 
-// 合成并存相册，抽出复用（放在 toast 提示函数之后，DD_ShowError/DD_ShowShellDone 才已声明）
+// 合成并存相册（放在 toast 提示函数之后，DD_ShowError/DD_ShowShellDone 才已声明）
 static void DD_ComposeAndSaveVideo(NSURL *url, DDShellTemplate *t) {
-    DD_Log(@"[视频套壳] 开始 name=%@ canvas=(%.0f x %.0f) url=%@ 进程=%@ exe=%@",
-           t.name, t.canvasSize.width, t.canvasSize.height, url,
-           DD_IsExtensionProcess() ? @"扩展(appex)" : @"主进程",
-           [[NSBundle mainBundle] executablePath] ?: @"?");
     NSURL *outURL = DD_ComposeShellVideo(url, t);
     if (!outURL) { DD_ShowError(@"套壳失败"); return; }
     DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
         if (success) DD_ShowShellDone();
-        else DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
+        else DD_ShowError(@"套壳失败");
     });
 }
 
@@ -2023,40 +1811,13 @@ static void DD_ComposeAndSaveVideo(NSURL *url, DDShellTemplate *t) {
 
     // 逐帧合成 + 导出是重活，丢后台跑，主线程留着转 loading
     DD_ShowLoading(@"正在套壳");
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    dispatch_async(DD_ShellQueue(), ^{
         DD_ComposeAndSaveVideo(url, t);
     });
 }
 
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
     [picker dismissViewControllerAnimated:YES completion:nil];
-}
-
-#pragma mark - 调试日志导出/清空
-
-- (void)exportLogTapped:(id)sender {
-    NSString *path = DD_LogPath();
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
-    if (!attr || [attr[NSFileSize] unsignedLongLongValue] == 0) {
-        DD_ShowToast(@"还没有调试日志");
-        return;
-    }
-    NSURL *url = [NSURL fileURLWithPath:path];
-    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url]
-                                                                     applicationActivities:nil];
-    if ([avc respondsToSelector:@selector(popoverPresentationController)]) {
-        avc.popoverPresentationController.sourceView = self.view;
-        avc.popoverPresentationController.sourceRect =
-            CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height - 60.0, 0, 0);
-        avc.popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionDown;
-    }
-    [self presentViewController:avc animated:YES completion:nil];
-}
-
-- (void)clearLogTapped:(id)sender {
-    [[NSFileManager defaultManager] removeItemAtPath:DD_LogPath() error:nil];
-    DD_ShowToast(@"调试日志已清空");
 }
 
 @end
@@ -2068,16 +1829,11 @@ static void DD_ComposeAndSaveVideo(NSURL *url, DDShellTemplate *t) {
         (void)[DDShellConfig shared];
         [DDShellWatcher shared]; // 挂载截图监听
 
-        DD_Log(@"[启动] tweak 加载 进程=%@ exe=%@", DD_IsExtensionProcess() ? @"扩展(appex)" : @"主进程",
-               [[NSBundle mainBundle] executablePath] ?: @"?");
-
-        // 清理上次会话（崩溃/强退/被杀）残留的临时文件；任务中途被杀时 in-flow 清理来不及跑，靠这里兜底
+        // 清掉上次会话（崩溃/强退/被杀）残留的临时文件；任务中途被杀时流程内的清理来不及跑
         NSString *tmpRoot = DD_TempRoot();
         for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpRoot error:nil]) {
             [[NSFileManager defaultManager] removeItemAtPath:[tmpRoot stringByAppendingPathComponent:item] error:nil];
         }
-
-        DD_InstallCrashHandlers(); // 崩溃捕获写入日志文件，供设置页导出查看
 
         // 取不到类时整条链都是给 nil 发消息，ObjC 天然 no-op
         id mgr = objc_getClass("WCPluginsMgr");
