@@ -711,10 +711,17 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     // 【WARN 级别已澄清】全程只出现 DISPATCH_MEMORYPRESSURE_WARN（最低档），从未 CRITICAL；各分辨率
     // （2160/1440/1280/1080，均为主进程）实测都只是 WARN 且都导出成功。故先前"为避 appex 内存墙而降
     // 分辨率"的前提不成立——降分辨率牺牲了清晰度却没换来稳定性。
-    // 当前默认 2160：长边顶配，输出约 1596×2160（3.44MP），低于相册 4K 上限 8.29M 故存相册安全；
-    // 套入视频窗口最大、细节最足，配合 HighestQuality 编码与 Lanczos 缩放（无波纹）。若老设备/更长
-    // 视频出现 CRITICAL 或闪退，按 1440 → 1280 → 1080 逐级下调即可，清晰度递降但均稳定。
-    static const CGFloat DD_WORK_CAP = 2160.0;
+    // 【分辨率天花板】硬上限是相册 4K 像素 8,294,400：超过即 3302 存不进相册。画布原始 2840×3840
+    // =10.9MP 是上限的 131%，故"用原始分辨率"不可行。按本算法 s=C/3840（高度恒为长边约束），
+    // C=3348 时正好 8.29MP 触顶，C=2160 时用掉 41.6%，C=3200 用掉 91%（余量 9%）。
+    // 当前默认 3200：输出约 2366×3200（7.57MP），像素是 2160 档的 2.2×，套入视频窗约 260px 宽
+    // （1080 档仅 88px、2160 档约 176px），配合 HighestQuality 编码与 Lanczos 缩放（无波纹）。
+    // 参考实测（2160 档 / 944 宽源 / 16s 视频）：进程=主进程，全程 #30→#480 匀速无停摆，中段仅
+    // 一次 [内存压力] WARN（最低档、非 CRITICAL），约 16s 导出成功、存相册 success=1。
+    // 若 3200 出现 CRITICAL / 闪退 / 3302，按 2880 → 2560 → 2160 逐级下调；2160 已验证稳。
+    // 注意：套入视频窗受【模版几何】限制（本模版视频框仅占画布宽约 11%），即便顶到天花板
+    // 3348，窗口也仅约 272px 宽 ≈ 源宽 944px 的 29%——视频到不了源原生清晰度，属模版设计所限。
+    static const CGFloat DD_WORK_CAP = 3200.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
