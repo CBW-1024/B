@@ -411,7 +411,11 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (!frameCG || !shotCG) return nil;
 
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
-    // 尺寸取自 cfg，按 CoreGraphics 的纹理上限卡一道，超了就放弃这次合成
+    // 尺寸取自 cfg，按 CoreGraphics 的纹理上限卡一道，超了就放弃这次合成。
+    // （曾试过【整体放大画布】做超采样来提升"被套的图"的清晰度：画布与四角同比放大，窗口
+    //  跟着变大、被套图像素量随倍率平方增长——1.5× 时被套图 296×640→444×961。但代价是机身
+    //  PNG 从 1:1 无损变成被放大、内存与成品体积同步平方增长，而各模板窗口占比差异很大
+    //  （本例窗口仅占画布宽 11%），收益不稳定、复杂度不划算，已回退为直接用 cfg 尺寸。）
     if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil;
 
     // 截图按实际像素尺寸参与计算
@@ -430,20 +434,19 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
     // 源先按 contain 预缩到屏幕窗尺寸，再做透视映射——避免把大分辨率直接喂进透视导致
     // 中间图过大、投影退化（ZDY 即先预缩放再透视）。
-    // 缩小这一步必须用 Lanczos：截图到窗口是 3.75× 缩小（1170px 源 → 约 312px 窗口，
-    // 仅剩 26.7%），仿射双线性的抗混叠不足，文字/列表分割线/图标细边会出摩尔纹与发虚
+    // 缩小这一步必须用 Lanczos：截图到窗口是 4× 量级的缩小（实测 1242px 源 → 296px，
+    // 仅剩 23.8%），仿射双线性的抗混叠不足，文字/列表分割线/图标细边会出摩尔纹与发虚
     // ——与视频链曾经"套入视频有波纹"完全同源（那里改 Lanczos 后消失）。放大(sc>=1)
     // 不产生混叠，仍走仿射即可。
     CGRect wb = DD_WindowBBox(t);
     CGFloat sc = MIN(wb.size.width / A, wb.size.height / B);
     if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-    // 诊断：cfg 画布尺寸 vs 模板 PNG 实际像素。canvasSize 只认 cfg，与 PNG 无关，若 PNG 更大
-    // 说明没用满真实像素（cfg 写逻辑点/设计稿尺寸、PNG 按 @2x/@3x 导出时就会这样）——机身图
-    // 被降采样、窗口物理尺寸同步变小，属白丢的清晰度。据此决定要不要改用 PNG 实际尺寸。
-    DD_Log(@"[图片套壳] name=%@ 画布=(%.0fx%.0f) PNG=(%.0fx%.0f) 窗口=(%.1fx%.1f) 源=(%.0fx%.0f) sc=%.4f(源宽的%.1f%%)",
+    // 诊断：窗口物理尺寸 = 被套图的清晰度硬上限（各模板窗口占比差异很大，本例仅占画布宽
+    // 11%）；PNG 比画布小说明机身在被放大，比画布大则说明 cfg 写小了、浪费了真实像素。
+    DD_Log(@"[图片套壳] name=%@ 画布=(%.0fx%.0f) PNG=(%.0fx%.0f) 窗口=(%.1fx%.1f) 源=(%.0fx%.0f) sc=%.4f(源宽的%.1f%%) 被套图=(%.0fx%.0f)",
            t.name, W, H,
            (CGFloat)CGImageGetWidth(frameCG), (CGFloat)CGImageGetHeight(frameCG),
-           wb.size.width, wb.size.height, A, B, sc, sc * 100.0);
+           wb.size.width, wb.size.height, A, B, sc, sc * 100.0, A * sc, B * sc);
     CIImage *srcImg = nil;
     if (sc < 1.0) {
         CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
