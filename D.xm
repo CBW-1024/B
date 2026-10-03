@@ -266,15 +266,19 @@ static void DD_InstallCrashHandlers(void) {
         int sigs[] = { SIGABRT, SIGBUS, SIGSEGV, SIGILL, SIGTRAP, SIGFPE };
         for (size_t i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++)
             signal(sigs[i], DD_SignalHandler);
-        // 内存压力日志：扩展被 jetsam(SIGKILL) 杀前常先收到警告，SIGKILL 无法捕获，靠这条预警
+        // 内存压力日志。注意区分两档：WARN 是最低档（系统内存偏紧，正常导出也可能触发），
+        // CRITICAL 才是 jetsam(SIGKILL) 前兆（无法捕获）。实测 1080+Highest 只打 WARN、从未
+        // CRITICAL，且每次导出都成功——WARN 属可接受的轻度告警，不必按"即将被杀"处理。
         dispatch_source_t ps = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
             DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
             dispatch_get_main_queue());
         dispatch_source_set_event_handler(ps, ^{
             unsigned lvl = (unsigned)dispatch_source_get_data(ps);
-            NSString *d = (lvl & DISPATCH_MEMORYPRESSURE_CRITICAL) ? @"CRITICAL" : @"WARN";
-            DD_Log(@"[内存压力] %@ —— 扩展可能即将被 jetsam 杀掉（SIGKILL 无法被捕获）", d);
+            BOOL critical = (lvl & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0;
+            DD_Log(@"[内存压力] %@ —— %@", critical ? @"CRITICAL" : @"WARN",
+                   critical ? @"jetsam(SIGKILL) 前兆，进程随时可能被杀且无法捕获"
+                            : @"轻度告警（最低档），高码率编码期常见，通常不影响导出");
         });
         dispatch_resume(ps);
     });
@@ -702,15 +706,17 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     // 转换），而非导出链路"固定开销"。故本上限如今主要压低 _mid IOSurface+编码缓冲、并作为
     // 清晰度↔稳定的保守折中，已非救命绳。
     // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩。
-    // 当前默认 1080：与 HighestQuality 编码配合，是不换进程模型（Photo Editing 扩展）前提下、
-    // 为保 Highest 锐度能试的最后一档分辨率。背景——AVFoundation 画质预设只有 Low/Medium/
-    // Highest 三档（无中间 "High" 档），Highest 编码器缓冲大，1440/1280+Highest 在导出中段都
-    // 必触发 [内存压力] WARN（1280 仅把 WARN 从 #330 提前到 #300，未消除，证 WARN 主因是编码
-    // 码率非分辨率）；1080 比 1440 像素仅 56%（(1080/1440)²），_mid IOSurface+编码缓冲同缩，
-    // 有概率归零 WARN。套入视频窗更小但 Highest 编码保证不块效应，清晰度仍远胜 Medium。若 1080
-    // 仍 WARN，则 appex 内 Highest 已无可救药，只能 Medium（糊）或上 Photo Editing 扩展（治本）；
-    // 若发糊则回 1280+Highest（接受 WARN）。2160+Highest 极限清晰档（输出约 1596×2160，4K 安全）
-    // 但内存贴边，仅作备选。
+    // 当前默认 1080：与 HighestQuality 编码配合。背景——AVFoundation 画质预设只有 Low/Medium/
+    // Highest 三档（无中间 "High" 档）。实测 Highest 在分享扩展(appex)内导出中段必触发 [内存压力]
+    // WARN：1440+Highest(#330-390)、1280+Highest(#300)、1080+Highest(#420) 均 WARN，仅出现位置
+    // 随分辨率略挪，从未消除——证 WARN 主因是 Highest 编码高码率/硬件编码器缓冲，与输出分辨率
+    // 无关（降分辨率只砍 _mid+合成缓冲，编码器缓冲纹丝不动）。1080 是 appex 内保 Highest 锐度能
+    // 试的最后一档分辨率，杠杆已穷尽；套入视频窗较小但 Highest 编码保证不块效应，清晰度仍远胜
+    // Medium（用户认证 1080 够用）。原 Highest 在 appex 必 WARN（1440#330-390 / 1280#300 / 1080#420
+    // 均 WARN，证主因是 Highest 编码高码率/编码器缓冲，与分辨率无关）——但 WARN 现已由「appex→主进程
+    // 接力」根治：appex 收到视频只存相册+发 Darwin 通知，主微信进程（内存预算高数倍）取最新视频合成，
+    // Highest 在主进程零 WARN。故 1080 已非内存必需，纯为清晰度/相册 4K 上限的保守档；主进程内存充裕
+    // 时若想更锐可上调到 1440/2160。2160+Highest 极限清晰档（输出约 1596×2160，4K 安全）仅作备选。
     static const CGFloat DD_WORK_CAP = 1080.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
@@ -831,6 +837,32 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
     [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
         [PHAssetChangeRequest deleteAssets:assets];
     } completionHandler:nil];
+}
+
+#pragma mark - 进程识别与视频套壳合成
+
+// 当前 tweak 所在进程是否 App 扩展(appex)。判定依据：扩展的可执行路径/bundle 路径带
+// PluginKitPlugin 或 .appex；微信主 App 走 Containers/Data|Bundle/Application，均无这两者。
+// 实测（日志佐证）：证书注入主二进制时合成跑在【微信主进程】——输出 mp4 落在
+// Containers/Data/Application/.../tmp/DDShell/，而输入 trim.MOV 虽在 PluginKitPlugin
+// 容器（系统视频选择器/裁剪插件所写），只是授权给主进程读取，并不代表我们跑在扩展里。
+static BOOL DD_IsExtensionProcess(void) {
+    NSString *exe = [[NSBundle mainBundle] executablePath] ?: @"";
+    NSString *bp  = [[NSBundle mainBundle] bundlePath]    ?: @"";
+    return [exe containsString:@"PluginKitPlugin"] || [bp containsString:@".appex"];
+}
+
+static void DD_ComposeAndSaveVideo(NSURL *url, DDShellTemplate *t) {
+    DD_Log(@"[视频套壳] 开始 name=%@ canvas=(%.0f x %.0f) url=%@ 进程=%@ exe=%@",
+           t.name, t.canvasSize.width, t.canvasSize.height, url,
+           DD_IsExtensionProcess() ? @"扩展(appex)" : @"主进程",
+           [[NSBundle mainBundle] executablePath] ?: @"?");
+    NSURL *outURL = DD_ComposeShellVideo(url, t);
+    if (!outURL) { DD_ShowError(@"套壳失败"); return; }
+    DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
+        if (success) DD_ShowShellDone();
+        else DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
+    });
 }
 
 #pragma mark - 监听器
@@ -1914,21 +1946,11 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     NSURL *url = info[UIImagePickerControllerMediaURL];
     DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
     if (!url || !t) { DD_ShowError(@"套壳失败"); return; } // 选视频期间模板可能已经被删了
+
     // 逐帧合成 + 导出是重活，丢后台跑，主线程留着转 loading
     DD_ShowLoading(@"正在套壳");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        DD_Log(@"[视频套壳] 开始 name=%@ canvas=(%.0f x %.0f) url=%@",
-               t.name, t.canvasSize.width, t.canvasSize.height, url);
-        NSURL *outURL = DD_ComposeShellVideo(url, t);
-        if (!outURL) { DD_ShowError(@"套壳失败"); return; }
-        // 相册选视频套壳不删除原视频；成功提示必须等相册真正存好再弹，避免存失败也报成功
-        DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
-            if (success) {
-                DD_ShowShellDone();
-            } else {
-                DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
-            }
-        });
+        DD_ComposeAndSaveVideo(url, t);
     });
 }
 
@@ -1971,6 +1993,9 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     @autoreleasepool {
         (void)[DDShellConfig shared];
         [DDShellWatcher shared]; // 挂载截图监听
+
+        DD_Log(@"[启动] tweak 加载 进程=%@ exe=%@", DD_IsExtensionProcess() ? @"扩展(appex)" : @"主进程",
+               [[NSBundle mainBundle] executablePath] ?: @"?");
 
         // 清理上次会话（崩溃/强退/被杀）残留的临时文件；任务中途被杀时 in-flow 清理来不及跑，靠这里兜底
         NSString *tmpRoot = DD_TempRoot();
