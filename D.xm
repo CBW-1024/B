@@ -690,9 +690,10 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     // 转换），而非导出链路"固定开销"。故本上限如今主要压低 _mid IOSurface+编码缓冲、并作为
     // 清晰度↔稳定的保守折中，已非救命绳。
     // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩。
-    // 当前默认 1440：420YUV 源下实测稳定（输出约 1065×1440，仍远低于 4K/相册 3302 上限）；
-    // 2160 仍必崩（画布原始 2840×3840 量级），除非换 Photo Editing 扩展拿高内存预算。
-    static const CGFloat DD_WORK_CAP = 1440.0;
+    // 当前默认 2160：4K 长边顶配，输出约 1596×2160（3.44MP），仍低于 4K/相册 3302 上限
+    // (8.29M) 故存相册安全；旧 BGRA 源时代此档标"必崩"，420YUV 已除源内存主因，正实测验证
+    // ——稳则定为顶配，不稳回退 1440（已验证稳）或 1920 中间档。
+    static const CGFloat DD_WORK_CAP = 2160.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
