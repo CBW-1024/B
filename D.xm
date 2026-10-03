@@ -537,7 +537,7 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     // 不保证消除停摆；真正治本是换 Photo Editing 扩展拿高数倍内存预算。
     // 必须含 kCVPixelBufferPixelFormatTypeKey（否则 AVFCore 直接抛 NSInvalidArgumentException）；
     // IOSurface 让源帧常驻 GPU 显存、与 CI 渲染零拷贝。
-    return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelBufferPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+    return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
               (id)kCVPixelBufferIOSurfacePropertiesKey    : @{},
               (id)kCVPixelBufferOpenGLESCompatibilityKey  : @YES };
 }
