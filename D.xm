@@ -690,10 +690,11 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     // 转换），而非导出链路"固定开销"。故本上限如今主要压低 _mid IOSurface+编码缓冲、并作为
     // 清晰度↔稳定的保守折中，已非救命绳。
     // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩。
-    // 当前默认 2160：4K 长边顶配，输出约 1596×2160（3.44MP），仍低于 4K/相册 3302 上限
-    // (8.29M) 故存相册安全；旧 BGRA 源时代此档标"必崩"，420YUV 已除源内存主因，正实测验证
-    // ——稳则定为顶配，不稳回退 1440（已验证稳）或 1920 中间档。
-    static const CGFloat DD_WORK_CAP = 2160.0;
+    // 当前默认 1440：与 HighestQuality 编码配合，1440 实测零 [内存压力] WARN，给 Highest 的
+    // 编码缓冲增量留足余量，稳定优先。若求极限清晰（模版/套入视频都更锐且视频窗更大）可上
+    // 2160+Highest：4K 长边顶配（输出约 1596×2160，仍低于 4K/相册 3302 上限 8.29M 故存相册
+    // 安全），但分享扩展进程内存贴边（实测曾触发一次 jetsam WARN、余量极小），需实测验证。
+    static const CGFloat DD_WORK_CAP = 1440.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
@@ -742,12 +743,12 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
 
     __block NSURL *result = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    // 导出质量用 MediumQuality 而非 HighestQuality：① 编码器内部缓冲大幅缩小，直接压低
-    // 分享扩展里的常驻内存峰值（HighestQuality 在 798×1080 下会把编码缓冲撑大，叠加源/合成
-    // 缓冲更易触顶 CRITICAL、引发中段数十秒卡顿）；② 编码更快。798×1080 已是下采样输出，
-    // Medium 与 Highest 视觉几乎无差。若设备内存充裕且追求极限画质，可改回 HighestQuality。
+    // 导出质量用 HighestQuality（恢复清晰度）：① Medium 虽大幅缩小编码缓冲、压低分享扩展常驻
+    // 内存峰值（当初为治 CRITICAL 停摆而用），但把模版边缘/套入视频压出块效应发糊；② 现源已改
+    // 420YUV 除内存主因，配合 1440 分辨率（实测零 WARN）给 Highest 编码缓冲留余量，故可回到
+    // Highest 拿回锐度。若设备内存吃紧或更长/更宽源触发 WARN，可降回 MediumQuality。
     AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
-                                                            presetName:AVAssetExportPresetMediumQuality];
+                                                            presetName:AVAssetExportPresetHighestQuality];
     ex.outputURL = [NSURL fileURLWithPath:outPath];
     ex.outputFileType = AVFileTypeMPEG4;
     ex.videoComposition = vc;
