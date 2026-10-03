@@ -245,10 +245,16 @@ static DDShellTemplate *DD_TemplateNamed(NSString *name) {
     return t;
 }
 
-// 当前生效的模板：只认显式应用过的那个，库里有但没应用过就算没有
-static NSString *DD_ActiveTemplateName(void) {
+// 当前生效的模板：只认显式应用过的那个，库里有但没应用过就算没有。
+// 模板 png 在这里一次解析完，要套壳、要画布尺寸都直接拿这个对象，不用再解一遍
+static DDShellTemplate *DD_ActiveTemplate(void) {
     NSString *sel = [DDShellConfig shared].selectedTpl;
-    return (sel.length && DD_TemplateNamed(sel)) ? sel : @"";
+    return sel.length ? DD_TemplateNamed(sel) : nil;
+}
+
+// 只要名字时用这个：没有生效模板就给空串，方便直接拼进界面文案和路径
+static NSString *DD_ActiveTemplateName(void) {
+    return DD_ActiveTemplate().name ?: @"";
 }
 
 #pragma mark - 合成
@@ -256,6 +262,30 @@ static NSString *DD_ActiveTemplateName(void) {
 // UIKit 坐标（左上原点）→ CoreImage 坐标（左下原点）翻转
 static CIVector *DD_CIVec(CGPoint p, CGFloat canvasH) {
     return [CIVector vectorWithCGPoint:CGPointMake(p.x, canvasH - p.y)];
+}
+
+// 按 contain 比例预缩源图：缩小走 Lanczos——截图到屏幕窗通常要缩好几倍，双线性的抗混叠
+// 不够，文字、分割线、图标细边会出摩尔纹；放大不产生混叠，仿射就够了。
+// 图片链和视频链共用这一段，两链的差别只在送进来的源是 CGImage 还是像素缓冲。
+static CIImage *DD_ScaledSource(CIImage *src, CGFloat sc) {
+    if (sc > 0.0 && isfinite(sc) && sc < 1.0) {
+        CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
+        if (lz) {
+            [lz setDefaults];
+            [lz setValue:src forKey:kCIInputImageKey];
+            [lz setValue:@(sc) forKey:kCIInputScaleKey];
+            if (lz.outputImage) return lz.outputImage;
+        }
+    }
+    return [src imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
+}
+
+// 把模板四角填进透视滤镜（y 已按画布高翻转到 CoreImage 坐标）
+static void DD_SetPerspectiveCorners(CIFilter *f, DDShellTemplate *t, CGFloat canvasH) {
+    [f setValue:DD_CIVec(t.lt, canvasH) forKey:@"inputTopLeft"];
+    [f setValue:DD_CIVec(t.rt, canvasH) forKey:@"inputTopRight"];
+    [f setValue:DD_CIVec(t.rb, canvasH) forKey:@"inputBottomRight"];
+    [f setValue:DD_CIVec(t.lb, canvasH) forKey:@"inputBottomLeft"];
 }
 
 // 模板四角围出的屏幕窗包围盒（用来把源按 contain 预缩到窗口大小）
@@ -303,29 +333,15 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
 
     // 先把源按 contain 预缩到屏幕窗大小，再做透视：直接把大分辨率喂进透视会让中间图过大、
-    // 投影退化。缩小这一步用 Lanczos——截图到窗口通常要缩好几倍，双线性的抗混叠不够，
-    // 文字、分割线、图标细边会出摩尔纹；放大不产生混叠，走仿射就够了。
+    // 投影退化
     CGRect wb = DD_WindowBBox(t);
     CGFloat sc = MIN(wb.size.width / A, wb.size.height / B);
     if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-    CIImage *srcImg = nil;
-    if (sc < 1.0) {
-        CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
-        if (lz) {
-            [lz setDefaults];
-            [lz setValue:[CIImage imageWithCGImage:shotCG] forKey:kCIInputImageKey];
-            [lz setValue:@(sc) forKey:kCIInputScaleKey];
-            srcImg = lz.outputImage;
-        }
-    }
-    if (!srcImg) srcImg = [[CIImage imageWithCGImage:shotCG] imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
+    CIImage *srcImg = DD_ScaledSource([CIImage imageWithCGImage:shotCG], sc);
     [f setDefaults];
     [f setValue:srcImg forKey:kCIInputImageKey];
     [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, A * sc, B * sc)] forKey:@"inputExtent"];
-    [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
-    [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
-    [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
-    [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
+    DD_SetPerspectiveCorners(f, t, H);
     CIImage *o = [f valueForKey:kCIOutputImageKey];
 
     if (o) {
@@ -455,30 +471,16 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         CGRect re = rot.extent;
         CGFloat sc = MIN(wb.size.width / re.size.width, wb.size.height / re.size.height);
         if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-        // 先平移归零（只动 origin，不改采样），再缩小。缩小走 Lanczos 抗混叠，
-        // 细密纹理才不会出摩尔纹；放大不产生混叠，走仿射即可。
+        // 先平移归零（只动 origin，不改采样），再按 contain 比例预缩
         CIImage *centered = [rot imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
-        CIImage *srcImg = nil;
-        if (sc < 1.0) {
-            CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
-            if (lz) {
-                [lz setDefaults];
-                [lz setValue:centered forKey:kCIInputImageKey];
-                [lz setValue:@(sc) forKey:kCIInputScaleKey];
-                srcImg = lz.outputImage;
-            }
-        }
-        if (!srcImg) srcImg = [centered imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
+        CIImage *srcImg = DD_ScaledSource(centered, sc);
 
         CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
         if (!f) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-3 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
         [f setDefaults];
         [f setValue:srcImg forKey:kCIInputImageKey];
         [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, re.size.width * sc, re.size.height * sc)] forKey:@"inputExtent"];
-        [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
-        [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
-        [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
-        [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
+        DD_SetPerspectiveCorners(f, t, H);
         CIImage *warped = f.outputImage;
         if (!warped) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-4 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
 
@@ -521,8 +523,8 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
             return;
         }
 
-        // iOS 的 CIContext 没有 reclaimResources（该方法仅 macOS 可用）；逐帧回收显存
-        // 由上面 init 里的 kCIContextCacheIntermediates:@NO 负责。
+        // 出一帧交一帧：中间结果不缓存（init 里的 kCIContextCacheIntermediates:@NO），
+        // 长视频的显存才不会跟着帧数往上堆
         [req finishWithComposedVideoFrame:dst];
         CVPixelBufferRelease(dst);
     }
@@ -659,17 +661,26 @@ static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
 
 static WeToast *gBusyToast = nil; // 进行中的 loading 提示（套壳 / 导入 / 导出），完成后收起
 
-// 套壳任务排队：自动截图、相册选图、相册选视频都排在同一条串行队列上，同一时刻只跑
-// 一个。这样两个任务不会同时弹 loading 互相抢（提示串台），内存峰值也不会叠加。
-static dispatch_queue_t DD_ShellQueue(void) {
-    static dispatch_queue_t q;
+// 套壳闸门：同一时刻只放行一个任务，抢不到闸的直接放弃，不排队。
+// 三条套壳入口（自动截屏 / 相册选图 / 相册选视频）都先抢它，任务彻底跑完才还闸。
+// 不排队是有意的：排队意味着几十秒后才轮到，那时自动截屏取到的"相册最新一张"
+// 早就不是刚截的那张了，会套错图，开了删原图还会删错图。
+static dispatch_semaphore_t DD_ShellGate(void) {
+    static dispatch_semaphore_t gate;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("com.ddshell.shell", DISPATCH_QUEUE_SERIAL); });
-    return q;
+    dispatch_once(&once, ^{ gate = dispatch_semaphore_create(1); });
+    return gate;
 }
 
-// 连拍互斥：同一时刻只处理一张，处理中到达的截屏事件直接丢弃
-static BOOL gShellBusy = NO;
+// 抢闸：抢到返回 YES。非阻塞，主线程上调也安全
+static BOOL DD_ShellTryBegin(void) {
+    return dispatch_semaphore_wait(DD_ShellGate(), DISPATCH_TIME_NOW) == 0;
+}
+
+// 还闸：必须在任务彻底结束（相册存完、提示弹完）之后调，漏一次后面就全废
+static void DD_ShellEnd(void) {
+    dispatch_semaphore_signal(DD_ShellGate());
+}
 
 static WeToast *DD_Toast(void) {
     return [NSClassFromString(@"WeToast") toast];
@@ -682,7 +693,7 @@ static void DD_HideLoading(void) {
     gBusyToast = nil;
 }
 // 开始 loading，实例存下来给后面收起用。
-// 上一个若还没收（自动套壳转着的时候用户又点了相册选图），先收掉它再起新的：
+// 上一个若还没收（比如套壳转着的时候又点了导出），先收掉它再起新的：
 // gBusyToast 只留一个实例，直接覆盖会让上一个转圈永远停在屏幕上——它自己那次收起
 // 调用只会收到新的这个。
 static void DD_ShowLoading(NSString *text) {
@@ -741,24 +752,19 @@ static void DD_ShowToast(NSString *text) {
     if (![DDShellConfig shared].enabled || ![DDShellConfig shared].autoShell) return;
     // 等系统把截图写入相册后再取
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDDShellDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        CFAbsoluteTime queuedAt = CFAbsoluteTimeGetCurrent();
-        dispatch_async(DD_ShellQueue(), ^{
-            if (gShellBusy) return; // 已有任务在跑，本次丢弃
-            // 排队等太久说明前面压着别的套壳任务（比如一段长视频正在导出）。等到那时候
-            // 相册最新一张早就不是刚截的那张了，再套就是套错图，直接丢弃。
-            if (CFAbsoluteTimeGetCurrent() - queuedAt > 3.0) return;
-            gShellBusy = YES;
+        // 抢不到闸说明有套壳任务在跑，这次截屏直接放弃，不排队也不提示——
+        // 等几十秒才轮到的话，"相册最新一张"早就不是刚截的那张了
+        if (!DD_ShellTryBegin()) return;
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             [self shellLatestScreenshotWithCompletion:^{
-                dispatch_async(DD_ShellQueue(), ^{
-                    gShellBusy = NO;
-                });
+                DD_ShellEnd();
             }];
         });
     });
 }
 
 - (void)shellLatestScreenshotWithCompletion:(void (^)(void))completion {
-    DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
+    DDShellTemplate *t = DD_ActiveTemplate();
     if (!t) { completion(); return; }
     DD_LatestImageAsset(^(PHAsset *asset) {
         if (!asset) { completion(); return; }
@@ -942,6 +948,12 @@ static const NSInteger DD_SHEET_EXPORT = 0x5ea1;
 static const NSInteger kDDShellTplColumns = 2;
 static const CGFloat   kDDShellTplGap     = 10.0;
 static const CGFloat   kDDShellSearchH    = 44.0;
+
+// 格子边长：页面宽减去首尾间距后按列数平分（缩略图是正方形）
+static CGFloat DD_CellSide(UICollectionView *cv) {
+    CGFloat gap = kDDShellTplGap;
+    return floor((cv.bounds.size.width - gap * (kDDShellTplColumns + 1)) / kDDShellTplColumns);
+}
 
 // 缩略图缓存：模板 png 是全尺寸图，每格都整图解一次码滚动会卡，按格子边长解码一次后缓存
 static NSCache *DD_ThumbCache(void) {
@@ -1216,8 +1228,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 }
 
 - (CGSize)collectionView:(UICollectionView *)cv layout:(UICollectionViewFlowLayout *)layout sizeForItemAtIndexPath:(NSIndexPath *)ip {
-    CGFloat gap = kDDShellTplGap;
-    CGFloat w = floor((cv.bounds.size.width - gap * (kDDShellTplColumns + 1)) / kDDShellTplColumns);
+    CGFloat w = DD_CellSide(cv);
     return CGSizeMake(w, w + 30.0); // 正方形缩略图 + 20pt 名字行
 }
 
@@ -1230,8 +1241,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     NSString *n = self.names[ip.item];
 
     cell.nameLabel.text = n;
-    CGFloat gap = kDDShellTplGap;
-    CGFloat w = floor((cv.bounds.size.width - gap * (kDDShellTplColumns + 1)) / kDDShellTplColumns);
+    CGFloat w = DD_CellSide(cv);
     // 缩略图命中缓存当场给；没命中就丢后台解，回来时确认这格还显示着同一个模板再填
     cell.thumbView.image = DD_CachedThumb(n, w);
     if (!cell.thumbView.image) {
@@ -1392,30 +1402,32 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     [self showWCActionSheet:@"选择导出方式" tag:DD_SHEET_EXPORT items:@[@"选择导出", @"全部导出"]];
 }
 
-// 进入选择态：勾选清空，右上角换成 删除 / 导出 / 取消
-- (void)enterExportSelectMode {
-    self.isSelectMode = YES;
-    [self.picked removeAllObjects];
+// 选择态 UI 三连：按钮可用性、标题计数、格子勾选状态都跟着 picked 变，一次刷齐
+- (void)refreshSelectUI {
     [self setupNavigationBar];
     [self updateTitle];
     [self.collectionView reloadData];
 }
 
+// 进入选择态：勾选清空，右上角换成 删除 / 导出 / 取消
+- (void)enterExportSelectMode {
+    self.isSelectMode = YES;
+    [self.picked removeAllObjects];
+    [self refreshSelectUI];
+}
+
 // 从「套壳操作 → 选择/多选」进入：顺手把那一个勾上
 - (void)enterExportSelectModeWithName:(NSString *)name {
-    [self enterExportSelectMode];
+    self.isSelectMode = YES;
+    [self.picked removeAllObjects];
     [self.picked addObject:name];
-    [self setupNavigationBar];
-    [self updateTitle];
-    [self.collectionView reloadData];
+    [self refreshSelectUI];
 }
 
 - (void)cancelExportSelectMode {
     self.isSelectMode = NO;
     [self.picked removeAllObjects];
-    [self setupNavigationBar];
-    [self updateTitle];
-    [self.collectionView reloadData];
+    [self refreshSelectUI];
 }
 
 - (void)exportSelectedFrames {
@@ -1740,25 +1752,25 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 
 #pragma mark - 相册选图/选视频套壳
 
-// 从相册挑选一张图，套入当前模板后存回相册（不删除所选原图）
-- (void)pickFromAlbumTapped:(id)sender {
-    if (!DD_TemplateNamed(DD_ActiveTemplateName())) { DD_ShowToast(@"模板未选择"); return; }
+// 拉起相册选择器：mediaTypes 传 nil 挑图片，传 @[@"public.movie"] 挑视频
+- (void)presentAlbumPickerWithMediaTypes:(NSArray<NSString *> *)mediaTypes {
+    if (!DD_ActiveTemplate()) { DD_ShowToast(@"模板未选择"); return; }
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    if (mediaTypes) picker.mediaTypes = mediaTypes;
     picker.delegate = self;
     picker.modalPresentationStyle = UIModalPresentationFullScreen;
     [self presentViewController:picker animated:YES completion:nil];
 }
 
+// 从相册挑选一张图，套入当前模板后存回相册（不删除所选原图）
+- (void)pickFromAlbumTapped:(id)sender {
+    [self presentAlbumPickerWithMediaTypes:nil];
+}
+
 // 从相册挑选一段视频，套入当前模板后导出存回相册（不删除所选原视频）
 - (void)pickVideoFromAlbumTapped:(id)sender {
-    if (!DD_TemplateNamed(DD_ActiveTemplateName())) { DD_ShowToast(@"模板未选择"); return; }
-    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = @[ @"public.movie" ];   // 只挑视频
-    picker.delegate = self;
-    picker.modalPresentationStyle = UIModalPresentationFullScreen;
-    [self presentViewController:picker animated:YES completion:nil];
+    [self presentAlbumPickerWithMediaTypes:@[ @"public.movie" ]]; // 只挑视频
 }
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
@@ -1775,13 +1787,14 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 // 相册选图套壳：单张图透视贴入模板，存回相册
 - (void)handlePickedImage:(NSDictionary *)info {
     UIImage *img = info[UIImagePickerControllerOriginalImage];
-    DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
+    DDShellTemplate *t = DD_ActiveTemplate();
     if (!t) { DD_ShowError(@"套壳失败"); return; } // 选图期间模板可能已经被删了
+    if (!DD_ShellTryBegin()) { DD_ShowToast(@"有套壳任务在进行中"); return; }
     // 合成要开全尺寸画布，丢后台跑，主线程留着转 loading
     DD_ShowLoading(@"正在套壳");
-    dispatch_async(DD_ShellQueue(), ^{
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         UIImage *outImg = DD_ComposeShellImage(img, t);
-        if (!outImg) { DD_ShowError(@"套壳失败"); return; }
+        if (!outImg) { DD_ShowError(@"套壳失败"); DD_ShellEnd(); return; }
         // 相册选图套壳不删除原图；成功提示必须等相册真正存好再弹，避免存失败也报成功
         DD_SaveImageToAlbum(outImg, ^(BOOL success, NSError *err) {
             if (success) {
@@ -1789,6 +1802,7 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
             } else {
                 DD_ShowError(@"套壳失败");
             }
+            DD_ShellEnd();
         });
     });
 }
@@ -1796,22 +1810,24 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
 // 合成并存相册（放在 toast 提示函数之后，DD_ShowError/DD_ShowShellDone 才已声明）
 static void DD_ComposeAndSaveVideo(NSURL *url, DDShellTemplate *t) {
     NSURL *outURL = DD_ComposeShellVideo(url, t);
-    if (!outURL) { DD_ShowError(@"套壳失败"); return; }
+    if (!outURL) { DD_ShowError(@"套壳失败"); DD_ShellEnd(); return; }
     DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
         if (success) DD_ShowShellDone();
         else DD_ShowError(@"套壳失败");
+        DD_ShellEnd();
     });
 }
 
 // 相册选视频套壳：逐帧透视合成后导出 mp4，存回相册
 - (void)handlePickedVideo:(NSDictionary *)info {
     NSURL *url = info[UIImagePickerControllerMediaURL];
-    DDShellTemplate *t = DD_TemplateNamed(DD_ActiveTemplateName());
+    DDShellTemplate *t = DD_ActiveTemplate();
     if (!url || !t) { DD_ShowError(@"套壳失败"); return; } // 选视频期间模板可能已经被删了
+    if (!DD_ShellTryBegin()) { DD_ShowToast(@"有套壳任务在进行中"); return; }
 
     // 逐帧合成 + 导出是重活，丢后台跑，主线程留着转 loading
     DD_ShowLoading(@"正在套壳");
-    dispatch_async(DD_ShellQueue(), ^{
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         DD_ComposeAndSaveVideo(url, t);
     });
 }
