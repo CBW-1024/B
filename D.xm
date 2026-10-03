@@ -705,19 +705,16 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     // 1036 宽源从 44s 停摆变为 7s 匀速无停摆，反证停摆主因正是【源内存】（解码后缓冲+格式
     // 转换），而非导出链路"固定开销"。故本上限如今主要压低 _mid IOSurface+编码缓冲、并作为
     // 清晰度↔稳定的保守折中，已非救命绳。
-    // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩。
-    // 当前默认 1080：与 HighestQuality 编码配合。背景——AVFoundation 画质预设只有 Low/Medium/
-    // Highest 三档（无中间 "High" 档）。实测 Highest 在分享扩展(appex)内导出中段必触发 [内存压力]
-    // WARN：1440+Highest(#330-390)、1280+Highest(#300)、1080+Highest(#420) 均 WARN，仅出现位置
-    // 随分辨率略挪，从未消除——证 WARN 主因是 Highest 编码高码率/硬件编码器缓冲，与输出分辨率
-    // 无关（降分辨率只砍 _mid+合成缓冲，编码器缓冲纹丝不动）。1080 是 appex 内保 Highest 锐度能
-    // 试的最后一档分辨率，杠杆已穷尽；套入视频窗较小但 Highest 编码保证不块效应，清晰度仍远胜
-    // Medium（用户认证 1080 够用）。原 Highest 在 appex 必 WARN（1440#330-390 / 1280#300 / 1080#420
-    // 均 WARN，证主因是 Highest 编码高码率/编码器缓冲，与分辨率无关）——但 WARN 现已由「appex→主进程
-    // 接力」根治：appex 收到视频只存相册+发 Darwin 通知，主微信进程（内存预算高数倍）取最新视频合成，
-    // Highest 在主进程零 WARN。故 1080 已非内存必需，纯为清晰度/相册 4K 上限的保守档；主进程内存充裕
-    // 时若想更锐可上调到 1440/2160。2160+Highest 极限清晰档（输出约 1596×2160，4K 安全）仅作备选。
-    static const CGFloat DD_WORK_CAP = 1080.0;
+    // 【进程归属已澄清】证书注入主二进制 → tweak 只跑在【微信主进程】。日志佐证：输出 mp4 落在
+    // Containers/Data/Application/.../tmp/DDShell/，且 DD_IsExtensionProcess() 恒为 NO；输入 trim.MOV
+    // 虽在 PluginKitPlugin 容器，那是系统视频选择器/裁剪插件所写并授权主进程读取，不代表我们跑在扩展里。
+    // 【WARN 级别已澄清】全程只出现 DISPATCH_MEMORYPRESSURE_WARN（最低档），从未 CRITICAL；各分辨率
+    // （2160/1440/1280/1080，均为主进程）实测都只是 WARN 且都导出成功。故先前"为避 appex 内存墙而降
+    // 分辨率"的前提不成立——降分辨率牺牲了清晰度却没换来稳定性。
+    // 当前默认 2160：长边顶配，输出约 1596×2160（3.44MP），低于相册 4K 上限 8.29M 故存相册安全；
+    // 套入视频窗口最大、细节最足，配合 HighestQuality 编码与 Lanczos 缩放（无波纹）。若老设备/更长
+    // 视频出现 CRITICAL 或闪退，按 1440 → 1280 → 1080 逐级下调即可，清晰度递降但均稳定。
+    static const CGFloat DD_WORK_CAP = 2160.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
