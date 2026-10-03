@@ -654,9 +654,15 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
     if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
 
-    // 画布超过相册可导入上限时等比缩小：避免导出成功、但 PHPhotosErrorDomain 3302 拒收。
-    // 经验安全上限：单边 ≤ 4096、总像素 ≤ 8294400（3840×2160），向下取偶对齐 H.264。
-    CGFloat capW = 4096.0, capH = 4096.0, capPx = 8294400.0;
+    // 工作分辨率上限（长边 DD_WORK_CAP）：三重作用——
+    // ① 相册导入 3302 拒收：输出压在 4K(8294400) 以内即安全，1440 远低于此；
+    // ② 分享扩展内存：满画布 IOSurface 缓冲(2160²≈18.6MB×2) + GPU CIContext 显存 + 解码
+    //    缓冲在扩展里会顶到 jetsam 上限（日志 WARN→CRITICAL 爬升即铁证），降工作分辨率
+    //    直接压低这部分常驻显存；③ 提速：像素量降 ~2.25×(2160²→1440²)，GPU 合成更快。
+    // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩；本 tweak
+    // 在分享扩展里必须主动降分辨率才能既快又不崩。设备内存充裕可上调（≤2048），2160 会崩。
+    static const CGFloat DD_WORK_CAP = 1440.0;
+    CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
     if (s < 1.0) {
