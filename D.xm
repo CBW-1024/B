@@ -403,6 +403,43 @@ static CGRect DD_WindowBBox(DDShellTemplate *t) {
     return CGRectMake(minX, minY, maxX - minX, maxY - minY);
 }
 
+// 窗口四角双线性插值：u 从左到右、v 从上到下，取值 0~1（对带透视畸变的梯形窗同样适用）
+static CGPoint DD_QuadLerp(DDShellTemplate *t, CGFloat u, CGFloat v) {
+    CGFloat tx = t.lt.x + (t.rt.x - t.lt.x) * u, ty = t.lt.y + (t.rt.y - t.lt.y) * u; // 上边
+    CGFloat bx = t.lb.x + (t.rb.x - t.lb.x) * u, by = t.lb.y + (t.rb.y - t.lb.y) * u; // 下边
+    return CGPointMake(tx + (bx - tx) * v, ty + (by - ty) * v);
+}
+
+// 源内容【真正该占据的子四边形】，返回等比缩放比 sc，四角写入 q[0..3]（lt/rt/rb/lb 顺序）。
+// 【根因】透视是把源矩形"拉伸填满"四角：contain 只保证缩放等比、不保证映射不变形，contain
+// 留出的空白不是留白而是被拉满。窗口是 312×640（1:2.05）的瘦长条，源比例差得越多越离谱：
+//     竖屏截图 1:2.16 → 只差 5%，拉伸无感，直接填满
+//     横屏 4:3 直接放 → 纵向 ×2.74（用户反馈的"被拉升"）
+//     横屏 4:3 旋转后 1:1.33 → 仍差 54%，光旋转治不了
+// 【做法】先算源等比缩放后在窗口里的占比，再把四角向内收缩到那个子区域、居中放置。
+// 【容差 kTol】占比 >= 0.85 视为差异可忽略、继续填满——竖屏截图占 94.9%，走填满，行为与
+// 改动前完全一致；横屏 16:9 旋转后占 86.6%，也填满（残留 15% 肉眼看不出）；横屏 4:3
+// 旋转后只占 65%，超出容差 → 居中，零变形，上下露出模板屏幕底色。
+static CGFloat DD_FitQuad(DDShellTemplate *t, CGFloat srcW, CGFloat srcH, CGPoint q[4]) {
+    CGRect wb = DD_WindowBBox(t);
+    CGFloat sc = MIN(wb.size.width / srcW, wb.size.height / srcH);
+    if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
+    CGFloat fw = (wb.size.width  > 0) ? (srcW * sc) / wb.size.width  : 1.0;
+    CGFloat fh = (wb.size.height > 0) ? (srcH * sc) / wb.size.height : 1.0;
+    if (fw > 1.0) fw = 1.0;
+    if (fh > 1.0) fh = 1.0;
+    static const CGFloat kTol = 0.85;
+    if (fw >= kTol) fw = 1.0;
+    if (fh >= kTol) fh = 1.0;
+    CGFloat u0 = (1.0 - fw) / 2.0, u1 = u0 + fw;
+    CGFloat v0 = (1.0 - fh) / 2.0, v1 = v0 + fh;
+    q[0] = DD_QuadLerp(t, u0, v0);   // 左上
+    q[1] = DD_QuadLerp(t, u1, v0);   // 右上
+    q[2] = DD_QuadLerp(t, u1, v1);   // 右下
+    q[3] = DD_QuadLerp(t, u0, v1);   // 左下
+    return sc;
+}
+
 static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     if (!shot || !t) return nil;
     UIImage *frameImg = t.image;
@@ -432,6 +469,14 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
 
+    // 横屏源：旋转 90° 后再往竖屏窗口里放（用户诉求：横屏拍的会被纵向拉升）。这里只需要
+    // 先定下旋转后的尺寸去参与 contain 计算，真正的旋转放到缩放【之后】做——避免 Core Image
+    // 把"旋转 + 缩放"合并优化、让 Lanczos 退化成仿射采样（波纹会回来）。
+    // 旋转方向取 M_PI_2；若躺倒方向不合预期，改成 -M_PI_2 即可。
+    CGFloat SA = A, SB = B;
+    BOOL rotated = (A > B);
+    if (rotated) { SA = B; SB = A; }   // 旋转 90° 后宽高互换
+
     // 源先按 contain 预缩到屏幕窗尺寸，再做透视映射——避免把大分辨率直接喂进透视导致
     // 中间图过大、投影退化（ZDY 即先预缩放再透视）。
     // 缩小这一步必须用 Lanczos：截图到窗口是 4× 量级的缩小（实测 1242px 源 → 296px，
@@ -439,14 +484,16 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     // ——与视频链曾经"套入视频有波纹"完全同源（那里改 Lanczos 后消失）。放大(sc>=1)
     // 不产生混叠，仍走仿射即可。
     CGRect wb = DD_WindowBBox(t);
-    CGFloat sc = MIN(wb.size.width / A, wb.size.height / B);
-    if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
+    CGPoint q[4];
+    CGFloat sc = DD_FitQuad(t, SA, SB, q);
     // 诊断：窗口物理尺寸 = 被套图的清晰度硬上限（各模板窗口占比差异很大，本例仅占画布宽
     // 11%）；PNG 比画布小说明机身在被放大，比画布大则说明 cfg 写小了、浪费了真实像素。
-    DD_Log(@"[图片套壳] name=%@ 画布=(%.0fx%.0f) PNG=(%.0fx%.0f) 窗口=(%.1fx%.1f) 源=(%.0fx%.0f) sc=%.4f(源宽的%.1f%%) 被套图=(%.0fx%.0f)",
+    BOOL centered = (fabs(q[0].x - t.lt.x) > 0.5) || (fabs(q[0].y - t.lt.y) > 0.5);
+    DD_Log(@"[图片套壳] name=%@ 画布=(%.0fx%.0f) PNG=(%.0fx%.0f) 窗口=(%.1fx%.1f) 源=(%.0fx%.0f)%@ sc=%.4f 被套图=(%.0fx%.0f) 放置=%@",
            t.name, W, H,
            (CGFloat)CGImageGetWidth(frameCG), (CGFloat)CGImageGetHeight(frameCG),
-           wb.size.width, wb.size.height, A, B, sc, sc * 100.0, A * sc, B * sc);
+           wb.size.width, wb.size.height, A, B, rotated ? @"[已旋转90°]" : @"", sc,
+           SA * sc, SB * sc, centered ? @"等比居中" : @"填满");
     CIImage *srcImg = nil;
     if (sc < 1.0) {
         CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
@@ -458,14 +505,20 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         }
     }
     if (!srcImg) srcImg = [[CIImage imageWithCGImage:shotCG] imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
+    if (rotated) {
+        CIImage *r = [srcImg imageByApplyingTransform:CGAffineTransformMakeRotation((CGFloat)M_PI_2)];
+        CGRect re = r.extent;
+        // 旋转后 extent 原点会偏移（常为负），平移归零，透视才能按 (0,0,SA*sc,SB*sc) 取 extent
+        srcImg = [r imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
+    }
     CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
     [f setDefaults];
     [f setValue:srcImg forKey:kCIInputImageKey];
-    [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, A * sc, B * sc)] forKey:@"inputExtent"];
-    [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
-    [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
-    [f setValue:DD_CIVec(t.rb, H) forKey:@"inputBottomRight"];
-    [f setValue:DD_CIVec(t.lb, H) forKey:@"inputBottomLeft"];
+    [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, SA * sc, SB * sc)] forKey:@"inputExtent"];
+    [f setValue:DD_CIVec(q[0], H) forKey:@"inputTopLeft"];
+    [f setValue:DD_CIVec(q[1], H) forKey:@"inputTopRight"];
+    [f setValue:DD_CIVec(q[2], H) forKey:@"inputBottomRight"];
+    [f setValue:DD_CIVec(q[3], H) forKey:@"inputBottomLeft"];
     CIImage *o = [f valueForKey:kCIOutputImageKey];
 
     if (o) {
