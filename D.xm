@@ -674,15 +674,15 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
 
     // 工作分辨率上限（长边 DD_WORK_CAP）：三重作用——
-    // ① 相册导入 3302 拒收：输出压在 4K(8294400) 以内即安全，1080 远低于此；
+    // ① 相册导入 3302 拒收：输出压在 4K(8294400) 以内即安全，720 远低于此；
     // ② 分享扩展内存：满画布 IOSurface 缓冲 + GPU CIContext 显存 + 源解码缓冲在扩展里
     //    会顶到 jetsam 上限。实测同一模板下，仅源视频更宽（1036 vs 720）就让本就贴着
     //    上限的基线再抬高、提前 5 秒触顶被杀；降工作分辨率把整体水位拉离悬崖，宽源那
     //    点偏移自然被吸收。③ 提速：像素量越少 GPU 合成越快。
     // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩；本 tweak
-    // 在分享扩展里必须主动降分辨率才能既快又不崩。设备内存充裕可上调到 1280/1440，但 1440
+    // 在分享扩展里必须主动降分辨率才能既快又不崩。设备内存充裕可上调到 1080/1280，但 1080
     // 对宽源/长视频偏贴边，2160 必崩。
-    static const CGFloat DD_WORK_CAP = 1080.0;
+    static const CGFloat DD_WORK_CAP = 720.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
