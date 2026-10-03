@@ -702,14 +702,16 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     // 转换），而非导出链路"固定开销"。故本上限如今主要压低 _mid IOSurface+编码缓冲、并作为
     // 清晰度↔稳定的保守折中，已非救命绳。
     // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩。
-    // 当前默认 1280：与 HighestQuality 编码配合。背景——AVFoundation 画质预设只有
-    // Low/Medium/Highest 三档（无中间 "High" 档），1440+Highest 在导出中段必触发 [内存压力]
-    // WARN（编码器缓冲累积贴边，虽暂未崩但有 SIGKILL 风险）；为保 Highest 锐度同时削掉 WARN，
-    // 只能降输出分辨率（唯一能压 _mid IOSurface+编码缓冲的旋钮）：1280 比 1440 像素少约 21%
-    // （(1280/1440)²），套入视频窗略小但 Highest 编码保证不块效应，清晰度仍远胜 Medium。若 1280
-    // 仍 WARN 则再降到 1080；若发糊则回 1440+Highest（接受 WARN）。2160+Highest 为极限清晰档
-    // （输出约 1596×2160，4K 安全）但内存贴边，仅作备选。
-    static const CGFloat DD_WORK_CAP = 1280.0;
+    // 当前默认 1080：与 HighestQuality 编码配合，是不换进程模型（Photo Editing 扩展）前提下、
+    // 为保 Highest 锐度能试的最后一档分辨率。背景——AVFoundation 画质预设只有 Low/Medium/
+    // Highest 三档（无中间 "High" 档），Highest 编码器缓冲大，1440/1280+Highest 在导出中段都
+    // 必触发 [内存压力] WARN（1280 仅把 WARN 从 #330 提前到 #300，未消除，证 WARN 主因是编码
+    // 码率非分辨率）；1080 比 1440 像素仅 56%（(1080/1440)²），_mid IOSurface+编码缓冲同缩，
+    // 有概率归零 WARN。套入视频窗更小但 Highest 编码保证不块效应，清晰度仍远胜 Medium。若 1080
+    // 仍 WARN，则 appex 内 Highest 已无可救药，只能 Medium（糊）或上 Photo Editing 扩展（治本）；
+    // 若发糊则回 1280+Highest（接受 WARN）。2160+Highest 极限清晰档（输出约 1596×2160，4K 安全）
+    // 但内存贴边，仅作备选。
+    static const CGFloat DD_WORK_CAP = 1080.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
