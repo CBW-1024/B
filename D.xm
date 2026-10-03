@@ -639,9 +639,11 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
             return;
         }
 
-        [_ctx reclaimResources];   // 每帧渲染后强制回收 GPU 临时纹理，斩断 CIContext 在渲染
-                                    // 循环里的显存累积——分享扩展里这是“有的视频套壳闪退”
-                                    // （jetsam 杀，日志中途断、无 [CRASH]）的根因。
+        // 注意：iOS 的 CIContext 没有 reclaimResources（该方法仅 macOS 可用，
+        // CIContext.h 标注 NS_AVAILABLE_MAC(10_4)，编译期即 unavailable on iOS），不能调用。
+        // iOS 端改用 init 里的 kCIContextCacheIntermediates:@NO 来斩断逐帧显存累积——
+        // 它让 CI 不缓存中间纹理、每帧渲染后即回收，等价于“每帧 reclaim”，足以在
+        // 分享扩展的紧内存下防 jetsam（WCR 跑在主进程、余量足，所以连这都不需要）。
         [req finishWithComposedVideoFrame:dst];
         CVPixelBufferRelease(dst);
     }
