@@ -740,8 +740,9 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     vc.renderSize = CGSizeMake(W, H);
     CMTime fd = vt.minFrameDuration;
     vc.frameDuration = (fd.timescale && fd.value) ? fd : CMTimeMake(1, 30);
-    DD_Log(@"[Compose] renderSize=(%.0f x %.0f) frameDuration=%lld/%d preset=MediumQuality",
-           W, H, (long long)vc.frameDuration.value, vc.frameDuration.timescale);
+    NSString *ddPreset = AVAssetExportPresetMediumQuality;
+    DD_Log(@"[Compose] renderSize=(%.0f x %.0f) frameDuration=%lld/%d preset=%@",
+           W, H, (long long)vc.frameDuration.value, vc.frameDuration.timescale, ddPreset);
 
     DDShellVideoInstruction *inst = [DDShellVideoInstruction new];
     inst.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
@@ -755,12 +756,13 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
 
     __block NSURL *result = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    // 导出质量用 HighestQuality（恢复清晰度）：① Medium 虽大幅缩小编码缓冲、压低分享扩展常驻
-    // 内存峰值（当初为治 CRITICAL 停摆而用），但把模版边缘/套入视频压出块效应发糊；② 现源已改
-    // 420YUV 除内存主因，配合 1440 分辨率（实测零 WARN）给 Highest 编码缓冲留余量，故可回到
-    // Highest 拿回锐度。若设备内存吃紧或更长/更宽源触发 WARN，可降回 MediumQuality。
+    // 导出质量用 MediumQuality（求稳）：① Medium 大幅缩小编码缓冲，压低分享扩展常驻内存峰值，
+    // 给更长/更宽源留余量（944 宽视频曾在 Highest 下偶发 [内存压力] WARN），消除贴边崩的风险；
+    // ② 波纹已由 CILanczosScaleTransform 独立解决，编码降档不会让波纹回来；③ 清晰度损失有限：
+    // 1440 输出下 Medium 仅轻微压模版边缘/视频块效应，可接受。若设备内存充裕且追求极限锐度，
+    // 可改回 HighestQuality（ddPreset 一处改动，日志会同步打印真实档位）。
     AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
-                                                            presetName:AVAssetExportPresetHighestQuality];
+                                                            presetName:ddPreset];
     ex.outputURL = [NSURL fileURLWithPath:outPath];
     ex.outputFileType = AVFileTypeMPEG4;
     ex.videoComposition = vc;
