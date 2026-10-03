@@ -505,7 +505,10 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         // 扩展范围缓冲（内存翻倍），钉死 working/output 为 sRGB；中间缓冲 _mid 复用单张
         // 满画布 IOSurface、不逐帧分配，内存打平以规避 jetsam。
         _ctx = [CIContext contextWithOptions:@{ (id)kCIContextWorkingColorSpace : (__bridge id)_cs,
-                                                (id)kCIContextOutputColorSpace  : (__bridge id)_cs }];
+                                                (id)kCIContextOutputColorSpace  : (__bridge id)_cs,
+                                                // 不缓存中间结果：防止逐帧渲染循环里 GPU 显存无限累积
+                                                // （分享扩展内存上限极紧，累积到 jetsam 即 SIGKILL 崩，无崩溃日志）。
+                                                (id)kCIContextCacheIntermediates : @NO }];
     }
     return self;
 }
@@ -636,6 +639,9 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
             return;
         }
 
+        [_ctx reclaimResources];   // 每帧渲染后强制回收 GPU 临时纹理，斩断 CIContext 在渲染
+                                    // 循环里的显存累积——分享扩展里这是“有的视频套壳闪退”
+                                    // （jetsam 杀，日志中途断、无 [CRASH]）的根因。
         [req finishWithComposedVideoFrame:dst];
         CVPixelBufferRelease(dst);
     }
