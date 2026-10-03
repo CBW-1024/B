@@ -684,13 +684,15 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     //    上限的基线再抬高、提前 5 秒触顶被杀；降工作分辨率把整体水位拉离悬崖，宽源那
     //    点偏移自然被吸收。③ 提速：像素量越少 GPU 合成越快。
     // 注意：实测把 DD_WORK_CAP 从 1080 降到 720，导出中段 CRITICAL 停摆（#360→#390 约
-    // 48s）几乎没缩短（1080 版约 44s），且画质下降——证明停摆来自导出链路（解码器+
-    // 编码器+AVAssetExportSession 内部缓冲）的固定内存开销，不随合成分辨率变化；合成
-    // 缓冲占比极小，降它杯水车薪。真正治本要削减源/编码内存（见源格式 420YUV）或换
-    // Photo Editing 扩展（内存预算高数倍）。默认 1080 是画质与稳定的折中。
+    // 48s）几乎没缩短（1080 版约 44s），且画质下降——说明停摆主因不在"合成分辨率"这一层。
+    // 后续将源改为 420YUV（NV12，免 NV12→BGRA 转换、省约 2.6× 源内存）后，同一模板、同一
+    // 1036 宽源从 44s 停摆变为 7s 匀速无停摆，反证停摆主因正是【源内存】（解码后缓冲+格式
+    // 转换），而非导出链路"固定开销"。故本上限如今主要压低 _mid IOSurface+编码缓冲、并作为
+    // 清晰度↔稳定的保守折中，已非救命绳。
     // WCR 同样用 GPU + 满画布 IOSurface，但它跑在微信进程（内存上限宽松）故不崩。
-    // 设备内存充裕可上调到 1280/1440，但 1440 对宽源/长视频偏贴边，2160 必崩。
-    static const CGFloat DD_WORK_CAP = 1080.0;
+    // 当前默认 1440：420YUV 源下实测稳定（输出约 1065×1440，仍远低于 4K/相册 3302 上限）；
+    // 2160 仍必崩（画布原始 2840×3840 量级），除非换 Photo Editing 扩展拿高内存预算。
+    static const CGFloat DD_WORK_CAP = 1440.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
     DDShellTemplate *st = t;
