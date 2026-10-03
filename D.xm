@@ -267,7 +267,8 @@ static void DD_InstallCrashHandlers(void) {
         for (size_t i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++)
             signal(sigs[i], DD_SignalHandler);
         // 内存压力日志。注意区分两档：WARN 是最低档（系统内存偏紧，正常导出也可能触发），
-        // CRITICAL 才是 jetsam(SIGKILL) 前兆（无法捕获）。实测 1080+Highest 只打 WARN、从未
+        // CRITICAL 才是 jetsam(SIGKILL) 前兆（无法捕获）。实测各档（直至 3200+Highest）
+        // 只打 WARN、从未 CRITICAL，且每次导出都成功——WARN 属可接受的轻度告警。
         // CRITICAL，且每次导出都成功——WARN 属可接受的轻度告警，不必按"即将被杀"处理。
         dispatch_source_t ps = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
@@ -423,15 +424,29 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
 
     CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
 
-    // 源先按 contain 预缩到屏幕窗尺寸，再做透视映射。直接把大图整张透视，中间图会被
-    // 拉得过大、逐帧合成容易卡死或被相册拒收（ZDY 即先预缩放再透视）。
+    // 源先按 contain 预缩到屏幕窗尺寸，再做透视映射——避免把大分辨率直接喂进透视导致
+    // 中间图过大、投影退化（ZDY 即先预缩放再透视）。
+    // 缩小这一步必须用 Lanczos：截图到窗口是 3.75× 缩小（1170px 源 → 约 312px 窗口，
+    // 仅剩 26.7%），仿射双线性的抗混叠不足，文字/列表分割线/图标细边会出摩尔纹与发虚
+    // ——与视频链曾经"套入视频有波纹"完全同源（那里改 Lanczos 后消失）。放大(sc>=1)
+    // 不产生混叠，仍走仿射即可。
     CGRect wb = DD_WindowBBox(t);
     CGFloat sc = MIN(wb.size.width / A, wb.size.height / B);
     if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-    CIImage *src = [[CIImage imageWithCGImage:shotCG] imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
+    CIImage *srcImg = nil;
+    if (sc < 1.0) {
+        CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
+        if (lz) {
+            [lz setDefaults];
+            [lz setValue:[CIImage imageWithCGImage:shotCG] forKey:kCIInputImageKey];
+            [lz setValue:@(sc) forKey:kCIInputScaleKey];
+            srcImg = lz.outputImage;
+        }
+    }
+    if (!srcImg) srcImg = [[CIImage imageWithCGImage:shotCG] imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
     CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
     [f setDefaults];
-    [f setValue:src forKey:kCIInputImageKey];
+    [f setValue:srcImg forKey:kCIInputImageKey];
     [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, A * sc, B * sc)] forKey:@"inputExtent"];
     [f setValue:DD_CIVec(t.lt, H) forKey:@"inputTopLeft"];
     [f setValue:DD_CIVec(t.rt, H) forKey:@"inputTopRight"];
@@ -501,17 +516,16 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     self = [super init];
     if (self) {
         _cs  = CGColorSpaceCreateDeviceRGB();
-        // 走 GPU 渲染（默认，不强制软件渲染）。软件渲染器在分享扩展里会把
-        // CIPerspectiveTransform 滤镜输出渲空——表现为“有声音、模板在、视频没进模版”
-        // （模板来自静态 CGImage 能正常渲，唯独 warped 那层空）。经反汇编 WCRefine 确认
-        // 其合成路径是“先烘焙 warped 到满画布 IOSurface 中间缓冲、再读回位图与前景合成”，
-        // 且 GPU 路径原本就能正确渲出 warped。为防宽色域/P3 源把 Core Image 推到 float
-        // 扩展范围缓冲（内存翻倍），钉死 working/output 为 sRGB；中间缓冲 _mid 复用单张
-        // 满画布 IOSurface、不逐帧分配，内存打平以规避 jetsam。
+        // 走 GPU 渲染（默认，不强制软件渲染）。软件渲染器会把 CIPerspectiveTransform
+        // 滤镜输出渲空——表现为“有声音、模板在、视频没进模版”（模板来自静态 CGImage 能正常
+        // 渲，唯独 warped 那层空）。经反汇编 WCRefine 确认其合成路径是“先烘焙 warped 到满
+        // 画布 IOSurface 中间缓冲、再读回位图与前景合成”，且 GPU 路径原本就能正确渲出 warped。
+        // 为防宽色域/P3 源把 Core Image 推到 float 扩展范围缓冲（内存翻倍），钉死 working/
+        // output 为 sRGB；中间缓冲 _mid 复用单张满画布 IOSurface、不逐帧分配，内存打平。
         _ctx = [CIContext contextWithOptions:@{ (id)kCIContextWorkingColorSpace : (__bridge id)_cs,
                                                 (id)kCIContextOutputColorSpace  : (__bridge id)_cs,
-                                                // 不缓存中间结果：防止逐帧渲染循环里 GPU 显存无限累积
-                                                // （分享扩展内存上限极紧，累积到 jetsam 即 SIGKILL 崩，无崩溃日志）。
+                                                // 不缓存中间结果：防止逐帧渲染循环里 GPU 显存随
+                                                // 帧数累积（大分辨率长视频下会显著推高内存峰值）。
                                                 (id)kCIContextCacheIntermediates : @NO }];
     }
     return self;
@@ -536,9 +550,11 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
     // 且每帧多占 ~2.6× 内存（5.3MB→2MB/帧 @1036×1280）；写 420YUV 则零转换、源解码内存
     // 直接砍到最低。Core Image 的 imageWithCVPixelBuffer: 对标准 420YUV 会自动转 RGB，
     // 合成逻辑无需改动；输出缓冲（required）仍是 BGRA+IOSurface（编码器需要，不可动）。
-    // 这是“降分辨率/对齐 WCR 仍中段停摆”之后的低成本减负尝试：源解码是导出链路里我们
-    // 唯一能砍的大头内存。实测 BGRA/YUV 在 1080 下停摆同为 ~44s，故本改动预期只小幅缓解、
-    // 不保证消除停摆；真正治本是换 Photo Editing 扩展拿高数倍内存预算。
+    // 这是“降分辨率/对齐 WCR 仍中段停摆”之后的减负改动：源解码是导出链路里我们能砍的
+    // 最大一块内存。事后实测证明它才是根治——同一 1036 宽源从 BGRA 的 44s 中段停摆变为
+    // 7s 匀速无停摆（此前误判为“仅小幅缓解”，实为完全消除）。
+    // （备注：曾提议换 Photo Editing 扩展拿高内存预算作治本，后经日志证实本就跑在微信
+    //  主进程、内存充裕，该方案已废弃，代码未保留。）
     // 必须含 kCVPixelBufferPixelFormatTypeKey（否则 AVFCore 直接抛 NSInvalidArgumentException）；
     // IOSurface 让源帧常驻 GPU 显存、与 CI 渲染零拷贝。
     return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
@@ -673,8 +689,8 @@ static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
         // 注意：iOS 的 CIContext 没有 reclaimResources（该方法仅 macOS 可用，
         // CIContext.h 标注 NS_AVAILABLE_MAC(10_4)，编译期即 unavailable on iOS），不能调用。
         // iOS 端改用 init 里的 kCIContextCacheIntermediates:@NO 来斩断逐帧显存累积——
-        // 它让 CI 不缓存中间纹理、每帧渲染后即回收，等价于“每帧 reclaim”，足以在
-        // 分享扩展的紧内存下防 jetsam（WCR 跑在主进程、余量足，所以连这都不需要）。
+        // 它让 CI 不缓存中间纹理、每帧渲染后即回收，等价于“每帧 reclaim”。本 tweak 跑在
+        // 微信主进程（内存远宽于扩展），但 3200 档 7.57MP 画布下显存累积仍可观，保留此设置。
         [req finishWithComposedVideoFrame:dst];
         CVPixelBufferRelease(dst);
     }
@@ -693,34 +709,25 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
     CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
     if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
 
-    // 工作分辨率上限（长边 DD_WORK_CAP）：三重作用——
-    // ① 相册导入 3302 拒收：输出压在 4K(8294400) 以内即安全，1080 远低于此；
-    // ② 分享扩展内存：满画布 IOSurface 缓冲 + GPU CIContext 显存 + 源解码缓冲在扩展里
-    //    会顶到 jetsam 上限。实测同一模板下，仅源视频更宽（1036 vs 720）就让本就贴着
-    //    上限的基线再抬高、提前 5 秒触顶被杀；降工作分辨率把整体水位拉离悬崖，宽源那
-    //    点偏移自然被吸收。③ 提速：像素量越少 GPU 合成越快。
-    // 注意：实测把 DD_WORK_CAP 从 1080 降到 720，导出中段 CRITICAL 停摆（#360→#390 约
-    // 48s）几乎没缩短（1080 版约 44s），且画质下降——说明停摆主因不在"合成分辨率"这一层。
-    // 后续将源改为 420YUV（NV12，免 NV12→BGRA 转换、省约 2.6× 源内存）后，同一模板、同一
-    // 1036 宽源从 44s 停摆变为 7s 匀速无停摆，反证停摆主因正是【源内存】（解码后缓冲+格式
-    // 转换），而非导出链路"固定开销"。故本上限如今主要压低 _mid IOSurface+编码缓冲、并作为
-    // 清晰度↔稳定的保守折中，已非救命绳。
-    // 【进程归属已澄清】证书注入主二进制 → tweak 只跑在【微信主进程】。日志佐证：输出 mp4 落在
-    // Containers/Data/Application/.../tmp/DDShell/，且 DD_IsExtensionProcess() 恒为 NO；输入 trim.MOV
-    // 虽在 PluginKitPlugin 容器，那是系统视频选择器/裁剪插件所写并授权主进程读取，不代表我们跑在扩展里。
-    // 【WARN 级别已澄清】全程只出现 DISPATCH_MEMORYPRESSURE_WARN（最低档），从未 CRITICAL；各分辨率
-    // （2160/1440/1280/1080，均为主进程）实测都只是 WARN 且都导出成功。故先前"为避 appex 内存墙而降
-    // 分辨率"的前提不成立——降分辨率牺牲了清晰度却没换来稳定性。
-    // 【分辨率天花板】硬上限是相册 4K 像素 8,294,400：超过即 3302 存不进相册。画布原始 2840×3840
-    // =10.9MP 是上限的 131%，故"用原始分辨率"不可行。按本算法 s=C/3840（高度恒为长边约束），
-    // C=3348 时正好 8.29MP 触顶，C=2160 时用掉 41.6%，C=3200 用掉 91%（余量 9%）。
-    // 当前默认 3200：输出约 2366×3200（7.57MP），像素是 2160 档的 2.2×，套入视频窗约 260px 宽
-    // （1080 档仅 88px、2160 档约 176px），配合 HighestQuality 编码与 Lanczos 缩放（无波纹）。
-    // 参考实测（2160 档 / 944 宽源 / 16s 视频）：进程=主进程，全程 #30→#480 匀速无停摆，中段仅
-    // 一次 [内存压力] WARN（最低档、非 CRITICAL），约 16s 导出成功、存相册 success=1。
-    // 若 3200 出现 CRITICAL / 闪退 / 3302，按 2880 → 2560 → 2160 逐级下调；2160 已验证稳。
-    // 注意：套入视频窗受【模版几何】限制（本模版视频框仅占画布宽约 11%），即便顶到天花板
-    // 3348，窗口也仅约 272px 宽 ≈ 源宽 944px 的 29%——视频到不了源原生清晰度，属模版设计所限。
+    // ── 工作分辨率上限（长边 DD_WORK_CAP）────────────────────────────────
+    // 【硬天花板】相册 4K 像素 8,294,400：超过即 3302 存不进相册。画布原始 2840×3840
+    // =10.9MP 是上限的 131%，故"用原始分辨率"不可行。本算法 s=C/3840（高度恒为长边约束），
+    // C=3348 时正好 8.29MP 触顶；C=3200 用掉 91%（余量 9%），C=2160 用掉 41.6%。
+    // 【当前默认 3200】输出约 2366×3200（7.57MP）。实测（944 宽源 / 16s 视频）：主进程，
+    // 全程 #30→#480 匀速无停摆，2 次 [内存压力] WARN（均最低档、非 CRITICAL），约 27s
+    // 导出成功、存相册 success=1（无 3302）。再上探到 3348 仅多 +12px 视频窗宽
+    // （260→272px），却要贴 4K 硬线，收益/风险不划算，故定为最终档。
+    // 【历史教训·勿回退】① 源格式改 420YUV(NV12) 是治"慢"的关键：此前 BGRA 源需每帧
+    // NV12→BGRA 转换、源缓冲 2.6×，同一 1036 宽源从 44s 中段停摆变为 7s 匀速无停摆——
+    // 停摆主因是【源内存】而非合成分辨率，所以降分辨率治不了停摆（曾实测 720 反而更慢）。
+    // ② 曾误判合成跑在分享扩展(appex)（因输入 trim.MOV 落在 PluginKitPlugin 容器），实为
+    // 证书注入主二进制 → 只跑在【微信主进程】：输出 mp4 落在 Containers/Data/Application/…，
+    // DD_IsExtensionProcess() 恒 NO；trim.MOV 只是系统视频选择器/裁剪插件所写并授权主进程
+    // 读取。③ 因此"为避 appex 内存墙而降分辨率"的前提不成立（2160/1440/1280/1080 各档
+    // 实测都只 WARN、都成功），故把分辨率提回 3200 拿回清晰度。
+    // 【降级链】更长视频/老设备若出现 CRITICAL 或 3302：2880 → 2560 → 2160（2160 已验证稳）。
+    // 【模版几何上限】本模版视频框仅占画布宽约 11%，即便顶到 3348 窗口也仅约 272px 宽 ≈
+    // 源宽 944px 的 29%——视频到不了源原生清晰度，属模版设计所限，非 tweak 可解。
     static const CGFloat DD_WORK_CAP = 3200.0;
     CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
     CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
@@ -771,12 +778,13 @@ static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
 
     __block NSURL *result = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    // 导出质量用 HighestQuality（清晰优先）：AVFoundation 画质预设仅有 Low/Medium/Highest 三档，
-    // 无中间 "High" 档。Highest 在 1440 下每次导出中段必触发 [内存压力] WARN（编码器缓冲累积贴边，
-    // 虽暂未崩但有 SIGKILL 风险）；为保 Highest 锐度同时削 WARN，改降输出分辨率 DD_WORK_CAP
-    // （1280，非编码档）压 _mid IOSurface+编码缓冲。Medium 虽零 WARN 但把套入视频压出明显块效应
-    // 发糊（用户否决）。波纹已由 CILanczosScaleTransform 独立解决，与编码档无关。若 1280+Highest
-    // 仍 WARN 则降 DD_WORK_CAP 到 1080；若发糊则回 1440+Highest（接受 WARN）。
+    // 导出质量用 HighestQuality（清晰优先）：AVFoundation 画质预设仅有 Low/Medium/Highest
+    // 三档，无中间 "High" 档。Medium 虽零 WARN 但把套入视频压出明显块效应发糊（用户否决）；
+    // Highest 的代价只是中段偶发 [内存压力] WARN——已澄清那是 DISPATCH_MEMORYPRESSURE_WARN
+    // （最低档，非 CRITICAL 前兆），主进程下实测每次都正常导出，可接受。
+    // 波纹已由 CILanczosScaleTransform 独立解决，与编码档无关（回退 Medium 也不会复发）。
+    // 若更长视频/老设备真出现 CRITICAL 或 3302，优先降 DD_WORK_CAP（3200→2880→2560→2160），
+    // 编码档最后才考虑回 Medium（会发糊）。
     AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
                                                             presetName:ddPreset];
     ex.outputURL = [NSURL fileURLWithPath:outPath];
