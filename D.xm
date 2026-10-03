@@ -852,19 +852,6 @@ static BOOL DD_IsExtensionProcess(void) {
     return [exe containsString:@"PluginKitPlugin"] || [bp containsString:@".appex"];
 }
 
-static void DD_ComposeAndSaveVideo(NSURL *url, DDShellTemplate *t) {
-    DD_Log(@"[视频套壳] 开始 name=%@ canvas=(%.0f x %.0f) url=%@ 进程=%@ exe=%@",
-           t.name, t.canvasSize.width, t.canvasSize.height, url,
-           DD_IsExtensionProcess() ? @"扩展(appex)" : @"主进程",
-           [[NSBundle mainBundle] executablePath] ?: @"?");
-    NSURL *outURL = DD_ComposeShellVideo(url, t);
-    if (!outURL) { DD_ShowError(@"套壳失败"); return; }
-    DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
-        if (success) DD_ShowShellDone();
-        else DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
-    });
-}
-
 #pragma mark - 监听器
 
 // 微信内置提示控件，运行时按类名获取，编译期不产生链接符号
@@ -1938,6 +1925,20 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
                 DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
             }
         });
+    });
+}
+
+// 合成并存相册，抽出复用（放在 toast 提示函数之后，DD_ShowError/DD_ShowShellDone 才已声明）
+static void DD_ComposeAndSaveVideo(NSURL *url, DDShellTemplate *t) {
+    DD_Log(@"[视频套壳] 开始 name=%@ canvas=(%.0f x %.0f) url=%@ 进程=%@ exe=%@",
+           t.name, t.canvasSize.width, t.canvasSize.height, url,
+           DD_IsExtensionProcess() ? @"扩展(appex)" : @"主进程",
+           [[NSBundle mainBundle] executablePath] ?: @"?");
+    NSURL *outURL = DD_ComposeShellVideo(url, t);
+    if (!outURL) { DD_ShowError(@"套壳失败"); return; }
+    DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
+        if (success) DD_ShowShellDone();
+        else DD_ShowError(err.localizedDescription.length ? err.localizedDescription : @"保存到相册失败");
     });
 }
 
