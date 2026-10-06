@@ -1384,13 +1384,11 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 %ctor {
     @autoreleasepool {
-        Class mgrCls = objc_getClass("WCPluginsMgr");
-        if (![mgrCls respondsToSelector:@selector(sharedInstance)]) return;
-
-        WCPluginsMgr *mgr = [mgrCls sharedInstance];
-        if (![mgr respondsToSelector:@selector(registerControllerWithTitle:version:controller:)]) return;
-        [mgr registerControllerWithTitle:@"DD语音包"
-                                 version:@"1.0.0"
-                              controller:@"DDVoicePackSettingsViewController"];
+        id mgr = objc_getClass("WCPluginsMgr");
+        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD语音包"
+                                                      version:@"1.0.0"
+                                                   controller:@"DDVoicePackSettingsViewController"];
+        }
     }
 }
