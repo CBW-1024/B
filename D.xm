@@ -1363,7 +1363,6 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-// 整目录按同名装进语音包根下子目录，同名则覆盖 —— 和 DD模板套壳 DD_InstallTemplateFolder 一致
 // 整目录或单文件，都按同名落到语音包根下，同名则覆盖 —— 和 DD模板套壳一致
 - (void)installVoicePackItem:(NSString *)src {
     NSFileManager *fm = [NSFileManager defaultManager];
