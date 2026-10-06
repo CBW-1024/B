@@ -73,8 +73,10 @@ static NSString * const kDDTouchTrailOnlyWhenRecordKey = @"DDTouchTrailOnlyWhenR
 // ========== 辅助函数 ==========
 
 static NSMutableDictionary *trailLayers = nil;
+// 上一次事件时是否处于「应显示轨迹」状态，用于捕捉「关闭开关 / 停止录屏」这类隐藏时机
+static BOOL lastShowing = NO;
 
-// 移除所有轨迹圆点（切换开关 / 异常自愈时调用）
+// 移除所有轨迹圆点（切换开关 / 停止录屏时调用）
 static void DDClearTrails(void) {
     for (CALayer *layer in trailLayers.allValues) [layer removeFromSuperlayer];
     [trailLayers removeAllObjects];
@@ -104,8 +106,20 @@ static CALayer *DDCreateTrailLayer(void) {
 
     // 实时判断：不缓存状态，录屏开关变化无需额外通知
     DDTouchTrailConfig *cfg = DDTouchTrailConfig.shared;
-    if (!cfg.touchTrailEnabled) return;
-    if (cfg.onlyWhenRecording && !UIScreen.mainScreen.isCaptured) return;
+
+    // 显示条件：总开关开，且（不限录屏 或 正在录屏）
+    BOOL shouldShow = cfg.touchTrailEnabled
+                   && (!cfg.onlyWhenRecording || UIScreen.mainScreen.isCaptured);
+
+    // 由「显示」转「隐藏」时清空残留：关开关 / 停止录屏都会走到这里，
+    // 否则提前 return 会跳过后面的清理循环，红点会卡在屏幕上
+    // 只清一次：清完把 lastShowing 置 NO，之后同类事件直接空转返回
+    if (!shouldShow) {
+        if (lastShowing) DDClearTrails();
+        lastShowing = NO;
+        return;
+    }
+    lastShowing = YES;
 
     for (UITouch *touch in event.allTouches) {
         CGPoint location = [touch locationInView:nil];
@@ -133,10 +147,6 @@ static CALayer *DDCreateTrailLayer(void) {
             default: break;
         }
     }
-
-    // 兜底：条目数超过物理手指上限，说明漏收了 Ended/Cancelled，全清自愈
-    // 正在显示的圆点会在下一次 Moved 时重建，不会误伤
-    if (trailLayers.count > 12) DDClearTrails();
 }
 
 %end
