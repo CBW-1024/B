@@ -1362,22 +1362,43 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-// 把 srcPath 下的内容拷到 destDir（跳过隐藏项和 __MACOSX）；是目录就平铺子项，是文件就整份拷
-- (void)copyItemsFromPath:(NSString *)srcPath toDirectory:(NSString *)destDir {
+// 整目录按同名装进语音包根下子目录，同名则覆盖 —— 和 DD模板套壳 DD_InstallTemplateFolder 一致
+- (void)installVoicePackFolder:(NSString *)src {
     NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    [fm fileExistsAtPath:srcPath isDirectory:&isDir];
-    if (!isDir) {
-        NSString *dst = [destDir stringByAppendingPathComponent:[srcPath lastPathComponent]];
-        [fm removeItemAtPath:dst error:nil];
-        [fm copyItemAtPath:srcPath toPath:dst error:nil];
-        return;
+    NSString *dst = [DDVoicePackRootPath() stringByAppendingPathComponent:src.lastPathComponent];
+    [fm removeItemAtPath:dst error:nil];
+    [fm copyItemAtPath:src toPath:dst error:nil];
+}
+
+// 单个 .silk 直接落到语音包根目录，同名则覆盖
+- (void)installVoicePackFile:(NSString *)src {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dst = [DDVoicePackRootPath() stringByAppendingPathComponent:src.lastPathComponent];
+    [fm removeItemAtPath:dst error:nil];
+    [fm copyItemAtPath:src toPath:dst error:nil];
+}
+
+// 解压后的目录：顶层有子文件夹就把每个子文件夹装成同名语音包；
+// 顶层没有文件夹（散装 .silk）就逐个落根目录。对应 DD模板套壳 DD_ImportTemplatesFrom 的思路
+- (void)importUnpackedDir:(NSString *)dir {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
+    BOOL installedFolder = NO;
+    for (NSString *name in items) {
+        if ([name hasPrefix:@"."] || [name isEqualToString:@"__MACOSX"]) continue;
+        NSString *full = [dir stringByAppendingPathComponent:name];
+        BOOL isDir = NO;
+        [fm fileExistsAtPath:full isDirectory:&isDir];
+        if (isDir) {
+            [self installVoicePackFolder:full];
+            installedFolder = YES;
+        }
     }
-    for (NSString *item in [fm contentsOfDirectoryAtPath:srcPath error:nil]) {
-        if ([item hasPrefix:@"."] || [item isEqualToString:@"__MACOSX"]) continue;
-        NSString *dst = [destDir stringByAppendingPathComponent:item];
-        [fm removeItemAtPath:dst error:nil];
-        [fm copyItemAtPath:[srcPath stringByAppendingPathComponent:item] toPath:dst error:nil];
+    if (installedFolder) return;
+    for (NSString *name in items) {
+        if ([name hasPrefix:@"."] || [name isEqualToString:@"__MACOSX"]) continue;
+        NSString *full = [dir stringByAppendingPathComponent:name];
+        if (DDVoicePackIsSilk(full)) [self installVoicePackFile:full];
     }
 }
 
@@ -1454,15 +1475,14 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
             BOOL isDir = NO;
             [[NSFileManager defaultManager] fileExistsAtPath:p isDirectory:&isDir];
             if (isDir) {
-                [self copyItemsFromPath:p toDirectory:destRoot];
+                [self installVoicePackFolder:p];
             } else if ([p.pathExtension.lowercaseString isEqualToString:@"zip"]) {
                 NSString *unzipDir = [tmp stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
                 if (DDVoicePackUnzipToDirectory(p, unzipDir)) {
-                    NSString *srcRoot = [self voicePackUnwrapIfSingleDir:unzipDir];
-                    [self copyItemsFromPath:srcRoot toDirectory:destRoot];
+                    [self importUnpackedDir:[self voicePackUnwrapIfSingleDir:unzipDir]];
                 }
             } else if ([p.pathExtension.lowercaseString isEqualToString:@"silk"]) {
-                [self copyItemsFromPath:p toDirectory:destRoot];
+                [self installVoicePackFile:p];
             }
         }
         dispatch_async(dispatch_get_main_queue(), ^{
