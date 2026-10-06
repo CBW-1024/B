@@ -9,7 +9,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#pragma mark - 常量定义
+// ========== 常量定义 ==========
 
 static NSString * const kWCVoicePackDidSelectSilkFileNotification = @"WCVoicePackDidSelectSilkFileNotification";
 static NSString * const kWCVoicePackDidSelectSilkFilePathKey = @"fullPath";
@@ -29,7 +29,7 @@ static const void *kWCVoiceLongPressGestureKey = &kWCVoiceLongPressGestureKey;
 static __weak UIViewController *sWCVoicePackSheetHostFromVC = nil;
 static NSString *sWCVoicePendingVoiceImportFromChatPath = nil;
 
-#pragma mark - 微信私有类声明
+// ========== 微信内部类声明 ==========
 
 @interface MMContext : NSObject
 + (id)activeUserContext;
@@ -54,15 +54,15 @@ static NSString *sWCVoicePendingVoiceImportFromChatPath = nil;
 
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
-+ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)right accessoryType:(long long)accessoryType;
-+ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title detail:(id)detail;
+// 普通 cell 走 WCTableViewNormalCellManager，这里不再重复声明
 - (id)getCell;
 @end
 
 @interface MMTableView : UITableView
 @end
 
-@interface CContact : NSObject
+// m_nsUsrName 实际定义在 CBaseContact 上（CContact 继承它），声明到父类避免误读
+@interface CBaseContact : NSObject
 - (NSString *)m_nsUsrName;
 @end
 
@@ -188,7 +188,7 @@ static NSString *sWCVoicePendingVoiceImportFromChatPath = nil;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-#pragma mark - 配置管理
+// ========== 配置管理 ==========
 
 @interface WCVoiceConfig : NSObject
 + (BOOL)messageVoicePackManagementEnabled;
@@ -239,7 +239,7 @@ static NSString *sWCVoicePendingVoiceImportFromChatPath = nil;
 
 @end
 
-#pragma mark - 语音预览工具
+// ========== 语音预览工具 ==========
 
 @interface WCVoiceSilkPreview : NSObject
 + (void)playSilkFileAtPath:(NSString *)path retainingPlayerOn:(id)owner;
@@ -269,7 +269,7 @@ static NSString *sWCVoicePendingVoiceImportFromChatPath = nil;
 
 @end
 
-#pragma mark - 文件操作辅助函数
+// ========== 文件操作辅助函数 ==========
 
 static NSString *WCVoicePackDirectoryPath(void) {
     NSString *libraryPath = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
@@ -346,7 +346,7 @@ static NSArray<NSString *> *WCVoiceSearchAudioFilesInDirectory(NSString *directo
     return [results sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
 }
 
-#pragma mark - 语音列表控制器接口声明
+// ========== 语音列表控制器（接口） ==========
 
 @class WCVoiceListController;
 
@@ -397,7 +397,7 @@ static NSArray<NSString *> *WCVoiceSearchAudioFilesInDirectory(NSString *directo
 
 @end
 
-#pragma mark - 表代理转发
+// ========== 表格代理转发 ==========
 
 @interface WCVoicePackTableDelegateProxy : NSObject <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, weak) id forwardTarget;
@@ -486,7 +486,7 @@ static NSArray<NSString *> *WCVoiceSearchAudioFilesInDirectory(NSString *directo
 
 @end
 
-#pragma mark - UIViewController 分类
+// ========== UIViewController 分类（面板入口） ==========
 
 @interface UIViewController (WCVoiceListPageSheet)
 - (void)dismissWCVoiceListPageSheet;
@@ -506,7 +506,7 @@ static NSArray<NSString *> *WCVoiceSearchAudioFilesInDirectory(NSString *directo
 
 @end
 
-#pragma mark - WCVoiceListController 实现
+// ========== 语音列表控制器（实现） ==========
 
 @implementation WCVoiceListController
 
@@ -1022,7 +1022,7 @@ static NSArray<NSString *> *WCVoiceSearchAudioFilesInDirectory(NSString *directo
     [self wcvoice_syncMMPageSheetNavigationBar];
 }
 
-#pragma mark - UISearchBarDelegate
+// ========== 搜索 ==========
 
 - (void)searchBarTextDidBeginEditing:(UISearchBar *)searchBar {
     self.isSearching = YES;
@@ -1089,7 +1089,7 @@ static NSArray<NSString *> *WCVoiceSearchAudioFilesInDirectory(NSString *directo
 
 @end
 
-#pragma mark - UINavigationController 分类
+// ========== UINavigationController 分类 ==========
 
 @interface UINavigationController (WCVoicePackSheet)
 - (void)wcvoice_voicePackSheetBackInvoked:(id)sender;
@@ -1108,7 +1108,7 @@ static NSArray<NSString *> *WCVoiceSearchAudioFilesInDirectory(NSString *directo
 
 @end
 
-#pragma mark - 音频处理与发送
+// ========== 音频处理与发送 ==========
 
 static unsigned int WCVoicePackDurationMsFromFile(NSString *path) {
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
@@ -1208,8 +1208,9 @@ static BOOL WCVoicePackSendSilkPayload(NSData *silkData, unsigned int voiceTimeM
     ((void (*)(id, SEL, id))objc_msgSend)(voiceMsg, @selector(setM_nsToUsr:), chatId);
     ((void (*)(id, SEL, unsigned int))objc_msgSend)(voiceMsg, @selector(setM_uiStatus:), 1u);
     ((void (*)(id, SEL, unsigned int))objc_msgSend)(voiceMsg, @selector(setM_uiDownloadStatus:), 9u);
-    ((void (*)(id, SEL, unsigned int))objc_msgSend)(voiceMsg, @selector(setM_uiVoiceFormat:), 4u);
-    ((void (*)(id, SEL, unsigned int))objc_msgSend)(voiceMsg, @selector(setM_uiVoiceTime:), voiceMs);
+    // 语音的时长 / 格式 / 数据一律装在 extInfo（CExtendInfoOfVoiceMsg）上。
+    // 不要在 wrap 上设：CMessageWrap 并没有 setM_uiVoiceTime: / setM_uiVoiceFormat: / setM_dtVoice:，
+    // 这几个方法只存在于 UploadVoiceWrap、MassSendWrap、CExtendInfoOfVoiceMsg 上。
     ((void (*)(id, SEL, id))objc_msgSend)(voiceMsg, @selector(setM_nsMsgSource:), nil);
     
     id sessionMgr = [ctx getService:objc_getClass("MMNewSessionMgr")];
@@ -1225,8 +1226,11 @@ static BOOL WCVoicePackSendSilkPayload(NSData *silkData, unsigned int voiceTimeM
     NSString *audioPath = ((NSString *(*)(Class, SEL, NSString *, unsigned int, NSString *))objc_msgSend)(utilClass, @selector(GetPathOfMesAudio:LocalID:DocPath:), chatId, localID, docPath);
     [[NSFileManager defaultManager] createDirectoryAtPath:[audioPath stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
     [silkData writeToFile:audioPath atomically:YES];
-    // 必须显式告诉微信文件落在哪，否则 ResendVoiceMsg 会按 localID 重算路径、读到坏文件
-    if (audioPath.length) ((void (*)(id, SEL, id))objc_msgSend)(voiceMsg, @selector(setM_nsVoicePath:), audioPath);
+    // 告诉微信音频落在哪（DD语音助手验证过的步骤）。
+    // 该方法在微信头文件里查无此物，加 respondsToSelector 保护：有就设，没有就跳过，别崩。
+    if (audioPath.length && [voiceMsg respondsToSelector:@selector(setM_nsVoicePath:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(voiceMsg, @selector(setM_nsVoicePath:), audioPath);
+    }
     
     Class extCls = objc_getClass("CExtendInfoOfVoiceMsg");
     if (extCls) {
@@ -1244,7 +1248,7 @@ static BOOL WCVoicePackSendSilkPayload(NSData *silkData, unsigned int voiceTimeM
         }
     }
     
-    ((void (*)(id, SEL, id))objc_msgSend)(voiceMsg, @selector(setM_dtVoice:), silkData);
+    // 语音数据已装在 extInfo 上，wrap 不再重复设 setM_dtVoice:（CMessageWrap 没有这个方法）
     ((void (*)(id, SEL, id))objc_msgSend)(voiceMsg, @selector(UpdateContent:), nil);
     
     if ([msgMgr respondsToSelector:@selector(ModMsg:MsgWrap:)]) {
@@ -1296,7 +1300,7 @@ static WCVoicePackSenderNoteSink *sSenderSink;
 }
 @end
 
-#pragma mark - 设置控制器
+// ========== 设置界面 ==========
 
 @interface WCVoiceSettingsController : UIViewController <UIDocumentPickerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
@@ -1424,8 +1428,6 @@ static WCVoicePackSenderNoteSink *sSenderSink;
 
 @end
 
-#pragma mark - Hook 逻辑
-
 static UIWindow *WCVoiceGetKeyWindow(void) {
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if (scene.activationState == UISceneActivationStateForegroundActive) {
@@ -1457,6 +1459,8 @@ static NSString *WCVoiceGetVoiceFilePathForImport(CMessageWrap *msg) {
     NSString *doc = ((NSString *(*)(Class, SEL))objc_msgSend)(util, @selector(GetDocPath));
     return ((NSString *(*)(Class, SEL, NSString *, unsigned int, NSString *))objc_msgSend)(util, @selector(GetPathOfMesAudio:LocalID:DocPath:), chat, (unsigned int)((NSUInteger (*)(id, SEL))objc_msgSend)(msg, @selector(m_uiMesLocalID)), doc);
 }
+
+// ========== Hook 长按「+」按钮打开语音包 ==========
 
 %hook MMUIButton
 - (void)didMoveToSuperview {
@@ -1505,6 +1509,8 @@ static NSArray *WCVoiceInjectMenuItem(id cell, NSArray *original, BOOL enabled, 
     return items;
 }
 
+// ========== Hook 语音消息菜单「纳入」 ==========
+
 %hook VoiceMessageCellView
 - (NSArray *)operationMenuItems {
     NSArray *items = %orig;
@@ -1540,7 +1546,7 @@ static NSArray *WCVoiceInjectMenuItem(id cell, NSArray *original, BOOL enabled, 
 }
 %end
 
-#pragma mark - 插件注册
+// ========== 插件注册 ==========
 
 %ctor {
     [WCVoicePackSender class];
