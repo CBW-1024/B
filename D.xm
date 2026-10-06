@@ -180,6 +180,29 @@
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender;
 @end
 
+// 微信内的 zip 工具，编译期只提供 selector 声明，运行期 objc_getClass 取，不产生链接符号
+@interface DDVoicePackZipArchive : NSObject
++ (BOOL)createZipFileAtPath:(id)zipPath withContentsOfDirectory:(id)dir keepParentDirectory:(BOOL)keep;
++ (BOOL)unzipFileAtPath:(id)zipPath toDestination:(id)dest;
+@end
+
+// 打包整个目录，zip 内保留该目录名（和 DD模板套壳一致）
+static BOOL DDVoicePackZipDirectory(NSString *srcDir, NSString *zipPath) {
+    return [objc_getClass("QSSZipArchive") createZipFileAtPath:zipPath
+                                      withContentsOfDirectory:srcDir
+                                          keepParentDirectory:YES];
+}
+
+// 解包 zip 到目录
+static BOOL DDVoicePackUnzipToDirectory(NSString *zipPath, NSString *destDir) {
+    return [objc_getClass("QSSZipArchive") unzipFileAtPath:zipPath toDestination:destDir];
+}
+
+// 临时目录：打包/解压的中间暂存，用 UUID 隔离避免互相污染
+static NSString *DDVoicePackTempRoot(void) {
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:[@"DDVoicePack_" stringByAppendingString:[NSUUID UUID].UUIDString]];
+}
+
 // ========== 配置管理 ==========
 
 // UserDefaults key
@@ -1329,46 +1352,124 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 // ---- 导入导出 ----
 
 - (void)importVoicePack {
-    // 只收文件夹：SILK 不是标准音频 UTI，单文件选择器选不到它
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder] asCopy:YES];
+    // 支持三种来源：整目录、zip 包、单个 .silk 文件。
+    // SILK 不是标准 UTI，单文件会退化成 public.data，加上它才能让 .silk 被选到；
+    // 全用字符串 UTI，不依赖 UT 框架（UTTypeFolder 没 link 为 nil 时 @[nil] 会崩）
+    NSArray *types = @[@"public.folder", @"public.zip-archive", @"public.data"];
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:types inMode:0]; // 0 = Import
     picker.delegate = self;
     picker.allowsMultipleSelection = YES;
-    picker.modalPresentationStyle = UIModalPresentationFormSheet;
     [self presentViewController:picker animated:YES completion:nil];
+}
+
+// 把 srcPath 下的内容拷到 destDir（跳过隐藏项和 __MACOSX）；是目录就平铺子项，是文件就整份拷
+- (void)copyItemsFromPath:(NSString *)srcPath toDirectory:(NSString *)destDir {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    [fm fileExistsAtPath:srcPath isDirectory:&isDir];
+    if (!isDir) {
+        NSString *dst = [destDir stringByAppendingPathComponent:[srcPath lastPathComponent]];
+        [fm removeItemAtPath:dst error:nil];
+        [fm copyItemAtPath:srcPath toPath:dst error:nil];
+        return;
+    }
+    for (NSString *item in [fm contentsOfDirectoryAtPath:srcPath error:nil]) {
+        if ([item hasPrefix:@"."] || [item isEqualToString:@"__MACOSX"]) continue;
+        NSString *dst = [destDir stringByAppendingPathComponent:item];
+        [fm removeItemAtPath:dst error:nil];
+        [fm copyItemAtPath:[srcPath stringByAppendingPathComponent:item] toPath:dst error:nil];
+    }
+}
+
+// zip 可能多包一层包装目录（如导出时打的 "DD语音包/"），下钻到真正装内容的那一层
+- (NSString *)voicePackUnwrapIfSingleDir:(NSString *)dir {
+    NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    NSMutableArray *subs = [NSMutableArray array];
+    for (NSString *it in items) {
+        if ([it hasPrefix:@"."] || [it isEqualToString:@"__MACOSX"]) continue;
+        [subs addObject:it];
+    }
+    if (subs.count == 1) {
+        NSString *only = [dir stringByAppendingPathComponent:subs[0]];
+        BOOL isDir = NO;
+        [[NSFileManager defaultManager] fileExistsAtPath:only isDirectory:&isDir];
+        if (isDir) return only;
+    }
+    return dir;
 }
 
 - (void)exportVoicePack {
-    NSURL *voiceDirURL = [NSURL fileURLWithPath:DDVoicePackRootPath() isDirectory:YES];
-    [[NSFileManager defaultManager] createDirectoryAtURL:voiceDirURL withIntermediateDirectories:YES attributes:nil error:nil];
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForExportingURLs:@[voiceDirURL] asCopy:YES];
-    picker.delegate = self;
-    picker.modalPresentationStyle = UIModalPresentationFormSheet;
-    [self presentViewController:picker animated:YES completion:nil];
+    NSString *voiceDir = DDVoicePackRootPath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:voiceDir]) return;
+
+    // 打包丢后台，主线程不卡
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *tmp = DDVoicePackTempRoot();
+        [fm createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
+        // 整目录拷进 stage 再压，zip 内保留目录名（和 DD模板套壳一致）
+        NSString *stage = [tmp stringByAppendingPathComponent:@"DD语音包"];
+        [fm copyItemAtPath:voiceDir toPath:stage error:nil];
+        NSString *zip = [tmp stringByAppendingPathComponent:@"DD语音包.zip"];
+        BOOL ok = DDVoicePackZipDirectory(stage, zip);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!ok) return; // 打包失败，临时目录等下次清理
+            NSURL *zipURL = [NSURL fileURLWithPath:zip];
+            UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[zipURL] applicationActivities:nil];
+            av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *err) {
+                [fm removeItemAtPath:tmp error:nil]; // 分享结束回收临时目录
+            };
+            UIPopoverPresentationController *pop = av.popoverPresentationController;
+            if (pop) { // iPad 需要锚点，否则崩溃
+                pop.sourceView = self.view;
+                pop.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+            }
+            [self presentViewController:av animated:YES completion:nil];
+        });
+    });
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    NSString *destRoot = DDVoicePackRootPath();
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:destRoot withIntermediateDirectories:YES attributes:nil error:nil];
-    for (NSURL *url in urls) [self copyItemAtURL:url toDirectory:destRoot];
-}
-
-- (void)copyItemAtURL:(NSURL *)srcURL toDirectory:(NSString *)destDir {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    [fm fileExistsAtPath:srcURL.path isDirectory:&isDir];
-
-    if (!isDir) {
-        NSString *dstPath = [destDir stringByAppendingPathComponent:[srcURL lastPathComponent]];
-        [fm removeItemAtPath:dstPath error:nil];
-        [fm copyItemAtPath:srcURL.path toPath:dstPath error:nil];
+    NSMutableArray<NSURL *> *scoped = [NSMutableArray array];
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSURL *u in urls) {
+        if (!u.path.length) continue; // 防 addObject:nil
+        if ([u startAccessingSecurityScopedResource]) [scoped addObject:u];
+        [paths addObject:u.path];
+    }
+    if (!paths.count) {
+        for (NSURL *u in scoped) [u stopAccessingSecurityScopedResource];
         return;
     }
-    for (NSURL *itemURL in [fm contentsOfDirectoryAtURL:srcURL includingPropertiesForKeys:nil options:0 error:nil]) {
-        NSString *dstPath = [destDir stringByAppendingPathComponent:[itemURL lastPathComponent]];
-        [fm removeItemAtPath:dstPath error:nil];
-        [fm copyItemAtURL:itemURL toURL:[NSURL fileURLWithPath:dstPath] error:nil];
-    }
+
+    NSString *destRoot = DDVoicePackRootPath();
+    [[NSFileManager defaultManager] createDirectoryAtPath:destRoot withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *tmp = DDVoicePackTempRoot();
+    [[NSFileManager defaultManager] createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // 解压 + 拷贝在后台跑，语音包多时避免主线程卡顿
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        for (NSString *p in paths) {
+            BOOL isDir = NO;
+            [[NSFileManager defaultManager] fileExistsAtPath:p isDirectory:&isDir];
+            if (isDir) {
+                [self copyItemsFromPath:p toDirectory:destRoot];
+            } else if ([p.pathExtension.lowercaseString isEqualToString:@"zip"]) {
+                NSString *unzipDir = [tmp stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+                if (DDVoicePackUnzipToDirectory(p, unzipDir)) {
+                    NSString *srcRoot = [self voicePackUnwrapIfSingleDir:unzipDir];
+                    [self copyItemsFromPath:srcRoot toDirectory:destRoot];
+                }
+            } else if ([p.pathExtension.lowercaseString isEqualToString:@"silk"]) {
+                [self copyItemsFromPath:p toDirectory:destRoot];
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (NSURL *u in scoped) [u stopAccessingSecurityScopedResource];
+            [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+        });
+    });
 }
 
 @end
