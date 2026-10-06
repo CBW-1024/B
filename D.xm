@@ -54,13 +54,13 @@
 - (unsigned int)m_uiMesLocalID;
 - (NSString *)m_nsFromUsr;
 - (NSString *)m_nsToUsr;
-- (void)setM_nsFromUsr:(NSString *)from;
 - (void)setM_nsToUsr:(NSString *)to;
 - (void)setM_uiStatus:(unsigned int)status;
 - (void)setM_uiDownloadStatus:(unsigned int)status;
 - (void)setM_nsMsgSource:(id)source;
 - (void)setM_uiCreateTime:(unsigned int)time;
 - (void)UpdateContent:(id)arg;
+- (void)setM_extendInfoWithMsgType:(id)info;
 - (instancetype)initWithMsgType:(long long)type nsFromUsr:(NSString *)usr;
 + (BOOL)isSenderFromMsgWrap:(id)wrap;
 @end
@@ -152,13 +152,17 @@
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
 + (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title detail:(id)detail;
-- (id)getCell;
+// 拿 manager 背后的真 cell 用这个。老代码里的 getCell 在 8.0.79 上已经没有了
+- (id)cell;
 @end
 
 @interface WCTableViewNormalCellManager : NSObject
 + (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue accessoryType:(long long)type;
 @end
 
+// 注意：dump 出来的父类经常失真（MMUIButton、VoiceMessageCellView 都被写成 : NSObject，
+// 实际一个是 UIButton 子类、一个是 UIView 子类，从它们带着 setFrame:/intrinsicContentSize 能看出来）。
+// 所以下面该写 UIButton / UIViewController 的就照真实继承写，别照 dump 抄 NSObject。
 @interface MMUIButton : UIButton
 @end
 
@@ -228,8 +232,6 @@ static BOOL DDVoicePackIsSilk(NSString *path) {
 // 列出一层目录：文件夹归 folders，SILK 文件归 files。
 // 跳过隐藏文件（.DS_Store 之类）和认不出的格式——列出来点了也是静默失败
 static void DDVoicePackListDirectory(NSString *dirPath, NSArray<NSString *> **outFolders, NSArray<NSString *> **outFiles) {
-    if (outFolders) *outFolders = @[];
-    if (outFiles) *outFiles = @[];
     if (!dirPath.length) return;
 
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -259,11 +261,11 @@ static NSUInteger DDVoicePackFileCountIn(NSString *dirPath) {
     return files.count;
 }
 
-// 去掉首尾空白和 .silk / .slik 后缀，返回可当文件名的基名
+// 去掉首尾空白和 .silk 后缀，返回可当文件名的基名
 static NSString *DDVoicePackSanitizedName(NSString *raw) {
     NSString *text = DDVoicePackTrim(raw);
     NSString *lower = [text lowercaseString];
-    if ([lower hasSuffix:@".silk"] || [lower hasSuffix:@".slik"]) {
+    if ([lower hasSuffix:@".silk"]) {
         text = DDVoicePackTrim([text substringToIndex:text.length - 5]);
     }
     return text.length ? text : nil;
@@ -294,8 +296,10 @@ static NSArray<NSString *> *DDVoicePackSearchFiles(NSString *root, NSString *key
 }
 
 static id DDVoicePackThemeManager(void) {
-    id context = [MMContext activeUserContext] ?: [MMContext rootContext];
-    return context ? [context getService:objc_getClass("MMThemeManager")] : nil;
+    // 微信内部类一律用 objc_getClass 拿，直接写类名会让链接器找符号
+    Class ctxCls = objc_getClass("MMContext");
+    id context = [ctxCls activeUserContext] ?: [ctxCls rootContext];
+    return [context getService:objc_getClass("MMThemeManager")];
 }
 
 static UIWindow *DDVoicePackKeyWindow(void) {
@@ -369,12 +373,8 @@ static const void *kDDVoicePackInputBridgeKey = &kDDVoicePackInputBridgeKey;
 
 - (void)ddvp_commit {
     if (!self.onCommit) return;
-    NSString *text = @"";
-    if ([self.tipsVC respondsToSelector:@selector(getTextView)]) {
-        UITextView *textView = [self.tipsVC getTextView];
-        text = textView.text ?: @"";
-    }
-    self.onCommit(text);
+    UITextView *textView = [self.tipsVC getTextView];
+    self.onCommit(textView.text ?: @"");
 }
 - (void)ddvp_cancel {
     if (self.onCancel) self.onCancel();
@@ -750,7 +750,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     if (![fromVC isKindOfClass:objc_getClass("BaseMsgContentViewController")]) return nil;
 
     CBaseContact *contact = [(BaseMsgContentViewController *)fromVC GetContact];
-    return contact.m_nsUsrName.length ? contact.m_nsUsrName : nil;
+    return contact.m_nsUsrName;
 }
 
 - (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath {
@@ -870,7 +870,8 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     NSString *path = objc_getAssociatedObject(sender, kDDVoicePackCellPathKey);
     if ([path isKindOfClass:[NSString class]] && path.length) return path;
 
-    UITableViewCell *cell = [sender respondsToSelector:@selector(getCell)] ? [sender getCell] : sender;
+    // 回调里的 sender 是 cell manager，不是 cell 本身，要 cell 方法才拿得到真 cell
+    UITableViewCell *cell = [sender respondsToSelector:@selector(cell)] ? [sender cell] : sender;
     if (![cell isKindOfClass:[UITableViewCell class]]) return nil;
     NSIndexPath *indexPath = [[self.tableViewMgr getTableView] indexPathForCell:cell];
     return [self ddvp_pathAtIndexPath:indexPath];
@@ -1085,11 +1086,12 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
     if (voiceMs < kDDVoicePackMinVoiceMs) voiceMs = kDDVoicePackMinVoiceMs;
     if (voiceMs > kDDVoicePackMaxVoiceMs) voiceMs = kDDVoicePackMaxVoiceMs;
 
-    id context = [MMContext activeUserContext] ?: [MMContext rootContext];
+    Class ctxCls = objc_getClass("MMContext");
+    id context = [ctxCls activeUserContext] ?: [ctxCls rootContext];
     if (!context) return NO;
 
     CBaseContact *selfContact = [[context getService:objc_getClass("CContactMgr")] getSelfContact];
-    NSString *myId = [selfContact respondsToSelector:@selector(m_nsUsrName)] ? [selfContact m_nsUsrName] : nil;
+    NSString *myId = [selfContact m_nsUsrName];
     if (!myId.length) return NO;
 
     CMessageWrap *msg = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:(long long)kDDVoicePackMsgTypeVoice nsFromUsr:myId];
@@ -1104,17 +1106,11 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
     CMessageMgr *msgMgr = [context getService:objc_getClass("CMessageMgr")];
     [msgMgr AddLocalMsg:chatId MsgWrap:msg];
 
-    NSString *docPath = [CUtility GetDocPath];
-    NSString *audioPath = [CUtility GetPathOfMesAudio:chatId LocalID:[msg m_uiMesLocalID] DocPath:docPath];
+    Class utilCls = objc_getClass("CUtility");
+    NSString *docPath = [utilCls GetDocPath];
+    NSString *audioPath = [utilCls GetPathOfMesAudio:chatId LocalID:[msg m_uiMesLocalID] DocPath:docPath];
     [[NSFileManager defaultManager] createDirectoryAtPath:[audioPath stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
     [silk writeToFile:audioPath atomically:YES];
-
-    // 告诉微信音频落在哪（DD语音助手验证过的步骤）。
-    // 该方法在微信头文件里查无此物，加 respondsToSelector 保护：有就设，没有就跳过，别崩。
-    SEL voicePathSel = NSSelectorFromString(@"setM_nsVoicePath:");
-    if (audioPath.length && [msg respondsToSelector:voicePathSel]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(msg, voicePathSel, audioPath);
-    }
 
     // 语音时长 / 格式 / 数据一律装 extInfo。CMessageWrap 上没有
     // setM_uiVoiceTime: / setM_uiVoiceFormat: / setM_dtVoice:，
@@ -1125,10 +1121,7 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
     [extInfo setM_uiVoiceFormat:kDDVoicePackVoiceFormatSilk];
     [extInfo setM_uiVoiceEndFlag:kDDVoicePackVoiceEndFlag];
     [extInfo setM_refMessageWrap:msg];
-    SEL extSel = NSSelectorFromString(@"setM_extendInfoWithMsgType:");
-    if ([msg respondsToSelector:extSel]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(msg, extSel, extInfo);
-    }
+    [msg setM_extendInfoWithMsgType:extInfo];
 
     [msg UpdateContent:nil];
     [msgMgr ModMsg:chatId MsgWrap:msg];
@@ -1138,7 +1131,7 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
     // 上传：AudioSender 是微信语音发送链路上的服务对象，ResendVoiceMsg:MsgWrap: 是唯一入口。
     // 不再 KVC 取 m_upload（取不到会抛 NSUndefinedKeyException 直接崩），也不再退 MMNewUploadVoiceMgr。
     AudioSender *sender = [context getService:objc_getClass("AudioSender")];
-    if (![sender respondsToSelector:@selector(ResendVoiceMsg:MsgWrap:)]) return NO;
+    if (!sender) return NO;
     [sender ResendVoiceMsg:chatId MsgWrap:msg];
     return YES;
 }
@@ -1155,15 +1148,13 @@ static dispatch_queue_t DDVoicePackSendQueue(void) {
 
 static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId) {
     if (!path.length || !chatId.length) return;
-    NSString *filePath = [path copy];
-    NSString *targetChat = [chatId copy];
 
     dispatch_async(DDVoicePackSendQueue(), ^{
         // 语音包里存的就是微信 SILK，原样发出去，不做任何转码
-        NSData *silk = [NSData dataWithContentsOfFile:filePath];
+        NSData *silk = [NSData dataWithContentsOfFile:path];
         if (!silk.length) return;
 
-        if (DDVoicePackSendSilk(silk, DDVoicePackDurationMs(filePath), targetChat)) {
+        if (DDVoicePackSendSilk(silk, DDVoicePackDurationMs(path), chatId)) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [DDVoicePackListController ddvp_closeSheetIfNeeded];
             });
@@ -1207,8 +1198,8 @@ static NSString * const kDDVoicePackImportMenuToken = @"ddvp:import";
 static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL enabled) {
     if (!enabled || !original) return original;
 
-    for (id item in original) {
-        if (![item respondsToSelector:@selector(userInfo)]) continue;
+    // 微信自己的菜单数组里全是 MMMenuItem，不用逐个问 userInfo
+    for (MMMenuItem *item in original) {
         if ([[item userInfo] isEqual:kDDVoicePackImportMenuToken]) return original;
     }
 
@@ -1224,8 +1215,9 @@ static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL ena
     return items;
 }
 
+// getMediaWrap 在语音 cell 上给的就是 CMessageWrap；不是消息对象时给 nil 发消息返回 0，自然判否
 static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
-    return [wrap respondsToSelector:@selector(m_uiMessageType)] && [wrap m_uiMessageType] == kDDVoicePackMsgTypeVoice;
+    return [wrap m_uiMessageType] == kDDVoicePackMsgTypeVoice;
 }
 
 %hook VoiceMessageCellView
@@ -1251,16 +1243,17 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     if (!msg) return;
 
     // 语音文件在微信沙箱里的落盘路径，跟发送时用的一套算法
-    BOOL fromSelf = [CMessageWrap isSenderFromMsgWrap:msg];
+    BOOL fromSelf = [objc_getClass("CMessageWrap") isSenderFromMsgWrap:msg];
     NSString *chat = fromSelf ? [msg m_nsToUsr] : [msg m_nsFromUsr];
     if (!chat.length) return;
 
-    NSString *path = [CUtility GetPathOfMesAudio:chat LocalID:[msg m_uiMesLocalID] DocPath:[CUtility GetDocPath]];
+    Class utilCls = objc_getClass("CUtility");
+    NSString *path = [utilCls GetPathOfMesAudio:chat LocalID:[msg m_uiMesLocalID] DocPath:[utilCls GetDocPath]];
     if (!path.length || ![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
 
     [DDVoicePackListController ddvp_setPendingImportPath:path];
 
-    UIViewController *fromVC = [self respondsToSelector:@selector(getViewController)] ? [self getViewController] : nil;
+    UIViewController *fromVC = [self getViewController];
     if (!fromVC) {
         UIResponder *responder = self;
         while ((responder = [responder nextResponder])) {
