@@ -844,12 +844,22 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [self ddvp_installTableProxyIfNeeded];
 }
 
+// 时长预估函数的前向声明（真正实现在文件后部，发送语音时复用同一份）
+static unsigned int DDVoicePackDurationMs(NSString *path);
+
+// 把毫秒格式化成列表副标题：短语音 "3秒"，长语音 "1:05"
+static NSString *DDVoicePackFormatDuration(unsigned int ms) {
+    unsigned int total = ms / 1000;
+    if (total < 60) return [NSString stringWithFormat:@"%u秒", total];
+    return [NSString stringWithFormat:@"%u:%02u", total / 60, total % 60];
+}
+
 - (id)ddvp_fileCellForPath:(NSString *)path title:(NSString *)title {
-    id cell = [objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(ddvp_fileRowTapped:)
-                                                                       target:self
-                                                                        title:title
-                                                                   rightValue:@""
-                                                                accessoryType:1];
+    NSString *detail = DDVoicePackFormatDuration(DDVoicePackDurationMs(path));
+    id cell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(ddvp_fileRowTapped:)
+                                                                target:self
+                                                                 title:title
+                                                                detail:detail];
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
     return cell;
 }
