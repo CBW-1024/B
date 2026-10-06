@@ -11,50 +11,17 @@
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
-#import <CoreMedia/CoreMedia.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-// ========== 常量定义 ==========
-
-// UserDefaults key
-static NSString * const kDDVoicePackEnabledKey = @"DDVoicePack_Enabled";
-static NSString * const kDDVoicePackKeepPanelKey = @"DDVoicePack_KeepPanelAfterSend";
-
-// 语音消息类型 / SILK 格式 / 语音结束标记
-static const unsigned int kDDVoicePackMsgTypeVoice = 34;
-static const unsigned int kDDVoicePackVoiceFormatSilk = 4;
-static const unsigned int kDDVoicePackVoiceEndFlag = 1;
-
-// 语音时长上下限（毫秒），微信只认 0.3s ~ 60s
-static const unsigned int kDDVoicePackMinVoiceMs = 300;
-static const unsigned int kDDVoicePackMaxVoiceMs = 60000;
-
-// 面板高度 = 屏高 * 该比例
-static const CGFloat kDDVoicePackSheetHeightRatio = 0.5;
-
-// 搜索防抖间隔（秒）：逐字符递归整个语音包目录太重
-static const NSTimeInterval kDDVoicePackSearchDebounce = 0.3;
-
-// 微信 SILK 文件头：编码出来没有就以 0x02 开头，补上微信才认
-static const uint8_t kDDVoicePackSilkHeader[] = { 0x02, '#', '!', 'S', 'I', 'L', 'K', '_', 'V', '3' };
-
-// 关联对象 key
-static const void *kDDVoicePackSheetContainerKey = &kDDVoicePackSheetContainerKey;
-static const void *kDDVoicePackSheetFromVCKey = &kDDVoicePackSheetFromVCKey;
-static const void *kDDVoicePackSheetAdapterKey = &kDDVoicePackSheetAdapterKey;
-static const void *kDDVoicePackSheetConfigKey = &kDDVoicePackSheetConfigKey;
-static const void *kDDVoicePackCellPathKey = &kDDVoicePackCellPathKey;
-static const void *kDDVoicePackPreviewPlayerKey = &kDDVoicePackPreviewPlayerKey;
-static const void *kDDVoicePackLongPressKey = &kDDVoicePackLongPressKey;
-static const void *kDDVoicePackInputBridgeKey = &kDDVoicePackInputBridgeKey;
-
-// 当前面板的宿主 VC（面板关闭后要通知它），以及待纳入的语音路径
-static __weak UIViewController *gDDVoicePackSheetHostVC = nil;
-static NSString *gDDVoicePackPendingImportPath = nil;
-
 // ========== 微信内部类声明 ==========
+
+// 微信头文件 dump 里没有这个类，接口按 DD消息助手的写法声明
+@interface WCPluginsMgr : NSObject
++ (instancetype)sharedInstance;
+- (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
+@end
 
 @interface MMContext : NSObject
 + (id)activeUserContext;
@@ -125,12 +92,6 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 - (void)stop;
 @end
 
-@interface MJSilkCodec : NSObject
-- (BOOL)initEncoderWithSampleRate:(long long)rate;
-- (id)encodeFromPCMData:(NSData *)pcm;
-- (void)uninitEncoder;
-@end
-
 @interface BaseMsgContentViewController : UIViewController
 - (id)GetContact;
 @end
@@ -172,6 +133,7 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 
 @interface WCTableViewManager : NSObject
 - (instancetype)initWithFrame:(CGRect)frame style:(UITableViewStyle)style;
+@property (nonatomic, readonly) UITableView *tableView;
 - (void)clearAllSection;
 - (void)addSection:(id)section;
 - (void)reloadTableView;
@@ -216,6 +178,10 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 
 // ========== 配置管理 ==========
 
+// UserDefaults key
+static NSString * const kDDVoicePackEnabledKey = @"DDVoicePack_Enabled";
+static NSString * const kDDVoicePackKeepPanelKey = @"DDVoicePack_KeepPanelAfterSend";
+
 @interface DDVoicePackConfig : NSObject
 + (BOOL)enabled;
 + (void)setEnabled:(BOOL)on;
@@ -243,16 +209,24 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 
 // ========== 辅助函数 ==========
 
-// 沿用旧版目录：改路径会让用户已有的语音包凭空消失，不值得
+// 语音包根目录。放 Library 下：应用私有、不进 iCloud、不在文件 App 里暴露
 static NSString *DDVoicePackRootPath(void) {
     NSString *library = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-    return [[[library stringByAppendingPathComponent:@"Preferences"] stringByAppendingPathComponent:@"WCVoice"] stringByAppendingPathComponent:@"Voice"];
+    return [[library stringByAppendingPathComponent:@"DDVoicePack"] stringByAppendingPathComponent:@"Voice"];
 }
 
 static NSString *DDVoicePackTrim(NSString *text) {
     return [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
+// 语音包只认 SILK。.silk 是标准扩展名，.aud 是微信缓存语音用的（同一个 SILK 容器）
+static BOOL DDVoicePackIsSilk(NSString *path) {
+    NSString *ext = [[path pathExtension] lowercaseString];
+    return [ext isEqualToString:@"silk"] || [ext isEqualToString:@"aud"];
+}
+
+// 列出一层目录：文件夹归 folders，SILK 文件归 files。
+// 跳过隐藏文件（.DS_Store 之类）和认不出的格式——列出来点了也是静默失败
 static void DDVoicePackListDirectory(NSString *dirPath, NSArray<NSString *> **outFolders, NSArray<NSString *> **outFiles) {
     if (outFolders) *outFolders = @[];
     if (outFiles) *outFiles = @[];
@@ -265,10 +239,15 @@ static void DDVoicePackListDirectory(NSString *dirPath, NSArray<NSString *> **ou
     NSMutableArray *folders = [NSMutableArray array];
     NSMutableArray *files = [NSMutableArray array];
     for (NSString *name in [fm contentsOfDirectoryAtPath:dirPath error:nil]) {
+        if ([name hasPrefix:@"."]) continue;
         NSString *full = [dirPath stringByAppendingPathComponent:name];
         BOOL itemIsDir = NO;
-        if ([fm fileExistsAtPath:full isDirectory:&itemIsDir] && itemIsDir) [folders addObject:name];
-        else [files addObject:name];
+        if (![fm fileExistsAtPath:full isDirectory:&itemIsDir]) continue;
+        if (itemIsDir) {
+            [folders addObject:name];
+        } else if (DDVoicePackIsSilk(full)) {
+            [files addObject:name];
+        }
     }
     if (outFolders) *outFolders = [folders sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
     if (outFiles) *outFiles = [files sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
@@ -278,20 +257,6 @@ static NSUInteger DDVoicePackFileCountIn(NSString *dirPath) {
     NSArray *files = nil;
     DDVoicePackListDirectory(dirPath, NULL, &files);
     return files.count;
-}
-
-static BOOL DDVoicePackIsSilk(NSString *path) {
-    NSString *ext = [[path pathExtension] lowercaseString];
-    return [ext isEqualToString:@"silk"] || [ext isEqualToString:@"aud"];
-}
-
-static BOOL DDVoicePackIsDecodableAudio(NSString *path) {
-    static NSSet *exts = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        exts = [NSSet setWithObjects:@"mp3", @"m4a", @"aac", @"wav", @"caf", @"flac", @"mp4", nil];
-    });
-    return [exts containsObject:[[path pathExtension] lowercaseString]];
 }
 
 // 去掉首尾空白和 .silk / .slik 后缀，返回可当文件名的基名
@@ -320,7 +285,7 @@ static NSArray<NSString *> *DDVoicePackSearchFiles(NSString *root, NSString *key
         BOOL isDir = NO;
         [fm fileExistsAtPath:fullPath isDirectory:&isDir];
         if (isDir) continue;
-        if (!DDVoicePackIsSilk(fullPath) && !DDVoicePackIsDecodableAudio(fullPath)) continue;
+        if (!DDVoicePackIsSilk(fullPath)) continue;
         if ([[relativePath lastPathComponent] rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound) {
             [results addObject:fullPath];
         }
@@ -362,38 +327,34 @@ static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId);
 
 // ========== 语音预览 ==========
 
-// 两种播放器（SilkAudioPlayer / AVAudioPlayer）都挂在同一个 key 上，停止时按类型分派
+// 试听只走微信的 SilkAudioPlayer，挂在宿主上，下次播放前先停掉上一个
+static const void *kDDVoicePackPreviewPlayerKey = &kDDVoicePackPreviewPlayerKey;
+
 static void DDVoicePackStopPreview(id owner) {
     if (!owner) return;
-    id player = objc_getAssociatedObject(owner, kDDVoicePackPreviewPlayerKey);
-    if (!player) return;
-    if ([player isKindOfClass:[AVAudioPlayer class]]) [(AVAudioPlayer *)player stop];
-    else if ([player respondsToSelector:@selector(stop)]) ((void (*)(id, SEL))objc_msgSend)(player, @selector(stop));
+    SilkAudioPlayer *player = objc_getAssociatedObject(owner, kDDVoicePackPreviewPlayerKey);
+    [player stop];
     objc_setAssociatedObject(owner, kDDVoicePackPreviewPlayerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void DDVoicePackPlayPreview(id owner, NSString *path) {
-    if (!path.length) return;
+    if (!DDVoicePackIsSilk(path)) return;
+
     DDVoicePackStopPreview(owner);
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
 
-    id player = nil;
-    if (DDVoicePackIsSilk(path)) {
-        Class cls = objc_getClass("SilkAudioPlayer");
-        if (!cls) return;
-        SilkAudioPlayer *silkPlayer = [[cls alloc] init];
-        [silkPlayer preparePlayWithFile:path sync:NO];
-        [silkPlayer playAtTime:0];
-        player = silkPlayer;
-    } else if (DDVoicePackIsDecodableAudio(path)) {
-        AVAudioPlayer *avPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:nil];
-        [avPlayer play];
-        player = avPlayer;
-    }
-    if (player) objc_setAssociatedObject(owner, kDDVoicePackPreviewPlayerKey, player, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    Class cls = objc_getClass("SilkAudioPlayer");
+    if (!cls) return;
+    SilkAudioPlayer *player = [[cls alloc] init];
+    [player preparePlayWithFile:path sync:NO];
+    [player playAtTime:0];
+    objc_setAssociatedObject(owner, kDDVoicePackPreviewPlayerKey, player, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // ========== 输入弹窗桥接 ==========
+
+// 桥接对象挂在 tipsVC 上保活
+static const void *kDDVoicePackInputBridgeKey = &kDDVoicePackInputBridgeKey;
 
 // MMTipsViewController 的回调是 init 参数，block 里还要回头读输入框，
 // 直接捕获 tipsVC 会形成 retain 环。桥接对象被 tipsVC 关联持有、弱引用 tipsVC，
@@ -449,6 +410,24 @@ static void DDVoicePackShowInput(NSString *title,
 
 // ========== 语音包列表面板 ==========
 
+// 面板高度 = 屏高 * 该比例
+static const CGFloat kDDVoicePackSheetHeightRatio = 0.5;
+
+// 搜索防抖间隔（秒）：逐字符递归整个语音包目录太重
+static const NSTimeInterval kDDVoicePackSearchDebounce = 0.3;
+
+// 面板相关：container 挂 fromVC（关面板时从它身上取），adapter / config 挂 nav
+static const void *kDDVoicePackSheetContainerKey = &kDDVoicePackSheetContainerKey;
+static const void *kDDVoicePackSheetFromVCKey = &kDDVoicePackSheetFromVCKey;
+static const void *kDDVoicePackSheetAdapterKey = &kDDVoicePackSheetAdapterKey;
+static const void *kDDVoicePackSheetConfigKey = &kDDVoicePackSheetConfigKey;
+// cell manager 上挂它对应的文件 / 目录路径
+static const void *kDDVoicePackCellPathKey = &kDDVoicePackCellPathKey;
+
+// 当前面板的宿主 VC（关面板要通知它），以及待纳入的语音路径
+static __weak UIViewController *gDDVoicePackSheetHostVC = nil;
+static NSString *gDDVoicePackPendingImportPath = nil;
+
 @interface DDVoicePackListController : UIViewController <UISearchBarDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
 @property (nonatomic, strong) UISearchBar *searchBar;
@@ -462,14 +441,13 @@ static void DDVoicePackShowInput(NSString *title,
 + (void)ddvp_setPendingImportPath:(NSString *)path;
 + (NSString *)ddvp_pendingImportPath;
 + (void)ddvp_clearPendingImportPath;
-+ (void)ddvp_ensureRootDirectoryExists;
 + (void)ddvp_closeSheetIfNeeded;
 + (void)ddvp_presentFromViewController:(UIViewController *)fromVC;
 
 - (void)ddvp_reloadData;
 - (void)ddvp_syncSheetNavigationBar;
 - (void)ddvp_updatePlusButton;
-- (UIButton *)ddvp_plusButtonWithThemeManager:(id)themeManager color:(UIColor *)color;
+- (UIButton *)ddvp_plusButton;
 
 // 以下供 DDVoicePackTableProxy 回调
 - (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath;
@@ -612,7 +590,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 @implementation DDVoicePackListController
 
-#pragma mark - 类方法
+// ---- 类方法 ----
 
 + (void)ddvp_setPendingImportPath:(NSString *)path {
     gDDVoicePackPendingImportPath = [path copy];
@@ -622,9 +600,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 }
 + (void)ddvp_clearPendingImportPath {
     gDDVoicePackPendingImportPath = nil;
-}
-+ (void)ddvp_ensureRootDirectoryExists {
-    [[NSFileManager defaultManager] createDirectoryAtPath:DDVoicePackRootPath() withIntermediateDirectories:YES attributes:nil error:nil];
 }
 + (void)ddvp_closeSheetIfNeeded {
     if ([DDVoicePackConfig keepPanelAfterSend]) return;
@@ -668,7 +643,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [backBtn addTarget:nav action:@selector(ddvp_voicePackBack:) forControlEvents:UIControlEventTouchUpInside];
     config.navBackButton = backBtn;
     config.navLeftButton = backBtn;
-    config.navRightButton = [listVC ddvp_plusButtonWithThemeManager:themeManager color:btnColor];
+    config.navRightButton = [listVC ddvp_plusButton];
 
     objc_setAssociatedObject(nav, kDDVoicePackSheetFromVCKey, fromVC, OBJC_ASSOCIATION_ASSIGN);
     objc_setAssociatedObject(nav, kDDVoicePackSheetAdapterKey, adapter, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -687,10 +662,10 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     gDDVoicePackSheetHostVC = fromVC;
 }
 
-#pragma mark - 生命周期
+// ---- 生命周期 ----
 
 - (instancetype)init {
-    if (self = [super init]) {
+    if ((self = [super init])) {
         _tableViewMgr = [[objc_getClass("WCTableViewManager") alloc] initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
         _folderPaths = @[];
         _filePaths = @[];
@@ -743,7 +718,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [self.searchBar resignFirstResponder];
 }
 
-#pragma mark - 目录与数据
+// ---- 目录与数据 ----
 
 - (NSString *)ddvp_currentDirectory {
     return self.directoryPath.length ? self.directoryPath : DDVoicePackRootPath();
@@ -771,13 +746,11 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     UIViewController *fromVC = objc_getAssociatedObject(nav, kDDVoicePackSheetFromVCKey);
     if (!fromVC) return nil;
 
-    Class baseMsgCls = objc_getClass("BaseMsgContentViewController");
-    if (!baseMsgCls || ![fromVC isKindOfClass:baseMsgCls]) return nil;
-    if (![fromVC respondsToSelector:@selector(GetContact)]) return nil;
+    // isKindOfClass 已经保证了类型，后面直接取就行，不用再 respondsToSelector
+    if (![fromVC isKindOfClass:objc_getClass("BaseMsgContentViewController")]) return nil;
 
-    CBaseContact *contact = [fromVC GetContact];
-    NSString *name = [contact respondsToSelector:@selector(m_nsUsrName)] ? [contact m_nsUsrName] : nil;
-    return name.length ? name : nil;
+    CBaseContact *contact = [(BaseMsgContentViewController *)fromVC GetContact];
+    return contact.m_nsUsrName.length ? contact.m_nsUsrName : nil;
 }
 
 - (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath {
@@ -797,8 +770,8 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 }
 
 - (BOOL)ddvp_rowCanPreviewAtIndexPath:(NSIndexPath *)indexPath {
-    NSString *path = [self ddvp_pathAtIndexPath:indexPath];
-    return DDVoicePackIsSilk(path) || DDVoicePackIsDecodableAudio(path);
+    // 目录列表只列 SILK，所以这里等价于「这一行是文件而不是文件夹」
+    return DDVoicePackIsSilk([self ddvp_pathAtIndexPath:indexPath]);
 }
 
 - (void)ddvp_reloadData {
@@ -864,14 +837,16 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     if ([tableView.delegate isKindOfClass:[DDVoicePackTableProxy class]]) return;
 
     DDVoicePackTableProxy *proxy = [[DDVoicePackTableProxy alloc] init];
-    proxy.forwardTarget = tableView.delegate ?: tableView.dataSource;
+    id originalTarget = tableView.delegate;
+    if (!originalTarget) originalTarget = tableView.dataSource;
+    proxy.forwardTarget = originalTarget;
     proxy.host = self;
     tableView.delegate = proxy;
     tableView.dataSource = proxy;
     self.tableProxy = proxy;
 }
 
-#pragma mark - 行点击
+// ---- 行点击 ----
 
 - (void)ddvp_folderRowTapped:(id)sender {
     if (self.searching) return;
@@ -901,7 +876,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     return [self ddvp_pathAtIndexPath:indexPath];
 }
 
-#pragma mark - 左滑操作
+// ---- 左滑操作 ----
 
 - (void)ddvp_previewItemAtIndexPath:(NSIndexPath *)indexPath {
     DDVoicePackPlayPreview(self, [self ddvp_pathAtIndexPath:indexPath]);
@@ -949,12 +924,13 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [self ddvp_syncSheetNavigationBar];
 }
 
-#pragma mark - 右上角「+」
+// ---- 右上角「+」 ----
 
-- (UIButton *)ddvp_plusButtonWithThemeManager:(id)themeManager color:(UIColor *)color {
+- (UIButton *)ddvp_plusButton {
+    id themeManager = DDVoicePackThemeManager();
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
     btn.frame = CGRectMake(0, 0, 44, 44);
-    [btn setImage:[themeManager svgImageNamed:@"plus_regular" color:color] forState:UIControlStateNormal];
+    [btn setImage:[themeManager svgImageNamed:@"plus_regular" color:[UIColor labelColor]] forState:UIControlStateNormal];
     [btn addTarget:self action:@selector(ddvp_plusButtonTapped) forControlEvents:UIControlEventTouchUpInside];
     return btn;
 }
@@ -973,14 +949,12 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     BOOL show = [self ddvp_shouldShowPlusButton];
 
     if (config) {
-        UIView *rightBtn = show ? [self ddvp_plusButtonWithThemeManager:DDVoicePackThemeManager() color:[UIColor labelColor]] : nil;
-        [config setNavRightButton:rightBtn];
+        [config setNavRightButton:show ? [self ddvp_plusButton] : nil];
         [self ddvp_syncSheetNavigationBar];
         return;
     }
     if (show) {
-        UIButton *btn = [self ddvp_plusButtonWithThemeManager:DDVoicePackThemeManager() color:[UIColor labelColor]];
-        self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:btn];
+        self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:[self ddvp_plusButton]];
     } else {
         self.navigationItem.rightBarButtonItem = nil;
     }
@@ -1034,7 +1008,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     });
 }
 
-#pragma mark - 搜索
+// ---- 搜索 ----
 
 - (void)searchBarTextDidBeginEditing:(UISearchBar *)searchBar {
     self.searching = YES;
@@ -1083,15 +1057,18 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 // ========== 音频处理与发送 ==========
 
+// 语音消息类型 / SILK 格式 / 语音结束标记
+static const unsigned int kDDVoicePackMsgTypeVoice = 34;
+static const unsigned int kDDVoicePackVoiceFormatSilk = 4;
+static const unsigned int kDDVoicePackVoiceEndFlag = 1;
+
+// 语音时长上下限（毫秒），微信只认 0.3s ~ 60s
+static const unsigned int kDDVoicePackMinVoiceMs = 300;
+static const unsigned int kDDVoicePackMaxVoiceMs = 60000;
+
+// SILK 不是 AVFoundation 认的格式，读不出时长，按文件大小粗估（约 2KB/s）。
+// 估不出来统一给 3 秒——兜底只在这里做一次，别在外面再兜一遍
 static unsigned int DDVoicePackDurationMs(NSString *path) {
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
-    CMTime duration = asset.duration;
-    if (CMTIME_IS_NUMERIC(duration) && !CMTIME_IS_INDEFINITE(duration)) {
-        Float64 seconds = CMTimeGetSeconds(duration);
-        if (seconds > 0 && seconds < 3600) return (unsigned int)llround(seconds * 1000);
-    }
-    // SILK 不是 AVFoundation 认的格式，读不出时长就按文件大小粗估（约 2KB/s）。
-    // 估不出来统一给 3 秒——兜底只在这里做一次，别在外面再兜一遍
     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
     unsigned long long fileSize = [attrs fileSize];
     if (fileSize > 0) {
@@ -1099,73 +1076,6 @@ static unsigned int DDVoicePackDurationMs(NSString *path) {
         if (estimatedMs > 0) return estimatedMs;
     }
     return 3000;
-}
-
-static NSData *DDVoicePackDecodeToPCM(NSString *path) {
-    AVAudioFile *inFile = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:path] error:nil];
-    if (!inFile) return nil;
-
-    AVAudioFormat *inFormat = inFile.processingFormat;
-    AVAudioFormat *outFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatInt16 sampleRate:16000 channels:1 interleaved:YES];
-    AVAudioConverter *converter = [[AVAudioConverter alloc] initFromFormat:inFormat toFormat:outFormat];
-
-    __block BOOL inputEOF = NO;
-    AVAudioConverterInputBlock inputBlock = ^AVAudioBuffer *(AVAudioPacketCount inNumberOfPackets, AVAudioConverterInputStatus *outStatus) {
-        if (inputEOF) {
-            *outStatus = AVAudioConverterInputStatus_EndOfStream;
-            return nil;
-        }
-        AVAudioPCMBuffer *inBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:inFormat frameCapacity:8192];
-        if (![inFile readIntoBuffer:inBuffer error:nil] || inBuffer.frameLength == 0) {
-            inputEOF = YES;
-            *outStatus = AVAudioConverterInputStatus_EndOfStream;
-            return nil;
-        }
-        *outStatus = AVAudioConverterInputStatus_HaveData;
-        return inBuffer;
-    };
-
-    NSMutableData *pcm = [NSMutableData data];
-    while (YES) {
-        AVAudioPCMBuffer *outBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:outFormat frameCapacity:16384];
-        AVAudioConverterOutputStatus status = [converter convertToBuffer:outBuffer error:nil withInputFromBlock:inputBlock];
-        if (outBuffer.frameLength) {
-            [pcm appendBytes:outBuffer.audioBufferList->mBuffers[0].mData length:outBuffer.audioBufferList->mBuffers[0].mDataByteSize];
-        }
-        if (status == AVAudioConverterOutputStatus_EndOfStream || outBuffer.frameLength == 0) break;
-    }
-    return pcm;
-}
-
-static NSData *DDVoicePackEncodeSilk(NSData *pcm) {
-    Class codecCls = objc_getClass("MJSilkCodec");
-    if (!codecCls) return nil;
-    MJSilkCodec *codec = [[codecCls alloc] init];
-    [codec initEncoderWithSampleRate:16000];
-    NSData *silk = [codec encodeFromPCMData:pcm];
-    [codec uninitEncoder];
-    return silk;
-}
-
-static NSData *DDVoicePackWithWeChatSilkHeader(NSData *silk) {
-    if (!silk.length) return silk;
-    const uint8_t *bytes = (const uint8_t *)silk.bytes;
-    if (bytes[0] == 0x02) return silk;
-    NSMutableData *out = [NSMutableData dataWithBytes:kDDVoicePackSilkHeader length:sizeof(kDDVoicePackSilkHeader)];
-    [out appendData:silk];
-    return out;
-}
-
-// SILK / AUD 直接用；其余格式先转 16k 单声道 PCM 再编 SILK
-static NSData *DDVoicePackSilkPayload(NSString *path, unsigned int *outDurationMs) {
-    unsigned int durationMs = DDVoicePackDurationMs(path);
-    if (outDurationMs) *outDurationMs = durationMs;
-
-    if (DDVoicePackIsSilk(path)) return [NSData dataWithContentsOfFile:path];
-
-    NSData *pcm = DDVoicePackDecodeToPCM(path);
-    if (!pcm.length) return nil;
-    return DDVoicePackWithWeChatSilkHeader(DDVoicePackEncodeSilk(pcm));
 }
 
 static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString *chatId) {
@@ -1233,7 +1143,7 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
     return YES;
 }
 
-// 转码（PCM + SILK 编码）耗时，长语音在主线程会卡住界面，丢串行队列里跑
+// 读文件 + 算时长都在后台串行队列里跑，长语音不至于卡住界面
 static dispatch_queue_t DDVoicePackSendQueue(void) {
     static dispatch_queue_t queue = NULL;
     static dispatch_once_t onceToken;
@@ -1249,11 +1159,11 @@ static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId) {
     NSString *targetChat = [chatId copy];
 
     dispatch_async(DDVoicePackSendQueue(), ^{
-        unsigned int durationMs = 0;
-        NSData *silk = DDVoicePackSilkPayload(filePath, &durationMs);
+        // 语音包里存的就是微信 SILK，原样发出去，不做任何转码
+        NSData *silk = [NSData dataWithContentsOfFile:filePath];
         if (!silk.length) return;
 
-        if (DDVoicePackSendSilk(silk, durationMs, targetChat)) {
+        if (DDVoicePackSendSilk(silk, DDVoicePackDurationMs(filePath), targetChat)) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [DDVoicePackListController ddvp_closeSheetIfNeeded];
             });
@@ -1262,6 +1172,9 @@ static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId) {
 }
 
 // ========== Hook 长按「+」按钮打开语音包 ==========
+
+// 长按手势挂在按钮上，防止 didMoveToSuperview 反复触发时重复添加
+static const void *kDDVoicePackLongPressKey = &kDDVoicePackLongPressKey;
 
 %hook MMUIButton
 
@@ -1288,27 +1201,23 @@ static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId) {
 // ========== Hook 语音消息菜单「纳入」 ==========
 
 // 菜单项去重标记：MMMenuItem 没有 title / action 的 getter，只能用 userInfo 做记号
-static NSString *DDVoicePackMenuToken(SEL action) {
-    return [@"ddvp:" stringByAppendingString:NSStringFromSelector(action)];
-}
+static NSString * const kDDVoicePackImportMenuToken = @"ddvp:import";
 
-// 往菜单末尾追加一项（开关关闭 / 已注入过则原样返回）
-static NSArray *DDVoicePackAppendMenuItem(id cell, NSArray *original, BOOL enabled, NSString *title, SEL action) {
+// 往菜单末尾追加「纳入」（开关关闭 / 已注入过则原样返回）
+static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL enabled) {
     if (!enabled || !original) return original;
 
-    NSString *token = DDVoicePackMenuToken(action);
     for (id item in original) {
         if (![item respondsToSelector:@selector(userInfo)]) continue;
-        id userInfo = [item userInfo];
-        if ([userInfo isKindOfClass:[NSString class]] && [(NSString *)userInfo isEqualToString:token]) return original;
+        if ([[item userInfo] isEqual:kDDVoicePackImportMenuToken]) return original;
     }
 
-    MMMenuItem *item = [[objc_getClass("MMMenuItem") alloc] initWithTitle:title
+    MMMenuItem *item = [[objc_getClass("MMMenuItem") alloc] initWithTitle:@"纳入"
                                                                 svgName:@"biz_audio_outlined_star"
                                                                  target:cell
-                                                                 action:action];
+                                                                 action:@selector(ddvp_importVoice:)];
     if (!item) return original;
-    item.userInfo = token;
+    item.userInfo = kDDVoicePackImportMenuToken;
 
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
     [items addObject:item];
@@ -1323,9 +1232,8 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 - (NSArray *)operationMenuItems {
     NSArray *items = %orig;
-    return DDVoicePackAppendMenuItem(self, items,
-                                     [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]),
-                                     @"纳入", @selector(ddvp_importVoice:));
+    return DDVoicePackAppendImportItem(self, items,
+                                       [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]));
 }
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
@@ -1385,7 +1293,7 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     [self.view addSubview:_tableViewManager.tableView];
 
-    [self ddvp_buildTable];
+    [self buildTable];
     self.view.backgroundColor = _tableViewManager.tableView.backgroundColor;
 }
 
@@ -1397,7 +1305,7 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     _tableViewManager.tableView.frame = CGRectMake(0, top, w, h - top);
 }
 
-- (void)ddvp_buildTable {
+- (void)buildTable {
     [_tableViewManager clearAllSection];
 
     WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:@"语音包设置（长按 + 打开入口）"];
@@ -1418,18 +1326,18 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 - (void)onEnabledSwitchChanged:(UISwitch *)sender {
     [DDVoicePackConfig setEnabled:sender.isOn];
-    if (sender.isOn) [DDVoicePackListController ddvp_ensureRootDirectoryExists];
-    [self ddvp_buildTable];
+    [self buildTable];
 }
 
 - (void)onKeepPanelSwitchChanged:(UISwitch *)sender {
     [DDVoicePackConfig setKeepPanelAfterSend:sender.isOn];
 }
 
-#pragma mark - 导入导出
+// ---- 导入导出 ----
 
 - (void)importVoicePack {
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder, UTTypeAudio] asCopy:YES];
+    // 只收文件夹：SILK 不是标准音频 UTI，单文件选择器选不到它
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder] asCopy:YES];
     picker.delegate = self;
     picker.allowsMultipleSelection = YES;
     picker.modalPresentationStyle = UIModalPresentationFormSheet;
@@ -1449,10 +1357,10 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     NSString *destRoot = DDVoicePackRootPath();
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:destRoot withIntermediateDirectories:YES attributes:nil error:nil];
-    for (NSURL *url in urls) [self ddvp_copyItemAtURL:url toDirectory:destRoot];
+    for (NSURL *url in urls) [self copyItemAtURL:url toDirectory:destRoot];
 }
 
-- (void)ddvp_copyItemAtURL:(NSURL *)srcURL toDirectory:(NSString *)destDir {
+- (void)copyItemAtURL:(NSURL *)srcURL toDirectory:(NSString *)destDir {
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
     [fm fileExistsAtPath:srcURL.path isDirectory:&isDir];
@@ -1476,14 +1384,13 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 %ctor {
     @autoreleasepool {
-        id mgr = objc_getClass("WCPluginsMgr");
-        if ([mgr respondsToSelector:@selector(sharedInstance)]) {
-            id instance = [mgr sharedInstance];
-            if ([instance respondsToSelector:@selector(registerControllerWithTitle:version:controller:)]) {
-                [instance registerControllerWithTitle:@"DD语音包"
-                                              version:@"1.0.0"
-                                           controller:@"DDVoicePackSettingsViewController"];
-            }
-        }
+        Class mgrCls = objc_getClass("WCPluginsMgr");
+        if (![mgrCls respondsToSelector:@selector(sharedInstance)]) return;
+
+        WCPluginsMgr *mgr = [mgrCls sharedInstance];
+        if (![mgr respondsToSelector:@selector(registerControllerWithTitle:version:controller:)]) return;
+        [mgr registerControllerWithTitle:@"DD语音包"
+                                 version:@"1.0.0"
+                              controller:@"DDVoicePackSettingsViewController"];
     }
 }
