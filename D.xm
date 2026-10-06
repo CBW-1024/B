@@ -275,8 +275,8 @@ static void DDVoicePackListDirectory(NSString *dirPath, NSArray<NSString *> **ou
 }
 
 static NSUInteger DDVoicePackFileCountIn(NSString *dirPath) {
-    NSArray *folders = nil, *files = nil;
-    DDVoicePackListDirectory(dirPath, &folders, &files);
+    NSArray *files = nil;
+    DDVoicePackListDirectory(dirPath, NULL, &files);
     return files.count;
 }
 
@@ -296,7 +296,7 @@ static BOOL DDVoicePackIsDecodableAudio(NSString *path) {
 
 // 去掉首尾空白和 .silk / .slik 后缀，返回可当文件名的基名
 static NSString *DDVoicePackSanitizedName(NSString *raw) {
-    NSString *text = DDVoicePackTrim(raw ?: @"");
+    NSString *text = DDVoicePackTrim(raw);
     NSString *lower = [text lowercaseString];
     if ([lower hasSuffix:@".silk"] || [lower hasSuffix:@".slik"]) {
         text = DDVoicePackTrim([text substringToIndex:text.length - 5]);
@@ -304,13 +304,9 @@ static NSString *DDVoicePackSanitizedName(NSString *raw) {
     return text.length ? text : nil;
 }
 
+// 去扩展名，重命名时当输入框的默认值
 static NSString *DDVoicePackBaseName(NSString *path) {
-    NSString *name = [path lastPathComponent];
-    NSString *ext = [path pathExtension];
-    if (ext.length && [name hasSuffix:[@"." stringByAppendingString:ext]]) {
-        return [name substringToIndex:name.length - ext.length - 1];
-    }
-    return name;
+    return [[path lastPathComponent] stringByDeletingPathExtension];
 }
 
 static NSArray<NSString *> *DDVoicePackSearchFiles(NSString *root, NSString *keyword) {
@@ -488,6 +484,14 @@ static void DDVoicePackShowInput(NSString *title,
 // ========== 表格代理转发 ==========
 
 // WCTableViewManager 自己就是 tableView 的 delegate，这里插一层代理只为吃下左滑相关回调
+// 代理自己接管的回调（左滑相关），其余全部转发给微信原来的 delegate
+static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
+    return sel_isEqual(aSelector, @selector(tableView:canEditRowAtIndexPath:)) ||
+           sel_isEqual(aSelector, @selector(tableView:editingStyleForRowAtIndexPath:)) ||
+           sel_isEqual(aSelector, @selector(tableView:commitEditingStyle:forRowAtIndexPath:)) ||
+           sel_isEqual(aSelector, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:));
+}
+
 @interface DDVoicePackTableProxy : NSObject <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, weak) id forwardTarget;
 @property (nonatomic, weak) DDVoicePackListController *host;
@@ -496,22 +500,12 @@ static void DDVoicePackShowInput(NSString *title,
 @implementation DDVoicePackTableProxy
 
 - (id)forwardingTargetForSelector:(SEL)aSelector {
-    if (sel_isEqual(aSelector, @selector(tableView:canEditRowAtIndexPath:)) ||
-        sel_isEqual(aSelector, @selector(tableView:editingStyleForRowAtIndexPath:)) ||
-        sel_isEqual(aSelector, @selector(tableView:commitEditingStyle:forRowAtIndexPath:)) ||
-        sel_isEqual(aSelector, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:))) {
-        return self;
-    }
+    if (DDVoicePackProxyOwnsSelector(aSelector)) return self;
     return self.forwardTarget;
 }
 
 - (BOOL)respondsToSelector:(SEL)aSelector {
-    if (sel_isEqual(aSelector, @selector(tableView:canEditRowAtIndexPath:)) ||
-        sel_isEqual(aSelector, @selector(tableView:editingStyleForRowAtIndexPath:)) ||
-        sel_isEqual(aSelector, @selector(tableView:commitEditingStyle:forRowAtIndexPath:)) ||
-        sel_isEqual(aSelector, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:))) {
-        return YES;
-    }
+    if (DDVoicePackProxyOwnsSelector(aSelector)) return YES;
     return [self.forwardTarget respondsToSelector:aSelector];
 }
 
@@ -644,15 +638,11 @@ static void DDVoicePackShowInput(NSString *title,
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:listVC];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
 
-    Class adapterCls = objc_getClass("MMPageSheetAdapter");
-    if (!adapterCls) {
-        [fromVC presentViewController:nav animated:YES completion:nil];
-        return;
-    }
-
     CGFloat sheetHeight = [UIScreen mainScreen].bounds.size.height * kDDVoicePackSheetHeightRatio;
-    id adapter = [adapterCls adapterWithViewController:nav height:sheetHeight];
+    Class adapterCls = objc_getClass("MMPageSheetAdapter");
+    id adapter = adapterCls ? [adapterCls adapterWithViewController:nav height:sheetHeight] : nil;
     if (!adapter) {
+        // MMPageSheet 不可用时退回系统弹窗，至少面板还能打开
         [fromVC presentViewController:nav animated:YES completion:nil];
         return;
     }
@@ -690,9 +680,8 @@ static void DDVoicePackShowInput(NSString *title,
 
     Class containerCls = objc_getClass("MMPageSheetContainerWindowController");
     id container = [[containerCls alloc] init];
-    objc_setAssociatedObject(nav, kDDVoicePackSheetContainerKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // container 只挂 fromVC：关面板时是从 fromVC 上取的
     objc_setAssociatedObject(fromVC, kDDVoicePackSheetContainerKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(listVC, kDDVoicePackSheetContainerKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [container setupWithProvider:adapter];
     [container showPageSheetAnimated:YES parentView:nil parentViewController:fromVC complete:nil];
     gDDVoicePackSheetHostVC = fromVC;
@@ -743,9 +732,6 @@ static void DDVoicePackShowInput(NSString *title,
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    if (objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey)) {
-        self.title = nil;
-    }
     [self ddvp_reloadData];
     [self ddvp_syncSheetNavigationBar];
     [self ddvp_updatePlusButton];
@@ -1104,10 +1090,14 @@ static unsigned int DDVoicePackDurationMs(NSString *path) {
         Float64 seconds = CMTimeGetSeconds(duration);
         if (seconds > 0 && seconds < 3600) return (unsigned int)llround(seconds * 1000);
     }
-    // SILK 不是 AVFoundation 认的格式，读不出时长时按文件大小粗估
+    // SILK 不是 AVFoundation 认的格式，读不出时长就按文件大小粗估（约 2KB/s）。
+    // 估不出来统一给 3 秒——兜底只在这里做一次，别在外面再兜一遍
     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
     unsigned long long fileSize = [attrs fileSize];
-    if (fileSize > 0) return (unsigned int)(fileSize / 2000) * 1000;
+    if (fileSize > 0) {
+        unsigned int estimatedMs = (unsigned int)(fileSize / 2000) * 1000;
+        if (estimatedMs > 0) return estimatedMs;
+    }
     return 3000;
 }
 
@@ -1194,7 +1184,7 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
 
     CMessageWrap *msg = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:(long long)kDDVoicePackMsgTypeVoice nsFromUsr:myId];
     if (!msg) return NO;
-    [msg setM_nsFromUsr:myId];
+    // m_nsFromUsr 已经由 initWithMsgType:nsFromUsr: 设好了，不用再设一遍
     [msg setM_nsToUsr:chatId];
     [msg setM_uiStatus:1];
     [msg setM_uiDownloadStatus:9];
@@ -1262,8 +1252,6 @@ static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId) {
         unsigned int durationMs = 0;
         NSData *silk = DDVoicePackSilkPayload(filePath, &durationMs);
         if (!silk.length) return;
-        // SILK 估不出时长时给个 3 秒兜底
-        if (durationMs < 500) durationMs = 3000;
 
         if (DDVoicePackSendSilk(silk, durationMs, targetChat)) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -1462,9 +1450,6 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:destRoot withIntermediateDirectories:YES attributes:nil error:nil];
     for (NSURL *url in urls) [self ddvp_copyItemAtURL:url toDirectory:destRoot];
-}
-
-- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
 }
 
 - (void)ddvp_copyItemAtURL:(NSURL *)srcURL toDirectory:(NSString *)destDir {
