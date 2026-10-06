@@ -1292,9 +1292,10 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @end
 
-// 仿 DD模板套壳：子类化把老 initWithDocumentTypes:inMode: 重声明成 NSInteger 版，
-// 编译器只用本声明、看不到 SDK 头里的 deprecated 属性，于是 -Werror 也拦不住它。
-// 全程只传字符串 UTI 标识符，不依赖 UniformTypeIdentifiers 框架。
+// 仿 DD模板套壳：子类只作编译器的类型/selector 声明用——把老 initWithDocumentTypes:inMode: 重声明成 NSInteger 版，
+// 编译器只看本声明、看不到 SDK 头里的 deprecated 属性，于是 -Werror 也拦不住它。
+// 运行时通过 NSClassFromString(@"UIDocumentPickerViewController") 取【真实类】来 alloc，本子类不会被实例化，
+// 因此不需要 @implementation、也不产生链接符号。全程只传字符串 UTI 标识符，不依赖 UniformTypeIdentifiers 框架。
 @interface DDVoicePackPicker : UIDocumentPickerViewController
 - (instancetype)initWithDocumentTypes:(NSArray<NSString *> *)types inMode:(NSInteger)mode;
 @end
@@ -1356,7 +1357,7 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     // 支持三种来源：整目录、zip 包、单个 .silk 文件。
     // 直接传字符串 UTI 标识符 + 老 API，不依赖 UniformTypeIdentifiers 框架（和 DD模板套壳一致）。
     NSArray *types = @[@"public.folder", @"public.zip-archive", @"public.data"];
-    DDVoicePackPicker *picker = [[DDVoicePackPicker alloc] initWithDocumentTypes:types inMode:0]; // 0 = Import
+    DDVoicePackPicker *picker = [[NSClassFromString(@"UIDocumentPickerViewController") alloc] initWithDocumentTypes:types inMode:0]; // 0 = Import；NSClassFromString 取真实类，DDVoicePackPicker 只用于编译器的类型/selector 声明，不参与实例化
     picker.delegate = self;
     picker.allowsMultipleSelection = YES;
     [self presentViewController:picker animated:YES completion:nil];
