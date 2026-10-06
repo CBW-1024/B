@@ -850,8 +850,8 @@ static unsigned int DDVoicePackDurationMs(NSString *path);
 // 把毫秒格式化成列表副标题：短语音 "3秒"，长语音 "1:05"
 static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     unsigned int total = ms / 1000;
-    if (total < 60) return [NSString stringWithFormat:@"%u秒", total];
-    return [NSString stringWithFormat:@"%u:%02u", total / 60, total % 60];
+    if (total < 60) return [NSString stringWithFormat:@"语音时长：%u秒", total];
+    return [NSString stringWithFormat:@"语音时长：%u分%u秒", total / 60, total % 60];
 }
 
 - (id)ddvp_fileCellForPath:(NSString *)path title:(NSString *)title {
