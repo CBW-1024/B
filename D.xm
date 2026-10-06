@@ -1221,7 +1221,7 @@ static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL ena
     }
 
     MMMenuItem *item = [[objc_getClass("MMMenuItem") alloc] initWithTitle:@"纳入"
-                                                                svgName:@"biz_audio_outlined_star"
+                                                                svgName:@"icons_outlined_addoutline"
                                                                  target:cell
                                                                  action:@selector(ddvp_importVoice:)];
     if (!item) return original;
