@@ -1185,7 +1185,7 @@ static const void *kDDVoicePackLongPressKey = &kDDVoicePackLongPressKey;
 
     if (objc_getAssociatedObject(self, kDDVoicePackLongPressKey)) return;
     UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(ddvp_moreLongPress:)];
-    longPress.minimumPressDuration = 1.0;
+    // 不设 minimumPressDuration，用系统默认（0.5 秒）
     [self addGestureRecognizer:longPress];
     objc_setAssociatedObject(self, kDDVoicePackLongPressKey, longPress, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
