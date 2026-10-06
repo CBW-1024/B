@@ -1,1489 +1,1437 @@
-// ============================================================================
-//  DDShell.xm —— 截图模板套壳插件
 //
-//  功能：截图后自动把截图套入模板存回相册；也能从相册挑图或挑视频手动套。
-//  流程：监听截屏通知 → 取相册最新一张 → 透视贴进模板的屏幕窗 → 盖机身图 → 存回相册。
-//  模板：每个模板一个目录，含 <名字>.png（机身前景图）+ <名字>.cfg（画布尺寸与四角坐标）。
-//  素材库：设置页入口，模板的导入导出（zip）、应用、重命名、删除都在这一页。
-// ============================================================================
+//  DD语音包.xm
+//  微信语音包插件
+//
+//  功能：
+//   1. 聊天页长按「+」打开语音包面板
+//   2. 语音消息菜单「纳入」，把聊过的语音归档进语音包
+//   3. 面板内分层浏览 / 搜索 / 试听，点一条直接发到当前聊天
+//   4. 设置页：总开关、持续发送、导入导出语音包目录
+//
 
 #import <UIKit/UIKit.h>
-#import <Photos/Photos.h>
-#import <CoreImage/CoreImage.h>
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#pragma mark - 微信类声明
+// ========== 微信内部类声明 ==========
 
-@interface WCTableViewManager : NSObject
-- (instancetype)initWithFrame:(CGRect)frame style:(NSInteger)style;
-- (void)clearAllSection;
-- (id)getTableView;
-- (void)addSection:(id)arg1;
-- (void)reloadTableView;
-@property (nonatomic, weak) id delegate;
-@end
-
-@interface WCTableViewSectionManager : NSObject
-+ (id)sectionInfoHeader:(id)arg1;
-- (void)addCell:(id)arg1;
-@end
-
-@interface WCTableViewCellManager : NSObject
-+ (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 on:(BOOL)arg4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)arg3 rightValue:(id)arg4;
-@end
-
+// 微信头文件 dump 里没有这个类，接口按 DD消息助手的写法声明
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-// 微信原生弹层。运行时按类名取，编译期不引用符号；方法签名挂在 NSObject 分类上只为通过编译。
-@interface NSObject (DDShellWCSheet)
-- (id)initWithTitle:(NSString *)title delegate:(id)delegate cancelButtonTitle:(NSString *)cancelButtonTitle
-destructiveButtonTitle:(NSString *)destructiveButtonTitle otherButtonTitles:(NSString *)otherButtonTitles;
-- (NSInteger)tag;
-- (void)showInView:(id)view;
+@interface MMContext : NSObject
++ (id)activeUserContext;
++ (id)rootContext;
+- (id)getService:(Class)serviceClass;
 @end
 
-#pragma mark - 配置
-
-static NSString *const kDDShellEnabled     = @"DDShellEnabled";
-static NSString *const kDDShellAuto        = @"DDShellAutoShell";
-static NSString *const kDDShellSelectedTpl = @"DDShellSelectedTpl";
-static NSString *const kDDShellDeleteSrc   = @"DDShellDeleteOriginal";
-static NSString *const kDDShellProcessed   = @"DDShellProcessedIds";
-
-@interface DDShellConfig : NSObject
-+ (instancetype)shared;
-@property (nonatomic) BOOL enabled;
-@property (nonatomic) BOOL autoShell;
-@property (nonatomic) BOOL deleteOriginal;
-@property (nonatomic, copy) NSString *selectedTpl;
-- (BOOL)hasProcessed:(NSString *)lid;
-- (void)markProcessed:(NSString *)lid;
+@interface MMThemeManager : NSObject
+- (UIImage *)svgImageNamed:(NSString *)name color:(UIColor *)color;
 @end
 
-@implementation DDShellConfig
-
-+ (instancetype)shared {
-    static DDShellConfig *instance;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ instance = [[self alloc] init]; });
-    return instance;
-}
-
-- (instancetype)init {
-    if (self = [super init]) {
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        // boolForKey 未设置时返回 NO，只有 autoShell 默认开，需要单独判一次
-        _enabled        = [ud boolForKey:kDDShellEnabled];
-        _autoShell      = [ud objectForKey:kDDShellAuto] ? [ud boolForKey:kDDShellAuto] : YES;
-        _deleteOriginal = [ud boolForKey:kDDShellDeleteSrc];
-        _selectedTpl    = [ud stringForKey:kDDShellSelectedTpl] ?: @"";
-        [ud setBool:_enabled forKey:kDDShellEnabled];
-        [ud setBool:_autoShell forKey:kDDShellAuto];
-        [ud setBool:_deleteOriginal forKey:kDDShellDeleteSrc];
-        [ud setObject:_selectedTpl forKey:kDDShellSelectedTpl];
-    }
-    return self;
-}
-
-- (void)setEnabled:(BOOL)v        { _enabled = v;        [self dd_setBool:v forKey:kDDShellEnabled]; }
-- (void)setAutoShell:(BOOL)v      { _autoShell = v;      [self dd_setBool:v forKey:kDDShellAuto]; }
-- (void)setDeleteOriginal:(BOOL)v { _deleteOriginal = v; [self dd_setBool:v forKey:kDDShellDeleteSrc]; }
-- (void)setSelectedTpl:(NSString *)v {
-    _selectedTpl = [v copy] ?: @"";
-    [[NSUserDefaults standardUserDefaults] setObject:_selectedTpl forKey:kDDShellSelectedTpl];
-}
-
-- (void)dd_setBool:(BOOL)v forKey:(NSString *)k {
-    [[NSUserDefaults standardUserDefaults] setBool:v forKey:k];
-}
-
-// 已处理过的图记下来，避免同一张被反复套壳
-- (BOOL)hasProcessed:(NSString *)lid {
-    if (!lid.length) return NO;
-    NSArray *arr = [[NSUserDefaults standardUserDefaults] arrayForKey:kDDShellProcessed];
-    return [arr containsObject:lid];
-}
-- (void)markProcessed:(NSString *)lid {
-    if (!lid.length) return;
-    NSMutableArray *m = [[[NSUserDefaults standardUserDefaults] arrayForKey:kDDShellProcessed] ?: @[] mutableCopy];
-    [m addObject:lid];
-    if (m.count > 200) m = [[m subarrayWithRange:NSMakeRange(m.count - 200, 200)] mutableCopy];
-    [[NSUserDefaults standardUserDefaults] setObject:m forKey:kDDShellProcessed];
-}
-
+// m_nsUsrName 定义在 CBaseContact 上（CContact 继承它），声明到父类避免误读
+@interface CBaseContact : NSObject
+- (NSString *)m_nsUsrName;
 @end
 
-#pragma mark - 模板目录
-
-// 模板根目录：Library/Preferences/DDShell/模板/
-// 不放 Documents：微信的「清理缓存」会清掉它，模板会丢；Preferences 不会被清。
-static NSString *DD_TplDir(void) {
-    static NSString *dir;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSString *lib  = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-        NSString *pref = [lib stringByAppendingPathComponent:@"Preferences"];
-        dir = [pref stringByAppendingPathComponent:@"DDShell/模板"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    });
-    return dir;
-}
-
-// 单个模板的目录：Library/Preferences/DDShell/模板/<名称>/
-static NSString *DD_TplFolder(NSString *name) {
-    return name.length ? [DD_TplDir() stringByAppendingPathComponent:name] : nil;
-}
-
-#pragma mark - 临时目录
-
-// 插件专用临时目录：NSTemporaryDirectory()/DDShell/
-// 与微信原生 tmp 隔开，方便下次启动时整目录清掉，不留残骸。
-static NSString *DD_TempRoot(void) {
-    NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:@"DDShell"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:root
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    return root;
-}
-
-#pragma mark - 模板模型
-
-@interface DDShellTemplate : NSObject
-@property (nonatomic, copy)   NSString *name;        // 模板名（不含扩展名）
-@property (nonatomic, strong) UIImage  *image;       // 机身前景图（png）
-@property (nonatomic)         CGSize    canvasSize;  // 模板画布像素尺寸（来自 cfg 的 template_width/height）
-@property (nonatomic)         CGPoint   lt, rt, lb, rb; // 屏幕窗四角（UIKit 坐标，左上原点，像素，来自 cfg）
+@interface CContactMgr : NSObject
+- (id)getSelfContact;
 @end
 
-@implementation DDShellTemplate
+@interface CMessageMgr : NSObject
+- (void)AddLocalMsg:(id)chatName MsgWrap:(id)msgWrap;
+- (void)ModMsg:(id)chatName MsgWrap:(id)msgWrap;
+// 首参传 nil：声明是两参，传 NSData 会被当成路径处理
+- (BOOL)SaveMesVoice:(id)a0 MsgWrap:(id)a1;
 @end
 
-// 在指定目录里找 name.ext。扩展名大小写不敏感：iOS 文件系统大小写敏感，
-// 直接拼小写扩展名会漏掉 Name.PNG / Name.CFG。
-static NSString *DD_FileInFolder(NSString *dir, NSString *name, NSString *ext) {
-    if (!dir.length || !name.length) return nil;
-    NSString *want = [[name stringByAppendingPathExtension:ext] lowercaseString];
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
-    for (NSString *f in files) {
-        if ([f.lowercaseString isEqualToString:want]) return [dir stringByAppendingPathComponent:f];
-    }
-    return nil;
-}
-
-// 在模板自己的目录里找 name.ext
-static NSString *DD_ActualFile(NSString *name, NSString *ext) {
-    return DD_FileInFolder(DD_TplFolder(name), name, ext);
-}
-
-// 模板 cfg 路径：<模板目录>/<名称>.cfg
-static NSString *DD_CfgPath(NSString *name) {
-    return DD_ActualFile(name, @"cfg");
-}
-
-static NSDictionary *DD_LoadCfg(NSString *name) {
-    NSData *d = [NSData dataWithContentsOfFile:DD_CfgPath(name)];
-    if (!d.length) return nil;
-    id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
-}
-
-// 枚举模板：根目录下每个子目录是一个模板，必须同时含 <名称>.png 与 <名称>.cfg
-static NSArray<NSString *> *DD_AllTemplateNames(void) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *items = [fm contentsOfDirectoryAtPath:DD_TplDir() error:nil];
-    NSMutableArray *out = [NSMutableArray array];
-    for (NSString *item in items) {
-        NSString *dir = [DD_TplDir() stringByAppendingPathComponent:item];
-        BOOL isDir = NO;
-        if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) continue; // 只看目录
-        if (!DD_ActualFile(item, @"png")) continue;
-        if (!DD_ActualFile(item, @"cfg")) continue; // png 与 cfg 必须同时存在
-        [out addObject:item];
-    }
-    return [out sortedArrayUsingSelector:@selector(compare:)];
-}
-
-static DDShellTemplate *DD_TemplateNamed(NSString *name) {
-    if (!name.length) return nil;
-    NSString *png = DD_ActualFile(name, @"png");
-    NSData *d = png ? [NSData dataWithContentsOfFile:png] : nil;
-    if (!d.length) return nil;
-    UIImage *img = [UIImage imageWithData:d];
-    if (!img) return nil;
-
-    DDShellTemplate *t = [DDShellTemplate new];
-    t.name = name;
-    t.image = img;
-
-    // cfg 缺失则模板不生效
-    NSDictionary *cfg = DD_LoadCfg(name);
-    if (!cfg) return nil;
-
-    // 画布尺寸取 cfg 的 template_width / template_height
-    double lw = [cfg[@"template_width"] doubleValue];
-    double lh = [cfg[@"template_height"] doubleValue];
-    CGSize canvas = CGSizeMake(lw, lh);
-
-    NSArray *keys = @[@"left_top", @"right_top", @"left_bottom", @"right_bottom"];
-    CGPoint pts[4];
-    for (NSUInteger i = 0; i < 4; i++) {
-        id x = cfg[[keys[i] stringByAppendingString:@"_x"]];
-        id y = cfg[[keys[i] stringByAppendingString:@"_y"]];
-        if (!x || !y) return nil; // 四角缺一个则模板不生效
-        pts[i] = CGPointMake([x doubleValue], [y doubleValue]);
-    }
-    t.canvasSize = canvas;
-    t.lt = pts[0]; t.rt = pts[1]; t.lb = pts[2]; t.rb = pts[3];
-    return t;
-}
-
-// 当前生效的模板：只认显式应用过的那个，库里有但没应用过就算没有。
-// 模板 png 在这里一次解析完，要套壳、要画布尺寸都直接拿这个对象，不用再解一遍
-static DDShellTemplate *DD_ActiveTemplate(void) {
-    NSString *sel = [DDShellConfig shared].selectedTpl;
-    return sel.length ? DD_TemplateNamed(sel) : nil;
-}
-
-// 只要名字时用这个：没有生效模板就给空串，方便直接拼进界面文案和路径
-static NSString *DD_ActiveTemplateName(void) {
-    return DD_ActiveTemplate().name ?: @"";
-}
-
-#pragma mark - 合成
-
-// UIKit 坐标（左上原点）→ CoreImage 坐标（左下原点）翻转
-static CIVector *DD_CIVec(CGPoint p, CGFloat canvasH) {
-    return [CIVector vectorWithCGPoint:CGPointMake(p.x, canvasH - p.y)];
-}
-
-// 按 contain 比例预缩源图：缩小走 Lanczos——截图到屏幕窗通常要缩好几倍，双线性的抗混叠
-// 不够，文字、分割线、图标细边会出摩尔纹；放大不产生混叠，仿射就够了。
-// 图片链和视频链共用这一段，两链的差别只在送进来的源是 CGImage 还是像素缓冲。
-static CIImage *DD_ScaledSource(CIImage *src, CGFloat sc) {
-    if (sc > 0.0 && isfinite(sc) && sc < 1.0) {
-        CIFilter *lz = [CIFilter filterWithName:@"CILanczosScaleTransform"];
-        if (lz) {
-            [lz setDefaults];
-            [lz setValue:src forKey:kCIInputImageKey];
-            [lz setValue:@(sc) forKey:kCIInputScaleKey];
-            if (lz.outputImage) return lz.outputImage;
-        }
-    }
-    return [src imageByApplyingTransform:CGAffineTransformMakeScale(sc, sc)];
-}
-
-// 把模板四角填进透视滤镜（y 已按画布高翻转到 CoreImage 坐标）
-static void DD_SetPerspectiveCorners(CIFilter *f, DDShellTemplate *t, CGFloat canvasH) {
-    [f setValue:DD_CIVec(t.lt, canvasH) forKey:@"inputTopLeft"];
-    [f setValue:DD_CIVec(t.rt, canvasH) forKey:@"inputTopRight"];
-    [f setValue:DD_CIVec(t.rb, canvasH) forKey:@"inputBottomRight"];
-    [f setValue:DD_CIVec(t.lb, canvasH) forKey:@"inputBottomLeft"];
-}
-
-// 模板四角围出的屏幕窗包围盒（用来把源按 contain 预缩到窗口大小）
-static CGRect DD_WindowBBox(DDShellTemplate *t) {
-    CGFloat xs[4] = { t.lt.x, t.rt.x, t.rb.x, t.lb.x };
-    CGFloat ys[4] = { t.lt.y, t.rt.y, t.rb.y, t.lb.y };
-    CGFloat minX = xs[0], maxX = xs[0], minY = ys[0], maxY = ys[0];
-    for (int i = 1; i < 4; i++) {
-        if (xs[i] < minX) minX = xs[i];
-        if (xs[i] > maxX) maxX = xs[i];
-        if (ys[i] < minY) minY = ys[i];
-        if (ys[i] > maxY) maxY = ys[i];
-    }
-    return CGRectMake(minX, minY, maxX - minX, maxY - minY);
-}
-
-// 把一张图透视贴进模板的屏幕窗，再盖上机身前景图，得到成品
-static UIImage *DD_ComposeShellImage(UIImage *shot, DDShellTemplate *t) {
-    if (!shot || !t) return nil;
-    UIImage *frameImg = t.image;
-    CGImageRef frameCG = frameImg.CGImage;
-    CGImageRef shotCG = shot.CGImage;
-    if (!frameCG || !shotCG) return nil;
-
-    CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
-    // 尺寸来自 cfg，按 CoreGraphics 的纹理上限卡一道，超了就放弃这次合成
-    if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil;
-
-    // 截图按实际像素尺寸参与计算
-    CGFloat A = (CGFloat)CGImageGetWidth(shotCG);
-    CGFloat B = (CGFloat)CGImageGetHeight(shotCG);
-    if (A < 1.0 || B < 1.0) return nil;
-
-    // 滤镜在这里先建好再判空：下面开了图形上下文，中途 return 会漏掉 EndImageContext
-    CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
-    if (!f) return nil;
-
-    // 画布按 1 倍开（1 单位 = 1 像素），成品尺寸才严格等于 cfg 写的模板尺寸
-    UIGraphicsBeginImageContextWithOptions(CGSizeMake(W, H), NO, 1.0);
-    // 透视结果的 extent 未必是整数（四角来自 cfg，可能带小数），落地时会再重采样一次，
-    // 显式开最高质量插值，免得最后一步被默认插值抹糊
-    CGContextRef uctx = UIGraphicsGetCurrentContext();
-    if (uctx) CGContextSetInterpolationQuality(uctx, kCGInterpolationHigh);
-
-    CIContext *ci = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer : @NO }];
-
-    // 先把源按 contain 预缩到屏幕窗大小，再做透视：直接把大分辨率喂进透视会让中间图过大、
-    // 投影退化
-    CGRect wb = DD_WindowBBox(t);
-    CGFloat sc = MIN(wb.size.width / A, wb.size.height / B);
-    if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-    CIImage *srcImg = DD_ScaledSource([CIImage imageWithCGImage:shotCG], sc);
-    [f setDefaults];
-    [f setValue:srcImg forKey:kCIInputImageKey];
-    [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, A * sc, B * sc)] forKey:@"inputExtent"];
-    DD_SetPerspectiveCorners(f, t, H);
-    CIImage *o = [f valueForKey:kCIOutputImageKey];
-
-    if (o) {
-        CGRect ext = o.extent;
-        CGImageRef cg = [ci createCGImage:o fromRect:ext];
-        if (cg) {
-            // 通过 UIImage 绘制规避 UIKit 上下文的坐标翻转
-            UIImage *layer = [UIImage imageWithCGImage:cg scale:1.0 orientation:UIImageOrientationUp];
-            CGRect r = CGRectMake(ext.origin.x,
-                                 H - ext.origin.y - ext.size.height,
-                                 ext.size.width, ext.size.height);
-            [layer drawInRect:r];
-            CGImageRelease(cg);
-        }
-    }
-
-    // 机身前景图盖在最上层
-    [frameImg drawInRect:CGRectMake(0, 0, W, H)];
-
-    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    return img;
-}
-
-#pragma mark - 视频套壳（相册选视频，逐帧透视合成后导出）
-
-// 套壳指令：把模板和源视频的旋转信息带进自定义合成器。
-// customVideoCompositorClass 只认类、由框架自己实例化，参数没法从外部传实例，
-// 只能挂在 instruction 上，合成器每帧从 request 里取回来。
-@interface DDShellVideoInstruction : NSObject <AVVideoCompositionInstruction>
-@property (nonatomic)         CMTimeRange         timeRange;
-@property (nonatomic)         BOOL                enablePostProcessing;
-@property (nonatomic)         BOOL                containsTweening;
-@property (nonatomic)         NSArray<NSValue *> *requiredSourceTrackIDs;
-@property (nonatomic)         CMPersistentTrackID passthroughTrackID;
-@property (nonatomic, strong) DDShellTemplate    *tpl;
-@property (nonatomic)         CGAffineTransform   preferredTransform;
+@interface CMessageWrap : NSObject
+- (unsigned int)m_uiMessageType;
+- (unsigned int)m_uiMesLocalID;
+- (NSString *)m_nsFromUsr;
+- (NSString *)m_nsToUsr;
+- (void)setM_nsToUsr:(NSString *)to;
+- (void)setM_uiStatus:(unsigned int)status;
+- (void)setM_uiDownloadStatus:(unsigned int)status;
+- (void)setM_nsMsgSource:(id)source;
+- (void)setM_uiCreateTime:(unsigned int)time;
+- (void)UpdateContent:(id)arg;
+- (void)setM_extendInfoWithMsgType:(id)info;
+- (instancetype)initWithMsgType:(long long)type nsFromUsr:(NSString *)usr;
++ (BOOL)isSenderFromMsgWrap:(id)wrap;
 @end
 
-@implementation DDShellVideoInstruction
+@interface MMNewSessionMgr : NSObject
+- (unsigned int)GenSendMsgTime;
 @end
 
-// 逐帧合成器：每帧把源视频帧透视贴进模板窗口，再叠机身图，输出到像素缓冲
-@interface DDShellVideoCompositor : NSObject <AVVideoCompositing>
-@property (atomic, assign)   BOOL             shouldCancelAllRequests;
-- (void)_renderOneRequest:(AVAsynchronousVideoCompositionRequest *)req;
+@interface AudioSender : NSObject
+- (void)ResendVoiceMsg:(NSString *)chat MsgWrap:(id)wrap;
 @end
 
-@implementation DDShellVideoCompositor {
-    CIContext      *_ctx;
-    CGColorSpaceRef _cs;
-    CVPixelBufferRef _mid;   // 满画布中间缓冲：透视结果先烘焙进来，再与机身合成。
-                            // 复用同一张、不逐帧分配，内存打平；在 dealloc 里释放。
-    CGSize           _midSize;
-}
-
-- (instancetype)init {
-    self = [super init];
-    if (self) {
-        _cs  = CGColorSpaceCreateDeviceRGB();
-        // 钉死 working/output 为 sRGB：宽色域 / P3 源会把 Core Image 推到浮点扩展范围
-        // 缓冲，内存翻倍。
-        // 不缓存中间结果：逐帧渲染的循环里不让显存跟着帧数累积。
-        _ctx = [CIContext contextWithOptions:@{ (id)kCIContextWorkingColorSpace : (__bridge id)_cs,
-                                                (id)kCIContextOutputColorSpace  : (__bridge id)_cs,
-                                                (id)kCIContextCacheIntermediates : @NO }];
-    }
-    return self;
-}
-- (void)dealloc {
-    if (_cs) CGColorSpaceRelease(_cs);
-    if (_mid) CVPixelBufferRelease(_mid);
-}
-// 渲染上下文变化（尺寸/像素格式等），本合成器每帧直接从 request 取 renderContext，无需缓存
-- (void)renderContextChanged:(AVVideoCompositionRenderContext *)newRenderContext {}
-- (NSDictionary *)requiredPixelBufferAttributesForRenderContext {
-    // 输出缓冲要 BGRA + IOSurface：编码器需要 BGRA，IOSurface 让它常驻 GPU 显存、
-    // CI 渲染零拷贝，省掉逐帧 CPU 缓冲的内存与拷贝开销。
-    return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelFormatType_32BGRA),
-              (id)kCVPixelBufferIOSurfacePropertiesKey    : @{},
-              (id)kCVPixelBufferOpenGLESCompatibilityKey  : @YES };
-}
-- (NSDictionary *)sourcePixelBufferAttributes {
-    // 源帧直接要 420YUV：解码器原生输出就是这个，写 BGRA 会多一次转换、每帧内存也翻倍。
-    // Core Image 会自动把 420YUV 转 RGB，合成部分不用为此改动；输出缓冲仍是 BGRA。
-    // 必须带 PixelFormatTypeKey，否则 AVFoundation 直接抛 NSInvalidArgumentException。
-    return @{ (id)kCVPixelBufferPixelFormatTypeKey        : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-              (id)kCVPixelBufferIOSurfacePropertiesKey    : @{},
-              (id)kCVPixelBufferOpenGLESCompatibilityKey  : @YES };
-}
-- (void)cancelAllPendingVideoCompositionRequests {
-    self.shouldCancelAllRequests = YES;
-}
-- (void)startVideoCompositionRequest:(AVAsynchronousVideoCompositionRequest *)req {
-    if (self.shouldCancelAllRequests) {
-        // 框架每次导出结束都会把这个标志置 YES，且倾向于复用同一个合成器实例；
-        // 不在这里复位的话，之后每次导出都会在入口被 finishCancelledRequest 早退、一帧不画。
-        self.shouldCancelAllRequests = NO;
-        [req finishCancelledRequest];
-        return;
-    }
-    // 导出用的自定义合成器必须同步完成（start 返回前调用 finish*）：帧若被丢到自建队列
-    // 异步提交，导出管线不会泵送它们，结果导出“成功”但画面全黑。
-    // 只有 AVPlayerItem 的播放链路才支持真正的异步合成。
-    [self _renderOneRequest:req];
-}
-
-- (void)_renderOneRequest:(AVAsynchronousVideoCompositionRequest *)req {
-    @autoreleasepool {
-        DDShellVideoInstruction *inst = (DDShellVideoInstruction *)req.videoCompositionInstruction;
-        DDShellTemplate *t = inst.tpl;
-        CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
-        CGRect wb = DD_WindowBBox(t);
-
-        CMPersistentTrackID tid = [(NSNumber *)inst.requiredSourceTrackIDs.firstObject intValue];
-        CVPixelBufferRef src = [req sourceFrameByTrackID:tid];
-        if (!src) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-1 userInfo:nil]]; return; }
-
-        CVPixelBufferRef dst = [req.renderContext newPixelBuffer];
-        if (!dst) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-2 userInfo:nil]]; return; }
-
-        // 源帧先按视频自带旋转摆正。preferredTransform 常带位移把旋转后的帧挪回正位，
-        // extent 原点往往不为 0，所以先把原点归零，再按 contain 预缩到屏幕窗大小，
-        // 最后透视映射到窗口——避免把巨大坐标 / 大分辨率直接喂进透视。
-        CIImage *raw = [CIImage imageWithCVPixelBuffer:src];
-        CIImage *rot = [raw imageByApplyingTransform:inst.preferredTransform];
-        CGRect re = rot.extent;
-        CGFloat sc = MIN(wb.size.width / re.size.width, wb.size.height / re.size.height);
-        if (!(sc > 0.0) || !isfinite(sc)) sc = 1.0;
-        // 先平移归零（只动 origin，不改采样），再按 contain 比例预缩
-        CIImage *centered = [rot imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
-        CIImage *srcImg = DD_ScaledSource(centered, sc);
-
-        CIFilter *f = [CIFilter filterWithName:@"CIPerspectiveTransformWithExtent"];
-        if (!f) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-3 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
-        [f setDefaults];
-        [f setValue:srcImg forKey:kCIInputImageKey];
-        [f setValue:[CIVector vectorWithCGRect:CGRectMake(0, 0, re.size.width * sc, re.size.height * sc)] forKey:@"inputExtent"];
-        DD_SetPerspectiveCorners(f, t, H);
-        CIImage *warped = f.outputImage;
-        if (!warped) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-4 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
-
-        // 先烘焙再合成：① 透视结果渲进 _mid（满画布 IOSurface，复用、不逐帧分配）；
-        // ② 读回位图 warpedBaked（已是 8bit sRGB、几何同画布）。
-        // 两层都落到同一格式的位图再合成，滤镜那层才不会渲空。
-        if (!_mid || (size_t)_midSize.width != (size_t)W || (size_t)_midSize.height != (size_t)H) {
-            if (_mid) { CVPixelBufferRelease(_mid); _mid = NULL; }
-            CVReturn cvr = CVPixelBufferCreate(kCFAllocatorDefault,
-                             (size_t)W, (size_t)H,
-                             kCVPixelFormatType_32BGRA,
-                             (__bridge CFDictionaryRef)@{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
-                                                          (id)kCVPixelBufferOpenGLESCompatibilityKey : @YES },
-                             &_mid);
-            if (cvr != kCVReturnSuccess || !_mid) {
-                [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-7 userInfo:nil]];
-                CVPixelBufferRelease(dst); return;
-            }
-            _midSize = CGSizeMake(W, H);
-        }
-
-        @try {
-            [_ctx render:warped toCVPixelBuffer:_mid bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
-        } @catch (NSException *e) {
-            [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-8 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
-            CVPixelBufferRelease(dst); return;
-        }
-        CIImage *warpedBaked = [CIImage imageWithCVPixelBuffer:_mid]; // 已是 8bit sRGB，几何同画布
-        if (!warpedBaked) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-9 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
-
-        CIImage *frame = [CIImage imageWithCGImage:t.image.CGImage];
-        CIImage *outImg = [frame imageByCompositingOverImage:warpedBaked]; // 机身图盖在最上层（与预览同序）
-        if (!outImg) { [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-5 userInfo:nil]]; CVPixelBufferRelease(dst); return; }
-
-        @try {
-            [_ctx render:outImg toCVPixelBuffer:dst bounds:CGRectMake(0, 0, W, H) colorSpace:_cs];
-        } @catch (NSException *e) {
-            [req finishWithError:[NSError errorWithDomain:@"DDShell" code:-6 userInfo:@{NSLocalizedDescriptionKey:e.reason}]];
-            CVPixelBufferRelease(dst);
-            return;
-        }
-
-        // 出一帧交一帧：中间结果不缓存（init 里的 kCIContextCacheIntermediates:@NO），
-        // 长视频的显存才不会跟着帧数往上堆
-        [req finishWithComposedVideoFrame:dst];
-        CVPixelBufferRelease(dst);
-    }
-}
+@interface CExtendInfoOfVoiceMsg : NSObject
+- (void)setM_dtVoice:(id)data;
+- (void)setM_uiVoiceTime:(unsigned int)ms;
+- (void)setM_uiVoiceFormat:(unsigned int)fmt;
+- (void)setM_uiVoiceEndFlag:(unsigned int)flag;
+- (void)setM_refMessageWrap:(id)wrap;
 @end
 
-// 把一段视频逐帧套壳后导出成 mp4，返回临时文件 URL（失败返回 nil）
-static NSURL *DD_ComposeShellVideo(NSURL *srcURL, DDShellTemplate *t) {
-    AVURLAsset *asset = [AVURLAsset assetWithURL:srcURL];
-    AVAssetTrack *vt = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
-    if (!vt) return nil;
-
-    CGFloat W = t.canvasSize.width, H = t.canvasSize.height;
-    if (W < 1.0 || H < 1.0 || W > 8192.0 || H > 8192.0) return nil; // 画布尺寸同样卡上限
-
-    // 工作分辨率上限：模板画布常常比相册能收的 4K 像素还大，超限会被相册直接拒收，
-    // 所以先按长边等比缩到上限内，再拿缩过的画布和四角去合成。
-    // 内存紧张的设备或更长的视频若出现内存告警、导出失败，把 DD_WORK_CAP 往下调一档即可。
-    static const CGFloat DD_WORK_CAP = 3200.0;
-    CGFloat capW = DD_WORK_CAP, capH = DD_WORK_CAP, capPx = DD_WORK_CAP * DD_WORK_CAP;
-    CGFloat s = MIN(MIN(1.0, capW / W), MIN(capH / H, sqrt(capPx / (W * H))));
-    DDShellTemplate *st = t;
-    if (s < 1.0) {
-        CGFloat nW = floor((W * s) / 2.0) * 2.0;   // 取偶数，编码器要求
-        CGFloat nH = floor((H * s) / 2.0) * 2.0;
-        if (nW < 2.0) nW = 2.0;
-        if (nH < 2.0) nH = 2.0;
-        UIGraphicsBeginImageContextWithOptions(CGSizeMake(nW, nH), NO, 1.0);
-        [t.image drawInRect:CGRectMake(0, 0, nW, nH)];
-        UIImage *sim = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
-        st = [DDShellTemplate new];
-        st.name = t.name;
-        st.image = sim ?: t.image;
-        st.canvasSize = CGSizeMake(nW, nH);
-        st.lt = CGPointMake(t.lt.x * s, t.lt.y * s);
-        st.rt = CGPointMake(t.rt.x * s, t.rt.y * s);
-        st.lb = CGPointMake(t.lb.x * s, t.lb.y * s);
-        st.rb = CGPointMake(t.rb.x * s, t.rb.y * s);
-        W = nW; H = nH;
-    }
-
-    NSString *outPath = [DD_TempRoot() stringByAppendingPathComponent:
-                         [[NSUUID UUID].UUIDString stringByAppendingPathExtension:@"mp4"]];
-
-    AVMutableVideoComposition *vc = [AVMutableVideoComposition videoComposition];
-    vc.renderSize = CGSizeMake(W, H);
-    CMTime fd = vt.minFrameDuration;
-    vc.frameDuration = (fd.timescale && fd.value) ? fd : CMTimeMake(1, 30);
-
-    DDShellVideoInstruction *inst = [DDShellVideoInstruction new];
-    inst.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
-    inst.enablePostProcessing = NO;
-    inst.containsTweening = NO;
-    inst.requiredSourceTrackIDs = @[ @(vt.trackID) ];
-    inst.tpl = st;
-    inst.preferredTransform = vt.preferredTransform;
-    vc.instructions = @[ inst ];
-    vc.customVideoCompositorClass = [DDShellVideoCompositor class];
-
-    __block NSURL *result = nil;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    // 画质预设只有 Low / Medium / Highest 三档，取 Highest 保清晰度
-    AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset
-                                                            presetName:AVAssetExportPresetHighestQuality];
-    ex.outputURL = [NSURL fileURLWithPath:outPath];
-    ex.outputFileType = AVFileTypeMPEG4;
-    ex.videoComposition = vc;
-    [ex exportAsynchronouslyWithCompletionHandler:^{
-        if (ex.status == AVAssetExportSessionStatusCompleted) result = ex.outputURL;
-        dispatch_semaphore_signal(sem);
-    }];
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-    if (!result) { // 导出失败，半截 mp4 不留
-        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-    }
-    return result;
-}
-
-// 视频存相册。临时 mp4 无论成败都回收：失败时尤其要删——没相册权限或磁盘满这两种失败
-// 会连着发生，留着只会让磁盘更紧，而下次启动才跑的整目录清理未必来得及。
-static void DD_SaveVideoToAlbum(NSURL *url, void (^done)(BOOL success, NSError *err)) {
-    [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
-        [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:url];
-    } completionHandler:^(BOOL success, NSError *error) {
-        [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
-        if (done) done(success, error);
-    }];
-}
-
-#pragma mark - 相册
-
-// 从相册取最新一张图作为本次要套壳的截图
-static void DD_LatestImageAsset(void (^done)(PHAsset *)) {
-    PHFetchOptions *o = [PHFetchOptions new];
-    o.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:NO]];
-    o.fetchLimit = 1;
-    PHFetchResult *r = [PHAsset fetchAssetsWithMediaType:PHAssetMediaTypeImage options:o];
-    done([r firstObject]);
-}
-
-static void DD_SaveImageToAlbum(UIImage *img, void (^done)(BOOL success, NSError *err)) {
-    __block PHObjectPlaceholder *ph = nil;
-    [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
-        PHAssetChangeRequest *req = [PHAssetChangeRequest creationRequestForAssetFromImage:img];
-        ph = req.placeholderForCreatedAsset;
-    } completionHandler:^(BOOL success, NSError *error) {
-        // 成品也记一笔，避免之后被当成未处理的截图重复套壳
-        if (success && ph.localIdentifier.length) {
-            [[DDShellConfig shared] markProcessed:ph.localIdentifier];
-        }
-        if (done) done(success, error);   // 真正存好/失败后才回调
-    }];
-}
-
-static void DD_DeleteAssets(NSArray<PHAsset *> *assets) {
-    [PHPhotoLibrary.sharedPhotoLibrary performChanges:^{
-        [PHAssetChangeRequest deleteAssets:assets];
-    } completionHandler:nil];
-}
-
-#pragma mark - 监听器
-
-// 微信内置提示控件，运行时按类名获取，编译期不产生链接符号
-@interface WeToast : NSObject
-+ (instancetype)toast;
-- (void)setLoadingStyle:(BOOL)style;
-- (void)showToastWithText:(NSString *)text;
-- (void)showDoneToastWithText:(NSString *)text;   // 方形带 ✓
-- (void)showErrorToastWithText:(NSString *)text;  // 方形带错误图标
-- (void)hideWithAnimated:(BOOL)animated;
+@interface CUtility : NSObject
++ (NSString *)GetDocPath;
++ (NSString *)GetPathOfMesAudio:(NSString *)userName LocalID:(unsigned int)localID DocPath:(NSString *)docPath;
 @end
 
-static WeToast *gBusyToast = nil; // 进行中的 loading 提示（套壳 / 导入 / 导出），完成后收起
-
-// 套壳闸门：同一时刻只跑一个任务，抢不到闸直接放弃、不排队。
-// 自动截屏、相册选图、相册选视频三条入口都先抢闸，任务彻底跑完才还闸。
-// 不排队的原因：自动截屏拿的是"当前最新一张图"，排到几十秒后大概率已不是刚截的那张，会套错/删错图。
-static dispatch_semaphore_t DD_ShellGate(void) {
-    static dispatch_semaphore_t gate;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ gate = dispatch_semaphore_create(1); });
-    return gate;
-}
-
-// 抢闸：抢到返回 YES。非阻塞，主线程上调也安全
-static BOOL DD_ShellTryBegin(void) {
-    return dispatch_semaphore_wait(DD_ShellGate(), DISPATCH_TIME_NOW) == 0;
-}
-
-// 还闸：必须在任务彻底结束（相册存完、提示弹完）之后调，漏一次后面就全废
-static void DD_ShellEnd(void) {
-    dispatch_semaphore_signal(DD_ShellGate());
-}
-
-static WeToast *DD_Toast(void) {
-    return [NSClassFromString(@"WeToast") toast];
-}
-
-// loading / 成功 / 失败 / 纯文字四种提示，都用微信的 WeToast
-// 收起 loading：调用方都在主线程
-static void DD_HideLoading(void) {
-    [gBusyToast hideWithAnimated:YES];
-    gBusyToast = nil;
-}
-// 同时只保留一个 loading 实例；起新的前先收掉旧的，否则上一个转圈会永远停在屏幕上。
-static void DD_ShowLoading(NSString *text) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (gBusyToast) DD_HideLoading();
-        WeToast *toast = DD_Toast();
-        [toast setLoadingStyle:YES];
-        [toast showToastWithText:text];
-        gBusyToast = toast;
-    });
-}
-static void DD_ShowShellDone(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        DD_HideLoading();
-        [DD_Toast() showDoneToastWithText:@"套壳成功"];
-    });
-}
-// 方形带错误图标。loading 用的是同一个 WeToast 实例，先收起
-static void DD_ShowError(NSString *text) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        DD_HideLoading();
-        [DD_Toast() showErrorToastWithText:text];
-    });
-}
-static void DD_ShowToast(NSString *text) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [DD_Toast() showToastWithText:text];
-    });
-}
-
-// 套壳收尾：出结果时走这里，弹提示并还闸，调用方不必在每个分支各自判断
-static void DD_ShellFinish(BOOL success) {
-    if (success) DD_ShowShellDone();
-    else DD_ShowError(@"套壳失败");
-    DD_ShellEnd();
-}
-
-// 选完素材后的开工：闸已在按钮点击时抢到，这里只确认模板还在并转 loading；
-// 模板意外缺失时弹错并还闸（闸是入口抢的，漏还就会让之后自动套壳全废）
-static BOOL DD_ShellStart(DDShellTemplate *t) {
-    if (!t) { DD_ShowError(@"套壳失败"); DD_ShellEnd(); return NO; }
-    DD_ShowLoading(@"正在套壳…");
-    return YES;
-}
-
-@interface DDShellWatcher : NSObject <PHPhotoLibraryChangeObserver>
-+ (instancetype)shared;
-- (void)tryProcessLockedShot;
-@property (nonatomic, assign) BOOL ddWaitingShot;      // 有截屏待落地，等相册变化再取图
-@property (nonatomic, strong) PHAsset *ddLockedAsset;  // 落地后锁死的截图，处理完才清，不会再取到别的图
+@interface SilkAudioPlayer : NSObject
+- (BOOL)preparePlayWithFile:(NSString *)path sync:(BOOL)sync;
+- (void)playAtTime:(unsigned int)time;
+- (void)stop;
 @end
 
-@implementation DDShellWatcher
-
-+ (instancetype)shared {
-    static DDShellWatcher *instance;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ instance = [[self alloc] init]; });
-    return instance;
-}
-
-- (instancetype)init {
-    if (self = [super init]) {
-        [[NSNotificationCenter defaultCenter] addObserver:self
-                                                 selector:@selector(onScreenshot:)
-                                                     name:UIApplicationUserDidTakeScreenshotNotification
-                                                   object:nil];
-        // 监听相册变化：截图落地进库那一刻才触发取图，不再靠固定延迟去猜落地时机
-        [[PHPhotoLibrary sharedPhotoLibrary] registerChangeObserver:self];
-    }
-    return self;
-}
-
-- (void)dealloc {
-    [[PHPhotoLibrary sharedPhotoLibrary] unregisterChangeObserver:self];
-}
-
-- (void)onScreenshot:(NSNotification *)n {
-    if (![DDShellConfig shared].enabled || ![DDShellConfig shared].autoShell) return;
-    // 已有待处理（等落地或已锁图）就忽略：连续截屏只套一张，避免连拍
-    if (self.ddWaitingShot || self.ddLockedAsset) return;
-    self.ddWaitingShot = YES; // 只记意图，等截图真正落地进相册（photoLibraryDidChange）再取图
-}
-
-// 相册变化：截屏落地后取最新一张锁死，或手动任务刚存图时处理已锁的图
-- (void)photoLibraryDidChange:(PHChange *)changeInstance {
-    if (self.ddWaitingShot) {
-        self.ddWaitingShot = NO; // 落地了，先清意图再取图，避免同一张重复触发
-        DD_LatestImageAsset(^(PHAsset *asset) {
-            if (asset) { self.ddLockedAsset = asset; [self tryProcessLockedShot]; }
-        });
-        return;
-    }
-    [self tryProcessLockedShot]; // 无待落地意图，但有锁图在等闸释放（手动任务存图也会触发这里）
-}
-
-// 锁图后尝试套壳：抢到闸就处理并清锁图；抢不到（手动任务在跑）保留锁图，等闸释放后再来
-- (void)tryProcessLockedShot {
-    if (!self.ddLockedAsset) return;
-    if (![DDShellConfig shared].enabled || ![DDShellConfig shared].autoShell) { self.ddLockedAsset = nil; return; }
-    if (!DD_ShellTryBegin()) return; // 手动任务占闸：保留锁图，等它结束存图触发 change 时再抢
-    PHAsset *asset = self.ddLockedAsset;
-    self.ddLockedAsset = nil;        // 取出即清，防止重复处理
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        [self composeAndSaveScreenshotWithAsset:asset completion:^{
-            DD_ShellEnd();
-        }];
-    });
-}
-
-// 套一张已锁定的截图：合成后存相册，原图与成品都记去重，防同一张被重复套
-- (void)composeAndSaveScreenshotWithAsset:(PHAsset *)asset completion:(void (^)(void))completion {
-    DDShellTemplate *t = DD_ActiveTemplate();
-    if (!t || !asset) { completion(); return; }
-    if ([[DDShellConfig shared] hasProcessed:asset.localIdentifier]) { completion(); return; } // 去重
-    PHImageRequestOptions *ro = [PHImageRequestOptions new];
-    ro.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
-    ro.networkAccessAllowed = NO;
-    DD_ShowLoading(@"正在套壳…");
-    [[PHImageManager defaultManager] requestImageForAsset:asset
-                                             targetSize:PHImageManagerMaximumSize
-                                            contentMode:PHImageContentModeDefault
-                                                options:ro
-                                          resultHandler:^(UIImage *img, NSDictionary *info) {
-        // Photos 会先回调低质量预览、再回调最终高清版；这里只认最终版，跳过预览，避免拿空图误报失败
-        if ([info[PHImageResultIsDegradedKey] boolValue]) return;
-        UIImage *outImg = (img) ? DD_ComposeShellImage(img, t) : nil;
-        if (!outImg) { DD_ShowError(@"套壳失败"); completion(); return; }
-        // 成功提示必须等相册真正存好才弹，避免"存失败也报成功"；删除原图也只在成功分支做。
-        // 同时标记原图，防止删成品后它又变回"最新一张"被重复套。
-        DD_SaveImageToAlbum(outImg, ^(BOOL success, NSError *err) {
-            if (success) {
-                [[DDShellConfig shared] markProcessed:asset.localIdentifier];
-                if ([DDShellConfig shared].deleteOriginal) DD_DeleteAssets(@[asset]);
-                DD_ShowShellDone();
-            } else {
-                DD_ShowError(@"套壳失败");
-            }
-            completion();
-        });
-    }];
-}
-
+@interface BaseMsgContentViewController : UIViewController
+- (id)GetContact;
 @end
 
-#pragma mark - 导入导出
+@interface MMTipsViewController : UIViewController
+- (instancetype)initWithTitle:(NSString *)title message:(NSString *)message btnTitle:(NSString *)cancel handler:(id)cancelHandler btnTitle:(NSString *)ok handler:(id)okHandler;
+- (void)addTextViewWithMaxLen:(unsigned int)maxLen;
+- (id)getTextView;
+- (void)setTextFieldDefaultText:(NSString *)text;
+- (void)show;
+@end
 
-// 这两个类只为提供 selector 声明：objc_getClass() 的返回值是 Class 类型的接收者，
-// clang 要见到同名 selector 的声明才放行。实际取的是微信里的 QSSZipArchive，
-// 编译期不产生链接符号。
-@interface DDZipArchive : NSObject
+@interface MMPageSheetConfig : NSObject
+@property (nonatomic, retain) NSString *title;
+@property (nonatomic, assign) BOOL preferredCenterTitleAlignment;
+@property (nonatomic, assign) BOOL navHidden;
+@property (nonatomic, assign) BOOL isAllowTapBgMaskToClose;
+@property (nonatomic, assign) BOOL enableDragToClose;
+@property (nonatomic, retain) UIColor *titleColor;
+@property (nonatomic, retain) UIColor *navBarBackgroundColor;
+@property (nonatomic, retain) UIColor *contentBackgroundColor;
+@property (nonatomic, retain) UIColor *maskBackgroundColor;
+@property (nonatomic, retain) UIView *navBackButton;
+@property (nonatomic, retain) UIView *navLeftButton;
+@property (nonatomic, retain) UIView *navRightButton;
+@end
+
+@interface MMPageSheetAdapter : NSObject
++ (id)adapterWithViewController:(id)vc height:(double)height;
+- (void)setPageSheetConfig:(id)config;
+- (void)setDetailViewHeight:(double)h;
+@end
+
+@interface MMPageSheetContainerWindowController : UIViewController
+- (void)setupWithProvider:(id)provider;
+- (void)showPageSheetAnimated:(BOOL)animated parentView:(id)view parentViewController:(id)vc complete:(void (^)(void))block;
+- (void)dismissWithAnimated:(BOOL)animated completion:(void (^)(void))block;
+@end
+
+@interface WCTableViewManager : NSObject
+- (instancetype)initWithFrame:(CGRect)frame style:(UITableViewStyle)style;
+@property (nonatomic, readonly) UITableView *tableView;
+- (void)clearAllSection;
+- (void)addSection:(id)section;
+- (void)reloadTableView;
+- (id)getTableView;
+@end
+
+@interface WCTableViewSectionManager : NSObject
++ (id)sectionInfoHeader:(id)header;
++ (id)sectionInfoHeader:(id)header Footer:(id)footer;
+- (void)addCell:(id)cell;
+@end
+
+// 注意：normalCellForSel:... 的两组变体分散在两个类上，混用会 unrecognized selector：
+//   WCTableViewCellManager        -> title:detail:
+//   WCTableViewNormalCellManager  -> title:rightValue:accessoryType:
+@interface WCTableViewCellManager : NSObject
++ (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
++ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title detail:(id)detail;
+// 拿 manager 背后的真 cell 用这个。老代码里的 getCell 在 8.0.79 上已经没有了
+- (id)cell;
+@end
+
+@interface WCTableViewNormalCellManager : NSObject
++ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue accessoryType:(long long)type;
+@end
+
+// 注意：dump 出来的父类经常失真（MMUIButton、VoiceMessageCellView 都被写成 : NSObject，
+// 实际一个是 UIButton 子类、一个是 UIView 子类，从它们带着 setFrame:/intrinsicContentSize 能看出来）。
+// 所以下面该写 UIButton / UIViewController 的就照真实继承写，别照 dump 抄 NSObject。
+@interface MMUIButton : UIButton
+@end
+
+// 微信头文件里 MMMenuItem 直接继承 NSObject（不是 UIMenuItem），且没有 title 的 getter，
+// 所以识别菜单项一律走 userInfo 打标记，不要读 title（会 unrecognized selector）
+@interface MMMenuItem : NSObject
+@property (nonatomic, retain) id userInfo;
+- (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
+@end
+
+@interface VoiceMessageCellView : UIView
+- (id)getMediaWrap;
+- (id)getViewController;
+- (NSArray *)operationMenuItems;
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender;
+@end
+
+// 微信内的 zip 工具，编译期只提供 selector 声明，运行期 objc_getClass 取，不产生链接符号
+@interface DDVoicePackZipArchive : NSObject
 + (BOOL)createZipFileAtPath:(id)zipPath withContentsOfDirectory:(id)dir keepParentDirectory:(BOOL)keep;
 + (BOOL)unzipFileAtPath:(id)zipPath toDestination:(id)dest;
 @end
 
-// 同上：既当类型用，也给下面几个方法提供 selector 声明，
-// 实际取的是 UIDocumentPickerViewController
-@interface DDFilePicker : UIViewController
-- (instancetype)initWithDocumentTypes:(NSArray<NSString *> *)types inMode:(NSInteger)mode;
-@property (nonatomic) BOOL allowsMultipleSelection;
-@property (nonatomic, weak) id delegate;
-@end
-
-// 打包整个目录，zip 内保留该目录名
-static BOOL DD_ZipDirectory(NSString *srcDir, NSString *zipPath) {
+// 打包整个目录，zip 内保留该目录名（和 DD模板套壳一致）
+static BOOL DDVoicePackZipDirectory(NSString *srcDir, NSString *zipPath) {
     return [objc_getClass("QSSZipArchive") createZipFileAtPath:zipPath
                                       withContentsOfDirectory:srcDir
                                           keepParentDirectory:YES];
 }
 
 // 解包 zip 到目录
-static BOOL DD_UnzipToDirectory(NSString *zipPath, NSString *destDir) {
+static BOOL DDVoicePackUnzipToDirectory(NSString *zipPath, NSString *destDir) {
     return [objc_getClass("QSSZipArchive") unzipFileAtPath:zipPath toDestination:destDir];
 }
 
-// 递归找出所有合法模板目录：目录名与目录内的 <目录名>.png、<目录名>.cfg 三者齐备。
-// zip 内可能是 DDShell模板/xx/、xx/ 或别的层级，所以要下钻。
-static void DD_CollectTemplateFolders(NSString *dir, NSMutableArray<NSString *> *out) {
+// 临时目录：打包/解压的中间暂存，用 UUID 隔离避免互相污染
+static NSString *DDVoicePackTempRoot(void) {
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:[@"DDVoicePack_" stringByAppendingString:[NSUUID UUID].UUIDString]];
+}
+
+// ========== 配置管理 ==========
+
+// UserDefaults key
+static NSString * const kDDVoicePackEnabledKey = @"DDVoicePack_Enabled";
+static NSString * const kDDVoicePackKeepPanelKey = @"DDVoicePack_KeepPanelAfterSend";
+
+@interface DDVoicePackConfig : NSObject
++ (BOOL)enabled;
++ (void)setEnabled:(BOOL)on;
++ (BOOL)keepPanelAfterSend;
++ (void)setKeepPanelAfterSend:(BOOL)on;
+@end
+
+@implementation DDVoicePackConfig
+
++ (BOOL)enabled {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kDDVoicePackEnabledKey];
+}
++ (void)setEnabled:(BOOL)on {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kDDVoicePackEnabledKey];
+}
+
++ (BOOL)keepPanelAfterSend {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kDDVoicePackKeepPanelKey];
+}
++ (void)setKeepPanelAfterSend:(BOOL)on {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kDDVoicePackKeepPanelKey];
+}
+
+@end
+
+// ========== 辅助函数 ==========
+
+// 语音包根目录。放 Library 下：应用私有、不进 iCloud、不在文件 App 里暴露
+static NSString *DDVoicePackRootPath(void) {
+    NSString *library = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    return [[library stringByAppendingPathComponent:@"DDVoicePack"] stringByAppendingPathComponent:@"Voice"];
+}
+
+static NSString *DDVoicePackTrim(NSString *text) {
+    return [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+// 语音包只认 SILK。.silk 是标准扩展名，.aud 是微信缓存语音用的（同一个 SILK 容器）
+static BOOL DDVoicePackIsSilk(NSString *path) {
+    NSString *ext = [[path pathExtension] lowercaseString];
+    return [ext isEqualToString:@"silk"] || [ext isEqualToString:@"aud"];
+}
+
+// 列出一层目录：文件夹归 folders，SILK 文件归 files。
+// 跳过隐藏文件（.DS_Store 之类）和认不出的格式——列出来点了也是静默失败
+static void DDVoicePackListDirectory(NSString *dirPath, NSArray<NSString *> **outFolders, NSArray<NSString *> **outFiles) {
+    if (!dirPath.length) return;
+
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
-    for (NSString *item in items) {
-        if ([item hasPrefix:@"."] || [item isEqualToString:@"__MACOSX"]) continue;
-        NSString *p = [dir stringByAppendingPathComponent:item];
-        BOOL isDir = NO;
-        if (![fm fileExistsAtPath:p isDirectory:&isDir] || !isDir) continue;
-        if (DD_FileInFolder(p, item, @"png") && DD_FileInFolder(p, item, @"cfg")) {
-            [out addObject:p];
-        } else {
-            DD_CollectTemplateFolders(p, out);
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) return;
+
+    NSMutableArray *folders = [NSMutableArray array];
+    NSMutableArray *files = [NSMutableArray array];
+    for (NSString *name in [fm contentsOfDirectoryAtPath:dirPath error:nil]) {
+        if ([name hasPrefix:@"."]) continue;
+        NSString *full = [dirPath stringByAppendingPathComponent:name];
+        BOOL itemIsDir = NO;
+        if (![fm fileExistsAtPath:full isDirectory:&itemIsDir]) continue;
+        if (itemIsDir) {
+            [folders addObject:name];
+        } else if (DDVoicePackIsSilk(full)) {
+            [files addObject:name];
         }
     }
+    if (outFolders) *outFolders = [folders sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    if (outFiles) *outFiles = [files sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
 }
 
-// 递归收集 root 下所有普通文件（跳过隐藏项与 macOS 资源叉）
-static void DD_CollectFiles(NSString *dir, NSMutableArray<NSString *> *out) {
+static NSUInteger DDVoicePackFileCountIn(NSString *dirPath) {
+    NSArray *files = nil;
+    DDVoicePackListDirectory(dirPath, NULL, &files);
+    return files.count;
+}
+
+// 去掉首尾空白和 .silk 后缀，返回可当文件名的基名
+static NSString *DDVoicePackSanitizedName(NSString *raw) {
+    NSString *text = DDVoicePackTrim(raw);
+    NSString *lower = [text lowercaseString];
+    if ([lower hasSuffix:@".silk"]) {
+        text = DDVoicePackTrim([text substringToIndex:text.length - 5]);
+    }
+    return text.length ? text : nil;
+}
+
+// 去扩展名，重命名时当输入框的默认值
+static NSString *DDVoicePackBaseName(NSString *path) {
+    return [[path lastPathComponent] stringByDeletingPathExtension];
+}
+
+static NSArray<NSString *> *DDVoicePackSearchFiles(NSString *root, NSString *keyword) {
+    if (!keyword.length) return @[];
+    NSMutableArray *results = [NSMutableArray array];
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
-    for (NSString *item in items) {
-        if ([item hasPrefix:@"."] || [item isEqualToString:@"__MACOSX"]) continue;
-        NSString *p = [dir stringByAppendingPathComponent:item];
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:root];
+    NSString *relativePath = nil;
+    while ((relativePath = [enumerator nextObject])) {
+        NSString *fullPath = [root stringByAppendingPathComponent:relativePath];
         BOOL isDir = NO;
-        if (![fm fileExistsAtPath:p isDirectory:&isDir]) continue;
-        if (isDir) DD_CollectFiles(p, out); else [out addObject:p];
+        [fm fileExistsAtPath:fullPath isDirectory:&isDir];
+        if (isDir) continue;
+        if (!DDVoicePackIsSilk(fullPath)) continue;
+        if ([[relativePath lastPathComponent] rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            [results addObject:fullPath];
+        }
     }
+    return [results sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
 }
 
-// 把一整个模板目录装进模板根目录
-static BOOL DD_InstallTemplateFolder(NSString *src) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *dst = DD_TplFolder(src.lastPathComponent);
-    if ([fm fileExistsAtPath:dst]) [fm removeItemAtPath:dst error:nil]; // 同名则覆盖
-    return [fm copyItemAtPath:src toPath:dst error:nil];
+static id DDVoicePackThemeManager(void) {
+    // 微信内部类一律用 objc_getClass 拿，直接写类名会让链接器找符号
+    Class ctxCls = objc_getClass("MMContext");
+    id context = [ctxCls activeUserContext] ?: [ctxCls rootContext];
+    return [context getService:objc_getClass("MMThemeManager")];
 }
 
-// 散装文件导入：按文件名（去扩展名）把 png 与 cfg 配对，每对建一个模板目录
-static NSInteger DD_ImportLooseFiles(NSArray<NSString *> *files) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSMutableDictionary<NSString *, NSMutableDictionary *> *pairs = [NSMutableDictionary dictionary];
-    for (NSString *f in files) {
-        NSString *base = f.lastPathComponent.stringByDeletingPathExtension;
-        NSString *ext  = f.pathExtension.lowercaseString;
-        if (!base.length) continue;
-        // 名字直接当目录名用：. 和 .. 会指到别的目录，覆盖同名时连上级一起删掉
-        if ([base isEqualToString:@"."] || [base isEqualToString:@".."]) continue;
-        if (![ext isEqualToString:@"png"] && ![ext isEqualToString:@"cfg"]) continue;
-        NSMutableDictionary *d = pairs[base] ?: [NSMutableDictionary dictionary];
-        d[ext] = f;
-        pairs[base] = d;
+static UIWindow *DDVoicePackKeyWindow(void) {
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.isKeyWindow) return window;
+        }
     }
-    NSInteger n = 0;
-    for (NSString *base in pairs) {
-        NSDictionary *d = pairs[base];
-        if (!d[@"png"] || !d[@"cfg"]) continue; // 单有 png 或单有 cfg 不成模板
-        NSString *dst = DD_TplFolder(base);
-        [fm removeItemAtPath:dst error:nil];
-        if (![fm createDirectoryAtPath:dst withIntermediateDirectories:YES attributes:nil error:nil]) continue;
-        [fm copyItemAtPath:d[@"png"] toPath:[dst stringByAppendingPathComponent:[base stringByAppendingPathExtension:@"png"]] error:nil];
-        [fm copyItemAtPath:d[@"cfg"] toPath:[dst stringByAppendingPathComponent:[base stringByAppendingPathExtension:@"cfg"]] error:nil];
-        n++;
-    }
-    return n;
-}
-
-// 把 root 下所有模板搬进模板根目录，返回成功数量
-static NSInteger DD_ImportTemplatesFrom(NSString *root) {
-    NSMutableArray<NSString *> *folders = [NSMutableArray array];
-    DD_CollectTemplateFolders(root, folders);
-    NSInteger n = 0;
-    for (NSString *src in folders) {
-        if (DD_InstallTemplateFolder(src)) n++;
-    }
-    if (!n) { // 没有整目录的，按散装 png + cfg 配对再试一次
-        NSMutableArray<NSString *> *files = [NSMutableArray array];
-        DD_CollectFiles(root, files);
-        n = DD_ImportLooseFiles(files);
-    }
-    return n;
-}
-
-// 把指定模板打包成一个 zip，返回 zip 路径（打包失败返回 nil）
-static NSString *DD_ExportTemplatesToZip(NSArray<NSString *> *names) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *tmp   = [DD_TempRoot() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
-    NSString *stage = [tmp stringByAppendingPathComponent:@"DDShell模板"];
-    [fm createDirectoryAtPath:stage withIntermediateDirectories:YES attributes:nil error:nil];
-    for (NSString *name in names) {
-        [fm copyItemAtPath:DD_TplFolder(name) toPath:[stage stringByAppendingPathComponent:name] error:nil];
-    }
-    NSString *zip = [tmp stringByAppendingPathComponent:@"DDShell_套壳模板.zip"];
-    if (DD_ZipDirectory(stage, zip)) return zip;
-    [fm removeItemAtPath:tmp error:nil]; // 打包失败，临时暂存目录回收（调用方提前 return 来不及清）
     return nil;
 }
 
-#pragma mark - 套壳素材库
-
-// 微信原生弹窗（运行时按类名取，编译期不产生链接符号）。
-// 按钮回调一律用无参 selector：微信调用时带不带参数不确定，无参声明收不到也安全。
-// 按钮靠不同 selector 区分；输入框内容用 getTextFieldText 从存下来的实例里取。
-@interface WCUIAlertView : NSObject
-- (instancetype)initWithTitle:(id)title message:(id)message;
-- (void)addBtnTitle:(id)title target:(id)target sel:(SEL)sel;
-- (void)setTextFieldDefaultText:(id)text;
-- (void)showTextFieldWithMaxLen:(unsigned int)len;
-- (void)show;
-- (id)getTextFieldText;
-@end
-
-// 两个 sheet 的 tag：套壳操作 / 选择导出方式
-static const NSInteger DD_SHEET_TPL    = 0x5e9d;
-static const NSInteger DD_SHEET_EXPORT = 0x5ea1;
-
-// 网格排布：列数与间距
-static const NSInteger kDDShellTplColumns = 2;
-static const CGFloat   kDDShellTplGap     = 10.0;
-static const CGFloat   kDDShellSearchH    = 44.0;
-
-// 格子边长：页面宽减去首尾间距后按列数平分（缩略图是正方形）
-static CGFloat DD_CellSide(UICollectionView *cv) {
-    CGFloat gap = kDDShellTplGap;
-    return floor((cv.bounds.size.width - gap * (kDDShellTplColumns + 1)) / kDDShellTplColumns);
-}
-
-// 缩略图缓存：模板 png 是全尺寸图，每格都整图解一次码滚动会卡，按格子边长解码一次后缓存
-static NSCache *DD_ThumbCache(void) {
-    static NSCache *cache;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        cache = [[NSCache alloc] init];
-        cache.countLimit = 80;
-        // 条数之外再卡一层字节数：80 条全占满约 93MB，64MB 够铺好几屏，峰值压得住。
-        // （NSCache 本身会在系统内存告警时自动清空，这里只是让平时也不至于堆那么高。）
-        cache.totalCostLimit = 64 * 1024 * 1024;
-    });
-    return cache;
-}
-
-// key = 模板名 + 格子边长。用名字就够：模板路径本来就是按名字拼出来的，
-// 名字一变路径必然跟着变，不存在“同名不同路径”。
-static NSString *DD_ThumbKey(NSString *name, CGFloat side) {
-    return (name.length && side > 0) ? [NSString stringWithFormat:@"%@|%d", name, (int)side] : nil;
-}
-
-// 清空缩略图缓存：导入同名模板是整目录覆盖，png 换了新图但路径一字未变、key 也完全
-// 一样，不清缓存格子会继续显示上一张缩略图。改名 / 删除时 key 跟着变（不会串图），
-// 但旧条目白占内存，一并清掉。
-static void DD_ThumbCachePurge(void) {
-    [DD_ThumbCache() removeAllObjects];
-}
-
-// 只查缓存，读不到就返回 nil：主线程调这个，不解码
-static UIImage *DD_CachedThumb(NSString *name, CGFloat side) {
-    NSString *key = DD_ThumbKey(name, side);
-    return key ? [DD_ThumbCache() objectForKey:key] : nil;
-}
-
-// 生成缩略图并进缓存：会解整张 png，只在后台线程调
-static UIImage *DD_ThumbForName(NSString *name, CGFloat side) {
-    NSString *key = DD_ThumbKey(name, side);
-    if (!key) return nil;
-
-    UIImage *hit = [DD_ThumbCache() objectForKey:key];
-    if (hit) return hit;
-
-    UIImage *src = [UIImage imageWithContentsOfFile:DD_ActualFile(name, @"png")];
-    if (!src || src.size.width <= 0 || src.size.height <= 0) return nil;
-
-    CGFloat rate = MIN(side / src.size.width, side / src.size.height); // 等比缩放
-    CGSize draw = CGSizeMake(src.size.width * rate, src.size.height * rate);
-    UIGraphicsBeginImageContextWithOptions(CGSizeMake(side, side), NO, [UIScreen mainScreen].scale);
-    [src drawInRect:CGRectMake((side - draw.width) / 2, (side - draw.height) / 2, draw.width, draw.height)];
-    UIImage *out = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    // cost 必须显式给：totalCostLimit 只对 setObject:forKey:cost: 的条目起作用，
-    // 不传 cost（默认 0）的话上面那条上限形同虚设。按位图实际占的字节算：
-    // 画布是 side×side（pt），乘屏幕 scale 得像素边长，再乘 4 字节（RGBA）。
-    if (out) {
-        NSUInteger px = (NSUInteger)(side * [UIScreen mainScreen].scale + 0.5);
-        [DD_ThumbCache() setObject:out forKey:key cost:px * px * 4];
+static UIViewController *DDVoicePackTopVC(void) {
+    UIViewController *top = DDVoicePackKeyWindow().rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if ([top isKindOfClass:[UINavigationController class]]) {
+        return [(UINavigationController *)top topViewController];
     }
-    return out;
+    if ([top isKindOfClass:[UITabBarController class]]) {
+        UIViewController *selected = [(UITabBarController *)top selectedViewController];
+        if ([selected isKindOfClass:[UINavigationController class]]) return [(UINavigationController *)selected topViewController];
+        return selected;
+    }
+    return top;
 }
 
-// 素材格：上图片下名字，选中时整格描边；右上角小角标只在勾选态出现
-@interface DDShellTplCell : UICollectionViewCell
-@property (nonatomic, strong) UIImageView *thumbView;
-@property (nonatomic, strong) UILabel *nameLabel;
-@property (nonatomic, strong) UIView *markView;
-@property (nonatomic, strong) UILabel *checkLabel;
+// 发送一条语音（实现见「音频处理与发送」区，这里提前声明给面板用）
+static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId);
+
+// ========== 语音预览 ==========
+
+// 试听只走微信的 SilkAudioPlayer，挂在宿主上，下次播放前先停掉上一个
+static const void *kDDVoicePackPreviewPlayerKey = &kDDVoicePackPreviewPlayerKey;
+
+static void DDVoicePackStopPreview(id owner) {
+    if (!owner) return;
+    SilkAudioPlayer *player = objc_getAssociatedObject(owner, kDDVoicePackPreviewPlayerKey);
+    [player stop];
+    objc_setAssociatedObject(owner, kDDVoicePackPreviewPlayerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void DDVoicePackPlayPreview(id owner, NSString *path) {
+    if (!DDVoicePackIsSilk(path)) return;
+
+    DDVoicePackStopPreview(owner);
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
+
+    Class cls = objc_getClass("SilkAudioPlayer");
+    if (!cls) return;
+    SilkAudioPlayer *player = [[cls alloc] init];
+    [player preparePlayWithFile:path sync:NO];
+    [player playAtTime:0];
+    objc_setAssociatedObject(owner, kDDVoicePackPreviewPlayerKey, player, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// ========== 输入弹窗桥接 ==========
+
+// 桥接对象挂在 tipsVC 上保活
+static const void *kDDVoicePackInputBridgeKey = &kDDVoicePackInputBridgeKey;
+
+// MMTipsViewController 的回调是 init 参数，block 里还要回头读输入框，
+// 直接捕获 tipsVC 会形成 retain 环。桥接对象被 tipsVC 关联持有、弱引用 tipsVC，
+// block 再捕获桥接对象，环就断了。
+@interface DDVoicePackInputBridge : NSObject
+@property (nonatomic, weak) id tipsVC;
+@property (nonatomic, copy) void (^onCommit)(NSString *text);
+@property (nonatomic, copy) void (^onCancel)(void);
 @end
 
-@implementation DDShellTplCell
+@implementation DDVoicePackInputBridge
 
-- (instancetype)initWithFrame:(CGRect)frame {
-    if (self = [super initWithFrame:frame]) {
-        UIColor *bg = [UIColor secondarySystemGroupedBackgroundColor]; // 灰页面上格子用白色，层次才对
-        UIColor *fg = [UIColor labelColor];
-        self.contentView.backgroundColor = bg;
-        self.contentView.layer.cornerRadius = 8.0;
-        self.contentView.layer.masksToBounds = YES;
+- (void)ddvp_commit {
+    if (!self.onCommit) return;
+    UITextView *textView = [self.tipsVC getTextView];
+    self.onCommit(textView.text ?: @"");
+}
+- (void)ddvp_cancel {
+    if (self.onCancel) self.onCancel();
+}
 
-        _thumbView = [[UIImageView alloc] initWithFrame:CGRectZero];
-        _thumbView.contentMode = UIViewContentModeScaleAspectFit;
-        _thumbView.clipsToBounds = YES;
-        [self.contentView addSubview:_thumbView];
+@end
 
-        _nameLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-        _nameLabel.font = [UIFont systemFontOfSize:12.0];
-        _nameLabel.textColor = fg;
-        _nameLabel.textAlignment = NSTextAlignmentCenter;
-        _nameLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        [self.contentView addSubview:_nameLabel];
+// 弹一个带输入框的提示框，确定时把输入文本交给 onCommit，取消时走 onCancel
+static void DDVoicePackShowInput(NSString *title,
+                                 NSString *message,
+                                 NSString *defaultText,
+                                 void (^onCommit)(NSString *text),
+                                 void (^onCancel)(void)) {
+    Class tipsCls = objc_getClass("MMTipsViewController");
+    if (!tipsCls) return;
 
-        _markView = [[UIView alloc] initWithFrame:CGRectZero];
-        _markView.layer.borderWidth = 2.5;
-        _markView.layer.cornerRadius = 8.0;
-        _markView.hidden = YES;
-        [self.contentView addSubview:_markView];
+    DDVoicePackInputBridge *bridge = [[DDVoicePackInputBridge alloc] init];
+    bridge.onCommit = onCommit;
+    bridge.onCancel = onCancel;
 
-        _checkLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-        _checkLabel.text = @"✓";
-        _checkLabel.font = [UIFont boldSystemFontOfSize:14.0];
-        _checkLabel.textColor = [UIColor whiteColor];
-        _checkLabel.textAlignment = NSTextAlignmentCenter;
-        _checkLabel.backgroundColor = [UIColor systemBlueColor];
-        _checkLabel.layer.cornerRadius = 9.0;
-        _checkLabel.layer.masksToBounds = YES;
-        _checkLabel.hidden = YES;
-        [self.contentView addSubview:_checkLabel];
+    id tipsVC = [[tipsCls alloc] initWithTitle:title
+                                       message:message
+                                      btnTitle:@"取消"
+                                       handler:^{ [bridge ddvp_cancel]; }
+                                      btnTitle:@"确定"
+                                       handler:^{ [bridge ddvp_commit]; }];
+    bridge.tipsVC = tipsVC;
+    objc_setAssociatedObject(tipsVC, kDDVoicePackInputBridgeKey, bridge, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [tipsVC addTextViewWithMaxLen:128];
+    [tipsVC setTextFieldDefaultText:defaultText ?: @""];
+    [tipsVC show];
+}
+
+// ========== 语音包列表面板 ==========
+
+// 面板高度 = 屏高 * 该比例
+static const CGFloat kDDVoicePackSheetHeightRatio = 0.5;
+
+// 搜索防抖间隔（秒）：逐字符递归整个语音包目录太重
+static const NSTimeInterval kDDVoicePackSearchDebounce = 0.3;
+
+// 面板相关：container 挂 fromVC（关面板时从它身上取），adapter / config 挂 nav
+static const void *kDDVoicePackSheetContainerKey = &kDDVoicePackSheetContainerKey;
+static const void *kDDVoicePackSheetFromVCKey = &kDDVoicePackSheetFromVCKey;
+static const void *kDDVoicePackSheetAdapterKey = &kDDVoicePackSheetAdapterKey;
+static const void *kDDVoicePackSheetConfigKey = &kDDVoicePackSheetConfigKey;
+// cell manager 上挂它对应的文件 / 目录路径
+static const void *kDDVoicePackCellPathKey = &kDDVoicePackCellPathKey;
+
+// 当前面板的宿主 VC（关面板要通知它），以及待纳入的语音路径
+static __weak UIViewController *gDDVoicePackSheetHostVC = nil;
+static NSString *gDDVoicePackPendingImportPath = nil;
+
+@interface DDVoicePackListController : UIViewController <UISearchBarDelegate>
+@property (nonatomic, strong) WCTableViewManager *tableViewMgr;
+@property (nonatomic, strong) UISearchBar *searchBar;
+@property (nonatomic, copy) NSString *directoryPath;
+@property (nonatomic, copy) NSArray<NSString *> *folderPaths;
+@property (nonatomic, copy) NSArray<NSString *> *filePaths;
+@property (nonatomic, copy) NSArray<NSString *> *searchResults;
+@property (nonatomic, assign, getter=isSearching) BOOL searching;
+@property (nonatomic, strong) id tableProxy;
+
++ (void)ddvp_setPendingImportPath:(NSString *)path;
++ (NSString *)ddvp_pendingImportPath;
++ (void)ddvp_clearPendingImportPath;
++ (void)ddvp_closeSheetIfNeeded;
++ (void)ddvp_presentFromViewController:(UIViewController *)fromVC;
+
+- (void)ddvp_reloadData;
+- (void)ddvp_syncSheetNavigationBar;
+- (void)ddvp_updatePlusButton;
+- (UIButton *)ddvp_plusButton;
+
+// 以下供 DDVoicePackTableProxy 回调
+- (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath;
+- (BOOL)ddvp_swipeAllowedAtIndexPath:(NSIndexPath *)indexPath;
+- (BOOL)ddvp_rowCanPreviewAtIndexPath:(NSIndexPath *)indexPath;
+- (void)ddvp_previewItemAtIndexPath:(NSIndexPath *)indexPath;
+- (void)ddvp_deleteItemAtIndexPath:(NSIndexPath *)indexPath;
+- (void)ddvp_renameItemAtIndexPath:(NSIndexPath *)indexPath;
+
+@end
+
+// ========== 表格代理转发 ==========
+
+// WCTableViewManager 自己就是 tableView 的 delegate，这里插一层代理只为吃下左滑相关回调
+// 代理自己接管的回调（左滑相关），其余全部转发给微信原来的 delegate
+static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
+    return sel_isEqual(aSelector, @selector(tableView:canEditRowAtIndexPath:)) ||
+           sel_isEqual(aSelector, @selector(tableView:editingStyleForRowAtIndexPath:)) ||
+           sel_isEqual(aSelector, @selector(tableView:commitEditingStyle:forRowAtIndexPath:)) ||
+           sel_isEqual(aSelector, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:));
+}
+
+@interface DDVoicePackTableProxy : NSObject <UITableViewDelegate, UITableViewDataSource>
+@property (nonatomic, weak) id forwardTarget;
+@property (nonatomic, weak) DDVoicePackListController *host;
+@end
+
+@implementation DDVoicePackTableProxy
+
+- (id)forwardingTargetForSelector:(SEL)aSelector {
+    if (DDVoicePackProxyOwnsSelector(aSelector)) return self;
+    return self.forwardTarget;
+}
+
+- (BOOL)respondsToSelector:(SEL)aSelector {
+    if (DDVoicePackProxyOwnsSelector(aSelector)) return YES;
+    return [self.forwardTarget respondsToSelector:aSelector];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return ((NSInteger (*)(id, SEL, UITableView *, NSInteger))objc_msgSend)(self.forwardTarget, _cmd, tableView, section);
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    return ((UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
+}
+
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
+    if ([self.host ddvp_swipeAllowedAtIndexPath:indexPath]) return YES;
+    return ((BOOL (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
+}
+
+- (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if ([self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
+        return [self.host ddvp_rowCanPreviewAtIndexPath:indexPath] ? UITableViewCellEditingStyleNone : UITableViewCellEditingStyleDelete;
+    }
+    return ((UITableViewCellEditingStyle (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
+}
+
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (style == UITableViewCellEditingStyleDelete && [self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
+        if (![self.host ddvp_rowCanPreviewAtIndexPath:indexPath]) [self.host ddvp_deleteItemAtIndexPath:indexPath];
+        return;
+    }
+    ((void (*)(id, SEL, UITableView *, UITableViewCellEditingStyle, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, style, indexPath);
+}
+
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (![self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
+        return ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
+    }
+
+    __weak typeof(self.host) weakHost = self.host;
+    UIContextualAction *deleteAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction *action, UIView *sourceView, void (^done)(BOOL)) {
+        [weakHost ddvp_deleteItemAtIndexPath:indexPath];
+        done(YES);
+    }];
+    UIContextualAction *renameAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"重命名" handler:^(UIContextualAction *action, UIView *sourceView, void (^done)(BOOL)) {
+        [weakHost ddvp_renameItemAtIndexPath:indexPath];
+        done(YES);
+    }];
+
+    NSArray *actions = @[deleteAction, renameAction];
+    BOOL fullSwipe = YES;
+    if ([self.host ddvp_rowCanPreviewAtIndexPath:indexPath]) {
+        UIContextualAction *previewAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"试听" handler:^(UIContextualAction *action, UIView *sourceView, void (^done)(BOOL)) {
+            [weakHost ddvp_previewItemAtIndexPath:indexPath];
+            done(YES);
+        }];
+        previewAction.backgroundColor = [UIColor systemBlueColor];
+        actions = @[deleteAction, renameAction, previewAction];
+        fullSwipe = NO;
+    }
+    UISwipeActionsConfiguration *config = [UISwipeActionsConfiguration configurationWithActions:actions];
+    config.performsFirstActionWithFullSwipe = fullSwipe;
+    return config;
+}
+
+@end
+
+// ========== UIViewController 分类（关闭面板） ==========
+
+@interface UIViewController (DDVoicePackSheet)
+- (void)ddvp_dismissVoicePackSheet;
+@end
+
+@implementation UIViewController (DDVoicePackSheet)
+
+- (void)ddvp_dismissVoicePackSheet {
+    id container = objc_getAssociatedObject(self, kDDVoicePackSheetContainerKey);
+    if (!container) return;
+    // 试听的声音由列表页 viewWillDisappear 里停，这里只管关面板
+    [container dismissWithAnimated:YES completion:nil];
+    objc_setAssociatedObject(self, kDDVoicePackSheetContainerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gDDVoicePackSheetHostVC = nil;
+}
+
+@end
+
+// ========== UINavigationController 分类（面板返回） ==========
+
+@interface UINavigationController (DDVoicePackSheet)
+- (void)ddvp_voicePackBack:(id)sender;
+@end
+
+@implementation UINavigationController (DDVoicePackSheet)
+
+- (void)ddvp_voicePackBack:(id)sender {
+    if (self.viewControllers.count > 1) {
+        [self popViewControllerAnimated:YES];
+        return;
+    }
+    UIViewController *host = objc_getAssociatedObject(self, kDDVoicePackSheetFromVCKey);
+    [host ddvp_dismissVoicePackSheet];
+}
+
+@end
+
+// ========== 语音包列表面板实现 ==========
+
+@implementation DDVoicePackListController
+
+// ---- 类方法 ----
+
++ (void)ddvp_setPendingImportPath:(NSString *)path {
+    gDDVoicePackPendingImportPath = [path copy];
+}
++ (NSString *)ddvp_pendingImportPath {
+    return gDDVoicePackPendingImportPath;
+}
++ (void)ddvp_clearPendingImportPath {
+    gDDVoicePackPendingImportPath = nil;
+}
++ (void)ddvp_closeSheetIfNeeded {
+    if ([DDVoicePackConfig keepPanelAfterSend]) return;
+    [gDDVoicePackSheetHostVC ddvp_dismissVoicePackSheet];
+}
+
++ (void)ddvp_presentFromViewController:(UIViewController *)fromVC {
+    if (!fromVC) return;
+
+    DDVoicePackListController *listVC = [[DDVoicePackListController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:listVC];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+
+    CGFloat sheetHeight = [UIScreen mainScreen].bounds.size.height * kDDVoicePackSheetHeightRatio;
+    Class adapterCls = objc_getClass("MMPageSheetAdapter");
+    id adapter = adapterCls ? [adapterCls adapterWithViewController:nav height:sheetHeight] : nil;
+    if (!adapter) {
+        // MMPageSheet 不可用时退回系统弹窗，至少面板还能打开
+        [fromVC presentViewController:nav animated:YES completion:nil];
+        return;
+    }
+
+    Class configCls = objc_getClass("MMPageSheetConfig");
+    MMPageSheetConfig *config = [[configCls alloc] init];
+    config.title = @"语音包管理";
+    config.preferredCenterTitleAlignment = YES;
+    config.navHidden = NO;
+    config.isAllowTapBgMaskToClose = YES;
+    config.enableDragToClose = YES;
+    config.navBarBackgroundColor = [UIColor systemBackgroundColor];
+    config.titleColor = [UIColor labelColor];
+    config.contentBackgroundColor = [UIColor systemBackgroundColor];
+    config.maskBackgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
+
+    UIColor *btnColor = [UIColor labelColor];
+    id themeManager = DDVoicePackThemeManager();
+
+    UIButton *backBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    backBtn.frame = CGRectMake(0, 0, 44, 44);
+    [backBtn setImage:[themeManager svgImageNamed:@"arrow_left_regular" color:btnColor] forState:UIControlStateNormal];
+    [backBtn addTarget:nav action:@selector(ddvp_voicePackBack:) forControlEvents:UIControlEventTouchUpInside];
+    config.navBackButton = backBtn;
+    config.navLeftButton = backBtn;
+    config.navRightButton = [listVC ddvp_plusButton];
+
+    objc_setAssociatedObject(nav, kDDVoicePackSheetFromVCKey, fromVC, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(nav, kDDVoicePackSheetAdapterKey, adapter, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(nav, kDDVoicePackSheetConfigKey, config, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    nav.navigationBarHidden = YES;
+
+    [adapter setPageSheetConfig:config];
+    [adapter setDetailViewHeight:sheetHeight];
+
+    Class containerCls = objc_getClass("MMPageSheetContainerWindowController");
+    id container = [[containerCls alloc] init];
+    // container 只挂 fromVC：关面板时是从 fromVC 上取的
+    objc_setAssociatedObject(fromVC, kDDVoicePackSheetContainerKey, container, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [container setupWithProvider:adapter];
+    [container showPageSheetAnimated:YES parentView:nil parentViewController:fromVC complete:nil];
+    gDDVoicePackSheetHostVC = fromVC;
+}
+
+// ---- 生命周期 ----
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        _tableViewMgr = [[objc_getClass("WCTableViewManager") alloc] initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
+        _folderPaths = @[];
+        _filePaths = @[];
+        _searchResults = @[];
     }
     return self;
 }
 
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    CGSize s = self.contentView.bounds.size;
-    CGFloat nameH = 20.0;
-    self.thumbView.frame = CGRectMake(0, 0, s.width, s.height - nameH);
-    self.nameLabel.frame = CGRectMake(4.0, s.height - nameH, s.width - 8.0, nameH);
-    self.markView.frame = self.contentView.bounds;
-    self.checkLabel.frame = CGRectMake(s.width - 24.0, 4.0, 18.0, 18.0);
-}
-
-@end
-
-// 分组底色：取设置页 tableView 的底色，两页同源，微信换主题时一起变
-static UIColor *DD_GroupBackgroundColor = nil;
-
-// 导航栏底边：全屏布局下就是 view.safeAreaInsets.top（状态栏 + 导航栏）
-static CGFloat DD_TopUnderNavBar(UIView *view) {
-    return view.safeAreaInsets.top;
-}
-
-// 导航栏外观不碰：微信自己实现整套导航栏（背景、标题、返回箭头、转场渲染），
-// 不走 UIKit 的 UINavigationBarAppearance。
-
-// 素材库页面：双排网格列出模板，右上角常驻 导入 / 导出，单击即设为当前生效模板。
-// 长按弹出操作菜单（使用 / 重命名 / 选择·多选 / 删除）；点「导出」可整包或勾选导出。
-@interface DDShellLibraryViewController : UIViewController <UICollectionViewDelegate, UICollectionViewDataSource, UICollectionViewDelegateFlowLayout, UISearchBarDelegate>
-@property (nonatomic, strong) UISearchBar *searchBar;           // 贴在 view 顶上的搜索框
-@property (nonatomic, strong) UICollectionView *collectionView;
-@property (nonatomic, strong) NSArray<NSString *> *allNames;    // 排序后的全量，搜索只是过滤展示
-@property (nonatomic, strong) NSArray<NSString *> *names;       // 当前展示（可能是过滤结果）
-@property (nonatomic) BOOL isSelectMode;                        // 是否处于选择态
-@property (nonatomic, strong) NSMutableSet<NSString *> *picked; // 选择态下勾选的模板
-@property (nonatomic, copy) NSString *tappedTpl;                // 刚弹出操作菜单的那个模板
-@property (nonatomic, copy) NSString *activeName;               // 当前生效的模板，列表刷新时算一次（每格现算会各解码一次全尺寸 png）
-@property (nonatomic, strong) WCUIAlertView *renameAlert;       // 正在弹的重命名框，回调里取输入框内容用
-@property (nonatomic, copy) NSString *renamingName;             // 正在改名的模板原名
-@property (nonatomic, strong) NSArray<NSString *> *pendingDelete; // 删除确认框待删的模板
-@end
-
-@implementation DDShellLibraryViewController
-
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.picked = [NSMutableSet set];
+    self.view.backgroundColor = [UIColor systemBackgroundColor];
+    // 面板自带导航栏（MMPageSheetConfig），这里只在非面板形态下补个标题
+    if (!objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey)) {
+        self.title = @"语音包管理";
+    }
 
-    // 保持默认全屏布局，导航栏底边在 viewDidLayoutSubviews 里按 safeAreaInsets.top 量。
-    // 不用 edgesForExtendedLayout = UIRectEdgeNone：它靠改 view 的 safeAreaInsets 实现，
-    // 和微信 Coordinator 转场时改的是同一块状态。
+    self.searchBar = [[UISearchBar alloc] init];
+    self.searchBar.delegate = self;
+    self.searchBar.placeholder = @"搜索语音包";
+    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
+    self.searchBar.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.searchBar];
 
-    self.view.backgroundColor = DD_GroupBackgroundColor;
+    UITableView *tableView = [self.tableViewMgr getTableView];
+    tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:tableView];
 
-    [self setupSearchBar];
-    [self setupCollectionView];
-    [self setupNavigationBar];
-    [self reloadList];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.searchBar.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [self.searchBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.searchBar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [tableView.topAnchor constraintEqualToAnchor:self.searchBar.bottomAnchor],
+        [tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
+    ]];
 }
 
-// 搜索条自己贴在 view 顶上：挂 navigationItem.searchController 会把导航栏撑高。
-// minimal 样式没有自带的灰底和分隔线，四周透出页面底色，和导航栏连成一片。
-- (void)setupSearchBar {
-    UISearchBar *sb = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, kDDShellSearchH)];
-    sb.placeholder = @"搜索套壳名称";
-    sb.delegate = self;
-    sb.searchBarStyle = UISearchBarStyleMinimal;
-    sb.searchTextField.backgroundColor = [UIColor secondarySystemBackgroundColor]; // 输入框本身是白的
-    self.searchBar = sb;
-    [self.view addSubview:sb];
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self ddvp_reloadData];
+    [self ddvp_syncSheetNavigationBar];
+    [self ddvp_updatePlusButton];
 }
 
-- (void)setupCollectionView {
-    UICollectionViewFlowLayout *layout = [[UICollectionViewFlowLayout alloc] init];
-    layout.minimumInteritemSpacing = kDDShellTplGap;
-    layout.minimumLineSpacing = kDDShellTplGap;
-    layout.sectionInset = UIEdgeInsetsMake(kDDShellTplGap, kDDShellTplGap, kDDShellTplGap, kDDShellTplGap);
-
-    // frame 交给 viewDidLayoutSubviews，这里先零尺寸占位
-    UICollectionView *cv = [[UICollectionView alloc] initWithFrame:CGRectZero collectionViewLayout:layout];
-    cv.backgroundColor = [UIColor clearColor]; // 透明，透出页面底色
-    cv.alwaysBounceVertical = YES;
-    // 一滚列表就收起搜索键盘（OnDrag = 开始拖动立刻收，干脆）
-    cv.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
-    cv.delegate = self;
-    cv.dataSource = self;
-    [cv registerClass:[DDShellTplCell class] forCellWithReuseIdentifier:@"DDShellTplCell"];
-
-    // 长按唤出「套壳操作」菜单（使用模板 / 重命名 / 选择·多选 / 删除此模板）；
-    // 单击则由 didSelectItemAtIndexPath 直接把该模板设为当前生效。
-    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
-                                        initWithTarget:self action:@selector(onLongPressTpl:)];
-    lp.minimumPressDuration = 0.5;                 // 系统默认时长，与常见“长按唤菜单”一致
-    [cv addGestureRecognizer:lp];
-
-    // 点列表任意位置（格子、格子间空白都算）收起搜索键盘。
-    // cancelsTouchesInView 必须设 NO：默认 YES 会在手势成立后取消整条 touch 序列，
-    // collectionView 就再也收不到这次点击，didSelectItemAtIndexPath 不触发（点不动模板）。
-    UITapGestureRecognizer *tp = [[UITapGestureRecognizer alloc]
-                                  initWithTarget:self action:@selector(onTapList:)];
-    tp.cancelsTouchesInView = NO;
-    [cv addGestureRecognizer:tp];
-
-    self.collectionView = cv;
-    [self.view addSubview:cv];
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    DDVoicePackStopPreview(self);
+    [self.searchBar resignFirstResponder];
 }
 
-// 搜索条压在最上面，网格从它底下铺满剩余空间
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    CGFloat top = DD_TopUnderNavBar(self.view);
-    CGFloat w = self.view.bounds.size.width;
-    CGFloat h = self.view.bounds.size.height;
-    self.searchBar.frame = CGRectMake(0, top, w, kDDShellSearchH);
-    self.collectionView.frame = CGRectMake(0, top + kDDShellSearchH, w, h - top - kDDShellSearchH);
+// ---- 目录与数据 ----
+
+- (NSString *)ddvp_currentDirectory {
+    return self.directoryPath.length ? self.directoryPath : DDVoicePackRootPath();
 }
 
-// 返回按钮不自定义：箭头由微信 Coordinator 的 defaultBackIndicator 生成，
-// 前提是 push 走微信自己的 PushViewController:animated:。自定义 leftBarButtonItem
-// 还会让边缘侧滑返回失效。
-
-// 默认按名称排序（本地化、数字感知：「模板2」排在「模板10」前面）
-- (void)reloadList {
-    NSMutableArray *all = [DD_AllTemplateNames() mutableCopy];
-    [all sortUsingSelector:@selector(localizedStandardCompare:)];
-    self.allNames = all;
-    self.activeName = DD_ActiveTemplateName();
-    [self applySearchFilter];
+- (NSString *)ddvp_sheetTitle {
+    return self.directoryPath.length ? [self.directoryPath lastPathComponent] : @"语音包管理";
 }
 
-- (void)updateTitle {
-    self.title = self.isSelectMode
-        ? [NSString stringWithFormat:@"已选择（%ld个）", (long)self.picked.count]
-        : [NSString stringWithFormat:@"套壳库（%ld个）", (long)self.names.count];
+// 面板标题随层级变化，推给 MMPageSheetConfig 才生效
+- (void)ddvp_syncSheetNavigationBar {
+    UINavigationController *nav = self.navigationController;
+    if (!nav) return;
+    id config = objc_getAssociatedObject(nav, kDDVoicePackSheetConfigKey);
+    id adapter = objc_getAssociatedObject(nav, kDDVoicePackSheetAdapterKey);
+    if (!config || !adapter) return;
+    [config setTitle:[self ddvp_sheetTitle]];
+    [adapter setPageSheetConfig:config];
 }
 
-// 搜索过滤：只动展示的 names，全量 allNames 不变；标题跟着显示过滤后的数量
-- (void)applySearchFilter {
-    NSString *kw = (self.searchBar.text ?: @"").lowercaseString;
-    if (!kw.length) {
-        self.names = self.allNames;
-    } else {
-        NSMutableArray *m = [NSMutableArray array];
-        for (NSString *n in self.allNames) {
-            if ([n.lowercaseString containsString:kw]) [m addObject:n];
+// 当前聊天对象：只有从聊天页进来的面板才知道往哪发
+- (NSString *)ddvp_targetChatUserName {
+    UINavigationController *nav = self.navigationController;
+    if (!nav) return nil;
+    UIViewController *fromVC = objc_getAssociatedObject(nav, kDDVoicePackSheetFromVCKey);
+    if (!fromVC) return nil;
+
+    // isKindOfClass 已经保证了类型，后面直接取就行，不用再 respondsToSelector
+    if (![fromVC isKindOfClass:objc_getClass("BaseMsgContentViewController")]) return nil;
+
+    CBaseContact *contact = [(BaseMsgContentViewController *)fromVC GetContact];
+    return contact.m_nsUsrName;
+}
+
+- (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath {
+    if (!indexPath) return nil;
+    if (self.searching) {
+        NSUInteger row = indexPath.row;
+        return row < self.searchResults.count ? self.searchResults[row] : nil;
+    }
+    NSUInteger row = indexPath.row;
+    if (row < self.folderPaths.count) return self.folderPaths[row];
+    row -= self.folderPaths.count;
+    return row < self.filePaths.count ? self.filePaths[row] : nil;
+}
+
+- (BOOL)ddvp_swipeAllowedAtIndexPath:(NSIndexPath *)indexPath {
+    return [self ddvp_pathAtIndexPath:indexPath].length > 0;
+}
+
+- (BOOL)ddvp_rowCanPreviewAtIndexPath:(NSIndexPath *)indexPath {
+    // 目录列表只列 SILK，所以这里等价于「这一行是文件而不是文件夹」
+    return DDVoicePackIsSilk([self ddvp_pathAtIndexPath:indexPath]);
+}
+
+- (void)ddvp_reloadData {
+    [self.tableViewMgr clearAllSection];
+    WCTableViewSectionManager *section = nil;
+
+    if (self.searching) {
+        if (self.searchResults.count) {
+            section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:[NSString stringWithFormat:@"%lu 个结果", (unsigned long)self.searchResults.count] Footer:@""];
+            for (NSString *path in self.searchResults) {
+                [section addCell:[self ddvp_fileCellForPath:path title:[path lastPathComponent]]];
+            }
         }
-        self.names = m;
-    }
-    [self updateTitle];
-    [self.collectionView reloadData];
-}
+    } else {
+        NSString *dirPath = [self ddvp_currentDirectory];
+        NSArray *folders = nil, *files = nil;
+        DDVoicePackListDirectory(dirPath, &folders, &files);
 
-- (void)searchBar:(UISearchBar *)sb textDidChange:(NSString *)text {
-    [self applySearchFilter];
-}
+        NSMutableArray *folderPaths = [NSMutableArray array];
+        for (NSString *name in folders) [folderPaths addObject:[dirPath stringByAppendingPathComponent:name]];
+        self.folderPaths = folderPaths;
 
-- (void)searchBarSearchButtonClicked:(UISearchBar *)sb {
-    [sb resignFirstResponder];
-}
+        NSMutableArray *filePaths = [NSMutableArray array];
+        for (NSString *name in files) [filePaths addObject:[dirPath stringByAppendingPathComponent:name]];
+        self.filePaths = filePaths;
 
-- (CGSize)collectionView:(UICollectionView *)cv layout:(UICollectionViewFlowLayout *)layout sizeForItemAtIndexPath:(NSIndexPath *)ip {
-    CGFloat w = DD_CellSide(cv);
-    return CGSizeMake(w, w + 30.0); // 正方形缩略图 + 20pt 名字行
-}
+        NSString *header = self.directoryPath.length
+            ? [NSString stringWithFormat:@"%lu 条语音", (unsigned long)files.count]
+            : [NSString stringWithFormat:@"%lu 个分类", (unsigned long)folders.count];
+        section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:header Footer:@""];
 
-- (NSInteger)collectionView:(UICollectionView *)cv numberOfItemsInSection:(NSInteger)section {
-    return self.names.count;
-}
-
-- (UICollectionViewCell *)collectionView:(UICollectionView *)cv cellForItemAtIndexPath:(NSIndexPath *)ip {
-    DDShellTplCell *cell = [cv dequeueReusableCellWithReuseIdentifier:@"DDShellTplCell" forIndexPath:ip];
-    NSString *n = self.names[ip.item];
-
-    cell.nameLabel.text = n;
-    CGFloat w = DD_CellSide(cv);
-    // 缩略图命中缓存当场给；没命中就丢后台解，回来时确认这格还显示着同一个模板再填
-    cell.thumbView.image = DD_CachedThumb(n, w);
-    if (!cell.thumbView.image) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            UIImage *img = DD_ThumbForName(n, w);
-            if (!img) return;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                DDShellTplCell *c = (DDShellTplCell *)[cv cellForItemAtIndexPath:ip];
-                if (c && [c.nameLabel.text isEqualToString:n]) c.thumbView.image = img;
-            });
-        });
+        for (NSString *path in self.folderPaths) {
+            NSString *detail = [NSString stringWithFormat:@"%lu 个语音", (unsigned long)DDVoicePackFileCountIn(path)];
+            id cell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(ddvp_folderRowTapped:)
+                                                                        target:self
+                                                                         title:[path lastPathComponent]
+                                                                        detail:detail];
+            objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            [section addCell:cell];
+        }
+        for (NSString *path in self.filePaths) {
+            [section addCell:[self ddvp_fileCellForPath:path title:[path lastPathComponent]]];
+        }
     }
 
-    BOOL picked = self.isSelectMode && [self.picked containsObject:n];
-    BOOL active = !self.isSelectMode && [n isEqualToString:self.activeName];
-    cell.checkLabel.hidden = !picked;
-    cell.markView.hidden = !(picked || active);
-    // 蓝框 = 已勾选待导出，绿框 = 当前正在用的模板
-    cell.markView.layer.borderColor = picked ? [UIColor systemBlueColor].CGColor : [UIColor systemGreenColor].CGColor;
+    if (section) [self.tableViewMgr addSection:section];
+    [[self.tableViewMgr getTableView] reloadData];
+    [self ddvp_installTableProxyIfNeeded];
+}
+
+- (id)ddvp_fileCellForPath:(NSString *)path title:(NSString *)title {
+    id cell = [objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(ddvp_fileRowTapped:)
+                                                                       target:self
+                                                                        title:title
+                                                                   rightValue:@""
+                                                                accessoryType:1];
+    objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
     return cell;
 }
 
-// 长按某个模板 → 弹「套壳操作」菜单。
-// 只在普通态响应：选择态下单击是切换勾选，再让长按弹菜单容易误触、且菜单里的
-// 「选择/多选」在选择态下语义重复。
-// cancelsTouchesInView 默认 YES：长按判定成立后 touch 序列被取消，不会连带触发单击选中。
-- (void)onLongPressTpl:(UILongPressGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateBegan) return;
-    if (self.isSelectMode) return;
-    CGPoint p = [g locationInView:self.collectionView];
-    NSIndexPath *ip = [self.collectionView indexPathForItemAtPoint:p];
-    if (!ip) return;
-    if (ip.item < 0 || ip.item >= (NSInteger)self.names.count) return;
-    NSString *n = self.names[ip.item];
-    if (!n.length) return;
+- (void)ddvp_installTableProxyIfNeeded {
+    UITableView *tableView = [self.tableViewMgr getTableView];
+    if ([tableView.delegate isKindOfClass:[DDVoicePackTableProxy class]]) return;
 
-    self.tappedTpl = n;
-    [self showWCActionSheet:@"套壳操作" tag:DD_SHEET_TPL items:@[@"使用模板", @"重命名", @"选择/多选", @"删除此模板"]];
+    DDVoicePackTableProxy *proxy = [[DDVoicePackTableProxy alloc] init];
+    id originalTarget = tableView.delegate;
+    if (!originalTarget) originalTarget = tableView.dataSource;
+    proxy.forwardTarget = originalTarget;
+    proxy.host = self;
+    tableView.delegate = proxy;
+    tableView.dataSource = proxy;
+    self.tableProxy = proxy;
 }
 
-// 点列表任意位置收起搜索键盘：模板少、列表滚不动时，滚动收起那招不生效，这里是兜底出口
-- (void)onTapList:(UITapGestureRecognizer *)g {
-    if (self.searchBar.isFirstResponder) [self.searchBar resignFirstResponder];
+// ---- 行点击 ----
+
+- (void)ddvp_folderRowTapped:(id)sender {
+    if (self.searching) return;
+    NSString *path = [self ddvp_pathForCellSender:sender];
+    if (!path.length) return;
+
+    DDVoicePackListController *child = [[DDVoicePackListController alloc] init];
+    child.directoryPath = path;
+    [self.navigationController pushViewController:child animated:YES];
 }
 
-- (void)collectionView:(UICollectionView *)cv didSelectItemAtIndexPath:(NSIndexPath *)ip {
-    NSString *n = self.names[ip.item];
+- (void)ddvp_fileRowTapped:(id)sender {
+    NSString *path = [self ddvp_pathForCellSender:sender];
+    NSString *chatId = [self ddvp_targetChatUserName];
+    if (!path.length || !chatId.length) return;
+    DDVoicePackSendFileAtPath(path, chatId);
+}
 
-    if (self.isSelectMode) { // 选择态：点一下切换勾选
-        if ([self.picked containsObject:n]) [self.picked removeObject:n]; else [self.picked addObject:n];
-        [self setupNavigationBar]; // 删除/导出的可用性跟着勾选数变
-        [self updateTitle];
-        [self.collectionView reloadItemsAtIndexPaths:@[ip]];
+// cell manager 在 reload 时已把路径写到自身关联对象上，点哪行取哪行，无需再用 indexPath 反查
+- (NSString *)ddvp_pathForCellSender:(id)sender {
+    NSString *path = objc_getAssociatedObject(sender, kDDVoicePackCellPathKey);
+    if ([path isKindOfClass:[NSString class]] && path.length) return path;
+    return nil;
+}
+
+// ---- 左滑操作 ----
+
+- (void)ddvp_previewItemAtIndexPath:(NSIndexPath *)indexPath {
+    DDVoicePackPlayPreview(self, [self ddvp_pathAtIndexPath:indexPath]);
+}
+
+- (void)ddvp_deleteItemAtIndexPath:(NSIndexPath *)indexPath {
+    [[NSFileManager defaultManager] removeItemAtPath:[self ddvp_pathAtIndexPath:indexPath] error:nil];
+    [self ddvp_refreshAfterMutation];
+}
+
+- (void)ddvp_renameItemAtIndexPath:(NSIndexPath *)indexPath {
+    NSString *oldPath = [self ddvp_pathAtIndexPath:indexPath];
+    if (!oldPath.length) return;
+    NSString *parent = [oldPath stringByDeletingLastPathComponent];
+
+    __weak typeof(self) weakSelf = self;
+    DDVoicePackShowInput(@"重命名", @"请输入新名称", DDVoicePackBaseName(oldPath), ^(NSString *text) {
+        [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:DDVoicePackTrim(text) indexPath:indexPath];
+    }, nil);
+}
+
+- (void)ddvp_renameItemAtPath:(NSString *)oldPath
+                       parent:(NSString *)parent
+                       toName:(NSString *)baseName
+                    indexPath:(NSIndexPath *)indexPath {
+    NSString *ext = [oldPath pathExtension];
+    NSString *newName = ext.length ? [baseName stringByAppendingPathExtension:ext] : baseName;
+    NSString *newPath = [parent stringByAppendingPathComponent:newName];
+
+    if (!baseName.length || [[NSFileManager defaultManager] fileExistsAtPath:newPath]) {
+        __weak typeof(self) weakSelf = self;
+        DDVoicePackShowInput(@"重命名", @"名称无效或已存在，请重新输入", baseName, ^(NSString *text) {
+            [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:DDVoicePackTrim(text) indexPath:indexPath];
+        }, nil);
         return;
     }
 
-    // 普通态：点一下直接把这个模板设为当前生效（即菜单里的「使用模板」），
-    // 完整操作菜单改由长按唤出。反馈沿用同一套：reloadList 后绿框挪到新模板上。
-    [DDShellConfig shared].selectedTpl = n;
-    [self reloadList];
+    [[NSFileManager defaultManager] moveItemAtPath:oldPath toPath:newPath error:nil];
+    [self ddvp_refreshAfterMutation];
 }
 
-#pragma mark 导航栏
-
-// 按钮颜色按 item 钉：优先级是「item 自己的 titleTextAttributes」
-// >「微信给 UIBarButtonItem 定的 appearance 代理」>「导航栏外观的 buttonAppearance」，
-// 只有最上面那层钉得住。钉的颜色取导航栏 tintColor，跟着微信主题走，不写死。
-- (UIBarButtonItem *)navButton:(NSString *)title action:(SEL)action {
-    UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:title
-                                                             style:UIBarButtonItemStylePlain
-                                                            target:self
-                                                            action:action];
-    UIColor *tint = self.navigationController.navigationBar.tintColor;
-    [item setTitleTextAttributes:@{ NSForegroundColorAttributeName: tint } forState:UIControlStateNormal];
-    return item;
+- (void)ddvp_refreshAfterMutation {
+    if (self.searching) [self ddvp_runSearch];
+    else [self ddvp_reloadData];
+    [self ddvp_syncSheetNavigationBar];
 }
 
-// 右上角按钮（数组首个最靠右）：
-//   普通态：导入 / 导出
-//   选择态：取消 / 导出 / 删除
-- (void)setupNavigationBar {
-    UIBarButtonItem *right, *mid, *left;
-    if (self.isSelectMode) {
-        right = [self navButton:@"取消" action:@selector(cancelExportSelectMode)];
-        mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
-        left  = [self navButton:@"删除" action:@selector(deleteSelectedFrames)];
-        BOOL has = self.picked.count > 0; // 一个都没勾上时导出和删除不可点
-        mid.enabled = has;
-        left.enabled = has;
+// ---- 右上角「+」 ----
+
+- (UIButton *)ddvp_plusButton {
+    id themeManager = DDVoicePackThemeManager();
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    btn.frame = CGRectMake(0, 0, 44, 44);
+    [btn setImage:[themeManager svgImageNamed:@"plus_regular" color:[UIColor labelColor]] forState:UIControlStateNormal];
+    [btn addTarget:self action:@selector(ddvp_plusButtonTapped) forControlEvents:UIControlEventTouchUpInside];
+    return btn;
+}
+
+// 根目录或有待纳入语音时才显示「+」，搜索态下让位给「取消」
+- (BOOL)ddvp_shouldShowPlusButton {
+    if (self.searching) return NO;
+    return self.directoryPath.length == 0 || [DDVoicePackListController ddvp_pendingImportPath].length > 0;
+}
+
+- (void)ddvp_updatePlusButton {
+    UINavigationController *nav = self.navigationController;
+    if (!nav || self.searching) return;
+
+    id config = objc_getAssociatedObject(nav, kDDVoicePackSheetConfigKey);
+    BOOL show = [self ddvp_shouldShowPlusButton];
+
+    if (config) {
+        [config setNavRightButton:show ? [self ddvp_plusButton] : nil];
+        [self ddvp_syncSheetNavigationBar];
+        return;
+    }
+    if (show) {
+        self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:[self ddvp_plusButton]];
     } else {
-        right = [self navButton:@"导入" action:@selector(uploadButtonTapped)];
-        mid   = [self navButton:@"导出" action:@selector(exportButtonTapped)];
-        left  = nil;
+        self.navigationItem.rightBarButtonItem = nil;
     }
-    // rightBarButtonItems 数组首个显示在最靠屏幕边缘：取消 / 导入贴着右边缘，左侧不动
-    NSMutableArray *items = [NSMutableArray array];
-    [items addObject:right];
-    [items addObject:mid];
-    if (left) [items addObject:left]; // 普通态没有第三个，addObject:nil 会崩
-    self.navigationItem.rightBarButtonItems = items;
 }
 
-#pragma mark 微信原生 WCActionSheet
+- (void)ddvp_plusButtonTapped {
+    if (self.searching) return;
 
-// 构造微信原生 WCActionSheet：init → 塞 WCActionSheetItem → 设 buttonTitleList / tag → showInView:
-- (void)showWCActionSheet:(NSString *)title tag:(NSInteger)tag items:(NSArray<NSString *> *)items {
-    Class sheetCls = NSClassFromString(@"WCActionSheet");
-    Class itemCls  = NSClassFromString(@"WCActionSheetItem");
-    if (!sheetCls || !itemCls) return;
+    NSString *root = [self ddvp_currentDirectory];
+    NSString *pending = [DDVoicePackListController ddvp_pendingImportPath];
 
-    id sheet = [[sheetCls alloc] initWithTitle:title
-                                       delegate:self
-                              cancelButtonTitle:@"取消"
-                         destructiveButtonTitle:nil
-                              otherButtonTitles:nil];
-
-    NSMutableArray *list = [NSMutableArray array];
-    for (NSString *t in items) {
-        [list addObject:[[itemCls alloc] initWithTitle:t]];
+    // 有待纳入的语音时，「+」走命名保存；否则是新建分类
+    if (pending.length) {
+        [self ddvp_showImportInputToDirectory:root errorMessage:nil];
+        return;
     }
-    [sheet setValue:list forKey:@"buttonTitleList"];
-    [sheet setValue:@(tag) forKey:@"tag"];
-    [sheet performSelector:@selector(showInView:) withObject:self.view];
+
+    __weak typeof(self) weakSelf = self;
+    DDVoicePackShowInput(@"语音包目录", @"请输入新增分类的名称", @"", ^(NSString *text) {
+        NSString *name = DDVoicePackTrim(text);
+        if (name.length) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:[root stringByAppendingPathComponent:name]
+                                      withIntermediateDirectories:YES
+                                                       attributes:nil
+                                                            error:nil];
+        }
+        [weakSelf ddvp_reloadData];
+    }, nil);
 }
 
-// WCActionSheetDelegate 回调：按 tag 分发，buttonTitleList[0] 对应 index 0；
-// 自带「取消」的 index 落在所有 item 之后，不会命中任何分支。
-- (void)actionSheet:(id)sheet clickedButtonAtIndex:(NSInteger)idx {
-    NSInteger tag = [sheet tag];
+- (void)ddvp_showImportInputToDirectory:(NSString *)directory errorMessage:(NSString *)errorMessage {
+    __weak typeof(self) weakSelf = self;
+    DDVoicePackShowInput(@"纳入语音", errorMessage ?: @"请输入新名称", @"", ^(NSString *text) {
+        NSString *baseName = DDVoicePackSanitizedName(text);
+        NSString *pending = [DDVoicePackListController ddvp_pendingImportPath];
+        NSString *destPath = [directory stringByAppendingPathComponent:[baseName stringByAppendingPathExtension:@"silk"]];
 
-    if (tag == DD_SHEET_EXPORT) { // 选择导出方式：0=选择导出 1=全部导出
-        if (idx == 0) [self enterExportSelectMode];
-        else if (idx == 1) [self exportAllFrames];
-    } else if (tag == DD_SHEET_TPL) { // 套壳操作：0=使用模板 1=重命名 2=选择/多选 3=删除此模板
-        NSString *n = self.tappedTpl;
-        if (idx == 0 && n.length) {
-            [DDShellConfig shared].selectedTpl = n;
-            [self reloadList]; // 绿框挪到新模板上就是反馈
-        } else if (idx == 1 && n.length) {
-            [self renameTemplateNamed:n];
-        } else if (idx == 2) {
-            [self enterExportSelectModeWithName:n];
-        } else if (idx == 3 && n.length) {
-            [self confirmDeleteNames:@[n]];
+        if (!baseName.length || [[NSFileManager defaultManager] fileExistsAtPath:destPath]) {
+            [weakSelf ddvp_showImportInputToDirectory:directory errorMessage:@"名称无效或已存在，请重新输入"];
+            return;
+        }
+
+        [[NSFileManager defaultManager] copyItemAtPath:pending toPath:destPath error:nil];
+        [DDVoicePackListController ddvp_clearPendingImportPath];
+        [weakSelf ddvp_reloadData];
+        [weakSelf ddvp_updatePlusButton];
+    }, ^{
+        // 取消纳入就把待办清掉，否则「+」会一直停在导入态
+        [DDVoicePackListController ddvp_clearPendingImportPath];
+        [weakSelf ddvp_updatePlusButton];
+    });
+}
+
+// ---- 搜索 ----
+
+- (void)searchBarTextDidBeginEditing:(UISearchBar *)searchBar {
+    self.searching = YES;
+    self.searchResults = @[];
+    [self ddvp_reloadData];
+
+    id config = objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey);
+    if (config) {
+        UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        [cancelBtn setTitle:@"取消" forState:UIControlStateNormal];
+        [cancelBtn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+        cancelBtn.titleLabel.font = [UIFont systemFontOfSize:17];
+        [cancelBtn sizeToFit];
+        [cancelBtn addTarget:self action:@selector(ddvp_searchCancelTapped) forControlEvents:UIControlEventTouchUpInside];
+        [config setNavRightButton:cancelBtn];
+        [self ddvp_syncSheetNavigationBar];
+    }
+}
+
+- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+    // 每敲一个字符就递归整个语音包目录太重，防抖一下
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(ddvp_runSearch) object:nil];
+    [self performSelector:@selector(ddvp_runSearch) withObject:nil afterDelay:kDDVoicePackSearchDebounce];
+}
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
+    [searchBar resignFirstResponder];
+}
+
+- (void)ddvp_searchCancelTapped {
+    self.searching = NO;
+    self.searchResults = @[];
+    self.searchBar.text = @"";
+    [self.searchBar resignFirstResponder];
+    [self ddvp_updatePlusButton];
+    [self ddvp_reloadData];
+}
+
+- (void)ddvp_runSearch {
+    NSString *keyword = DDVoicePackTrim(self.searchBar.text);
+    self.searchResults = keyword.length ? DDVoicePackSearchFiles(DDVoicePackRootPath(), keyword) : @[];
+    [self ddvp_reloadData];
+}
+
+@end
+
+// ========== 音频处理与发送 ==========
+
+// 语音消息类型 / SILK 格式 / 语音结束标记
+static const unsigned int kDDVoicePackMsgTypeVoice = 34;
+static const unsigned int kDDVoicePackVoiceFormatSilk = 4;
+static const unsigned int kDDVoicePackVoiceEndFlag = 1;
+
+// 语音时长上下限（毫秒），微信只认 0.3s ~ 60s
+static const unsigned int kDDVoicePackMinVoiceMs = 300;
+static const unsigned int kDDVoicePackMaxVoiceMs = 60000;
+
+// SILK 不是 AVFoundation 认的格式，读不出时长，按文件大小粗估（约 2KB/s）。
+// 估不出来统一给 3 秒——兜底只在这里做一次，别在外面再兜一遍
+static unsigned int DDVoicePackDurationMs(NSString *path) {
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    unsigned long long fileSize = [attrs fileSize];
+    if (fileSize > 0) {
+        unsigned int estimatedMs = (unsigned int)(fileSize / 2000) * 1000;
+        if (estimatedMs > 0) return estimatedMs;
+    }
+    return 3000;
+}
+
+static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString *chatId) {
+    if (!silk.length || !chatId.length) return NO;
+
+    unsigned int voiceMs = durationMs;
+    if (voiceMs < kDDVoicePackMinVoiceMs) voiceMs = kDDVoicePackMinVoiceMs;
+    if (voiceMs > kDDVoicePackMaxVoiceMs) voiceMs = kDDVoicePackMaxVoiceMs;
+
+    Class ctxCls = objc_getClass("MMContext");
+    id context = [ctxCls activeUserContext] ?: [ctxCls rootContext];
+    if (!context) return NO;
+
+    CBaseContact *selfContact = [[context getService:objc_getClass("CContactMgr")] getSelfContact];
+    NSString *myId = [selfContact m_nsUsrName];
+    if (!myId.length) return NO;
+
+    CMessageWrap *msg = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:(long long)kDDVoicePackMsgTypeVoice nsFromUsr:myId];
+    if (!msg) return NO;
+    // m_nsFromUsr 已经由 initWithMsgType:nsFromUsr: 设好了，不用再设一遍
+    [msg setM_nsToUsr:chatId];
+    [msg setM_uiStatus:1];
+    [msg setM_uiDownloadStatus:9];
+    [msg setM_nsMsgSource:nil];
+    [msg setM_uiCreateTime:[[context getService:objc_getClass("MMNewSessionMgr")] GenSendMsgTime]];
+
+    CMessageMgr *msgMgr = [context getService:objc_getClass("CMessageMgr")];
+    [msgMgr AddLocalMsg:chatId MsgWrap:msg];
+
+    Class utilCls = objc_getClass("CUtility");
+    NSString *docPath = [utilCls GetDocPath];
+    NSString *audioPath = [utilCls GetPathOfMesAudio:chatId LocalID:[msg m_uiMesLocalID] DocPath:docPath];
+    [[NSFileManager defaultManager] createDirectoryAtPath:[audioPath stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+    [silk writeToFile:audioPath atomically:YES];
+
+    // 语音时长 / 格式 / 数据一律装 extInfo。CMessageWrap 上没有
+    // setM_uiVoiceTime: / setM_uiVoiceFormat: / setM_dtVoice:，
+    // 这几个只存在于 UploadVoiceWrap、MassSendWrap、CExtendInfoOfVoiceMsg 上，硬调会崩。
+    CExtendInfoOfVoiceMsg *extInfo = [[objc_getClass("CExtendInfoOfVoiceMsg") alloc] init];
+    [extInfo setM_dtVoice:silk];
+    [extInfo setM_uiVoiceTime:voiceMs];
+    [extInfo setM_uiVoiceFormat:kDDVoicePackVoiceFormatSilk];
+    [extInfo setM_uiVoiceEndFlag:kDDVoicePackVoiceEndFlag];
+    [extInfo setM_refMessageWrap:msg];
+    [msg setM_extendInfoWithMsgType:extInfo];
+
+    [msg UpdateContent:nil];
+    [msgMgr ModMsg:chatId MsgWrap:msg];
+    // 落盘：首参传 nil（传 NSData 会被当成路径）
+    [msgMgr SaveMesVoice:nil MsgWrap:msg];
+
+    // 上传：AudioSender 是微信语音发送链路上的服务对象，ResendVoiceMsg:MsgWrap: 是唯一入口。
+    // 不再 KVC 取 m_upload（取不到会抛 NSUndefinedKeyException 直接崩），也不再退 MMNewUploadVoiceMgr。
+    AudioSender *sender = [context getService:objc_getClass("AudioSender")];
+    if (!sender) return NO;
+    [sender ResendVoiceMsg:chatId MsgWrap:msg];
+    return YES;
+}
+
+// 读文件 + 算时长都在后台串行队列里跑，长语音不至于卡住界面
+static dispatch_queue_t DDVoicePackSendQueue(void) {
+    static dispatch_queue_t queue = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.dd.voicepack.send", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId) {
+    if (!path.length || !chatId.length) return;
+
+    dispatch_async(DDVoicePackSendQueue(), ^{
+        // 语音包里存的就是微信 SILK，原样发出去，不做任何转码
+        NSData *silk = [NSData dataWithContentsOfFile:path];
+        if (!silk.length) return;
+
+        if (DDVoicePackSendSilk(silk, DDVoicePackDurationMs(path), chatId)) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [DDVoicePackListController ddvp_closeSheetIfNeeded];
+            });
+        }
+    });
+}
+
+// ========== Hook 长按「+」按钮打开语音包 ==========
+
+// 长按手势挂在按钮上，防止 didMoveToSuperview 反复触发时重复添加
+static const void *kDDVoicePackLongPressKey = &kDDVoicePackLongPressKey;
+
+%hook MMUIButton
+
+- (void)didMoveToSuperview {
+    %orig;
+    if (![DDVoicePackConfig enabled]) return;
+    if (![self.accessibilityLabel isEqualToString:@"更多"]) return;
+
+    if (objc_getAssociatedObject(self, kDDVoicePackLongPressKey)) return;
+    UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(ddvp_moreLongPress:)];
+    // 不设 minimumPressDuration，用系统默认（0.5 秒）
+    [self addGestureRecognizer:longPress];
+    objc_setAssociatedObject(self, kDDVoicePackLongPressKey, longPress, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+%new
+- (void)ddvp_moreLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+    [DDVoicePackListController ddvp_presentFromViewController:DDVoicePackTopVC()];
+}
+
+%end
+
+// ========== Hook 语音消息菜单「纳入」 ==========
+
+// 菜单项去重标记：MMMenuItem 没有 title / action 的 getter，只能用 userInfo 做记号
+static NSString * const kDDVoicePackImportMenuToken = @"ddvp:import";
+
+// 往菜单末尾追加「纳入」（开关关闭 / 已注入过则原样返回）
+static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL enabled) {
+    if (!enabled || !original) return original;
+
+    // 微信自己的菜单数组里全是 MMMenuItem，不用逐个问 userInfo
+    for (MMMenuItem *item in original) {
+        if ([[item userInfo] isEqual:kDDVoicePackImportMenuToken]) return original;
+    }
+
+    MMMenuItem *item = [[objc_getClass("MMMenuItem") alloc] initWithTitle:@"纳入"
+                                                                svgName:@"biz_audio_outlined_star"
+                                                                 target:cell
+                                                                 action:@selector(ddvp_importVoice:)];
+    if (!item) return original;
+    item.userInfo = kDDVoicePackImportMenuToken;
+
+    NSMutableArray *items = [NSMutableArray arrayWithArray:original];
+    [items addObject:item];
+    return items;
+}
+
+// getMediaWrap 在语音 cell 上给的就是 CMessageWrap；不是消息对象时给 nil 发消息返回 0，自然判否
+static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
+    return [wrap m_uiMessageType] == kDDVoicePackMsgTypeVoice;
+}
+
+%hook VoiceMessageCellView
+
+- (NSArray *)operationMenuItems {
+    NSArray *items = %orig;
+    return DDVoicePackAppendImportItem(self, items,
+                                       [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]));
+}
+
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(ddvp_importVoice:)) {
+        return [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]);
+    }
+    // %orig 独占一行：Logos 对行尾内容的处理很糙，跟其他语句写同一行容易出编译错
+    BOOL origResult = %orig;
+    return origResult;
+}
+
+%new
+- (void)ddvp_importVoice:(id)sender {
+    CMessageWrap *msg = [self getMediaWrap];
+    if (!msg) return;
+
+    // 语音文件在微信沙箱里的落盘路径，跟发送时用的一套算法
+    BOOL fromSelf = [objc_getClass("CMessageWrap") isSenderFromMsgWrap:msg];
+    NSString *chat = fromSelf ? [msg m_nsToUsr] : [msg m_nsFromUsr];
+    if (!chat.length) return;
+
+    Class utilCls = objc_getClass("CUtility");
+    NSString *path = [utilCls GetPathOfMesAudio:chat LocalID:[msg m_uiMesLocalID] DocPath:[utilCls GetDocPath]];
+    if (!path.length || ![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
+
+    [DDVoicePackListController ddvp_setPendingImportPath:path];
+
+    UIViewController *fromVC = [self getViewController];
+    if (!fromVC) {
+        UIResponder *responder = self;
+        while ((responder = [responder nextResponder])) {
+            if ([responder isKindOfClass:[UIViewController class]]) {
+                fromVC = (UIViewController *)responder;
+                break;
+            }
         }
     }
-    self.tappedTpl = nil;
+    if (fromVC) [DDVoicePackListController ddvp_presentFromViewController:fromVC];
+    else [DDVoicePackListController ddvp_clearPendingImportPath];
 }
 
-#pragma mark 导出
+%end
 
-// 点「导出」：选择态直接导出勾选的；普通态先问「选择导出」还是「全部导出」
-- (void)exportButtonTapped {
-    if (self.isSelectMode) { [self exportSelectedFrames]; return; }
-    if (!self.names.count) return; // 空素材库静默返回
+// ========== 设置界面 ==========
 
-    [self showWCActionSheet:@"选择导出方式" tag:DD_SHEET_EXPORT items:@[@"选择导出", @"全部导出"]];
+@interface DDVoicePackSettingsViewController : UIViewController <UIDocumentPickerDelegate>
+@property (nonatomic, strong) WCTableViewManager *tableViewManager;
+@end
+
+@implementation DDVoicePackSettingsViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"语音包设置";
+
+    // 表格整屏延伸，由 viewDidLayoutSubviews 推到导航栏底边
+    _tableViewManager = [[objc_getClass("WCTableViewManager") alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
+    _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    [self.view addSubview:_tableViewManager.tableView];
+
+    [self buildTable];
+    self.view.backgroundColor = _tableViewManager.tableView.backgroundColor;
 }
 
-// 选择态 UI 三连：按钮可用性、标题计数、格子勾选状态都跟着 picked 变，一次刷齐
-- (void)refreshSelectUI {
-    [self setupNavigationBar];
-    [self updateTitle];
-    [self.collectionView reloadData];
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat top = self.view.safeAreaInsets.top;
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    _tableViewManager.tableView.frame = CGRectMake(0, top, w, h - top);
 }
 
-// 进入选择态：勾选清空，右上角换成 删除 / 导出 / 取消
-- (void)enterExportSelectMode {
-    self.isSelectMode = YES;
-    [self.picked removeAllObjects];
-    [self refreshSelectUI];
+- (void)buildTable {
+    [_tableViewManager clearAllSection];
+
+    WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:@"语音包设置（长按 + 打开入口）"];
+    BOOL enabled = [DDVoicePackConfig enabled];
+    [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onEnabledSwitchChanged:) target:self title:@"启用语音包" on:enabled]];
+    if (enabled) {
+        [section addCell:[objc_getClass("WCTableViewCellManager") switchCellForSel:@selector(onKeepPanelSwitchChanged:) target:self title:@"↳持续发送" on:[DDVoicePackConfig keepPanelAfterSend]]];
+    }
+    [_tableViewManager addSection:section];
+
+    WCTableViewSectionManager *ioSection = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:@"数据管理"];
+    [ioSection addCell:[objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(importVoicePack) target:self title:@"导入语音包" rightValue:@"" accessoryType:1]];
+    [ioSection addCell:[objc_getClass("WCTableViewNormalCellManager") normalCellForSel:@selector(exportVoicePack) target:self title:@"导出语音包" rightValue:@"" accessoryType:1]];
+    [_tableViewManager addSection:ioSection];
+
+    [_tableViewManager reloadTableView];
 }
 
-// 从「套壳操作 → 选择/多选」进入：顺手把那一个勾上
-- (void)enterExportSelectModeWithName:(NSString *)name {
-    self.isSelectMode = YES;
-    [self.picked removeAllObjects];
-    [self.picked addObject:name];
-    [self refreshSelectUI];
+- (void)onEnabledSwitchChanged:(UISwitch *)sender {
+    [DDVoicePackConfig setEnabled:sender.isOn];
+    [self buildTable];
 }
 
-- (void)cancelExportSelectMode {
-    self.isSelectMode = NO;
-    [self.picked removeAllObjects];
-    [self refreshSelectUI];
+- (void)onKeepPanelSwitchChanged:(UISwitch *)sender {
+    [DDVoicePackConfig setKeepPanelAfterSend:sender.isOn];
 }
 
-- (void)exportSelectedFrames {
-    NSArray *names = [self.picked.allObjects sortedArrayUsingSelector:@selector(compare:)];
-    [self shareZipForNames:names];
+// ---- 导入导出 ----
+
+// 仿 DD模板套壳：子类化把老 initWithDocumentTypes:inMode: 重声明成 NSInteger 版，
+// 编译器只用本声明、看不到 SDK 头里的 deprecated 属性，于是 -Werror 也拦不住它。
+// 全程只传字符串 UTI 标识符，不依赖 UniformTypeIdentifiers 框架。
+@interface DDVoicePackPicker : UIDocumentPickerViewController
+- (instancetype)initWithDocumentTypes:(NSArray<NSString *> *)types inMode:(NSInteger)mode;
+@end
+
+- (void)importVoicePack {
+    // 支持三种来源：整目录、zip 包、单个 .silk 文件。
+    // 直接传字符串 UTI 标识符 + 老 API，不依赖 UniformTypeIdentifiers 框架（和 DD模板套壳一致）。
+    NSArray *types = @[@"public.folder", @"public.zip-archive", @"public.data"];
+    DDVoicePackPicker *picker = [[DDVoicePackPicker alloc] initWithDocumentTypes:types inMode:0]; // 0 = Import
+    picker.delegate = self;
+    picker.allowsMultipleSelection = YES;
+    [self presentViewController:picker animated:YES completion:nil];
 }
 
-// 「全部导出」= 当前列表全量导出
-- (void)exportAllFrames {
-    [self shareZipForNames:self.names];
+// 整目录按同名装进语音包根下子目录，同名则覆盖 —— 和 DD模板套壳 DD_InstallTemplateFolder 一致
+// 整目录或单文件，都按同名落到语音包根下，同名则覆盖 —— 和 DD模板套壳一致
+- (void)installVoicePackItem:(NSString *)src {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dst = [DDVoicePackRootPath() stringByAppendingPathComponent:src.lastPathComponent];
+    [fm removeItemAtPath:dst error:nil];
+    [fm copyItemAtPath:src toPath:dst error:nil];
 }
 
-// 打包后调起系统分享（存到文件 / 隔空投送等），分享成功则退出选择态
-- (void)shareZipForNames:(NSArray<NSString *> *)names {
-    // 打包要整批拷贝模板 png，丢后台跑，主线程留着转 loading
-    DD_ShowLoading(@"正在导出…");
+// 解压后的目录：顶层有子文件夹就把每个子文件夹装成同名语音包；
+// 顶层没有文件夹（散装 .silk）就逐个落根目录。对应 DD模板套壳 DD_ImportTemplatesFrom 的思路
+- (void)importUnpackedDir:(NSString *)dir {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
+    BOOL installedFolder = NO;
+    for (NSString *name in items) {
+        if ([name hasPrefix:@"."] || [name isEqualToString:@"__MACOSX"]) continue;
+        NSString *full = [dir stringByAppendingPathComponent:name];
+        BOOL isDir = NO;
+        [fm fileExistsAtPath:full isDirectory:&isDir];
+        if (isDir) {
+            [self installVoicePackItem:full];
+            installedFolder = YES;
+        }
+    }
+    if (installedFolder) return;
+    for (NSString *name in items) {
+        if ([name hasPrefix:@"."] || [name isEqualToString:@"__MACOSX"]) continue;
+        NSString *full = [dir stringByAppendingPathComponent:name];
+        if (DDVoicePackIsSilk(full)) [self installVoicePackItem:full];
+    }
+}
+
+// zip 可能多包一层包装目录（如导出时打的 "DD语音包/"），下钻到真正装内容的那一层
+- (NSString *)voicePackUnwrapIfSingleDir:(NSString *)dir {
+    NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    NSMutableArray *subs = [NSMutableArray array];
+    for (NSString *it in items) {
+        if ([it hasPrefix:@"."] || [it isEqualToString:@"__MACOSX"]) continue;
+        [subs addObject:it];
+    }
+    if (subs.count == 1) {
+        NSString *only = [dir stringByAppendingPathComponent:subs[0]];
+        BOOL isDir = NO;
+        [[NSFileManager defaultManager] fileExistsAtPath:only isDirectory:&isDir];
+        if (isDir) return only;
+    }
+    return dir;
+}
+
+- (void)exportVoicePack {
+    NSString *voiceDir = DDVoicePackRootPath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:voiceDir]) return;
+
+    // 打包丢后台，主线程不卡
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSString *zip = DD_ExportTemplatesToZip(names);
+        NSString *tmp = DDVoicePackTempRoot();
+        [fm createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
+        // 整目录拷进 stage 再压，zip 内保留目录名（和 DD模板套壳一致）
+        NSString *stage = [tmp stringByAppendingPathComponent:@"DD语音包"];
+        [fm copyItemAtPath:voiceDir toPath:stage error:nil];
+        NSString *zip = [tmp stringByAppendingPathComponent:@"DD语音包.zip"];
+        BOOL ok = DDVoicePackZipDirectory(stage, zip);
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!zip) { DD_ShowError(@"导出失败"); return; }
-
-            DD_HideLoading();
-            NSString *tmpDir = zip.stringByDeletingLastPathComponent; // 打包用的临时目录，分享结束后删掉
-            UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[ [NSURL fileURLWithPath:zip] ]
-                                                                             applicationActivities:nil];
+            if (!ok) return; // 打包失败，临时目录等下次清理
+            NSURL *zipURL = [NSURL fileURLWithPath:zip];
+            UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[zipURL] applicationActivities:nil];
             av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *err) {
-                [[NSFileManager defaultManager] removeItemAtPath:tmpDir error:nil];
-                if (completed) [self cancelExportSelectMode];
+                [fm removeItemAtPath:tmp error:nil]; // 分享结束回收临时目录
             };
             UIPopoverPresentationController *pop = av.popoverPresentationController;
             if (pop) { // iPad 需要锚点，否则崩溃
@@ -1495,133 +1443,11 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
     });
 }
 
-#pragma mark 重命名
-
-- (void)renameTemplateNamed:(NSString *)name {
-    [self showRenameForName:name text:name];
-}
-
-// 统一的重命名弹窗：始终显示「名字：xxx」+ 规则提示；出错时复用（关旧弹新）同一套外观，不提示具体原因
-- (void)showRenameForName:(NSString *)name text:(NSString *)text {
-    self.renamingName = name;
-    NSString *msg = [NSString stringWithFormat:@"名字：%@\n不支持：空白/特殊符号", name];
-    WCUIAlertView *av = [[NSClassFromString(@"WCUIAlertView") alloc] initWithTitle:@"模板命名" message:msg];
-    [av setTextFieldDefaultText:text];
-    [av addBtnTitle:@"取消" target:self sel:@selector(ddAlertCancelled)];
-    [av addBtnTitle:@"确定" target:self sel:@selector(ddRenameConfirmed)];
-    [av showTextFieldWithMaxLen:32];
-    [av show];
-    self.renameAlert = av;
-}
-
-- (void)ddRenameConfirmed {
-    NSString *text = [self.renameAlert getTextFieldText];
-    NSString *oldName = self.renamingName;
-    self.renameAlert = nil;
-    self.renamingName = nil;
-    if ([self renameTemplate:oldName to:text]) return;
-    // 按钮回调里直接再 show 会和本次弹窗的收起动画撞上，等一帧再弹，填过的内容留在框里
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self showRenameForName:oldName text:text];
-    });
-}
-
-// 目录和目录里的 png/cfg 一起改名；当前正在用的模板被改名则同步选中记录
-// 返回 YES 表示改好了
-- (BOOL)renameTemplate:(NSString *)oldName to:(NSString *)newName {
-    newName = [newName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (!newName.length) return NO;
-    if ([newName isEqualToString:oldName]) return YES; // 没改动，按成功收场
-    // 名字直接当目录名用：/ 会被当成路径分隔符（模板藏进嵌套目录，列表读不到），
-    // . 和 .. 会指到别的目录（删除时连上级一起删掉）
-    if ([newName containsString:@"/"] || [newName isEqualToString:@"."] || [newName isEqualToString:@".."]) {
-        return NO;
-    }
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *srcDir = DD_TplFolder(oldName), *dstDir = DD_TplFolder(newName);
-    if ([fm fileExistsAtPath:dstDir]) return NO; // 已有同名模板
-
-    BOOL ok = YES;
-    for (NSString *ext in @[@"png", @"cfg"]) {
-        NSString *src = DD_FileInFolder(srcDir, oldName, ext);
-        NSString *dst = [srcDir stringByAppendingPathComponent:[newName stringByAppendingPathExtension:ext]];
-        if (![fm moveItemAtPath:src toPath:dst error:nil]) ok = NO;
-    }
-    if (ok) ok = [fm moveItemAtPath:srcDir toPath:dstDir error:nil];
-    if (!ok) return NO;
-
-    if ([[DDShellConfig shared].selectedTpl isEqualToString:oldName]) [DDShellConfig shared].selectedTpl = newName;
-    DD_ThumbCachePurge(); // 名字变了，旧 key 的条目留着只会白占内存
-    [self reloadList]; // 列表里名字变了就是反馈，不用再弹回执
-    return YES;
-}
-
-#pragma mark 删除
-
-// 实际删除：连整目录一起删；删掉的是当前模板则清空选择
-- (void)deleteNames:(NSArray<NSString *> *)names {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *name in names) {
-        [fm removeItemAtPath:DD_TplFolder(name) error:nil];
-    }
-    // 删掉正在用的就清空选择，不自动顶下一个
-    if ([names containsObject:[DDShellConfig shared].selectedTpl]) {
-        [DDShellConfig shared].selectedTpl = @"";
-    }
-    DD_ThumbCachePurge(); // 清掉已删模板的残留条目
-}
-
-// 选择态点右上角「删除」：先确认再删
-- (void)deleteSelectedFrames {
-    NSArray *names = [self.picked.allObjects sortedArrayUsingSelector:@selector(compare:)];
-    [self confirmDeleteNames:names];
-}
-
-// 删除确认，单个和批量共用
-- (void)confirmDeleteNames:(NSArray<NSString *> *)names {
-    NSString *msg = names.count == 1
-        ? [NSString stringWithFormat:@"已选：%@", names.firstObject]
-        : [NSString stringWithFormat:@"已选：%ld 个模板", (long)names.count];
-
-    self.pendingDelete = names;
-    WCUIAlertView *av = [[NSClassFromString(@"WCUIAlertView") alloc] initWithTitle:@"模板删除" message:msg];
-    [av addBtnTitle:@"取消" target:self sel:@selector(ddAlertCancelled)];
-    [av addBtnTitle:@"确定" target:self sel:@selector(ddDeleteConfirmed)];
-    [av show];
-}
-
-- (void)ddDeleteConfirmed {
-    NSArray *names = self.pendingDelete;
-    self.pendingDelete = nil;
-    [self deleteNames:names];
-    [self reloadList];                                    // 重新读盘排序，去掉已删的
-    if (self.isSelectMode) [self cancelExportSelectMode]; // 再退出选择态
-}
-
-// 取消按钮共用：把弹窗带的临时状态清掉
-- (void)ddAlertCancelled {
-    self.renameAlert = nil;
-    self.renamingName = nil;
-    self.pendingDelete = nil;
-}
-
-#pragma mark 导入
-
-// 从系统文件导入：zip / 模板目录 / 散装 png + cfg 都支持
-- (void)uploadButtonTapped {
-    NSArray *types = @[@"public.item", @"public.content", @"public.data", @"public.folder", @"public.zip-archive"];
-    DDFilePicker *picker = [[NSClassFromString(@"UIDocumentPickerViewController") alloc] initWithDocumentTypes:types inMode:0]; // 0 = Import
-    picker.allowsMultipleSelection = YES;
-    picker.delegate = self;
-    [self presentViewController:picker animated:YES completion:nil];
-}
-
-- (void)documentPicker:(id)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSMutableArray<NSURL *> *scoped = [NSMutableArray array];
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
     for (NSURL *u in urls) {
-        if (!u.path.length) continue; // 防 addObject:nil 崩
+        if (!u.path.length) continue; // 防 addObject:nil
         if ([u startAccessingSecurityScopedResource]) [scoped addObject:u];
         [paths addObject:u.path];
     }
@@ -1630,253 +1456,46 @@ static CGFloat DD_TopUnderNavBar(UIView *view) {
         return;
     }
 
-    NSString *tmp = [DD_TempRoot() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+    NSString *destRoot = DDVoicePackRootPath();
+    [[NSFileManager defaultManager] createDirectoryAtPath:destRoot withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *tmp = DDVoicePackTempRoot();
     [[NSFileManager defaultManager] createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
 
-    // 解压 zip、整批拷模板都要在后台跑，模板多时好几秒没动静，先转上 loading 再走
-    DD_ShowLoading(@"正在导入…");
+    // 解压 + 拷贝在后台跑，语音包多时避免主线程卡顿
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSInteger n = 0;
         for (NSString *p in paths) {
             BOOL isDir = NO;
             [[NSFileManager defaultManager] fileExistsAtPath:p isDirectory:&isDir];
             if (isDir) {
-                n += DD_ImportTemplatesFrom(p);
+                [self installVoicePackItem:p];
             } else if ([p.pathExtension.lowercaseString isEqualToString:@"zip"]) {
-                NSString *dest = [tmp stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
-                if (DD_UnzipToDirectory(p, dest)) n += DD_ImportTemplatesFrom(dest);
+                NSString *unzipDir = [tmp stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+                if (DDVoicePackUnzipToDirectory(p, unzipDir)) {
+                    [self importUnpackedDir:[self voicePackUnwrapIfSingleDir:unzipDir]];
+                }
+            } else if ([p.pathExtension.lowercaseString isEqualToString:@"silk"]) {
+                [self installVoicePackItem:p];
             }
         }
-        if (!n) n = DD_ImportLooseFiles(paths); // 直接挑了 png + cfg 的情况
-
         dispatch_async(dispatch_get_main_queue(), ^{
             for (NSURL *u in scoped) [u stopAccessingSecurityScopedResource];
             [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-            DD_HideLoading();
-            if (!n) DD_ShowToast(@"没有找到可导入的模板"); // 导入成功靠列表多出来的格子反馈
-            DD_ThumbCachePurge();   // 同名模板是被覆盖安装的，不清缓存会显示上一张缩略图
-            [self reloadList];
         });
     });
 }
 
-- (void)documentPickerWasCancelled:(id)controller { }
-
 @end
 
-#pragma mark - 设置界面
-
-// 微信私有的 push（大写 P）：只有走它，Coordinator 才会接管返回箭头
-@interface UINavigationController (DDShellWCPush)
-- (void)PushViewController:(UIViewController *)viewController animated:(BOOL)animated;
-@end
-
-@interface DDShellSettingsViewController : UIViewController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
-@property (nonatomic, strong) WCTableViewManager *tableViewMgr;
-@end
-
-@implementation DDShellSettingsViewController
-
-- (void)ensureTableViewMgr {
-    if (_tableViewMgr) return;
-    id mgrCls = objc_getClass("WCTableViewManager");
-    WCTableViewManager *mgr = [mgrCls alloc];
-    _tableViewMgr = [mgr initWithFrame:[UIScreen mainScreen].bounds style:UITableViewStyleInsetGrouped];
-}
-
-- (instancetype)init {
-    if (self = [super init]) {
-        [self ensureTableViewMgr];
-    }
-    return self;
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"模板套壳设置";
-
-    // 页面底色直接取现成 tableView 的底色，顺手存进 DD_GroupBackgroundColor 给素材库用
-    UITableView *tableView = [self.tableViewMgr getTableView];
-    DD_GroupBackgroundColor = tableView.backgroundColor;
-    self.view.backgroundColor = DD_GroupBackgroundColor;
-    tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
-    [self.view addSubview:tableView];
-}
-
-// 表格从导航栏底下开始：全屏铺的话上滚时单元格会从导航栏底下穿过（与素材库同一套算法）。
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    CGFloat top = DD_TopUnderNavBar(self.view);
-    UITableView *tableView = [self.tableViewMgr getTableView];
-    tableView.frame = CGRectMake(0, top,
-                                 self.view.bounds.size.width,
-                                 self.view.bounds.size.height - top);
-}
-
-// 从素材库返回时刷新「N 个 / 当前 X」
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self buildTable];
-}
-
-- (void)buildTable {
-    id cellCls = objc_getClass("WCTableViewCellManager");
-    id secCls  = objc_getClass("WCTableViewSectionManager");
-    [self.tableViewMgr clearAllSection];
-    WCTableViewSectionManager *section = [secCls sectionInfoHeader:@"套壳设置"];
-
-    [section addCell:[cellCls switchCellForSel:@selector(enabledSwitchChanged:)
-                                        target:self title:@"启用模板套壳"
-                                            on:[DDShellConfig shared].enabled]];
-
-    if ([DDShellConfig shared].enabled) {
-        [section addCell:[cellCls switchCellForSel:@selector(autoSwitchChanged:)
-                                            target:self title:@"↳截图自动套壳"
-                                                on:[DDShellConfig shared].autoShell]];
-
-        // 素材库入口：点进去是独立页面，导出/导入在该页右上角
-        NSArray *tpls = DD_AllTemplateNames();
-        NSString *active = DD_ActiveTemplateName();
-        [section addCell:[cellCls normalCellForSel:@selector(openLibraryTapped:)
-                                            target:self title:@"↳套壳素材库"
-                                         rightValue:[NSString stringWithFormat:@"%lu 个 / 当前 %@",
-                                                    (unsigned long)tpls.count, active.length ? active : @"无"]]];
-
-        [section addCell:[cellCls switchCellForSel:@selector(deleteSwitchChanged:)
-                                            target:self title:@"↳删除套壳截图"
-                                                on:[DDShellConfig shared].deleteOriginal]];
-
-        [section addCell:[cellCls normalCellForSel:@selector(pickFromAlbumTapped:)
-                                            target:self title:@"↳相册图片套壳"
-                                         rightValue:nil]];
-
-        [section addCell:[cellCls normalCellForSel:@selector(pickVideoFromAlbumTapped:)
-                                            target:self title:@"↳相册视频套壳"
-                                         rightValue:nil]];
-    }
-
-    [self.tableViewMgr addSection:section];
-    [self.tableViewMgr reloadTableView];
-}
-
-- (void)openLibraryTapped:(id)sender {
-    // 走微信自己的 PushViewController:animated:（声明见上方），返回箭头才归微信管
-    [self.navigationController PushViewController:[DDShellLibraryViewController new] animated:YES];
-}
-
-- (void)enabledSwitchChanged:(UISwitch *)sender {
-    [DDShellConfig shared].enabled = sender.isOn;
-    [self buildTable];
-}
-- (void)autoSwitchChanged:(UISwitch *)sender {
-    [DDShellConfig shared].autoShell = sender.isOn;
-    [self buildTable];
-}
-- (void)deleteSwitchChanged:(UISwitch *)sender {
-    [DDShellConfig shared].deleteOriginal = sender.isOn;
-    [self buildTable];
-}
-
-#pragma mark - 相册选图/选视频套壳
-
-// 手动入口：点按钮时先确认有模板、再抢闸。抢不到（有任务在跑）当场提示并返回 NO，
-// 连相册选择器都不弹——不让人白挑半天素材，退出才被告知忙。闸在选完素材后由
-// DD_ShellFinish 还，取消选择时由 imagePickerControllerDidCancel 还。
-- (BOOL)beginManualPick {
-    if (!DD_ActiveTemplate()) { DD_ShowToast(@"模板未选择"); return NO; }
-    if (!DD_ShellTryBegin()) { DD_ShowToast(@"有套壳任务在进行中"); return NO; }
-    return YES;
-}
-
-// 拉起相册选择器：mediaTypes 传 nil 挑图片，传 @[@"public.movie"] 挑视频。
-// 模板与闸的前置检查已在 beginManualPick 完成，这里只负责弹选择器。
-- (void)presentAlbumPickerWithMediaTypes:(NSArray<NSString *> *)mediaTypes {
-    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    if (mediaTypes) picker.mediaTypes = mediaTypes;
-    picker.delegate = self;
-    picker.modalPresentationStyle = UIModalPresentationFullScreen;
-    [self presentViewController:picker animated:YES completion:nil];
-}
-
-// 从相册挑选一张图，套入当前模板后存回相册（不删除所选原图）
-- (void)pickFromAlbumTapped:(id)sender {
-    if ([self beginManualPick]) [self presentAlbumPickerWithMediaTypes:nil];
-}
-
-// 从相册挑选一段视频，套入当前模板后导出存回相册（不删除所选原视频）
-- (void)pickVideoFromAlbumTapped:(id)sender {
-    if ([self beginManualPick]) [self presentAlbumPickerWithMediaTypes:@[ @"public.movie" ]]; // 只挑视频
-}
-
-- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
-    [picker dismissViewControllerAnimated:YES completion:^{
-        // 图片与视频共用一个回调，按媒体类型分流
-        if ([info[UIImagePickerControllerMediaType] isEqualToString:@"public.movie"]) {
-            [self handlePickedVideo:info];
-        } else {
-            [self handlePickedImage:info];
-        }
-    }];
-}
-
-// 相册选图套壳：单张图透视贴入模板，存回相册
-- (void)handlePickedImage:(NSDictionary *)info {
-    UIImage *img = info[UIImagePickerControllerOriginalImage];
-    if (!img) { DD_ShowError(@"套壳失败"); DD_ShellEnd(); return; }   // 没拿到图 → 还闸
-    DDShellTemplate *t = DD_ActiveTemplate();
-    if (!DD_ShellStart(t)) return;   // 模板没了 → 已提示并还闸（闸在按钮点击时已抢到）
-    // 合成要开全尺寸画布，丢后台跑；提示与还闸统一交给 DD_ShellFinish
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        UIImage *outImg = DD_ComposeShellImage(img, t);
-        if (!outImg) { DD_ShellFinish(NO); return; }
-        DD_SaveImageToAlbum(outImg, ^(BOOL success, NSError *err) {
-            DD_ShellFinish(success);
-        });
-    });
-}
-
-// 相册选视频套壳：逐帧透视合成后导出 mp4，存回相册
-- (void)handlePickedVideo:(NSDictionary *)info {
-    NSURL *url = info[UIImagePickerControllerMediaURL];
-    if (!url) { DD_ShowError(@"套壳失败"); DD_ShellEnd(); return; }   // 没拿到视频 → 还闸
-    DDShellTemplate *t = DD_ActiveTemplate();
-    if (!DD_ShellStart(t)) return;   // 模板没了 → 已提示并还闸（闸在按钮点击时已抢到）
-    // 逐帧合成 + 导出是重活，丢后台跑；提示与还闸统一交给 DD_ShellFinish
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSURL *outURL = DD_ComposeShellVideo(url, t);
-        if (!outURL) { DD_ShellFinish(NO); return; }
-        DD_SaveVideoToAlbum(outURL, ^(BOOL success, NSError *err) {
-            DD_ShellFinish(success);
-        });
-    });
-}
-
-- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
-    [picker dismissViewControllerAnimated:YES completion:^{
-        DD_ShellEnd();   // 没选素材就退出，把入口时抢到的闸还回去，否则闸会一直占着
-    }];
-}
-
-@end
-
-#pragma mark - 注册入口
+// ========== 插件注册 ==========
 
 %ctor {
     @autoreleasepool {
-        (void)[DDShellConfig shared];
-        [DDShellWatcher shared]; // 挂载截图监听
-
-        // 清掉上次会话（崩溃/强退/被杀）残留的临时文件；任务中途被杀时流程内的清理来不及跑
-        NSString *tmpRoot = DD_TempRoot();
-        for (NSString *item in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpRoot error:nil]) {
-            [[NSFileManager defaultManager] removeItemAtPath:[tmpRoot stringByAppendingPathComponent:item] error:nil];
-        }
-
-        // 取不到类时整条链都是给 nil 发消息，ObjC 天然 no-op
         id mgr = objc_getClass("WCPluginsMgr");
-        [[mgr sharedInstance] registerControllerWithTitle:@"DD模板套壳"
-                                                  version:@"1.0.0"
-                                               controller:@"DDShellSettingsViewController"];
+        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
+            [[mgr sharedInstance] registerControllerWithTitle:@"DD语音包"
+                                                      version:@"1.0.0"
+                                                   controller:@"DDVoicePackSettingsViewController"];
+        }
     }
 }
