@@ -1292,6 +1292,13 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @end
 
+// 仿 DD模板套壳：子类化把老 initWithDocumentTypes:inMode: 重声明成 NSInteger 版，
+// 编译器只用本声明、看不到 SDK 头里的 deprecated 属性，于是 -Werror 也拦不住它。
+// 全程只传字符串 UTI 标识符，不依赖 UniformTypeIdentifiers 框架。
+@interface DDVoicePackPicker : UIDocumentPickerViewController
+- (instancetype)initWithDocumentTypes:(NSArray<NSString *> *)types inMode:(NSInteger)mode;
+@end
+
 @implementation DDVoicePackSettingsViewController
 
 - (void)viewDidLoad {
@@ -1344,13 +1351,6 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 }
 
 // ---- 导入导出 ----
-
-// 仿 DD模板套壳：子类化把老 initWithDocumentTypes:inMode: 重声明成 NSInteger 版，
-// 编译器只用本声明、看不到 SDK 头里的 deprecated 属性，于是 -Werror 也拦不住它。
-// 全程只传字符串 UTI 标识符，不依赖 UniformTypeIdentifiers 框架。
-@interface DDVoicePackPicker : UIDocumentPickerViewController
-- (instancetype)initWithDocumentTypes:(NSArray<NSString *> *)types inMode:(NSInteger)mode;
-@end
 
 - (void)importVoicePack {
     // 支持三种来源：整目录、zip 包、单个 .silk 文件。
