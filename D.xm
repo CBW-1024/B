@@ -51,7 +51,6 @@ static NSString * const kDDTouchTrailOnlyWhenRecordKey = @"DDTouchTrailOnlyWhenR
 - (instancetype)init {
     if (self = [super init]) {
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        // boolForKey 对未写入过的 key 直接返回 NO，无需额外播种默认值
         _touchTrailEnabled = [ud boolForKey:kDDTouchTrailEnabledKey];
         _onlyWhenRecording = [ud boolForKey:kDDTouchTrailOnlyWhenRecordKey];
     }
@@ -165,7 +164,6 @@ static CALayer *DDCreateTrailLayer(void) {
 
     // 表格整屏延伸，由 viewDidLayoutSubviews 推到导航栏底边
     _tableViewManager = [[objc_getClass("WCTableViewManager") alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
-    // 已手动避开导航栏，关掉系统自动 inset，避免两套机制叠加
     _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     [self.view addSubview:_tableViewManager.tableView];
 
