@@ -109,8 +109,6 @@
 @property (nonatomic, assign) BOOL navHidden;
 @property (nonatomic, assign) BOOL isAllowTapBgMaskToClose;
 @property (nonatomic, assign) BOOL enableDragToClose;
-@property (nonatomic, assign) BOOL autoAdjustAtKeyboardChange;
-@property (nonatomic, assign) BOOL backgroundBlur;
 @property (nonatomic, retain) UIColor *titleColor;
 @property (nonatomic, retain) UIColor *navBarBackgroundColor;
 @property (nonatomic, retain) UIColor *contentBackgroundColor;
@@ -653,8 +651,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     config.navHidden = NO;
     config.isAllowTapBgMaskToClose = YES;
     config.enableDragToClose = YES;
-    config.autoAdjustAtKeyboardChange = YES;   // 搜索框弹键盘时自动抬高面板
-    config.backgroundBlur = YES;               // 背景毛玻璃
     config.navBarBackgroundColor = [UIColor systemBackgroundColor];
     config.titleColor = [UIColor labelColor];
     config.contentBackgroundColor = [UIColor systemBackgroundColor];
