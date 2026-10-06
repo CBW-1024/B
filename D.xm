@@ -109,6 +109,8 @@
 @property (nonatomic, assign) BOOL navHidden;
 @property (nonatomic, assign) BOOL isAllowTapBgMaskToClose;
 @property (nonatomic, assign) BOOL enableDragToClose;
+@property (nonatomic, assign) BOOL autoAdjustAtKeyboardChange;
+@property (nonatomic, assign) BOOL backgroundBlur;
 @property (nonatomic, retain) UIColor *titleColor;
 @property (nonatomic, retain) UIColor *navBarBackgroundColor;
 @property (nonatomic, retain) UIColor *contentBackgroundColor;
@@ -122,6 +124,7 @@
 + (id)adapterWithViewController:(id)vc height:(double)height;
 - (void)setPageSheetConfig:(id)config;
 - (void)setDetailViewHeight:(double)h;
+- (void)updateDetailViewHeight:(double)h animated:(BOOL)animated;
 @end
 
 @interface MMPageSheetContainerWindowController : UIViewController
@@ -432,9 +435,6 @@ static void DDVoicePackShowInput(NSString *title,
 
 // ========== 语音包列表面板 ==========
 
-// 面板高度 = 屏高 * 该比例
-static const CGFloat kDDVoicePackSheetHeightRatio = 0.5;
-
 // 搜索防抖间隔（秒）：逐字符递归整个语音包目录太重
 static const NSTimeInterval kDDVoicePackSearchDebounce = 0.3;
 
@@ -451,6 +451,9 @@ static __weak UIViewController *gDDVoicePackSheetHostVC = nil;
 static NSString *gDDVoicePackPendingImportPath = nil;
 
 @interface DDVoicePackListController : UIViewController <UISearchBarDelegate>
+// MMPageSheet 内容高度协议：返回内容需要的高度，面板据此自适应而非固定比例
+- (double)pageSheetContentHeight;
+- (double)pageSheetContentWidth;
 @property (nonatomic, strong) WCTableViewManager *tableViewMgr;
 @property (nonatomic, strong) UISearchBar *searchBar;
 @property (nonatomic, copy) NSString *directoryPath;
@@ -635,7 +638,9 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:listVC];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
 
-    CGFloat sheetHeight = [UIScreen mainScreen].bounds.size.height * kDDVoicePackSheetHeightRatio;
+    // 先按当前目录刷一次数据，再用内容高度初始化面板（代替固定屏高比例）
+    [listVC ddvp_reloadData];
+    CGFloat sheetHeight = [listVC ddvp_preferredSheetHeight];
     Class adapterCls = objc_getClass("MMPageSheetAdapter");
     id adapter = adapterCls ? [adapterCls adapterWithViewController:nav height:sheetHeight] : nil;
     if (!adapter) {
@@ -651,6 +656,8 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     config.navHidden = NO;
     config.isAllowTapBgMaskToClose = YES;
     config.enableDragToClose = YES;
+    config.autoAdjustAtKeyboardChange = YES;   // 搜索框弹键盘时自动抬高面板
+    config.backgroundBlur = YES;               // 背景毛玻璃
     config.navBarBackgroundColor = [UIColor systemBackgroundColor];
     config.titleColor = [UIColor labelColor];
     config.contentBackgroundColor = [UIColor systemBackgroundColor];
@@ -761,6 +768,34 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [adapter setPageSheetConfig:config];
 }
 
+// 内容高度：搜索框 + 段头 + 各行（按行数估算，不依赖布局状态，确定且稳定）
+- (double)ddvp_preferredSheetHeight {
+    NSInteger rows = self.searching ? self.searchResults.count
+                  : (self.folderPaths.count + self.filePaths.count);
+    CGFloat searchH = CGRectGetHeight(self.searchBar.frame) > 0 ? CGRectGetHeight(self.searchBar.frame) : 56;
+    CGFloat desired = searchH + 44 /* 段头 */ + rows * 56.0;
+    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+    return MAX(screenH * 0.4, MIN(desired, screenH * 0.85));
+}
+
+// MMPageSheet 内容高度协议：适配器据此自适应面板高度
+- (double)pageSheetContentHeight {
+    return [self ddvp_preferredSheetHeight];
+}
+
+- (double)pageSheetContentWidth {
+    return [UIScreen mainScreen].bounds.size.width;
+}
+
+// 内容变化（搜索/进出目录）后让面板平滑伸缩到新高度
+- (void)ddvp_syncSheetHeight {
+    UINavigationController *nav = self.navigationController;
+    if (!nav) return;
+    id adapter = objc_getAssociatedObject(nav, kDDVoicePackSheetAdapterKey);
+    if (![adapter respondsToSelector:@selector(updateDetailViewHeight:animated:)]) return;
+    [adapter updateDetailViewHeight:[self ddvp_preferredSheetHeight] animated:YES];
+}
+
 // 当前聊天对象：只有从聊天页进来的面板才知道往哪发
 - (NSString *)ddvp_targetChatUserName {
     UINavigationController *nav = self.navigationController;
@@ -842,6 +877,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     if (section) [self.tableViewMgr addSection:section];
     [[self.tableViewMgr getTableView] reloadData];
     [self ddvp_installTableProxyIfNeeded];
+    [self ddvp_syncSheetHeight];
 }
 
 - (id)ddvp_fileCellForPath:(NSString *)path title:(NSString *)title {
