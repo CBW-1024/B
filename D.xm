@@ -16,7 +16,7 @@
 
 // ========== 微信内部类声明 ==========
 
-// 微信头文件 dump 里没有这个类，接口按 DD消息助手的写法声明
+// 微信内部类，头文件里没有，按运行时行为声明
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -44,7 +44,7 @@
 @interface CMessageMgr : NSObject
 - (void)AddLocalMsg:(id)chatName MsgWrap:(id)msgWrap;
 - (void)ModMsg:(id)chatName MsgWrap:(id)msgWrap;
-// 首参传 nil：声明是两参，传 NSData 会被当成路径处理
+// 首参传 nil；传 NSData 会被当成路径处理
 - (BOOL)SaveMesVoice:(id)a0 MsgWrap:(id)a1;
 @end
 
@@ -157,9 +157,8 @@
 + (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue accessoryType:(long long)type;
 @end
 
-// 注意：dump 出来的父类经常失真（MMUIButton、VoiceMessageCellView 都被写成 : NSObject，
-// 实际一个是 UIButton 子类、一个是 UIView 子类，从它们带着 setFrame:/intrinsicContentSize 能看出来）。
-// 所以下面该写 UIButton / UIViewController 的就照真实继承写，别照 dump 抄 NSObject。
+// 注意：头文件里导出的父类经常失真（MMUIButton、VoiceMessageCellView 都被写成 NSObject，
+// 实际一个是 UIButton 子类、一个是 UIView 子类），按真实继承写，别照抄
 @interface MMUIButton : UIButton
 @end
 
@@ -177,20 +176,20 @@
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender;
 @end
 
-// 微信内的 zip 工具，编译期只提供 selector 声明，运行期 objc_getClass 取，不产生链接符号
+// 微信内的 zip 工具（真名 QSSZipArchive）。这里另起名字声明，只为拿到 selector 签名过编译，
+// 运行时 objc_getClass 取真实类，本类从不实例化，也不产生链接符号
 @interface DDVoicePackZipArchive : NSObject
 + (BOOL)createZipFileAtPath:(id)zipPath withContentsOfDirectory:(id)dir keepParentDirectory:(BOOL)keep;
 + (BOOL)unzipFileAtPath:(id)zipPath toDestination:(id)dest;
 @end
 
-// 打包整个目录，zip 内保留该目录名（和 DD模板套壳一致）
+// 打包整个目录，zip 内保留该目录名
 static BOOL DDVoicePackZipDirectory(NSString *srcDir, NSString *zipPath) {
     return [objc_getClass("QSSZipArchive") createZipFileAtPath:zipPath
                                       withContentsOfDirectory:srcDir
                                           keepParentDirectory:YES];
 }
 
-// 解包 zip 到目录
 static BOOL DDVoicePackUnzipToDirectory(NSString *zipPath, NSString *destDir) {
     return [objc_getClass("QSSZipArchive") unzipFileAtPath:zipPath toDestination:destDir];
 }
@@ -233,8 +232,8 @@ static NSString * const kDDVoicePackKeepPanelKey = @"DDVoicePack_KeepPanelAfterS
 
 // ========== 辅助函数 ==========
 
-// 语音包根目录。放 Library/Preferences 下，和 DD模板套壳对齐：
-// 微信「清理缓存」会清 Documents，但动不了 Preferences，语音不会丢；且不进 iCloud、不在文件 App 暴露
+// 语音包根目录。放 Library/Preferences 下：微信「清理缓存」只清 Documents，动不了这里，
+// 语音不会丢；且不进 iCloud、不在文件 App 暴露
 static NSString *DDVoicePackRootPath(void) {
     NSString *library = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
     NSString *pref = [library stringByAppendingPathComponent:@"Preferences"];
@@ -252,7 +251,7 @@ static BOOL DDVoicePackIsSilk(NSString *path) {
 }
 
 // 列出一层目录：文件夹归 folders，SILK 文件归 files。
-// 跳过隐藏文件（.DS_Store 之类）和认不出的格式——列出来点了也是静默失败
+// 隐藏文件（.DS_Store 之类）和认不出的格式直接跳过——列出来点了也发不出去
 static void DDVoicePackListDirectory(NSString *dirPath, NSArray<NSString *> **outFolders, NSArray<NSString *> **outFiles) {
     if (!dirPath.length) return;
 
@@ -313,7 +312,7 @@ static NSArray<NSString *> *DDVoicePackSearchFiles(NSString *root, NSString *key
 }
 
 static id DDVoicePackThemeManager(void) {
-    // 微信内部类一律用 objc_getClass 拿，直接写类名会让链接器找符号
+    // 微信内部类一律 objc_getClass 取，直接写类名会让链接器找符号
     Class ctxCls = objc_getClass("MMContext");
     id context = [ctxCls activeUserContext] ?: [ctxCls rootContext];
     return [context getService:objc_getClass("MMThemeManager")];
@@ -343,12 +342,62 @@ static UIViewController *DDVoicePackTopVC(void) {
     return top;
 }
 
-// 发送一条语音（实现见「音频处理与发送」区，这里提前声明给面板用）
+// 这两个实现在「音频处理与发送」区，面板要用，先在这里声明
 static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId);
+static unsigned int DDVoicePackDurationMs(NSString *path);
+
+// ========== 微信原生提示 ==========
+
+// 微信内置提示控件，运行时按类名取，编译期不产生链接符号
+@interface WeToast : NSObject
++ (instancetype)toast;
+- (void)setLoadingStyle:(BOOL)style;
+- (void)showToastWithText:(NSString *)text;
+- (void)showDoneToastWithText:(NSString *)text;    // 方形带 ✓
+- (void)showErrorToastWithText:(NSString *)text;   // 方形带错误图标
+- (void)hideWithAnimated:(int)animated;
+@end
+
+static WeToast *gDDVoicePackBusyToast = nil; // 进行中的 loading，出结果时收起
+
+static WeToast *DDVoicePackToast(void) {
+    return [NSClassFromString(@"WeToast") toast];
+}
+
+// loading 和结果提示是同一套控件，出结果前必须先收起 loading
+static void DDVoicePackHideLoading(void) {
+    [gDDVoicePackBusyToast hideWithAnimated:YES];
+    gDDVoicePackBusyToast = nil;
+}
+
+// 同时只保留一个 loading 实例；起新的前先收掉旧的，否则上一个转圈会永远停在屏幕上
+static void DDVoicePackShowLoading(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gDDVoicePackBusyToast) DDVoicePackHideLoading();
+        WeToast *toast = DDVoicePackToast();
+        [toast setLoadingStyle:YES];
+        [toast showToastWithText:text];
+        gDDVoicePackBusyToast = toast;
+    });
+}
+
+static void DDVoicePackShowDone(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DDVoicePackHideLoading();
+        [DDVoicePackToast() showDoneToastWithText:text];
+    });
+}
+
+static void DDVoicePackShowError(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DDVoicePackHideLoading();
+        [DDVoicePackToast() showErrorToastWithText:text];
+    });
+}
 
 // ========== 语音预览 ==========
 
-// 试听只走微信的 SilkAudioPlayer，挂在宿主上，下次播放前先停掉上一个
+// 试听用微信的 SilkAudioPlayer，挂在宿主 VC 上，每次播放前先停掉上一个
 static const void *kDDVoicePackPreviewPlayerKey = &kDDVoicePackPreviewPlayerKey;
 
 static void DDVoicePackStopPreview(id owner) {
@@ -416,7 +465,7 @@ static void DDVoicePackShowInput(NSString *title,
                                        handler:^{ [bridge ddvp_commit]; }];
     bridge.tipsVC = tipsVC;
     objc_setAssociatedObject(tipsVC, kDDVoicePackInputBridgeKey, bridge, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [tipsVC addTextViewWithMaxLen:30];
+    [tipsVC addTextViewWithMaxLen:30]; // 名字上限，APFS 文件名 255 字节够用
     [tipsVC setTextFieldDefaultText:defaultText ?: @""];
     [tipsVC show];
 }
@@ -479,7 +528,7 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 // ========== 表格代理转发 ==========
 
 // WCTableViewManager 自己就是 tableView 的 delegate，这里插一层代理只为吃下左滑相关回调
-// 代理自己接管的回调（左滑相关），其余全部转发给微信原来的 delegate
+// 这四个由代理接管，其余全部转发给微信原来的 delegate
 static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     return sel_isEqual(aSelector, @selector(tableView:canEditRowAtIndexPath:)) ||
            sel_isEqual(aSelector, @selector(tableView:editingStyleForRowAtIndexPath:)) ||
@@ -519,26 +568,22 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
-        // 滑动删除已由 trailingSwipeActionsConfiguration 接管，不再返回 Delete 编辑样式，
-        // 否则 iOS 叠加「滑动位移 + 编辑内缩」导致右滑收起后内容残留向右偏移。
+        // 删除走左滑动作，不返回 Delete 编辑样式：两种机制叠加会让收起后行内容残留偏移
         return UITableViewCellEditingStyleNone;
     }
     return ((UITableViewCellEditingStyle (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
 }
 
-// 滑动（editing）时不要对 contentView 施加缩进位移，否则左滑露出操作、右滑收起后行会残留向右偏移。
-// 我们从不用传统左侧删除按钮，缩进纯属多余，禁用即可从源头消除偏移。
+// 左滑时不让 contentView 缩进，否则收起后行内容会残留向右偏移
 - (BOOL)tableView:(UITableView *)tableView shouldIndentWhileEditingRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self.host ddvp_swipeAllowedAtIndexPath:indexPath]) return NO;
     return ((BOOL (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
 }
 
-// 左滑（trailing）统一露出操作：文件行「试听 / 重命名 / 删除」，文件夹行「重命名 / 删除」（文件夹无试听）。
-// 不再提供右滑，单一方向更简单。
+// 左滑统一露出操作：文件行「试听 / 重命名 / 删除」，文件夹行「重命名 / 删除」。
+// 微信只实现了老式的 editActionsForRowAtIndexPath:，转发新方法会 unrecognized selector，故不转发行直接给 nil
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (![self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
-        return ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
-    }
+    if (![self.host ddvp_swipeAllowedAtIndexPath:indexPath]) return nil;
 
     __weak typeof(self.host) weakHost = self.host;
     UIContextualAction *deleteAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"删除" handler:^(UIContextualAction *action, UIView *sourceView, void (^done)(BOOL)) {
@@ -595,7 +640,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 @implementation UINavigationController (DDVoicePackSheet)
 
 - (void)ddvp_voicePackBack:(id)sender {
-    // 搜索中：左上角返回箭头先充当「取消搜索」，不 pop 也不关面板（A 方案：取消后再点才回上层/关面板）
+    // 搜索中：返回箭头先当「取消搜索」用，再点一次才回上层或关面板
     DDVoicePackListController *top = (DDVoicePackListController *)self.topViewController;
     if ([top isKindOfClass:[DDVoicePackListController class]] && top.searching) {
         [top ddvp_searchCancelTapped];
@@ -750,10 +795,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 // 当前聊天对象：只有从聊天页进来的面板才知道往哪发
 - (NSString *)ddvp_targetChatUserName {
     UIViewController *fromVC = objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetFromVCKey);
-
-    // isKindOfClass 已经保证了类型，后面直接取就行，不用再 respondsToSelector
     if (![fromVC isKindOfClass:objc_getClass("BaseMsgContentViewController")]) return nil;
-
     CBaseContact *contact = [(BaseMsgContentViewController *)fromVC GetContact];
     return contact.m_nsUsrName;
 }
@@ -802,7 +844,8 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
         for (NSString *name in files) [filePaths addObject:[dirPath stringByAppendingPathComponent:name]];
         self.filePaths = filePaths;
 
-        NSString *header = self.directoryPath.length
+        // 根目录有分类时按分类计，没有就按散装条数计
+        NSString *header = (self.directoryPath.length || !folders.count)
             ? [NSString stringWithFormat:@"%lu 条语音", (unsigned long)files.count]
             : [NSString stringWithFormat:@"%lu 个分类", (unsigned long)folders.count];
         section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:header Footer:@""];
@@ -826,10 +869,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [self ddvp_installTableProxyIfNeeded];
 }
 
-// 时长预估函数的前向声明（真正实现在文件后部，发送语音时复用同一份）
-static unsigned int DDVoicePackDurationMs(NSString *path);
-
-// 把毫秒格式化成列表副标题：短语音 "3秒"，长语音 "1:05"
+// 把毫秒格式化成列表副标题：3 秒 → "语音时长：3秒"，65 秒 → "语音时长：1分5秒"
 static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     unsigned int total = ms / 1000;
     if (total < 60) return [NSString stringWithFormat:@"语音时长：%u秒", total];
@@ -845,8 +885,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
                                                                  detail:detail];
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
 
-    // 文件行不需要导航箭头：cell 是 WCTableViewCellManager 封装，经 cellConfig → rightConfig 把 accessoryType 设为 0（无箭头）。
-    // WCTableViewCellNormalConfig 必有 rightConfig、rightConfig 必响应 setAccessoryType:，无需 respondsToSelector 守卫。
+    // 文件行不要导航箭头。cell 是 manager 的封装对象，得经 cellConfig → rightConfig 才能设 accessoryType
     id cellConfig = ((id (*)(id, SEL))objc_msgSend)(cell, @selector(cellConfig));
     id rightCfg   = ((id (*)(id, SEL))objc_msgSend)(cellConfig, @selector(rightConfig));
     ((void (*)(id, SEL, unsigned long long))objc_msgSend)(rightCfg, @selector(setAccessoryType:), 0ULL);
@@ -884,7 +923,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     DDVoicePackSendFileAtPath(path, chatId);
 }
 
-// cell manager 在 reload 时已把路径写到自身关联对象上，点哪行取哪行，无需再用 indexPath 反查
+// 路径在 reload 时就写进了 cell manager 的关联对象，点哪行取哪行
 - (NSString *)ddvp_pathForCellSender:(id)sender {
     NSString *path = objc_getAssociatedObject(sender, kDDVoicePackCellPathKey);
     if ([path isKindOfClass:[NSString class]] && path.length) return path;
@@ -970,7 +1009,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     return btn;
 }
 
-// 根目录或有待纳入语音时才显示「+」，搜索态下让位给「取消」
+// 根目录、或有待纳入语音时才显示「+」；搜索态隐藏，取消搜索由左上角返回箭头兼任
 - (BOOL)ddvp_shouldShowPlusButton {
     if (self.searching) return NO;
     return self.directoryPath.length == 0 || [DDVoicePackListController ddvp_pendingImportPath].length > 0;
@@ -1090,7 +1129,7 @@ static const unsigned int kDDVoicePackMinVoiceMs = 300;
 static const unsigned int kDDVoicePackMaxVoiceMs = 60000;
 
 // SILK 不是 AVFoundation 认的格式，读不出时长，按文件大小粗估（约 2KB/s）。
-// 估不出来就是 0，由发送侧的 300ms 下限钳制兜住，这里不重复兜底
+// 估不出来就是 0，交给发送侧的 300ms 下限去钳制
 static unsigned int DDVoicePackDurationMs(NSString *path) {
     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
     return (unsigned int)([attrs fileSize] / 2000) * 1000;
@@ -1125,9 +1164,8 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
     [[NSFileManager defaultManager] createDirectoryAtPath:[audioPath stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
     [silk writeToFile:audioPath atomically:YES];
 
-    // 语音时长 / 格式 / 数据一律装 extInfo。CMessageWrap 上没有
-    // setM_uiVoiceTime: / setM_uiVoiceFormat: / setM_dtVoice:，
-    // 这几个只存在于 UploadVoiceWrap、MassSendWrap、CExtendInfoOfVoiceMsg 上，硬调会崩。
+    // 语音时长 / 格式 / 数据一律装 extInfo：CMessageWrap 上没有那几个 setter，
+    // 它们只存在于 UploadVoiceWrap / MassSendWrap / CExtendInfoOfVoiceMsg，硬调会崩
     CExtendInfoOfVoiceMsg *extInfo = [[objc_getClass("CExtendInfoOfVoiceMsg") alloc] init];
     [extInfo setM_dtVoice:silk];
     [extInfo setM_uiVoiceTime:voiceMs];
@@ -1138,11 +1176,11 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
 
     [msg UpdateContent:nil];
     [msgMgr ModMsg:chatId MsgWrap:msg];
-    // 落盘：首参传 nil（传 NSData 会被当成路径）
+    // 落盘：首参传 nil
     [msgMgr SaveMesVoice:nil MsgWrap:msg];
 
     // 上传：AudioSender 是微信语音发送链路上的服务对象，ResendVoiceMsg:MsgWrap: 是唯一入口。
-    // 不再 KVC 取 m_upload（取不到会抛 NSUndefinedKeyException 直接崩），也不再退 MMNewUploadVoiceMgr。
+    // 别用 KVC 取 m_upload——取不到会抛 NSUndefinedKeyException
     AudioSender *sender = [context getService:objc_getClass("AudioSender")];
     if (!sender) return NO;
     [sender ResendVoiceMsg:chatId MsgWrap:msg];
@@ -1189,7 +1227,6 @@ static const void *kDDVoicePackLongPressKey = &kDDVoicePackLongPressKey;
 
     if (objc_getAssociatedObject(self, kDDVoicePackLongPressKey)) return;
     UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(ddvp_moreLongPress:)];
-    // 不设 minimumPressDuration，用系统默认（0.5 秒）
     [self addGestureRecognizer:longPress];
     objc_setAssociatedObject(self, kDDVoicePackLongPressKey, longPress, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -1211,7 +1248,6 @@ static NSString * const kDDVoicePackImportMenuToken = @"ddvp:import";
 static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL enabled) {
     if (!enabled || !original) return original;
 
-    // 微信自己的菜单数组里全是 MMMenuItem，不用逐个问 userInfo
     for (MMMenuItem *item in original) {
         if ([[item userInfo] isEqual:kDDVoicePackImportMenuToken]) return original;
     }
@@ -1244,7 +1280,7 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     if (action == @selector(ddvp_importVoice:)) {
         return [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]);
     }
-    // %orig 独占一行：Logos 对行尾内容的处理很糙，跟其他语句写同一行容易出编译错
+    // %orig 单独一行：Logos 对行尾内容的处理不牢靠，与其他语句同行容易编译失败
     BOOL origResult = %orig;
     return origResult;
 }
@@ -1283,63 +1319,13 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 // ========== 设置界面 ==========
 
-// ========== 微信原生提示：WeToast（方形） ==========
-
-// 微信内置提示控件，运行时按类名获取，编译期不产生链接符号（和 DD模板套壳一致）
-@interface WeToast : NSObject
-+ (instancetype)toast;
-- (void)setLoadingStyle:(BOOL)style;
-- (void)showToastWithText:(NSString *)text;
-- (void)showDoneToastWithText:(NSString *)text;    // 方形带 ✓
-- (void)showErrorToastWithText:(NSString *)text;   // 方形带错误图标
-- (void)hideWithAnimated:(int)animated;
-@end
-
-static WeToast *gDDVoicePackBusyToast = nil; // 进行中的 loading，出结果时收起
-
-static WeToast *DDVoicePackToast(void) {
-    return [NSClassFromString(@"WeToast") toast];
-}
-
-// loading 和结果提示是同一套控件，出结果前必须先收起 loading
-static void DDVoicePackHideLoading(void) {
-    [gDDVoicePackBusyToast hideWithAnimated:YES];
-    gDDVoicePackBusyToast = nil;
-}
-
-// 同时只保留一个 loading 实例；起新的前先收掉旧的，否则上一个转圈会永远停在屏幕上
-static void DDVoicePackShowLoading(NSString *text) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (gDDVoicePackBusyToast) DDVoicePackHideLoading();
-        WeToast *toast = DDVoicePackToast();
-        [toast setLoadingStyle:YES];
-        [toast showToastWithText:text];
-        gDDVoicePackBusyToast = toast;
-    });
-}
-
-static void DDVoicePackShowDone(NSString *text) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        DDVoicePackHideLoading();
-        [DDVoicePackToast() showDoneToastWithText:text];
-    });
-}
-
-static void DDVoicePackShowError(NSString *text) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        DDVoicePackHideLoading();
-        [DDVoicePackToast() showErrorToastWithText:text];
-    });
-}
-
 @interface DDVoicePackSettingsViewController : UIViewController <UIDocumentPickerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @end
 
-// 仿 DD模板套壳：子类只作编译器的类型/selector 声明用——把老 initWithDocumentTypes:inMode: 重声明成 NSInteger 版，
-// 编译器只看本声明、看不到 SDK 头里的 deprecated 属性，于是 -Werror 也拦不住它。
-// 运行时通过 NSClassFromString(@"UIDocumentPickerViewController") 取【真实类】来 alloc，本子类不会被实例化，
-// 因此不需要 @implementation、也不产生链接符号。全程只传字符串 UTI 标识符，不依赖 UniformTypeIdentifiers 框架。
+// 只为骗过编译器：把 initWithDocumentTypes:inMode: 重声明成 NSInteger 版，绕开 SDK 头里的
+// deprecated 标记，-Werror 就不拦了。运行时用 NSClassFromString 取真实类来 alloc，本子类从不实例化，
+// 因此不需要 @implementation，也不产生链接符号
 @interface DDVoicePackPicker : UIDocumentPickerViewController
 - (instancetype)initWithDocumentTypes:(NSArray<NSString *> *)types inMode:(NSInteger)mode;
 @end
@@ -1398,16 +1384,15 @@ static void DDVoicePackShowError(NSString *text) {
 // ---- 导入导出 ----
 
 - (void)importVoicePack {
-    // 支持三种来源：整目录、zip 包、单个 .silk 文件。
-    // 直接传字符串 UTI 标识符 + 老 API，不依赖 UniformTypeIdentifiers 框架（和 DD模板套壳一致）。
+    // 三种来源：整目录、zip 包、单个 .silk 文件
     NSArray *types = @[@"public.folder", @"public.zip-archive", @"public.data"];
-    DDVoicePackPicker *picker = [[NSClassFromString(@"UIDocumentPickerViewController") alloc] initWithDocumentTypes:types inMode:0]; // 0 = Import；NSClassFromString 取真实类，DDVoicePackPicker 只用于编译器的类型/selector 声明，不参与实例化
+    DDVoicePackPicker *picker = [[NSClassFromString(@"UIDocumentPickerViewController") alloc] initWithDocumentTypes:types inMode:0]; // 0 = Import
     picker.delegate = self;
     picker.allowsMultipleSelection = YES;
     [self presentViewController:picker animated:YES completion:nil];
 }
 
-// 整目录或单文件，都按同名落到语音包根下，同名则覆盖 —— 和 DD模板套壳一致
+// 整目录或单文件都按同名落到语音包根下，同名则覆盖
 - (BOOL)installVoicePackItem:(NSString *)src {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dst = [DDVoicePackRootPath() stringByAppendingPathComponent:src.lastPathComponent];
@@ -1415,25 +1400,19 @@ static void DDVoicePackShowError(NSString *text) {
     return [fm copyItemAtPath:src toPath:dst error:nil];
 }
 
-// 解压后的目录：顶层有子文件夹就把每个子文件夹装成同名语音包；
-// 顶层没有文件夹（散装 .silk）就逐个落根目录。对应 DD模板套壳 DD_ImportTemplatesFrom 的思路
-// 对应 DD模板套壳 DD_ImportTemplatesFrom 的思路，返回装进去的个数（0 表示这条 zip 里没有可用内容）
+// 解压后的目录：子文件夹逐个装成同名语音包，散装 .silk 逐个落根目录。
+// 返回装进去的个数，0 表示这条 zip 里没有可用内容
 - (NSInteger)importUnpackedDir:(NSString *)dir {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
     NSInteger n = 0;
-    BOOL installedFolder = NO;
     for (NSString *name in items) {
         if ([name hasPrefix:@"."] || [name isEqualToString:@"__MACOSX"]) continue;
         NSString *full = [dir stringByAppendingPathComponent:name];
         BOOL isDir = NO;
         [fm fileExistsAtPath:full isDirectory:&isDir];
-        if (isDir) {
-            if ([self installVoicePackItem:full]) n++;
-            installedFolder = YES;
-        }
+        if (isDir && [self installVoicePackItem:full]) n++;
     }
-    if (installedFolder) return n;
     for (NSString *name in items) {
         if ([name hasPrefix:@"."] || [name isEqualToString:@"__MACOSX"]) continue;
         NSString *full = [dir stringByAppendingPathComponent:name];
@@ -1462,7 +1441,7 @@ static void DDVoicePackShowError(NSString *text) {
 - (void)exportVoicePack {
     NSString *voiceDir = DDVoicePackRootPath();
     NSFileManager *fm = [NSFileManager defaultManager];
-    // 语音包目录都不存在说明一个分类都没有，直接当失败，别静默
+    // 一个分类都还没有，直接报失败，不要静默
     if (![fm fileExistsAtPath:voiceDir]) {
         DDVoicePackShowError(@"导出失败");
         return;
@@ -1474,15 +1453,15 @@ static void DDVoicePackShowError(NSString *text) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSString *tmp = DDVoicePackTempRoot();
         [fm createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
-        // 整目录拷进 stage 再压，zip 内保留目录名（和 DD模板套壳一致）
+        // 整目录拷进 stage 再压，zip 内保留目录名
         NSString *stage = [tmp stringByAppendingPathComponent:@"DD语音包"];
         [fm copyItemAtPath:voiceDir toPath:stage error:nil];
         NSString *zip = [tmp stringByAppendingPathComponent:@"DD语音包.zip"];
         BOOL ok = DDVoicePackZipDirectory(stage, zip);
         dispatch_async(dispatch_get_main_queue(), ^{
-            // 打包失败，临时目录等下次清理
-            if (!ok) { DDVoicePackShowError(@"导出失败"); return; }
-            // 导出成功不弹提示：紧接着就是分享面板，用户看得到
+            // 失败也得清掉，否则整份语音包副本一直留在 tmp 里
+            if (!ok) { [fm removeItemAtPath:tmp error:nil]; DDVoicePackShowError(@"导出失败"); return; }
+            // 成功不弹提示：紧接着就是分享面板，结果用户自己看得到
             DDVoicePackHideLoading();
 
             NSURL *zipURL = [NSURL fileURLWithPath:zip];
