@@ -151,8 +151,6 @@
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
 + (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title detail:(id)detail;
-// 拿 manager 背后的真 cell 用这个。老代码里的 getCell 在 8.0.79 上已经没有了
-- (id)cell;
 @end
 
 @interface WCTableViewNormalCellManager : NSObject
@@ -177,12 +175,6 @@
 - (id)getViewController;
 - (NSArray *)operationMenuItems;
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender;
-@end
-
-// 微信内的 zip 工具，编译期只提供 selector 声明，运行期 objc_getClass 取，不产生链接符号
-@interface DDVoicePackZipArchive : NSObject
-+ (BOOL)createZipFileAtPath:(id)zipPath withContentsOfDirectory:(id)dir keepParentDirectory:(BOOL)keep;
-+ (BOOL)unzipFileAtPath:(id)zipPath toDestination:(id)dest;
 @end
 
 // 打包整个目录，zip 内保留该目录名（和 DD模板套壳一致）
@@ -490,7 +482,6 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     return sel_isEqual(aSelector, @selector(tableView:canEditRowAtIndexPath:)) ||
            sel_isEqual(aSelector, @selector(tableView:editingStyleForRowAtIndexPath:)) ||
-           sel_isEqual(aSelector, @selector(tableView:commitEditingStyle:forRowAtIndexPath:)) ||
            sel_isEqual(aSelector, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)) ||
            sel_isEqual(aSelector, @selector(tableView:shouldIndentWhileEditingRowAtIndexPath:));
 }
@@ -512,14 +503,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     return [self.forwardTarget respondsToSelector:aSelector];
 }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return ((NSInteger (*)(id, SEL, UITableView *, NSInteger))objc_msgSend)(self.forwardTarget, _cmd, tableView, section);
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    return ((UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
-}
-
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self.host ddvp_swipeAllowedAtIndexPath:indexPath]) return YES;
     return ((BOOL (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
@@ -539,14 +522,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 - (BOOL)tableView:(UITableView *)tableView shouldIndentWhileEditingRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self.host ddvp_swipeAllowedAtIndexPath:indexPath]) return NO;
     return ((BOOL (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
-}
-
-- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (style == UITableViewCellEditingStyleDelete && [self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
-        if (![self.host ddvp_rowCanPreviewAtIndexPath:indexPath]) [self.host ddvp_deleteItemAtIndexPath:indexPath];
-        return;
-    }
-    ((void (*)(id, SEL, UITableView *, UITableViewCellEditingStyle, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, style, indexPath);
 }
 
 // 左滑（trailing）统一露出操作：文件行「试听 / 重命名 / 删除」，文件夹行「重命名 / 删除」（文件夹无试听）。
