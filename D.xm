@@ -491,7 +491,9 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     return sel_isEqual(aSelector, @selector(tableView:canEditRowAtIndexPath:)) ||
            sel_isEqual(aSelector, @selector(tableView:editingStyleForRowAtIndexPath:)) ||
            sel_isEqual(aSelector, @selector(tableView:commitEditingStyle:forRowAtIndexPath:)) ||
-           sel_isEqual(aSelector, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:));
+           sel_isEqual(aSelector, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)) ||
+           sel_isEqual(aSelector, @selector(tableView:leadingSwipeActionsConfigurationForRowAtIndexPath:)) ||
+           sel_isEqual(aSelector, @selector(tableView:shouldIndentWhileEditingRowAtIndexPath:));
 }
 
 @interface DDVoicePackTableProxy : NSObject <UITableViewDelegate, UITableViewDataSource>
@@ -564,18 +566,26 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     }];
 
     NSArray *actions = @[deleteAction, renameAction];
-    BOOL fullSwipe = YES;
-    if ([self.host ddvp_rowCanPreviewAtIndexPath:indexPath]) {
-        UIContextualAction *previewAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"试听" handler:^(UIContextualAction *action, UIView *sourceView, void (^done)(BOOL)) {
-            [weakHost ddvp_previewItemAtIndexPath:indexPath];
-            done(YES);
-        }];
-        previewAction.backgroundColor = [UIColor systemBlueColor];
-        actions = @[deleteAction, renameAction, previewAction];
-        fullSwipe = NO;
-    }
     UISwipeActionsConfiguration *config = [UISwipeActionsConfiguration configurationWithActions:actions];
-    config.performsFirstActionWithFullSwipe = fullSwipe;
+    config.performsFirstActionWithFullSwipe = YES;
+    return config;
+}
+
+// 右滑（leading）露出「试听」，仅对文件行生效；文件夹行无试听，返回 nil 即不提供右滑操作。
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView leadingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (![self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
+        return ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
+    }
+    if (![self.host ddvp_rowCanPreviewAtIndexPath:indexPath]) return nil;
+
+    __weak typeof(self.host) weakHost = self.host;
+    UIContextualAction *previewAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"试听" handler:^(UIContextualAction *action, UIView *sourceView, void (^done)(BOOL)) {
+        [weakHost ddvp_previewItemAtIndexPath:indexPath];
+        done(YES);
+    }];
+    previewAction.backgroundColor = [UIColor systemBlueColor];
+    UISwipeActionsConfiguration *config = [UISwipeActionsConfiguration configurationWithActions:@[previewAction]];
+    config.performsFirstActionWithFullSwipe = NO;
     return config;
 }
 
@@ -872,11 +882,13 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
                                                                  detail:detail];
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
 
-    // 右侧「>>」发送按钮：挂到微信 rightConfig 槽，并清掉自绘箭头避免与按钮冲突
+    // 右侧「>>」发送按钮：挂到微信 rightConfig 的 rightView 槽，只有点这个按钮才发送。
+    // 不使用任何 setAccssoryTarget/Action 兜底，纯 UIButton + addTarget。
     id cellConfig = ((id (*)(id, SEL))objc_msgSend)(cell, @selector(cellConfig));
     if ([cellConfig respondsToSelector:@selector(rightConfig)]) {
         id rightCfg = ((id (*)(id, SEL))objc_msgSend)(cellConfig, @selector(rightConfig));
         if (rightCfg) {
+            // 清掉微信自绘箭头，避免和「>>」按钮在右侧挤在一起
             if ([rightCfg respondsToSelector:@selector(setAccessoryType:)]) {
                 ((void (*)(id, SEL, unsigned long long))objc_msgSend)(rightCfg, @selector(setAccessoryType:), 0);
             }
@@ -888,11 +900,6 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
             [sendBtn addTarget:self action:@selector(ddvp_sendCellButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
             objc_setAssociatedObject(sendBtn, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
             if ([rightCfg respondsToSelector:@selector(setRightView:)]) [rightCfg setRightView:sendBtn];
-            // 兜底：让微信 accessory 区域的点击也走发送（sender 不管是 cell 还是按钮都能读到 path）
-            if ([rightCfg respondsToSelector:@selector(setAccssoryTarget:)])
-                ((void (*)(id, SEL, id))objc_msgSend)(rightCfg, @selector(setAccssoryTarget:), self);
-            if ([rightCfg respondsToSelector:@selector(setAccssoryAction:)])
-                ((void (*)(id, SEL, SEL))objc_msgSend)(rightCfg, @selector(setAccssoryAction:), @selector(ddvp_sendCellButtonTapped:));
         }
     }
     return cell;
