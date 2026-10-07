@@ -283,16 +283,6 @@ static NSUInteger DDVoicePackFileCountIn(NSString *dirPath) {
     return files.count;
 }
 
-// 去掉首尾空白和 .silk 后缀，返回可当文件名的基名
-static NSString *DDVoicePackSanitizedName(NSString *raw) {
-    NSString *text = DDVoicePackTrim(raw);
-    NSString *lower = [text lowercaseString];
-    if ([lower hasSuffix:@".silk"]) {
-        text = DDVoicePackTrim([text substringToIndex:text.length - 5]);
-    }
-    return text.length ? text : nil;
-}
-
 // 去扩展名，重命名时当输入框的默认值
 static NSString *DDVoicePackBaseName(NSString *path) {
     return [[path lastPathComponent] stringByDeletingPathExtension];
@@ -420,7 +410,7 @@ static void DDVoicePackShowInput(NSString *title,
                                        handler:^{ [bridge ddvp_commit]; }];
     bridge.tipsVC = tipsVC;
     objc_setAssociatedObject(tipsVC, kDDVoicePackInputBridgeKey, bridge, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [tipsVC addTextViewWithMaxLen:128];
+    [tipsVC addTextViewWithMaxLen:30];
     [tipsVC setTextFieldDefaultText:defaultText ?: @""];
     [tipsVC show];
 }
@@ -462,6 +452,8 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 - (void)ddvp_syncSheetNavigationBar;
 - (void)ddvp_updatePlusButton;
 - (UIButton *)ddvp_plusButton;
+- (void)ddvp_showNewFolderInputToDirectory:(NSString *)directory;
+- (void)ddvp_showImportInputToDirectory:(NSString *)directory;
 
 // 以下供 DDVoicePackTableProxy 回调
 - (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath;
@@ -910,28 +902,38 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     NSString *parent = [oldPath stringByDeletingLastPathComponent];
 
     __weak typeof(self) weakSelf = self;
-    DDVoicePackShowInput(@"重命名", @"请输入新名称", DDVoicePackBaseName(oldPath), ^(NSString *text) {
-        [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:DDVoicePackTrim(text) indexPath:indexPath];
+    DDVoicePackShowInput(@"重命名", @"请输入有效名字", DDVoicePackBaseName(oldPath), ^(NSString *text) {
+        [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:text indexPath:indexPath];
     }, nil);
 }
 
 - (void)ddvp_renameItemAtPath:(NSString *)oldPath
                        parent:(NSString *)parent
-                       toName:(NSString *)baseName
+                       toName:(NSString *)rawName
                     indexPath:(NSIndexPath *)indexPath {
-    NSString *ext = [oldPath pathExtension];
-    NSString *newName = ext.length ? [baseName stringByAppendingPathExtension:ext] : baseName;
-    NSString *newPath = [parent stringByAppendingPathComponent:newName];
+    // 输入框里只有名字，后缀沿用原文件的
+    NSString *baseName = DDVoicePackTrim(rawName);
+    // 清空了名字就是放弃，不改名也不提示
+    if (!baseName.length) return;
 
-    if (!baseName.length || [[NSFileManager defaultManager] fileExistsAtPath:newPath]) {
+    NSString *newPath = [[parent stringByAppendingPathComponent:baseName]
+                         stringByAppendingPathExtension:[oldPath pathExtension]];
+
+    // iOS 文件系统不区分大小写：只改大小写时新旧路径指向同一个文件，不能算「已存在」
+    BOOL taken = [[NSFileManager defaultManager] fileExistsAtPath:newPath] &&
+                 [newPath caseInsensitiveCompare:oldPath] != NSOrderedSame;
+    // 完全同名就不必移动（避免 move 到自己身上）；否则真移动并记录成败
+    BOOL moved = [newPath isEqualToString:oldPath] ||
+                 [[NSFileManager defaultManager] moveItemAtPath:oldPath toPath:newPath error:nil];
+
+    // 名字被别的文件占用、或移动失败（如名字含 /）都重弹，不静默吞掉
+    if (taken || !moved) {
         __weak typeof(self) weakSelf = self;
-        DDVoicePackShowInput(@"重命名", @"名称无效或已存在，请重新输入", baseName, ^(NSString *text) {
-            [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:DDVoicePackTrim(text) indexPath:indexPath];
+        DDVoicePackShowInput(@"重命名", @"请输入有效名字", baseName, ^(NSString *text) {
+            [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:text indexPath:indexPath];
         }, nil);
         return;
     }
-
-    [[NSFileManager defaultManager] moveItemAtPath:oldPath toPath:newPath error:nil];
     [self ddvp_refreshAfterMutation];
 }
 
@@ -973,36 +975,49 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
     // 有待纳入的语音时，「+」走命名保存；否则是新建分类
     if (pending.length) {
-        [self ddvp_showImportInputToDirectory:root errorMessage:nil];
+        [self ddvp_showImportInputToDirectory:root];
         return;
     }
 
+    [self ddvp_showNewFolderInputToDirectory:root];
+}
+
+- (void)ddvp_showNewFolderInputToDirectory:(NSString *)directory {
     __weak typeof(self) weakSelf = self;
-    DDVoicePackShowInput(@"语音包目录", @"请输入新增分类的名称", @"", ^(NSString *text) {
+    DDVoicePackShowInput(@"语音包目录", @"请输入有效名字", @"", ^(NSString *text) {
         NSString *name = DDVoicePackTrim(text);
-        if (name.length) {
-            [[NSFileManager defaultManager] createDirectoryAtPath:[root stringByAppendingPathComponent:name]
-                                      withIntermediateDirectories:YES
-                                                       attributes:nil
-                                                            error:nil];
+        // 清空了名字就是放弃
+        if (!name.length) return;
+
+        // 名字带 / 会被当成多级路径，建出两级目录
+        if ([name rangeOfString:@"/"].location != NSNotFound) {
+            [weakSelf ddvp_showNewFolderInputToDirectory:directory];
+            return;
         }
+
+        [[NSFileManager defaultManager] createDirectoryAtPath:[directory stringByAppendingPathComponent:name]
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:nil];
         [weakSelf ddvp_reloadData];
     }, nil);
 }
 
-- (void)ddvp_showImportInputToDirectory:(NSString *)directory errorMessage:(NSString *)errorMessage {
+- (void)ddvp_showImportInputToDirectory:(NSString *)directory {
     __weak typeof(self) weakSelf = self;
-    DDVoicePackShowInput(@"纳入语音", errorMessage ?: @"请输入新名称", @"", ^(NSString *text) {
-        NSString *baseName = DDVoicePackSanitizedName(text);
+    DDVoicePackShowInput(@"纳入语音", @"请输入有效名字", @"", ^(NSString *text) {
+        NSString *baseName = DDVoicePackTrim(text);
         NSString *pending = [DDVoicePackListController ddvp_pendingImportPath];
         NSString *destPath = [directory stringByAppendingPathComponent:[baseName stringByAppendingPathExtension:@"silk"]];
 
-        if (!baseName.length || [[NSFileManager defaultManager] fileExistsAtPath:destPath]) {
-            [weakSelf ddvp_showImportInputToDirectory:directory errorMessage:@"名称无效或已存在，请重新输入"];
+        // 空名、被别的文件占用、复制失败（如名字含 /）都重弹，且不清除待办
+        BOOL saved = baseName.length &&
+                     ![[NSFileManager defaultManager] fileExistsAtPath:destPath] &&
+                     [[NSFileManager defaultManager] copyItemAtPath:pending toPath:destPath error:nil];
+        if (!saved) {
+            [weakSelf ddvp_showImportInputToDirectory:directory];
             return;
         }
-
-        [[NSFileManager defaultManager] copyItemAtPath:pending toPath:destPath error:nil];
         [DDVoicePackListController ddvp_clearPendingImportPath];
         [weakSelf ddvp_reloadData];
         [weakSelf ddvp_updatePlusButton];
