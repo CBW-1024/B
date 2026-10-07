@@ -1,5 +1,5 @@
 //
-//  DD语音包.xm
+//  DDVoice.txt
 //  微信语音包插件
 //
 //  功能：
@@ -447,8 +447,6 @@ static const void *kDDVoicePackSheetAdapterKey = &kDDVoicePackSheetAdapterKey;
 static const void *kDDVoicePackSheetConfigKey = &kDDVoicePackSheetConfigKey;
 // cell manager 上挂它对应的文件 / 目录路径
 static const void *kDDVoicePackCellPathKey = &kDDVoicePackCellPathKey;
-// 文件行左侧试听按钮（自定义，挂在真实 cell 上，cell 复用时复用不重复建）
-static const void *kDDVoicePackPlayBtnKey = &kDDVoicePackPlayBtnKey;
 
 // 当前面板的宿主 VC（关面板要通知它），以及待纳入的语音路径
 static __weak UIViewController *gDDVoicePackSheetHostVC = nil;
@@ -482,12 +480,6 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 - (void)ddvp_previewItemAtIndexPath:(NSIndexPath *)indexPath;
 - (void)ddvp_deleteItemAtIndexPath:(NSIndexPath *)indexPath;
 - (void)ddvp_renameItemAtIndexPath:(NSIndexPath *)indexPath;
-
-// 文件行自定义图标（左侧试听 / 右侧发送），由代理在 cellForRow 里按行类型装饰
-- (void)ddvp_decorateFileCell:(UITableViewCell *)cell;
-- (void)ddvp_undecorateCell:(UITableViewCell *)cell;
-- (void)ddvp_playCellButtonTapped:(id)sender;
-- (void)ddvp_sendCellButtonTapped:(id)sender;
 
 @end
 
@@ -524,20 +516,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = ((UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
-
-    // 把正确路径挂到真实 cell 上（文件行复用不同文件、目录行复用不同目录都要刷新）
-    NSString *path = [self.host ddvp_pathAtIndexPath:indexPath];
-    if ([path isKindOfClass:[NSString class]] && path.length) {
-        objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
-    }
-    // 文件行加试听 / 发送图标；非文件行（目录）清掉，避免复用串台
-    if ([self.host ddvp_rowCanPreviewAtIndexPath:indexPath]) {
-        [self.host ddvp_decorateFileCell:cell];
-    } else {
-        [self.host ddvp_undecorateCell:cell];
-    }
-    return cell;
+    return ((UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
 }
 
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -547,7 +526,9 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
-        return [self.host ddvp_rowCanPreviewAtIndexPath:indexPath] ? UITableViewCellEditingStyleNone : UITableViewCellEditingStyleDelete;
+        // 滑动删除已由 trailingSwipeActionsConfiguration 接管，这里不再返回 Delete 编辑样式。
+        // 否则 iOS 会同时叠加「滑动位移」与「编辑内缩」，导致右滑收起后内容残留向右偏移。
+        return UITableViewCellEditingStyleNone;
     }
     return ((UITableViewCellEditingStyle (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
 }
@@ -632,17 +613,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 @end
 
 // ========== 语音包列表面板实现 ==========
-
-// 从按钮 / 手势事件源往上找到所在的 UITableViewCell
-static UITableViewCell *ddvp_cellFromEvent(id sender) {
-    UIView *view = [sender isKindOfClass:[UIGestureRecognizer class]]
-        ? [(UIGestureRecognizer *)sender view] : (UIView *)sender;
-    while (view) {
-        if ([view isKindOfClass:[UITableViewCell class]]) return (UITableViewCell *)view;
-        view = view.superview;
-    }
-    return nil;
-}
 
 @implementation DDVoicePackListController
 
@@ -863,6 +833,8 @@ static UITableViewCell *ddvp_cellFromEvent(id sender) {
                                                                         target:self
                                                                          title:[path lastPathComponent]
                                                                         detail:detail];
+            // 去掉点按高亮变色反馈（点击仍触发 ddvp_folderRowTapped: 进子目录）
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
             objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
             [section addCell:cell];
         }
@@ -888,65 +860,15 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
 - (id)ddvp_fileCellForPath:(NSString *)path title:(NSString *)title {
     NSString *detail = DDVoicePackFormatDuration(DDVoicePackDurationMs(path));
-    // 直接点击行不再发送；只有右侧发送图标才发送（见 ddvp_decorateFileCell:）
-    id cell = [objc_getClass("WCTableViewCellManager") normalCellForSel:nil
+    id cell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(ddvp_fileRowTapped:)
                                                                 target:self
                                                                  title:title
                                                                 detail:detail];
+    // 整行点按即发送，去掉默认的点按高亮变色反馈与右侧箭头
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.accessoryType = UITableViewCellAccessoryNone;
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
     return cell;
-}
-
-// 文件行：左侧试听图标、右侧发送图标
-// 微信此 subtitle cell 基于 WCTableViewCellLeftConfig/RightConfig 自定义布局，不读系统 indentationLevel，
-// 所以手动加到 contentView 左侧的按钮会压住标题（这就是之前重叠的根因）。解决办法：用约束把
-// textLabel / detailTextLabel 的 leading 推到试听按钮右侧（≥ 关系，不和微信原有布局冲突）。
-// 右侧发送沿用 accessoryView 槽（微信会自动让位）。试听按钮与文本约束都只建一次（关联对象缓存），保证幂等。
-- (void)ddvp_decorateFileCell:(UITableViewCell *)cell {
-    cell.selectionStyle = UITableViewCellSelectionStyleNone;   // 直接点击行不高亮、不触发任何动作
-    cell.accessoryType = UITableViewCellAccessoryNone;
-
-    // 右侧发送图标：系统三角图标 arrowtriangle.right.fill（沿用 accessoryView 槽，微信 layout 自动让位）。
-    // 用系统 SF Symbol，不强制绿色，tintColor 按 labelColor 自适应。
-    UIButton *sendBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    sendBtn.frame = CGRectMake(0, 0, 40, 40);
-    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightRegular];
-    UIImage *arrowImg = [UIImage systemImageNamed:@"arrowtriangle.right.fill" withConfiguration:cfg];
-    [sendBtn setImage:arrowImg forState:UIControlStateNormal];
-    [sendBtn setTintColor:[UIColor labelColor]];
-    [sendBtn addTarget:self action:@selector(ddvp_sendCellButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    cell.accessoryView = sendBtn;
-
-    // 左侧试听图标：自定义按钮，绑定到真实 cell，复用不重复建
-    UIButton *playBtn = objc_getAssociatedObject(cell, kDDVoicePackPlayBtnKey);
-    if (!playBtn) {
-        playBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-        playBtn.translatesAutoresizingMaskIntoConstraints = NO;
-        [playBtn setImage:[DDVoicePackThemeManager() svgImageNamed:@"icons_filled_record_voice" color:[UIColor labelColor]] forState:UIControlStateNormal];
-        [playBtn addTarget:self action:@selector(ddvp_playCellButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-        [cell.contentView addSubview:playBtn];
-        [NSLayoutConstraint activateConstraints:@[
-            [playBtn.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:12],
-            [playBtn.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
-            [playBtn.widthAnchor constraintEqualToConstant:24],
-            [playBtn.heightAnchor constraintEqualToConstant:24],
-            // 把标题 / 副标题推到试听按钮右侧，避免压字（≥ 关系兼容微信原有布局）
-            [cell.textLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:playBtn.trailingAnchor constant:8],
-            [cell.detailTextLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:playBtn.trailingAnchor constant:8],
-        ]];
-        objc_setAssociatedObject(cell, kDDVoicePackPlayBtnKey, playBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-}
-
-// 非文件行（目录）复用成别的行时，清掉文件行专属装饰，避免图标串台
-- (void)ddvp_undecorateCell:(UITableViewCell *)cell {
-    cell.selectionStyle = UITableViewCellSelectionStyleDefault;   // 目录行点击要能高亮、能进子目录
-    cell.accessoryView = nil;
-    UIButton *playBtn = objc_getAssociatedObject(cell, kDDVoicePackPlayBtnKey);
-    if (playBtn) {
-        [playBtn removeFromSuperview];
-        objc_setAssociatedObject(cell, kDDVoicePackPlayBtnKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
 }
 
 - (void)ddvp_installTableProxyIfNeeded {
@@ -975,16 +897,8 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     [self.navigationController pushViewController:child animated:YES];
 }
 
-- (void)ddvp_playCellButtonTapped:(id)sender {
-    UITableViewCell *cell = ddvp_cellFromEvent(sender);
-    NSString *path = cell ? objc_getAssociatedObject(cell, kDDVoicePackCellPathKey) : nil;
-    if (!DDVoicePackIsSilk(path)) return;   // 目录行复用此 cell 时图标已清空，这里再兜底
-    DDVoicePackPlayPreview(self, path);
-}
-
-- (void)ddvp_sendCellButtonTapped:(id)sender {
-    UITableViewCell *cell = ddvp_cellFromEvent(sender);
-    NSString *path = cell ? objc_getAssociatedObject(cell, kDDVoicePackCellPathKey) : nil;
+- (void)ddvp_fileRowTapped:(id)sender {
+    NSString *path = [self ddvp_pathForCellSender:sender];
     NSString *chatId = [self ddvp_targetChatUserName];
     if (!path.length || !chatId.length) return;
     DDVoicePackSendFileAtPath(path, chatId);
