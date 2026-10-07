@@ -288,6 +288,12 @@ static NSString *DDVoicePackBaseName(NSString *path) {
     return [[path lastPathComponent] stringByDeletingPathExtension];
 }
 
+// 名字里带 / 会被拼成多级路径（文件被移出目录）、以 . 开头会变成隐藏文件（列不出来），
+// 两种情况文件都会从列表消失，且 move/copy 是成功的，不会走失败分支
+static BOOL DDVoicePackIsValidName(NSString *name) {
+    return [name rangeOfString:@"/"].location == NSNotFound && ![name hasPrefix:@"."];
+}
+
 static NSArray<NSString *> *DDVoicePackSearchFiles(NSString *root, NSString *keyword) {
     NSMutableArray *results = [NSMutableArray array];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -912,6 +918,14 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     // 清空了名字就是放弃，不改名也不提示
     if (!baseName.length) return;
 
+    if (!DDVoicePackIsValidName(baseName)) {
+        __weak typeof(self) weakSelf = self;
+        DDVoicePackShowInput(@"重命名", @"请输入有效名字", baseName, ^(NSString *text) {
+            [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:text indexPath:indexPath];
+        }, nil);
+        return;
+    }
+
     NSString *newPath = [[parent stringByAppendingPathComponent:baseName]
                          stringByAppendingPathExtension:[oldPath pathExtension]];
 
@@ -982,8 +996,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
         // 清空了名字就是放弃
         if (!name.length) return;
 
-        // 名字带 / 会被当成多级路径，建出两级目录
-        if ([name rangeOfString:@"/"].location != NSNotFound) {
+        if (!DDVoicePackIsValidName(name)) {
             [weakSelf ddvp_showNewFolderInputToDirectory:directory];
             return;
         }
@@ -1003,8 +1016,9 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
         NSString *pending = [DDVoicePackListController ddvp_pendingImportPath];
         NSString *destPath = [directory stringByAppendingPathComponent:[baseName stringByAppendingPathExtension:@"silk"]];
 
-        // 空名、被别的文件占用、复制失败（如名字含 /）都重弹，且不清除待办
+        // 空名、名字非法、被别的文件占用、复制失败都重弹，且不清除待办
         BOOL saved = baseName.length &&
+                     DDVoicePackIsValidName(baseName) &&
                      ![[NSFileManager defaultManager] fileExistsAtPath:destPath] &&
                      [[NSFileManager defaultManager] copyItemAtPath:pending toPath:destPath error:nil];
         if (!saved) {
