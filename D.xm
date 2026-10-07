@@ -1048,8 +1048,10 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
 - (void)searchBarTextDidBeginEditing:(UISearchBar *)searchBar {
     self.searching = YES;
-    self.searchResults = @[];
-    [self ddvp_reloadData];
+    // 按当前文字立即搜一次：搜索框可能已留有上次文字（如点过键盘「搜索」后重新点入），
+    // 此时 textDidChange 不会触发，若不主动搜一次就会出现「有文字却无结果」。
+    // 文字为空时 ddvp_runSearch 同样得到 @[]，行为和原来一致。
+    [self ddvp_runSearch];
 
     id config = objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey);
     if (config) {
