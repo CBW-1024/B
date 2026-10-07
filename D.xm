@@ -526,9 +526,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
-        // 滑动删除已由 trailingSwipeActionsConfiguration 接管，这里不再返回 Delete 编辑样式。
-        // 否则 iOS 会同时叠加「滑动位移」与「编辑内缩」，导致右滑收起后内容残留向右偏移。
-        return UITableViewCellEditingStyleNone;
+        return [self.host ddvp_rowCanPreviewAtIndexPath:indexPath] ? UITableViewCellEditingStyleNone : UITableViewCellEditingStyleDelete;
     }
     return ((UITableViewCellEditingStyle (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
 }
@@ -833,8 +831,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
                                                                         target:self
                                                                          title:[path lastPathComponent]
                                                                         detail:detail];
-            // 去掉点按高亮变色反馈（点击仍触发 ddvp_folderRowTapped: 进子目录）
-            [cell setSelectionStyle:UITableViewCellSelectionStyleNone];
             objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
             [section addCell:cell];
         }
@@ -864,9 +860,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     id cell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(ddvp_fileRowNoop:)
                                                                 target:self
                                                                  title:title
-                                                                detail:detail];
-    // 整行点按无高亮反馈
-    [cell setSelectionStyle:UITableViewCellSelectionStyleNone];
+                                                                 detail:detail];
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
 
     // 右侧「>>」发送按钮：挂到微信 rightConfig 槽，并清掉自绘箭头避免与按钮冲突
