@@ -235,10 +235,12 @@ static NSString * const kDDVoicePackKeepPanelKey = @"DDVoicePack_KeepPanelAfterS
 
 // ========== 辅助函数 ==========
 
-// 语音包根目录。放 Library 下：应用私有、不进 iCloud、不在文件 App 里暴露
+// 语音包根目录。放 Library/Preferences 下，和 DD模板套壳对齐：
+// 微信「清理缓存」会清 Documents，但动不了 Preferences，语音不会丢；且不进 iCloud、不在文件 App 暴露
 static NSString *DDVoicePackRootPath(void) {
     NSString *library = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-    return [[library stringByAppendingPathComponent:@"DDVoicePack"] stringByAppendingPathComponent:@"Voice"];
+    NSString *pref = [library stringByAppendingPathComponent:@"Preferences"];
+    return [[pref stringByAppendingPathComponent:@"DDVoicePack"] stringByAppendingPathComponent:@"Voice"];
 }
 
 static NSString *DDVoicePackTrim(NSString *text) {
