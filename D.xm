@@ -781,7 +781,9 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 - (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath {
     if (!indexPath) return nil;
-    if (self.searching) {
+    // 仅在「搜索且关键词非空」时按结果取路径；关键词为空时回落到目录列表（不清空）
+    BOOL activeSearch = self.searching && DDVoicePackTrim(self.searchBar.text).length > 0;
+    if (activeSearch) {
         NSUInteger row = indexPath.row;
         return row < self.searchResults.count ? self.searchResults[row] : nil;
     }
@@ -804,13 +806,16 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [self.tableViewMgr clearAllSection];
     WCTableViewSectionManager *section = nil;
 
-    if (self.searching) {
+    // 仅在「搜索且关键词非空」时列搜索结果；其余（非搜索、或搜索中但关键词为空）一律展示目录列表
+    BOOL activeSearch = self.searching && DDVoicePackTrim(self.searchBar.text).length > 0;
+    if (activeSearch) {
         if (self.searchResults.count) {
             section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:[NSString stringWithFormat:@"%lu 个结果", (unsigned long)self.searchResults.count] Footer:@""];
             for (NSString *path in self.searchResults) {
                 [section addCell:[self ddvp_fileCellForPath:path title:[path lastPathComponent]]];
             }
         }
+        // 有词但零命中：section 保持 nil，表格空白（与原行为一致）
     } else {
         NSString *dirPath = [self ddvp_currentDirectory];
         NSArray *folders = nil, *files = nil;
@@ -1054,7 +1059,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     self.searching = YES;
     // 按当前文字立即搜一次：搜索框可能已留有上次文字（如点过键盘「搜索」后重新点入），
     // 此时 textDidChange 不会触发，若不主动搜一次就会出现「有文字却无结果」。
-    // 文字为空时 ddvp_runSearch 同样得到 @[]，行为和原来一致。
+    // 文字为空时 ddvp_runSearch 得 @[]，但 reloadData 会回落到目录列表（不清空）。
     [self ddvp_runSearch];
 
     id config = objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey);
