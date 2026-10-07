@@ -874,15 +874,11 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
                                                                  detail:detail];
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
 
-    // 文件行不需要导航箭头，清掉右侧默认 disclosure（accessoryType=0 即无箭头）。
-    // 注意 cell 是 WCTableViewCellManager 封装，须经 cellConfig → rightConfig 才能改箭头。
+    // 文件行不需要导航箭头：cell 是 WCTableViewCellManager 封装，经 cellConfig → rightConfig 把 accessoryType 设为 0（无箭头）。
+    // WCTableViewCellNormalConfig 必有 rightConfig、rightConfig 必响应 setAccessoryType:，无需 respondsToSelector 守卫。
     id cellConfig = ((id (*)(id, SEL))objc_msgSend)(cell, @selector(cellConfig));
-    if ([cellConfig respondsToSelector:@selector(rightConfig)]) {
-        id rightCfg = ((id (*)(id, SEL))objc_msgSend)(cellConfig, @selector(rightConfig));
-        if (rightCfg && [rightCfg respondsToSelector:@selector(setAccessoryType:)]) {
-            ((void (*)(id, SEL, unsigned long long))objc_msgSend)(rightCfg, @selector(setAccessoryType:), 0ULL);
-        }
-    }
+    id rightCfg   = ((id (*)(id, SEL))objc_msgSend)(cellConfig, @selector(rightConfig));
+    ((void (*)(id, SEL, unsigned long long))objc_msgSend)(rightCfg, @selector(setAccessoryType:), 0ULL);
     return cell;
 }
 
