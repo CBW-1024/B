@@ -886,8 +886,10 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
             objc_setAssociatedObject(sendBtn, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
             if ([rightCfg respondsToSelector:@selector(setRightView:)]) [rightCfg setRightView:sendBtn];
             // 兜底：让微信 accessory 区域的点击也走发送（sender 不管是 cell 还是按钮都能读到 path）
-            if ([rightCfg respondsToSelector:@selector(setAccssoryTarget:)]) [rightCfg setAccssoryTarget:self];
-            if ([rightCfg respondsToSelector:@selector(setAccssoryAction:)]) [rightCfg setAccssoryAction:@selector(ddvp_sendCellButtonTapped:)];
+            if ([rightCfg respondsToSelector:@selector(setAccssoryTarget:)])
+                ((void (*)(id, SEL, id))objc_msgSend)(rightCfg, @selector(setAccssoryTarget:), self);
+            if ([rightCfg respondsToSelector:@selector(setAccssoryAction:)])
+                ((void (*)(id, SEL, SEL))objc_msgSend)(rightCfg, @selector(setAccssoryAction:), @selector(ddvp_sendCellButtonTapped:));
         }
     }
     return cell;
