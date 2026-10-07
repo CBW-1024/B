@@ -572,6 +572,25 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     return config;
 }
 
+// 修复左滑露出操作、右滑收起后内容残留向右偏移：
+// 微信 WCTableViewCell 在滑动收起后未能复位 contentView，这里在编辑（滑动）结束时刻强制复位。
+- (void)tableView:(UITableView *)tableView didEndEditingRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+    if (cell) {
+        if ([cell respondsToSelector:@selector(setEditing:animated:)]) {
+            [cell setEditing:NO animated:NO];
+        }
+        // 清掉滑动收起后 contentView 残留的向右位移（frame 层面，不只是 transform）：
+        // 左滑露出操作、右滑收起时微信 cell 把 contentView 往右推了一点，这里复位成充满 cell。
+        CGRect b = cell.bounds;
+        cell.contentView.frame = CGRectMake(0, 0, b.size.width, b.size.height);
+        cell.contentView.transform = CGAffineTransformIdentity;
+    }
+    if ([self.forwardTarget respondsToSelector:_cmd]) {
+        ((void (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
+    }
+}
+
 @end
 
 // ========== UIViewController 分类（关闭面板） ==========
