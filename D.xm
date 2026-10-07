@@ -526,7 +526,9 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
-        return [self.host ddvp_rowCanPreviewAtIndexPath:indexPath] ? UITableViewCellEditingStyleNone : UITableViewCellEditingStyleDelete;
+        // 滑动删除已由 trailingSwipeActionsConfiguration 接管，不再返回 Delete 编辑样式，
+        // 否则 iOS 叠加「滑动位移 + 编辑内缩」导致右滑收起后内容残留向右偏移。
+        return UITableViewCellEditingStyleNone;
     }
     return ((UITableViewCellEditingStyle (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
 }
