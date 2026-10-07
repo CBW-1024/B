@@ -860,13 +860,36 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
 - (id)ddvp_fileCellForPath:(NSString *)path title:(NSString *)title {
     NSString *detail = DDVoicePackFormatDuration(DDVoicePackDurationMs(path));
-    id cell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(ddvp_fileRowTapped:)
+    // 整行点按不发送（只有右侧「>>」按钮才发送），整行绑定空方法
+    id cell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(ddvp_fileRowNoop:)
                                                                 target:self
                                                                  title:title
                                                                 detail:detail];
-    // 整行点按即发送，去掉默认的点按高亮变色反馈（右侧箭头保留）
+    // 整行点按无高亮反馈
     [cell setSelectionStyle:UITableViewCellSelectionStyleNone];
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
+
+    // 右侧「>>」发送按钮：挂到微信 rightConfig 槽，并清掉自绘箭头避免与按钮冲突
+    id cellConfig = ((id (*)(id, SEL))objc_msgSend)(cell, @selector(cellConfig));
+    if ([cellConfig respondsToSelector:@selector(rightConfig)]) {
+        id rightCfg = ((id (*)(id, SEL))objc_msgSend)(cellConfig, @selector(rightConfig));
+        if (rightCfg) {
+            if ([rightCfg respondsToSelector:@selector(setAccessoryType:)]) {
+                ((void (*)(id, SEL, unsigned long long))objc_msgSend)(rightCfg, @selector(setAccessoryType:), 0);
+            }
+            UIButton *sendBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+            [sendBtn setTitle:@">>" forState:UIControlStateNormal];
+            [sendBtn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+            sendBtn.titleLabel.font = [UIFont systemFontOfSize:17.0];
+            [sendBtn sizeToFit];
+            [sendBtn addTarget:self action:@selector(ddvp_sendCellButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+            objc_setAssociatedObject(sendBtn, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            if ([rightCfg respondsToSelector:@selector(setRightView:)]) [rightCfg setRightView:sendBtn];
+            // 兜底：让微信 accessory 区域的点击也走发送（sender 不管是 cell 还是按钮都能读到 path）
+            if ([rightCfg respondsToSelector:@selector(setAccssoryTarget:)]) [rightCfg setAccssoryTarget:self];
+            if ([rightCfg respondsToSelector:@selector(setAccssoryAction:)]) [rightCfg setAccssoryAction:@selector(ddvp_sendCellButtonTapped:)];
+        }
+    }
     return cell;
 }
 
@@ -896,7 +919,11 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     [self.navigationController pushViewController:child animated:YES];
 }
 
-- (void)ddvp_fileRowTapped:(id)sender {
+// 整行点击不做任何事（发送只走右侧「>>」按钮）
+- (void)ddvp_fileRowNoop:(id)sender {}
+
+// 右侧「>>」发送按钮的点击：取关联路径并发送到当前聊天
+- (void)ddvp_sendCellButtonTapped:(id)sender {
     NSString *path = [self ddvp_pathForCellSender:sender];
     NSString *chatId = [self ddvp_targetChatUserName];
     if (!path.length || !chatId.length) return;
