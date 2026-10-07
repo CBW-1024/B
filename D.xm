@@ -781,9 +781,8 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 - (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath {
     if (!indexPath) return nil;
-    // 仅在「搜索且关键词非空」时按结果取路径；关键词为空时回落到目录列表（不清空）
-    BOOL activeSearch = self.searching && DDVoicePackTrim(self.searchBar.text).length > 0;
-    if (activeSearch) {
+    // 有搜索结果时按结果取路径，否则回落到目录列表（搜索输入为空不清空，贴近原生）
+    if (self.searchResults.count) {
         NSUInteger row = indexPath.row;
         return row < self.searchResults.count ? self.searchResults[row] : nil;
     }
@@ -806,16 +805,12 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [self.tableViewMgr clearAllSection];
     WCTableViewSectionManager *section = nil;
 
-    // 仅在「搜索且关键词非空」时列搜索结果；其余（非搜索、或搜索中但关键词为空）一律展示目录列表
-    BOOL activeSearch = self.searching && DDVoicePackTrim(self.searchBar.text).length > 0;
-    if (activeSearch) {
-        if (self.searchResults.count) {
-            section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:[NSString stringWithFormat:@"%lu 个结果", (unsigned long)self.searchResults.count] Footer:@""];
-            for (NSString *path in self.searchResults) {
-                [section addCell:[self ddvp_fileCellForPath:path title:[path lastPathComponent]]];
-            }
+    // 有搜索结果时列搜索结果，否则展示目录列表（搜索输入为空即显示整列，贴近原生）
+    if (self.searchResults.count) {
+        section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:[NSString stringWithFormat:@"%lu 个结果", (unsigned long)self.searchResults.count] Footer:@""];
+        for (NSString *path in self.searchResults) {
+            [section addCell:[self ddvp_fileCellForPath:path title:[path lastPathComponent]]];
         }
-        // 有词但零命中：section 保持 nil，表格空白（与原行为一致）
     } else {
         NSString *dirPath = [self ddvp_currentDirectory];
         NSArray *folders = nil, *files = nil;
