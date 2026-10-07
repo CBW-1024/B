@@ -177,6 +177,12 @@
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender;
 @end
 
+// 微信内的 zip 工具，编译期只提供 selector 声明，运行期 objc_getClass 取，不产生链接符号
+@interface DDVoicePackZipArchive : NSObject
++ (BOOL)createZipFileAtPath:(id)zipPath withContentsOfDirectory:(id)dir keepParentDirectory:(BOOL)keep;
++ (BOOL)unzipFileAtPath:(id)zipPath toDestination:(id)dest;
+@end
+
 // 打包整个目录，zip 内保留该目录名（和 DD模板套壳一致）
 static BOOL DDVoicePackZipDirectory(NSString *srcDir, NSString *zipPath) {
     return [objc_getClass("QSSZipArchive") createZipFileAtPath:zipPath
@@ -501,6 +507,14 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 - (BOOL)respondsToSelector:(SEL)aSelector {
     if (DDVoicePackProxyOwnsSelector(aSelector)) return YES;
     return [self.forwardTarget respondsToSelector:aSelector];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return ((NSInteger (*)(id, SEL, UITableView *, NSInteger))objc_msgSend)(self.forwardTarget, _cmd, tableView, section);
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    return ((UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
 }
 
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
