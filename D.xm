@@ -468,6 +468,10 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 - (void)ddvp_previewItemAtIndexPath:(NSIndexPath *)indexPath;
 - (void)ddvp_deleteItemAtIndexPath:(NSIndexPath *)indexPath;
 - (void)ddvp_renameItemAtIndexPath:(NSIndexPath *)indexPath;
+- (void)ddvp_showRenameInputAtPath:(NSString *)oldPath
+                            parent:(NSString *)parent
+                              name:(NSString *)name
+                         indexPath:(NSIndexPath *)indexPath;
 - (void)ddvp_searchCancelTapped;
 
 @end
@@ -903,8 +907,16 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     if (!oldPath.length) return;
     NSString *parent = [oldPath stringByDeletingLastPathComponent];
 
+    [self ddvp_showRenameInputAtPath:oldPath parent:parent name:DDVoicePackBaseName(oldPath) indexPath:indexPath];
+}
+
+// 重命名唯一的弹窗出口：首次和重弹都走这里，只是默认值不同
+- (void)ddvp_showRenameInputAtPath:(NSString *)oldPath
+                            parent:(NSString *)parent
+                              name:(NSString *)name
+                         indexPath:(NSIndexPath *)indexPath {
     __weak typeof(self) weakSelf = self;
-    DDVoicePackShowInput(@"重命名", @"请输入有效名字", DDVoicePackBaseName(oldPath), ^(NSString *text) {
+    DDVoicePackShowInput(@"重命名", @"请输入有效名字", name, ^(NSString *text) {
         [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:text indexPath:indexPath];
     }, nil);
 }
@@ -918,11 +930,9 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     // 清空了名字就是放弃，不改名也不提示
     if (!baseName.length) return;
 
+    // 名字里带 / 会被拼成多级路径、以 . 开头会变成隐藏文件，两种情况 move 都会成功、文件从列表消失
     if (!DDVoicePackIsValidName(baseName)) {
-        __weak typeof(self) weakSelf = self;
-        DDVoicePackShowInput(@"重命名", @"请输入有效名字", baseName, ^(NSString *text) {
-            [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:text indexPath:indexPath];
-        }, nil);
+        [self ddvp_showRenameInputAtPath:oldPath parent:parent name:baseName indexPath:indexPath];
         return;
     }
 
@@ -936,12 +946,9 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     BOOL moved = [newPath isEqualToString:oldPath] ||
                  [[NSFileManager defaultManager] moveItemAtPath:oldPath toPath:newPath error:nil];
 
-    // 名字被别的文件占用、或移动失败（如名字含 /）都重弹，不静默吞掉
+    // 名字被别的文件占用、或移动失败都重弹，不静默吞掉
     if (taken || !moved) {
-        __weak typeof(self) weakSelf = self;
-        DDVoicePackShowInput(@"重命名", @"请输入有效名字", baseName, ^(NSString *text) {
-            [weakSelf ddvp_renameItemAtPath:oldPath parent:parent toName:text indexPath:indexPath];
-        }, nil);
+        [self ddvp_showRenameInputAtPath:oldPath parent:parent name:baseName indexPath:indexPath];
         return;
     }
     [self ddvp_refreshAfterMutation];
