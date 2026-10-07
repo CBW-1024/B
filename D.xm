@@ -1283,6 +1283,55 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 // ========== 设置界面 ==========
 
+// ========== 微信原生提示：WeToast（方形） ==========
+
+// 微信内置提示控件，运行时按类名获取，编译期不产生链接符号（和 DD模板套壳一致）
+@interface WeToast : NSObject
++ (instancetype)toast;
+- (void)setLoadingStyle:(BOOL)style;
+- (void)showToastWithText:(NSString *)text;
+- (void)showDoneToastWithText:(NSString *)text;    // 方形带 ✓
+- (void)showErrorToastWithText:(NSString *)text;   // 方形带错误图标
+- (void)hideWithAnimated:(int)animated;
+@end
+
+static WeToast *gDDVoicePackBusyToast = nil; // 进行中的 loading，出结果时收起
+
+static WeToast *DDVoicePackToast(void) {
+    return [NSClassFromString(@"WeToast") toast];
+}
+
+// loading 和结果提示是同一套控件，出结果前必须先收起 loading
+static void DDVoicePackHideLoading(void) {
+    [gDDVoicePackBusyToast hideWithAnimated:YES];
+    gDDVoicePackBusyToast = nil;
+}
+
+// 同时只保留一个 loading 实例；起新的前先收掉旧的，否则上一个转圈会永远停在屏幕上
+static void DDVoicePackShowLoading(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gDDVoicePackBusyToast) DDVoicePackHideLoading();
+        WeToast *toast = DDVoicePackToast();
+        [toast setLoadingStyle:YES];
+        [toast showToastWithText:text];
+        gDDVoicePackBusyToast = toast;
+    });
+}
+
+static void DDVoicePackShowDone(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DDVoicePackHideLoading();
+        [DDVoicePackToast() showDoneToastWithText:text];
+    });
+}
+
+static void DDVoicePackShowError(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DDVoicePackHideLoading();
+        [DDVoicePackToast() showErrorToastWithText:text];
+    });
+}
+
 @interface DDVoicePackSettingsViewController : UIViewController <UIDocumentPickerDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 @end
@@ -1359,18 +1408,20 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 }
 
 // 整目录或单文件，都按同名落到语音包根下，同名则覆盖 —— 和 DD模板套壳一致
-- (void)installVoicePackItem:(NSString *)src {
+- (BOOL)installVoicePackItem:(NSString *)src {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dst = [DDVoicePackRootPath() stringByAppendingPathComponent:src.lastPathComponent];
     [fm removeItemAtPath:dst error:nil];
-    [fm copyItemAtPath:src toPath:dst error:nil];
+    return [fm copyItemAtPath:src toPath:dst error:nil];
 }
 
 // 解压后的目录：顶层有子文件夹就把每个子文件夹装成同名语音包；
 // 顶层没有文件夹（散装 .silk）就逐个落根目录。对应 DD模板套壳 DD_ImportTemplatesFrom 的思路
-- (void)importUnpackedDir:(NSString *)dir {
+// 对应 DD模板套壳 DD_ImportTemplatesFrom 的思路，返回装进去的个数（0 表示这条 zip 里没有可用内容）
+- (NSInteger)importUnpackedDir:(NSString *)dir {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
+    NSInteger n = 0;
     BOOL installedFolder = NO;
     for (NSString *name in items) {
         if ([name hasPrefix:@"."] || [name isEqualToString:@"__MACOSX"]) continue;
@@ -1378,16 +1429,17 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
         BOOL isDir = NO;
         [fm fileExistsAtPath:full isDirectory:&isDir];
         if (isDir) {
-            [self installVoicePackItem:full];
+            if ([self installVoicePackItem:full]) n++;
             installedFolder = YES;
         }
     }
-    if (installedFolder) return;
+    if (installedFolder) return n;
     for (NSString *name in items) {
         if ([name hasPrefix:@"."] || [name isEqualToString:@"__MACOSX"]) continue;
         NSString *full = [dir stringByAppendingPathComponent:name];
-        if (DDVoicePackIsSilk(full)) [self installVoicePackItem:full];
+        if (DDVoicePackIsSilk(full) && [self installVoicePackItem:full]) n++;
     }
+    return n;
 }
 
 // zip 可能多包一层包装目录（如导出时打的 "DD语音包/"），下钻到真正装内容的那一层
@@ -1410,7 +1462,13 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 - (void)exportVoicePack {
     NSString *voiceDir = DDVoicePackRootPath();
     NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:voiceDir]) return;
+    // 语音包目录都不存在说明一个分类都没有，直接当失败，别静默
+    if (![fm fileExistsAtPath:voiceDir]) {
+        DDVoicePackShowError(@"导出失败");
+        return;
+    }
+
+    DDVoicePackShowLoading(@"正在导出…");
 
     // 打包丢后台，主线程不卡
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -1422,7 +1480,11 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
         NSString *zip = [tmp stringByAppendingPathComponent:@"DD语音包.zip"];
         BOOL ok = DDVoicePackZipDirectory(stage, zip);
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!ok) return; // 打包失败，临时目录等下次清理
+            // 打包失败，临时目录等下次清理
+            if (!ok) { DDVoicePackShowError(@"导出失败"); return; }
+            // 导出成功不弹提示：紧接着就是分享面板，用户看得到
+            DDVoicePackHideLoading();
+
             NSURL *zipURL = [NSURL fileURLWithPath:zip];
             UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[zipURL] applicationActivities:nil];
             av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *err) {
@@ -1457,25 +1519,30 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     NSString *tmp = DDVoicePackTempRoot();
     [[NSFileManager defaultManager] createDirectoryAtPath:tmp withIntermediateDirectories:YES attributes:nil error:nil];
 
+    DDVoicePackShowLoading(@"正在导入…");
+
     // 解压 + 拷贝在后台跑，语音包多时避免主线程卡顿
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSInteger total = 0;
         for (NSString *p in paths) {
             BOOL isDir = NO;
             [[NSFileManager defaultManager] fileExistsAtPath:p isDirectory:&isDir];
             if (isDir) {
-                [self installVoicePackItem:p];
+                if ([self installVoicePackItem:p]) total++;
             } else if ([p.pathExtension.lowercaseString isEqualToString:@"zip"]) {
                 NSString *unzipDir = [tmp stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
                 if (DDVoicePackUnzipToDirectory(p, unzipDir)) {
-                    [self importUnpackedDir:[self voicePackUnwrapIfSingleDir:unzipDir]];
+                    total += [self importUnpackedDir:[self voicePackUnwrapIfSingleDir:unzipDir]];
                 }
             } else if ([p.pathExtension.lowercaseString isEqualToString:@"silk"]) {
-                [self installVoicePackItem:p];
+                if ([self installVoicePackItem:p]) total++;
             }
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             for (NSURL *u in scoped) [u stopAccessingSecurityScopedResource];
             [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+            if (total) DDVoicePackShowDone(@"导入成功");
+            else DDVoicePackShowError(@"导入失败");
         });
     });
 }
