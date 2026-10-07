@@ -475,6 +475,7 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 - (void)ddvp_previewItemAtIndexPath:(NSIndexPath *)indexPath;
 - (void)ddvp_deleteItemAtIndexPath:(NSIndexPath *)indexPath;
 - (void)ddvp_renameItemAtIndexPath:(NSIndexPath *)indexPath;
+- (void)ddvp_searchCancelTapped;
 
 @end
 
@@ -597,6 +598,12 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 @implementation UINavigationController (DDVoicePackSheet)
 
 - (void)ddvp_voicePackBack:(id)sender {
+    // 搜索中：左上角返回箭头先充当「取消搜索」，不 pop 也不关面板（A 方案：取消后再点才回上层/关面板）
+    DDVoicePackListController *top = (DDVoicePackListController *)self.topViewController;
+    if ([top isKindOfClass:[DDVoicePackListController class]] && top.searching) {
+        [top ddvp_searchCancelTapped];
+        return;
+    }
     if (self.viewControllers.count > 1) {
         [self popViewControllerAnimated:YES];
         return;
@@ -1052,14 +1059,11 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
     id config = objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey);
     if (config) {
-        UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        [cancelBtn setTitle:@"取消" forState:UIControlStateNormal];
-        [cancelBtn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
-        cancelBtn.titleLabel.font = [UIFont systemFontOfSize:17];
-        [cancelBtn sizeToFit];
-        [cancelBtn addTarget:self action:@selector(ddvp_searchCancelTapped) forControlEvents:UIControlEventTouchUpInside];
-        [config setNavRightButton:cancelBtn];
+        // 搜索期间隐藏右上角「+」；取消搜索改由左上角返回箭头兼任（见 ddvp_voicePackBack:）
+        [config setNavRightButton:nil];
         [self ddvp_syncSheetNavigationBar];
+    } else {
+        self.navigationItem.rightBarButtonItem = nil;
     }
 }
 
