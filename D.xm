@@ -716,7 +716,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [self.view addSubview:self.searchBar];
 
     UITableView *tableView = [self.tableViewMgr getTableView];
-    tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     tableView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:tableView];
 
@@ -781,8 +780,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 - (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath {
     if (!indexPath) return nil;
-    // 有搜索结果时按结果取路径，否则回落到目录列表（搜索输入为空不清空，贴近原生）
-    if (self.searchResults.count) {
+    if (self.searching) {
         NSUInteger row = indexPath.row;
         return row < self.searchResults.count ? self.searchResults[row] : nil;
     }
@@ -805,11 +803,12 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     [self.tableViewMgr clearAllSection];
     WCTableViewSectionManager *section = nil;
 
-    // 有搜索结果时列搜索结果，否则展示目录列表（搜索输入为空即显示整列，贴近原生）
-    if (self.searchResults.count) {
-        section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:[NSString stringWithFormat:@"%lu 个结果", (unsigned long)self.searchResults.count] Footer:@""];
-        for (NSString *path in self.searchResults) {
-            [section addCell:[self ddvp_fileCellForPath:path title:[path lastPathComponent]]];
+    if (self.searching) {
+        if (self.searchResults.count) {
+            section = [objc_getClass("WCTableViewSectionManager") sectionInfoHeader:[NSString stringWithFormat:@"%lu 个结果", (unsigned long)self.searchResults.count] Footer:@""];
+            for (NSString *path in self.searchResults) {
+                [section addCell:[self ddvp_fileCellForPath:path title:[path lastPathComponent]]];
+            }
         }
     } else {
         NSString *dirPath = [self ddvp_currentDirectory];
@@ -1052,10 +1051,9 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
 - (void)searchBarTextDidBeginEditing:(UISearchBar *)searchBar {
     self.searching = YES;
-    // 按当前文字立即搜一次：搜索框可能已留有上次文字（如点过键盘「搜索」后重新点入），
-    // 此时 textDidChange 不会触发，若不主动搜一次就会出现「有文字却无结果」。
-    // 文字为空时 ddvp_runSearch 得 @[]，但 reloadData 会回落到目录列表（不清空）。
-    [self ddvp_runSearch];
+    // 进入搜索后不实时筛选，先清空结果；点键盘「搜索」才出内容并收起键盘
+    self.searchResults = @[];
+    [self ddvp_reloadData];
 
     id config = objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey);
     if (config) {
@@ -1067,11 +1065,8 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     }
 }
 
-- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
-    [self ddvp_runSearch];
-}
-
 - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
+    [self ddvp_runSearch];
     [searchBar resignFirstResponder];
 }
 
