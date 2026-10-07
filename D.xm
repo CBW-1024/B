@@ -661,7 +661,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
     UIButton *backBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     backBtn.frame = CGRectMake(0, 0, 44, 44);
-    [backBtn setImage:[themeManager svgImageNamed:@"arrow_left_regular" color:btnColor] forState:UIControlStateNormal];
+    [backBtn setImage:[themeManager svgImageNamed:@"icons_outlined_back" color:btnColor] forState:UIControlStateNormal];
     [backBtn addTarget:nav action:@selector(ddvp_voicePackBack:) forControlEvents:UIControlEventTouchUpInside];
     config.navBackButton = backBtn;
     config.navLeftButton = backBtn;
@@ -958,7 +958,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     id themeManager = DDVoicePackThemeManager();
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
     btn.frame = CGRectMake(0, 0, 44, 44);
-    [btn setImage:[themeManager svgImageNamed:@"plus_regular" color:[UIColor labelColor]] forState:UIControlStateNormal];
+    [btn setImage:[themeManager svgImageNamed:@"icons_outlined_add" color:[UIColor labelColor]] forState:UIControlStateNormal];
     [btn addTarget:self action:@selector(ddvp_plusButtonTapped) forControlEvents:UIControlEventTouchUpInside];
     return btn;
 }
