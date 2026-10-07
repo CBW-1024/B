@@ -731,7 +731,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 // 面板标题随层级变化，推给 MMPageSheetConfig 才生效
 - (void)ddvp_syncSheetNavigationBar {
     UINavigationController *nav = self.navigationController;
-    if (!nav) return;
     id config = objc_getAssociatedObject(nav, kDDVoicePackSheetConfigKey);
     id adapter = objc_getAssociatedObject(nav, kDDVoicePackSheetAdapterKey);
     [config setTitle:[self ddvp_sheetTitle]];
@@ -740,10 +739,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
 // 当前聊天对象：只有从聊天页进来的面板才知道往哪发
 - (NSString *)ddvp_targetChatUserName {
-    UINavigationController *nav = self.navigationController;
-    if (!nav) return nil;
-    UIViewController *fromVC = objc_getAssociatedObject(nav, kDDVoicePackSheetFromVCKey);
-    if (!fromVC) return nil;
+    UIViewController *fromVC = objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetFromVCKey);
 
     // isKindOfClass 已经保证了类型，后面直接取就行，不用再 respondsToSelector
     if (![fromVC isKindOfClass:objc_getClass("BaseMsgContentViewController")]) return nil;
@@ -960,10 +956,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 }
 
 - (void)ddvp_updatePlusButton {
-    UINavigationController *nav = self.navigationController;
-    if (!nav) return;
-
-    id config = objc_getAssociatedObject(nav, kDDVoicePackSheetConfigKey);
+    id config = objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey);
     BOOL show = [self ddvp_shouldShowPlusButton];
     [config setNavRightButton:show ? [self ddvp_plusButton] : nil];
     [self ddvp_syncSheetNavigationBar];
@@ -1089,7 +1082,6 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
 
     Class ctxCls = objc_getClass("MMContext");
     id context = [ctxCls activeUserContext] ?: [ctxCls rootContext];
-    if (!context) return NO;
 
     CBaseContact *selfContact = [[context getService:objc_getClass("CContactMgr")] getSelfContact];
     NSString *myId = [selfContact m_nsUsrName];
@@ -1147,7 +1139,7 @@ static dispatch_queue_t DDVoicePackSendQueue(void) {
 }
 
 static void DDVoicePackSendFileAtPath(NSString *path, NSString *chatId) {
-    if (!path.length || !chatId.length) return;
+    if (!path.length) return;
 
     dispatch_async(DDVoicePackSendQueue(), ^{
         // 语音包里存的就是微信 SILK，原样发出去，不做任何转码
