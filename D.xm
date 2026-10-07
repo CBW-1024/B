@@ -862,7 +862,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
                                                                 detail:detail];
     id realCell = [cell cell];
     if ([realCell respondsToSelector:@selector(setAccessoryType:)]) {
-        [realCell setAccessoryType:0];
+        [realCell setAccessoryType:UITableViewCellAccessoryNone];
     }
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
     return cell;
