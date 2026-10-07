@@ -834,7 +834,7 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
                                                                          title:[path lastPathComponent]
                                                                         detail:detail];
             // 去掉点按高亮变色反馈（点击仍触发 ddvp_folderRowTapped: 进子目录）
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            [cell setSelectionStyle:UITableViewCellSelectionStyleNone];
             objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
             [section addCell:cell];
         }
@@ -864,18 +864,8 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
                                                                 target:self
                                                                  title:title
                                                                 detail:detail];
-    // 整行点按即发送，去掉默认的点按高亮变色反馈
-    cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    // 右侧箭头是微信 WCTableViewCellRightConfig 自己画的（不是系统 accessoryType），
-    // 直接对 cell 设 accessoryType 无效。拿到 rightConfig 把 accessoryType 置 0、rightView 置 nil 才能去掉。
-    id cellConfig = [cell cellConfig];
-    if ([cellConfig respondsToSelector:@selector(rightConfig)]) {
-        id rightCfg = [cellConfig rightConfig];
-        if (rightCfg) {
-            if ([rightCfg respondsToSelector:@selector(setAccessoryType:)]) [rightCfg setAccessoryType:0];
-            if ([rightCfg respondsToSelector:@selector(setRightView:)]) [rightCfg setRightView:nil];
-        }
-    }
+    // 整行点按即发送，去掉默认的点按高亮变色反馈（右侧箭头保留）
+    [cell setSelectionStyle:UITableViewCellSelectionStyleNone];
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
     return cell;
 }
