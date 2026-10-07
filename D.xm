@@ -299,7 +299,6 @@ static NSString *DDVoicePackBaseName(NSString *path) {
 }
 
 static NSArray<NSString *> *DDVoicePackSearchFiles(NSString *root, NSString *keyword) {
-    if (!keyword.length) return @[];
     NSMutableArray *results = [NSMutableArray array];
     NSFileManager *fm = [NSFileManager defaultManager];
     NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:root];
@@ -733,7 +732,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self ddvp_reloadData];
-    [self ddvp_syncSheetNavigationBar];
     [self ddvp_updatePlusButton];
 }
 
@@ -779,7 +777,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 }
 
 - (NSString *)ddvp_pathAtIndexPath:(NSIndexPath *)indexPath {
-    if (!indexPath) return nil;
     if (self.searching) {
         NSUInteger row = indexPath.row;
         return row < self.searchResults.count ? self.searchResults[row] : nil;
@@ -880,7 +877,6 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
     DDVoicePackTableProxy *proxy = [[DDVoicePackTableProxy alloc] init];
     id originalTarget = tableView.delegate;
-    if (!originalTarget) originalTarget = tableView.dataSource;
     proxy.forwardTarget = originalTarget;
     proxy.host = self;
     tableView.delegate = proxy;
@@ -960,7 +956,6 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 - (void)ddvp_refreshAfterMutation {
     if (self.searching) [self ddvp_runSearch];
     else [self ddvp_reloadData];
-    [self ddvp_syncSheetNavigationBar];
 }
 
 // ---- 右上角「+」 ----
@@ -982,7 +977,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
 - (void)ddvp_updatePlusButton {
     UINavigationController *nav = self.navigationController;
-    if (!nav || self.searching) return;
+    if (!nav) return;
 
     id config = objc_getAssociatedObject(nav, kDDVoicePackSheetConfigKey);
     BOOL show = [self ddvp_shouldShowPlusButton];
@@ -1000,8 +995,6 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 }
 
 - (void)ddvp_plusButtonTapped {
-    if (self.searching) return;
-
     NSString *root = [self ddvp_currentDirectory];
     NSString *pending = [DDVoicePackListController ddvp_pendingImportPath];
 
