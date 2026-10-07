@@ -16,12 +16,13 @@
 
 // ========== 微信内部类声明 ==========
 
-// 微信内部类，头文件里没有，按运行时行为声明
+// 懒猫插件宿主的注册接口
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
+// 以下微信内部类，头文件里没有，按运行时行为声明
 @interface MMContext : NSObject
 + (id)activeUserContext;
 + (id)rootContext;
@@ -1532,11 +1533,11 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 %ctor {
     @autoreleasepool {
-        id mgr = objc_getClass("WCPluginsMgr");
-        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD语音包"
-                                                      version:@"1.0.0"
-                                                   controller:@"DDVoicePackSettingsViewController"];
+        Class mgrCls = objc_getClass("WCPluginsMgr");
+        if (mgrCls) {
+            [[mgrCls sharedInstance] registerControllerWithTitle:@"DD语音包"
+                                                         version:@"1.0.0"
+                                                      controller:@"DDVoicePackSettingsViewController"];
         }
     }
 }
