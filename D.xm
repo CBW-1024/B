@@ -658,14 +658,12 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     config.contentBackgroundColor = [UIColor systemBackgroundColor];
     config.maskBackgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
 
-    UIColor *btnColor = [UIColor labelColor];
     id themeManager = DDVoicePackThemeManager();
 
     UIButton *backBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     backBtn.frame = CGRectMake(0, 0, 44, 44);
-    [backBtn setImage:[themeManager svgImageNamed:@"icons_outlined_back" color:btnColor] forState:UIControlStateNormal];
+    [backBtn setImage:[themeManager svgImageNamed:@"icons_outlined_back" color:[UIColor labelColor]] forState:UIControlStateNormal];
     [backBtn addTarget:nav action:@selector(ddvp_voicePackBack:) forControlEvents:UIControlEventTouchUpInside];
-    config.navBackButton = backBtn;
     config.navLeftButton = backBtn;
     config.navRightButton = [listVC ddvp_plusButton];
 
