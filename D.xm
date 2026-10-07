@@ -898,17 +898,22 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 }
 
 // 文件行：左侧试听图标、右侧发送图标
-// 微信此 subtitle cell 不认 imageView 槽（标题不会为其让位，会重叠），左侧改用自定义按钮固定在 contentView 左边，
-// 并靠 indentationLevel 把标题 / 副标题整体右移避让；右侧发送沿用 accessoryView 槽（微信 layout 会自动让位）。
-// 代理的 cellForRow 每次都调用，所以必须幂等：试听按钮只建一次（关联对象缓存），发送按钮每轮重建无碍。
+// 微信此 subtitle cell 基于 WCTableViewCellLeftConfig/RightConfig 自定义布局，不读系统 indentationLevel，
+// 所以手动加到 contentView 左侧的按钮会压住标题（这就是之前重叠的根因）。解决办法：用约束把
+// textLabel / detailTextLabel 的 leading 推到试听按钮右侧（≥ 关系，不和微信原有布局冲突）。
+// 右侧发送沿用 accessoryView 槽（微信会自动让位）。试听按钮与文本约束都只建一次（关联对象缓存），保证幂等。
 - (void)ddvp_decorateFileCell:(UITableViewCell *)cell {
     cell.selectionStyle = UITableViewCellSelectionStyleNone;   // 直接点击行不高亮、不触发任何动作
     cell.accessoryType = UITableViewCellAccessoryNone;
 
-    // 右侧发送图标（沿用 accessoryView 槽）
+    // 右侧发送图标：系统三角图标 arrowtriangle.right.fill（沿用 accessoryView 槽，微信 layout 自动让位）。
+    // 用系统 SF Symbol，不强制绿色，tintColor 按 labelColor 自适应。
     UIButton *sendBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     sendBtn.frame = CGRectMake(0, 0, 40, 40);
-    [sendBtn setImage:[DDVoicePackThemeManager() svgImageNamed:@"icons_filled_send" color:[UIColor labelColor]] forState:UIControlStateNormal];
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightRegular];
+    UIImage *arrowImg = [UIImage systemImageNamed:@"arrowtriangle.right.fill" withConfiguration:cfg];
+    [sendBtn setImage:arrowImg forState:UIControlStateNormal];
+    [sendBtn setTintColor:[UIColor labelColor]];
     [sendBtn addTarget:self action:@selector(ddvp_sendCellButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     cell.accessoryView = sendBtn;
 
@@ -917,25 +922,25 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     if (!playBtn) {
         playBtn = [UIButton buttonWithType:UIButtonTypeCustom];
         playBtn.translatesAutoresizingMaskIntoConstraints = NO;
-        [playBtn setImage:[DDVoicePackThemeManager() svgImageNamed:@"icons_outlined_play" color:[UIColor labelColor]] forState:UIControlStateNormal];
+        [playBtn setImage:[DDVoicePackThemeManager() svgImageNamed:@"icons_filled_record_voice" color:[UIColor labelColor]] forState:UIControlStateNormal];
         [playBtn addTarget:self action:@selector(ddvp_playCellButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
         [cell.contentView addSubview:playBtn];
-        [cell.contentView addConstraints:@[
-            [NSLayoutConstraint constraintWithItem:playBtn attribute:NSLayoutAttributeLeading relatedBy:NSLayoutRelationEqual toItem:cell.contentView attribute:NSLayoutAttributeLeading multiplier:1 constant:12],
-            [NSLayoutConstraint constraintWithItem:playBtn attribute:NSLayoutAttributeCenterY relatedBy:NSLayoutRelationEqual toItem:cell.contentView attribute:NSLayoutAttributeCenterY multiplier:1 constant:0],
-            [NSLayoutConstraint constraintWithItem:playBtn attribute:NSLayoutAttributeWidth relatedBy:NSLayoutRelationEqual toItem:nil attribute:NSLayoutAttributeNotAnAttribute multiplier:1 constant:24],
-            [NSLayoutConstraint constraintWithItem:playBtn attribute:NSLayoutAttributeHeight relatedBy:NSLayoutRelationEqual toItem:nil attribute:NSLayoutAttributeNotAnAttribute multiplier:1 constant:24],
+        [NSLayoutConstraint activateConstraints:@[
+            [playBtn.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:12],
+            [playBtn.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
+            [playBtn.widthAnchor constraintEqualToConstant:24],
+            [playBtn.heightAnchor constraintEqualToConstant:24],
+            // 把标题 / 副标题推到试听按钮右侧，避免压字（≥ 关系兼容微信原有布局）
+            [cell.textLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:playBtn.trailingAnchor constant:8],
+            [cell.detailTextLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:playBtn.trailingAnchor constant:8],
         ]];
         objc_setAssociatedObject(cell, kDDVoicePackPlayBtnKey, playBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    // 让标题 / 副标题右移，给左侧试听按钮让位
-    cell.indentationLevel = 3;
 }
 
 // 非文件行（目录）复用成别的行时，清掉文件行专属装饰，避免图标串台
 - (void)ddvp_undecorateCell:(UITableViewCell *)cell {
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;   // 目录行点击要能高亮、能进子目录
-    cell.indentationLevel = 0;
     cell.accessoryView = nil;
     UIButton *playBtn = objc_getAssociatedObject(cell, kDDVoicePackPlayBtnKey);
     if (playBtn) {
