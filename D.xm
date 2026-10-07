@@ -860,6 +860,10 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
                                                                 target:self
                                                                  title:title
                                                                 detail:detail];
+    id realCell = [cell cell];
+    if ([realCell respondsToSelector:@selector(setAccessoryType:)]) {
+        [realCell setAccessoryType:0];
+    }
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
     return cell;
 }
