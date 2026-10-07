@@ -492,7 +492,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
            sel_isEqual(aSelector, @selector(tableView:editingStyleForRowAtIndexPath:)) ||
            sel_isEqual(aSelector, @selector(tableView:commitEditingStyle:forRowAtIndexPath:)) ||
            sel_isEqual(aSelector, @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:)) ||
-           sel_isEqual(aSelector, @selector(tableView:leadingSwipeActionsConfigurationForRowAtIndexPath:)) ||
            sel_isEqual(aSelector, @selector(tableView:shouldIndentWhileEditingRowAtIndexPath:));
 }
 
@@ -550,6 +549,8 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     ((void (*)(id, SEL, UITableView *, UITableViewCellEditingStyle, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, style, indexPath);
 }
 
+// 左滑（trailing）统一露出操作：文件行「试听 / 重命名 / 删除」，文件夹行「重命名 / 删除」（文件夹无试听）。
+// 不再提供右滑，单一方向更简单。
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (![self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
         return ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
@@ -565,27 +566,18 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
         done(YES);
     }];
 
-    NSArray *actions = @[deleteAction, renameAction];
+    NSMutableArray *actions = [NSMutableArray arrayWithObjects:deleteAction, renameAction, nil];
+    if ([self.host ddvp_rowCanPreviewAtIndexPath:indexPath]) {
+        UIContextualAction *previewAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"试听" handler:^(UIContextualAction *action, UIView *sourceView, void (^done)(BOOL)) {
+            [weakHost ddvp_previewItemAtIndexPath:indexPath];
+            done(YES);
+        }];
+        previewAction.backgroundColor = [UIColor systemBlueColor];
+        [actions addObject:previewAction];
+    }
+
     UISwipeActionsConfiguration *config = [UISwipeActionsConfiguration configurationWithActions:actions];
     config.performsFirstActionWithFullSwipe = YES;
-    return config;
-}
-
-// 右滑（leading）露出「试听」，仅对文件行生效；文件夹行无试听，返回 nil 即不提供右滑操作。
-- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView leadingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (![self.host ddvp_swipeAllowedAtIndexPath:indexPath]) {
-        return ((UISwipeActionsConfiguration *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
-    }
-    if (![self.host ddvp_rowCanPreviewAtIndexPath:indexPath]) return nil;
-
-    __weak typeof(self.host) weakHost = self.host;
-    UIContextualAction *previewAction = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"试听" handler:^(UIContextualAction *action, UIView *sourceView, void (^done)(BOOL)) {
-        [weakHost ddvp_previewItemAtIndexPath:indexPath];
-        done(YES);
-    }];
-    previewAction.backgroundColor = [UIColor systemBlueColor];
-    UISwipeActionsConfiguration *config = [UISwipeActionsConfiguration configurationWithActions:@[previewAction]];
-    config.performsFirstActionWithFullSwipe = NO;
     return config;
 }
 
