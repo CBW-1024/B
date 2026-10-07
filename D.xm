@@ -447,8 +447,8 @@ static const void *kDDVoicePackSheetAdapterKey = &kDDVoicePackSheetAdapterKey;
 static const void *kDDVoicePackSheetConfigKey = &kDDVoicePackSheetConfigKey;
 // cell manager 上挂它对应的文件 / 目录路径
 static const void *kDDVoicePackCellPathKey = &kDDVoicePackCellPathKey;
-// 标记文件行左侧 imageView 是否已加过试听点击手势（cell 复用时不重复加）
-static const void *kDDVoicePackPlayGestureKey = &kDDVoicePackPlayGestureKey;
+// 文件行左侧试听按钮（自定义，挂在真实 cell 上，cell 复用时复用不重复建）
+static const void *kDDVoicePackPlayBtnKey = &kDDVoicePackPlayBtnKey;
 
 // 当前面板的宿主 VC（关面板要通知它），以及待纳入的语音路径
 static __weak UIViewController *gDDVoicePackSheetHostVC = nil;
@@ -897,33 +897,51 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     return cell;
 }
 
-// 文件行：左侧试听图标、右侧发送图标（用 cell 自带 imageView / accessoryView 槽，标题自动让位）
-// 代理的 cellForRow 每次都调用，所以这里要幂等：图标只建一次，路径靠真实 cell 上的关联对象实时读取
+// 文件行：左侧试听图标、右侧发送图标
+// 微信此 subtitle cell 不认 imageView 槽（标题不会为其让位，会重叠），左侧改用自定义按钮固定在 contentView 左边，
+// 并靠 indentationLevel 把标题 / 副标题整体右移避让；右侧发送沿用 accessoryView 槽（微信 layout 会自动让位）。
+// 代理的 cellForRow 每次都调用，所以必须幂等：试听按钮只建一次（关联对象缓存），发送按钮每轮重建无碍。
 - (void)ddvp_decorateFileCell:(UITableViewCell *)cell {
     cell.selectionStyle = UITableViewCellSelectionStyleNone;   // 直接点击行不高亮、不触发任何动作
     cell.accessoryType = UITableViewCellAccessoryNone;
 
-    // 右侧发送图标
+    // 右侧发送图标（沿用 accessoryView 槽）
     UIButton *sendBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     sendBtn.frame = CGRectMake(0, 0, 40, 40);
-    [sendBtn setImage:[DDVoicePackThemeManager() svgImageNamed:@"icons_outlined_send" color:[UIColor labelColor]] forState:UIControlStateNormal];
+    [sendBtn setImage:[DDVoicePackThemeManager() svgImageNamed:@"icons_filled_send" color:[UIColor labelColor]] forState:UIControlStateNormal];
     [sendBtn addTarget:self action:@selector(ddvp_sendCellButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     cell.accessoryView = sendBtn;
 
-    // 左侧试听图标：复用 cell 自带 imageView 槽，标题 / 副标题会自动右移避让
-    cell.imageView.image = [DDVoicePackThemeManager() svgImageNamed:@"icons_outlined_play" color:[UIColor labelColor]];
-    if (!objc_getAssociatedObject(cell, kDDVoicePackPlayGestureKey)) {
-        cell.imageView.userInteractionEnabled = YES;
-        [cell.imageView addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ddvp_playCellButtonTapped:)]];
-        objc_setAssociatedObject(cell, kDDVoicePackPlayGestureKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // 左侧试听图标：自定义按钮，绑定到真实 cell，复用不重复建
+    UIButton *playBtn = objc_getAssociatedObject(cell, kDDVoicePackPlayBtnKey);
+    if (!playBtn) {
+        playBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        playBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        [playBtn setImage:[DDVoicePackThemeManager() svgImageNamed:@"icons_outlined_play" color:[UIColor labelColor]] forState:UIControlStateNormal];
+        [playBtn addTarget:self action:@selector(ddvp_playCellButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [cell.contentView addSubview:playBtn];
+        [cell.contentView addConstraints:@[
+            [NSLayoutConstraint constraintWithItem:playBtn attribute:NSLayoutAttributeLeading relatedBy:NSLayoutRelationEqual toItem:cell.contentView attribute:NSLayoutAttributeLeading multiplier:1 constant:12],
+            [NSLayoutConstraint constraintWithItem:playBtn attribute:NSLayoutAttributeCenterY relatedBy:NSLayoutRelationEqual toItem:cell.contentView attribute:NSLayoutAttributeCenterY multiplier:1 constant:0],
+            [NSLayoutConstraint constraintWithItem:playBtn attribute:NSLayoutAttributeWidth relatedBy:NSLayoutRelationEqual toItem:nil attribute:NSLayoutAttributeNotAnAttribute multiplier:1 constant:24],
+            [NSLayoutConstraint constraintWithItem:playBtn attribute:NSLayoutAttributeHeight relatedBy:NSLayoutRelationEqual toItem:nil attribute:NSLayoutAttributeNotAnAttribute multiplier:1 constant:24],
+        ]];
+        objc_setAssociatedObject(cell, kDDVoicePackPlayBtnKey, playBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    // 让标题 / 副标题右移，给左侧试听按钮让位
+    cell.indentationLevel = 3;
 }
 
 // 非文件行（目录）复用成别的行时，清掉文件行专属装饰，避免图标串台
 - (void)ddvp_undecorateCell:(UITableViewCell *)cell {
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;   // 目录行点击要能高亮、能进子目录
-    cell.imageView.image = nil;
+    cell.indentationLevel = 0;
     cell.accessoryView = nil;
+    UIButton *playBtn = objc_getAssociatedObject(cell, kDDVoicePackPlayBtnKey);
+    if (playBtn) {
+        [playBtn removeFromSuperview];
+        objc_setAssociatedObject(cell, kDDVoicePackPlayBtnKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
 }
 
 - (void)ddvp_installTableProxyIfNeeded {
