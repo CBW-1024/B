@@ -447,6 +447,8 @@ static const void *kDDVoicePackSheetAdapterKey = &kDDVoicePackSheetAdapterKey;
 static const void *kDDVoicePackSheetConfigKey = &kDDVoicePackSheetConfigKey;
 // cell manager 上挂它对应的文件 / 目录路径
 static const void *kDDVoicePackCellPathKey = &kDDVoicePackCellPathKey;
+// 标记文件行左侧 imageView 是否已加过试听点击手势（cell 复用时不重复加）
+static const void *kDDVoicePackPlayGestureKey = &kDDVoicePackPlayGestureKey;
 
 // 当前面板的宿主 VC（关面板要通知它），以及待纳入的语音路径
 static __weak UIViewController *gDDVoicePackSheetHostVC = nil;
@@ -480,6 +482,12 @@ static NSString *gDDVoicePackPendingImportPath = nil;
 - (void)ddvp_previewItemAtIndexPath:(NSIndexPath *)indexPath;
 - (void)ddvp_deleteItemAtIndexPath:(NSIndexPath *)indexPath;
 - (void)ddvp_renameItemAtIndexPath:(NSIndexPath *)indexPath;
+
+// 文件行自定义图标（左侧试听 / 右侧发送），由代理在 cellForRow 里按行类型装饰
+- (void)ddvp_decorateFileCell:(UITableViewCell *)cell;
+- (void)ddvp_undecorateCell:(UITableViewCell *)cell;
+- (void)ddvp_playCellButtonTapped:(id)sender;
+- (void)ddvp_sendCellButtonTapped:(id)sender;
 
 @end
 
@@ -516,7 +524,20 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    return ((UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
+    UITableViewCell *cell = ((UITableViewCell *(*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(self.forwardTarget, _cmd, tableView, indexPath);
+
+    // 把正确路径挂到真实 cell 上（文件行复用不同文件、目录行复用不同目录都要刷新）
+    NSString *path = [self.host ddvp_pathAtIndexPath:indexPath];
+    if ([path isKindOfClass:[NSString class]] && path.length) {
+        objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+    // 文件行加试听 / 发送图标；非文件行（目录）清掉，避免复用串台
+    if ([self.host ddvp_rowCanPreviewAtIndexPath:indexPath]) {
+        [self.host ddvp_decorateFileCell:cell];
+    } else {
+        [self.host ddvp_undecorateCell:cell];
+    }
+    return cell;
 }
 
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -611,6 +632,17 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 @end
 
 // ========== 语音包列表面板实现 ==========
+
+// 从按钮 / 手势事件源往上找到所在的 UITableViewCell
+static UITableViewCell *ddvp_cellFromEvent(id sender) {
+    UIView *view = [sender isKindOfClass:[UIGestureRecognizer class]]
+        ? [(UIGestureRecognizer *)sender view] : (UIView *)sender;
+    while (view) {
+        if ([view isKindOfClass:[UITableViewCell class]]) return (UITableViewCell *)view;
+        view = view.superview;
+    }
+    return nil;
+}
 
 @implementation DDVoicePackListController
 
@@ -856,16 +888,42 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
 - (id)ddvp_fileCellForPath:(NSString *)path title:(NSString *)title {
     NSString *detail = DDVoicePackFormatDuration(DDVoicePackDurationMs(path));
-    id cell = [objc_getClass("WCTableViewCellManager") normalCellForSel:@selector(ddvp_fileRowTapped:)
+    // 直接点击行不再发送；只有右侧发送图标才发送（见 ddvp_decorateFileCell:）
+    id cell = [objc_getClass("WCTableViewCellManager") normalCellForSel:nil
                                                                 target:self
                                                                  title:title
                                                                 detail:detail];
-    id realCell = [cell cell];
-    if ([realCell respondsToSelector:@selector(setAccessoryType:)]) {
-        [realCell setAccessoryType:UITableViewCellAccessoryNone];
-    }
     objc_setAssociatedObject(cell, kDDVoicePackCellPathKey, path, OBJC_ASSOCIATION_COPY_NONATOMIC);
     return cell;
+}
+
+// 文件行：左侧试听图标、右侧发送图标（用 cell 自带 imageView / accessoryView 槽，标题自动让位）
+// 代理的 cellForRow 每次都调用，所以这里要幂等：图标只建一次，路径靠真实 cell 上的关联对象实时读取
+- (void)ddvp_decorateFileCell:(UITableViewCell *)cell {
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;   // 直接点击行不高亮、不触发任何动作
+    cell.accessoryType = UITableViewCellAccessoryNone;
+
+    // 右侧发送图标
+    UIButton *sendBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    sendBtn.frame = CGRectMake(0, 0, 40, 40);
+    [sendBtn setImage:[DDVoicePackThemeManager() svgImageNamed:@"icons_outlined_send" color:[UIColor labelColor]] forState:UIControlStateNormal];
+    [sendBtn addTarget:self action:@selector(ddvp_sendCellButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    cell.accessoryView = sendBtn;
+
+    // 左侧试听图标：复用 cell 自带 imageView 槽，标题 / 副标题会自动右移避让
+    cell.imageView.image = [DDVoicePackThemeManager() svgImageNamed:@"icons_outlined_play" color:[UIColor labelColor]];
+    if (!objc_getAssociatedObject(cell, kDDVoicePackPlayGestureKey)) {
+        cell.imageView.userInteractionEnabled = YES;
+        [cell.imageView addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(ddvp_playCellButtonTapped:)]];
+        objc_setAssociatedObject(cell, kDDVoicePackPlayGestureKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+// 非文件行（目录）复用成别的行时，清掉文件行专属装饰，避免图标串台
+- (void)ddvp_undecorateCell:(UITableViewCell *)cell {
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;   // 目录行点击要能高亮、能进子目录
+    cell.imageView.image = nil;
+    cell.accessoryView = nil;
 }
 
 - (void)ddvp_installTableProxyIfNeeded {
@@ -894,8 +952,16 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     [self.navigationController pushViewController:child animated:YES];
 }
 
-- (void)ddvp_fileRowTapped:(id)sender {
-    NSString *path = [self ddvp_pathForCellSender:sender];
+- (void)ddvp_playCellButtonTapped:(id)sender {
+    UITableViewCell *cell = ddvp_cellFromEvent(sender);
+    NSString *path = cell ? objc_getAssociatedObject(cell, kDDVoicePackCellPathKey) : nil;
+    if (!DDVoicePackIsSilk(path)) return;   // 目录行复用此 cell 时图标已清空，这里再兜底
+    DDVoicePackPlayPreview(self, path);
+}
+
+- (void)ddvp_sendCellButtonTapped:(id)sender {
+    UITableViewCell *cell = ddvp_cellFromEvent(sender);
+    NSString *path = cell ? objc_getAssociatedObject(cell, kDDVoicePackCellPathKey) : nil;
     NSString *chatId = [self ddvp_targetChatUserName];
     if (!path.length || !chatId.length) return;
     DDVoicePackSendFileAtPath(path, chatId);
