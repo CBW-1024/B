@@ -435,9 +435,6 @@ static void DDVoicePackShowInput(NSString *title,
 // 面板高度 = 屏高 * 该比例（固定，不随内容自适应）
 static const CGFloat kDDVoicePackSheetHeightRatio = 0.6;
 
-// 搜索防抖间隔（秒）：逐字符递归整个语音包目录太重
-static const NSTimeInterval kDDVoicePackSearchDebounce = 0.3;
-
 // 面板相关：container 挂 fromVC（关面板时从它身上取），adapter / config 挂 nav
 static const void *kDDVoicePackSheetContainerKey = &kDDVoicePackSheetContainerKey;
 static const void *kDDVoicePackSheetFromVCKey = &kDDVoicePackSheetFromVCKey;
@@ -1067,9 +1064,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 }
 
 - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
-    // 每敲一个字符就递归整个语音包目录太重，防抖一下
-    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(ddvp_runSearch) object:nil];
-    [self performSelector:@selector(ddvp_runSearch) withObject:nil afterDelay:kDDVoicePackSearchDebounce];
+    [self ddvp_runSearch];
 }
 
 - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
