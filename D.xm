@@ -363,13 +363,10 @@ static void DDVoicePackStopPreview(id owner) {
 }
 
 static void DDVoicePackPlayPreview(id owner, NSString *path) {
-    if (!DDVoicePackIsSilk(path)) return;
-
     DDVoicePackStopPreview(owner);
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
 
     Class cls = objc_getClass("SilkAudioPlayer");
-    if (!cls) return;
     SilkAudioPlayer *player = [[cls alloc] init];
     [player preparePlayWithFile:path sync:NO];
     [player playAtTime:0];
@@ -410,7 +407,6 @@ static void DDVoicePackShowInput(NSString *title,
                                  void (^onCommit)(NSString *text),
                                  void (^onCancel)(void)) {
     Class tipsCls = objc_getClass("MMTipsViewController");
-    if (!tipsCls) return;
 
     DDVoicePackInputBridge *bridge = [[DDVoicePackInputBridge alloc] init];
     bridge.onCommit = onCommit;
@@ -638,16 +634,9 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 
     DDVoicePackListController *listVC = [[DDVoicePackListController alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:listVC];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
 
     CGFloat sheetHeight = [UIScreen mainScreen].bounds.size.height * kDDVoicePackSheetHeightRatio;
-    Class adapterCls = objc_getClass("MMPageSheetAdapter");
-    id adapter = adapterCls ? [adapterCls adapterWithViewController:nav height:sheetHeight] : nil;
-    if (!adapter) {
-        // MMPageSheet 不可用时退回系统弹窗，至少面板还能打开
-        [fromVC presentViewController:nav animated:YES completion:nil];
-        return;
-    }
+    id adapter = [objc_getClass("MMPageSheetAdapter") adapterWithViewController:nav height:sheetHeight];
 
     Class configCls = objc_getClass("MMPageSheetConfig");
     MMPageSheetConfig *config = [[configCls alloc] init];
@@ -702,10 +691,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor systemBackgroundColor];
-    // 面板自带导航栏（MMPageSheetConfig），这里只在非面板形态下补个标题
-    if (!objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey)) {
-        self.title = @"语音包管理";
-    }
 
     self.searchBar = [[UISearchBar alloc] init];
     self.searchBar.delegate = self;
@@ -757,7 +742,6 @@ static BOOL DDVoicePackProxyOwnsSelector(SEL aSelector) {
     if (!nav) return;
     id config = objc_getAssociatedObject(nav, kDDVoicePackSheetConfigKey);
     id adapter = objc_getAssociatedObject(nav, kDDVoicePackSheetAdapterKey);
-    if (!config || !adapter) return;
     [config setTitle:[self ddvp_sheetTitle]];
     [adapter setPageSheetConfig:config];
 }
@@ -889,8 +873,6 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 - (void)ddvp_folderRowTapped:(id)sender {
     if (self.searching) return;
     NSString *path = [self ddvp_pathForCellSender:sender];
-    if (!path.length) return;
-
     DDVoicePackListController *child = [[DDVoicePackListController alloc] init];
     child.directoryPath = path;
     [self.navigationController pushViewController:child animated:YES];
@@ -900,7 +882,7 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 - (void)ddvp_fileRowTapped:(id)sender {
     NSString *path = [self ddvp_pathForCellSender:sender];
     NSString *chatId = [self ddvp_targetChatUserName];
-    if (!path.length || !chatId.length) return;
+    if (!chatId.length) return;
     DDVoicePackSendFileAtPath(path, chatId);
 }
 
@@ -981,17 +963,8 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
 
     id config = objc_getAssociatedObject(nav, kDDVoicePackSheetConfigKey);
     BOOL show = [self ddvp_shouldShowPlusButton];
-
-    if (config) {
-        [config setNavRightButton:show ? [self ddvp_plusButton] : nil];
-        [self ddvp_syncSheetNavigationBar];
-        return;
-    }
-    if (show) {
-        self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:[self ddvp_plusButton]];
-    } else {
-        self.navigationItem.rightBarButtonItem = nil;
-    }
+    [config setNavRightButton:show ? [self ddvp_plusButton] : nil];
+    [self ddvp_syncSheetNavigationBar];
 }
 
 - (void)ddvp_plusButtonTapped {
@@ -1049,13 +1022,9 @@ static NSString *DDVoicePackFormatDuration(unsigned int ms) {
     [self ddvp_reloadData];
 
     id config = objc_getAssociatedObject(self.navigationController, kDDVoicePackSheetConfigKey);
-    if (config) {
-        // 搜索期间隐藏右上角「+」；取消搜索改由左上角返回箭头兼任（见 ddvp_voicePackBack:）
-        [config setNavRightButton:nil];
-        [self ddvp_syncSheetNavigationBar];
-    } else {
-        self.navigationItem.rightBarButtonItem = nil;
-    }
+    // 搜索期间隐藏右上角「+」；取消搜索改由左上角返回箭头兼任（见 ddvp_voicePackBack:）
+    [config setNavRightButton:nil];
+    [self ddvp_syncSheetNavigationBar];
 }
 
 - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
@@ -1092,20 +1061,13 @@ static const unsigned int kDDVoicePackMinVoiceMs = 300;
 static const unsigned int kDDVoicePackMaxVoiceMs = 60000;
 
 // SILK 不是 AVFoundation 认的格式，读不出时长，按文件大小粗估（约 2KB/s）。
-// 估不出来统一给 3 秒——兜底只在这里做一次，别在外面再兜一遍
+// 估不出来就是 0，由发送侧的 300ms 下限钳制兜住，这里不重复兜底
 static unsigned int DDVoicePackDurationMs(NSString *path) {
     NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    unsigned long long fileSize = [attrs fileSize];
-    if (fileSize > 0) {
-        unsigned int estimatedMs = (unsigned int)(fileSize / 2000) * 1000;
-        if (estimatedMs > 0) return estimatedMs;
-    }
-    return 3000;
+    return (unsigned int)([attrs fileSize] / 2000) * 1000;
 }
 
 static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString *chatId) {
-    if (!silk.length || !chatId.length) return NO;
-
     unsigned int voiceMs = durationMs;
     if (voiceMs < kDDVoicePackMinVoiceMs) voiceMs = kDDVoicePackMinVoiceMs;
     if (voiceMs > kDDVoicePackMaxVoiceMs) voiceMs = kDDVoicePackMaxVoiceMs;
@@ -1119,7 +1081,6 @@ static BOOL DDVoicePackSendSilk(NSData *silk, unsigned int durationMs, NSString 
     if (!myId.length) return NO;
 
     CMessageWrap *msg = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:(long long)kDDVoicePackMsgTypeVoice nsFromUsr:myId];
-    if (!msg) return NO;
     // m_nsFromUsr 已经由 initWithMsgType:nsFromUsr: 设好了，不用再设一遍
     [msg setM_nsToUsr:chatId];
     [msg setM_uiStatus:1];
@@ -1231,7 +1192,6 @@ static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL ena
                                                                 svgName:@"icons_filled_voice"
                                                                  target:cell
                                                                  action:@selector(ddvp_importVoice:)];
-    if (!item) return original;
     item.userInfo = kDDVoicePackImportMenuToken;
 
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
