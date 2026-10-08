@@ -4,7 +4,7 @@
 //    1. 语音转发：收藏语音 / 语音消息可直接转发，长按菜单补「转发」入口
 //    2. 自定义语音秒数：上行语音时长改写为 1~60s 内指定值
 //    3. 媒体转换：视频 / 文件 →「转语音」（抽音轨编 SILK 发送）
-//                 语音 →「转文件」（解 SILK 导出 m4a 发送）
+//                 语音 →「转文件」（原始 SILK 容器直接发文件消息）
 //
 //  媒体尚未下载时先触发微信原生下载，落盘后再转换；转换期间在聊天主窗口顶部
 //  显示「正在转换中」浮卡，消息发起发送即收起。
@@ -58,6 +58,9 @@
 @interface CMessageWrap : NSObject
 + (BOOL)isSenderFromMsgWrap:(id)arg1;
 + (id)GetPathOfAppData:(id)msgWrap;
+// 微信自己发文件用的工厂方法：一次把 m_nsContent / CExtendInfoOfAPP / 附件字段填好。
+// （WCRefine 的语音转文件就是走这个；8.0.79 CMessageWrap.h:46 确认存在）
++ (id)genFileAppMsgWithFileName:(id)arg1 filePath:(id)arg2 fileData:(id)arg3;
 - (id)initWithMsgType:(long long)arg1;
 - (BOOL)IsVoiceMsg;
 - (BOOL)IsVideoMsg;
@@ -182,6 +185,7 @@
 
 @interface CMessageMgr : NSObject
 - (void)StartDownloadVideo:(id)a0 MsgWrap:(id)a1 Priority:(BOOL)a2 Silent:(BOOL)a3;
+- (void)AddMsg:(id)a0 MsgWrap:(id)a1;
 - (void)AddAppMsg:(id)a0 MsgWrap:(id)a1 DataPath:(id)a2 Scene:(unsigned int)a3;
 - (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;
@@ -943,44 +947,33 @@ static NSString *dd_persist_copy(NSString *src, NSString *ext) {
         [NSString stringWithFormat:@"ddvc_voice_%@.%@", [[NSUUID UUID] UUIDString], ext]];
     return [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
 }
-// 发送语音原始文件消息：AddAppMsg 本地落库 → StartUploadAppMsg 触发上传。
-static void dd_send_file_to_chat(NSString *usr, NSString *filePath, NSString *fileName, NSString *ext) {
+// 发送语音原始文件消息（WCRefine 同款做法）：
+// [CMessageWrap genFileAppMsgWithFileName:filePath:fileData:] 是微信自己发文件用的类方法，
+// 内部一次把 m_nsContent / CExtendInfoOfAPP / 附件字段填对，不用手拼 appmsg XML。
+// 再用 AddMsg:MsgWrap: 入库（WCR 走的就是这条，没有 StartUploadAppMsg）。
+static BOOL dd_send_file_to_chat(NSString *usr, NSString *filePath, NSString *fileName, NSString *ext) {
     NSString *persistPath = dd_persist_copy(filePath, ext);
     if (persistPath.length) filePath = persistPath;
-    if (!dd_file_exists(filePath) || !usr.length) return;
+    if (!dd_file_exists(filePath) || !usr.length) return NO;
     NSData *fdata = [NSData dataWithContentsOfFile:filePath];
-    if (fdata.length == 0) return;
+    if (fdata.length == 0) return NO;
 
-    unsigned long long fsize = fdata.length;
+    Class cls = (Class)objc_getClass("CMessageWrap");
+    if (![cls respondsToSelector:@selector(genFileAppMsgWithFileName:filePath:fileData:)]) return NO;
 
-    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVCAppMsgType];
-    [wrap setM_uiMessageType:kDDVCAppMsgType];
+    CMessageWrap *wrap = [cls genFileAppMsgWithFileName:fileName filePath:filePath fileData:fdata];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
     [wrap setM_nsToUsr:usr];
     [wrap setM_uiCreateTime:[(MMNewSessionMgr *)dd_mm_service(@"MMNewSessionMgr") GenSendMsgTime]];
     [wrap setM_uiStatus:kDDMsgStatusSending];
 
-    CExtendInfoOfAPP *app = [[objc_getClass("CExtendInfoOfAPP") alloc] init];
-    [app setM_uiAppMsgInnerType:kDDVCAppInnerFile];
-    [app setM_nsAppFileName:fileName];
-    [app setM_nsAppFileExt:ext];
-    [app setM_uiAppDataSize:fsize];
-    [app setM_nsTitle:fileName];
-    [app setM_bAppAttachExistInSvr:YES];
-    [wrap setM_extendInfoWithMsgType:app];
-
-    // 消息正文 appmsg XML（type=6 文件）。不写则微信重启重建消息时正文为空 → 判不出文件名/附件。
-    [wrap setM_nsContent:[NSString stringWithFormat:
-        @"<msg><appmsg appid=\"\" sdkver=\"0\"><title>%@</title><des></des><type>6</type>"
-         "<appattach><totallen>%llu</totallen><attachid></attachid><fileext>%@</fileext>"
-         "<filename>%@</filename></appattach></appmsg></msg>", fileName, fsize, ext, fileName]];
-
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-    [mgr AddAppMsg:usr MsgWrap:wrap DataPath:filePath Scene:0];
-    [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
+    [mgr AddMsg:usr MsgWrap:wrap];
+    return YES;
 }
-// 语音消息 → 文件消息：直接把微信语音原始文件（.aud，容器内是 SILK v3）拷出去发。
+// 语音消息 → 文件消息：直接把微信语音原始文件（.aud，容器内就是 SILK v3）拷出去发。
 // 不做 SILK → PCM → m4a 转换，绕开解码环节，也就不会受帧长 / 端序 / 尾部填充影响。
+// 扩展名给 silk：WCRefine 的 supportedAudioExtensions 白名单第一项就是 silk。
 static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
@@ -989,13 +982,11 @@ static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
     dispatch_async(dd_convert_queue, ^{
         NSString *p = dd_voice_path_of_msg(msg);
         if (!dd_file_exists(p)) { dd_hub_fail(@"①语音路径无效"); return; }
-        NSString *ext = p.pathExtension.length ? p.pathExtension : @"aud";
-        NSString *fn  = [NSString stringWithFormat:@"语音_%u.%@", (unsigned int)time(NULL), ext];
+        NSString *fn = [NSString stringWithFormat:@"语音_%u.silk", (unsigned int)time(NULL)];
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            dd_send_file_to_chat(usr, p, fn, ext);
-            // 消息已入库并出现在会话里，提示到此收起，不等上传结果。
-            dd_hub_finish();
+            if (dd_send_file_to_chat(usr, p, fn, @"silk")) dd_hub_finish();
+            else dd_hub_fail(@"②文件消息生成失败");
         });
     });
 }
