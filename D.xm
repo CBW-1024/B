@@ -75,6 +75,7 @@
 - (void)setM_uiDownloadStatus:(unsigned int)arg1;
 - (void)setM_bForward:(BOOL)arg1;
 - (id)getVoicePath;
+- (void)setM_nsVoicePath:(NSString *)arg1;
 @end
 
 @interface CExtendInfoOfVoiceMsg : NSObject
@@ -151,8 +152,7 @@
 @end
 
 @interface FavForwardLogicController : NSObject
-// 8.0.79：由收藏项构造"待转发消息列表"，返回值会被加入待转发列表，不需要碰 ivar / KVC
-- (id)preparedMessageWrapsFromFavItem:(id)arg1 fileSource:(int)arg2;
+- (void)addMsgFromItem:(id)arg1;
 @end
 
 @interface ForwardMessageLogicController : NSObject
@@ -582,6 +582,7 @@ static unsigned int dd_new_voice_local_id(void) {
     return kDDVoiceLocalIDBase + (unsigned int)arc4random_uniform(kDDVoiceLocalIDRange);
 }
 // 发送语音到会话：AddLocalMsg 分配 localID → 写 SILK 到规范路径 → SaveMesVoice → ResendVoiceMsg。
+// 必须显式 setM_nsVoicePath，否则 ResendVoiceMsg 会按 localID 重算路径、读坏文件。
 // SaveMesVoice 首参传 nil（声明两参，传 NSData 会被当成路径）。
 static void dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     NSData *data = [NSData dataWithContentsOfFile:audPath];
@@ -602,9 +603,8 @@ static void dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddLocalMsg:usr MsgWrap:wrap];
 
-    // 8.0.79 的 CMessageWrap 只剩 getVoicePath，setM_nsVoicePath: 已移除，调用会崩溃。
-    // 音频照样拷到规范路径（ResendVoiceMsg 按 localID 取），只是不再显式赋值。
-    dd_install_audio_file(wrap, audPath);
+    NSString *voicePath = dd_install_audio_file(wrap, audPath);
+    if (voicePath.length) [wrap setM_nsVoicePath:voicePath];
 
     [mgr SaveMesVoice:nil MsgWrap:wrap];
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
@@ -660,6 +660,19 @@ static id dd_msg_wrap_from_fav_data(id favData, id favItem) {
     }
     return wrap;
 }
+static void dd_append_voice_msg(id favItem, id controller) {
+    NSArray *list = ((FavoritesItem *)favItem).dataList;
+    if ([list count] == 0) return;
+    id wrap = dd_msg_wrap_from_fav_data([list firstObject], favItem);
+    Class ctrlCls = objc_getClass("FavForwardLogicController");
+    if (ctrlCls && ![[controller class] isSubclassOfClass:ctrlCls]) return;
+    Ivar iv = class_getInstanceVariable([controller class], "m_messageWrapList");
+    if (!iv) return;
+    id store = object_getIvar(controller, iv);
+    if (![store isKindOfClass:[NSMutableArray class]]) return;
+    [(NSMutableArray *)store addObject:wrap];
+}
+
 #pragma mark - 语音转换：路径解析
 
 // 含音轨 / 可复用容器白名单。视频路径解析与文件菜单准入共用。
@@ -1095,14 +1108,9 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 #pragma mark - Hook：收藏语音做成待转发消息
 
 %hook FavForwardLogicController
-// 8.0.79 新入口：收藏项 -> 待转发消息列表，返回值会被微信加进待转发列表
-- (id)preparedMessageWrapsFromFavItem:(id)arg1 fileSource:(int)arg2 {
-    if (dd_voice_fav_enabled() && dd_is_fav_voice_item(arg1)) {
-        NSArray *list = ((FavoritesItem *)arg1).dataList;
-        id wrap = dd_msg_wrap_from_fav_data([list firstObject], arg1);
-        return [NSMutableArray arrayWithObject:wrap];
-    }
-    return %orig;
+- (void)addMsgFromItem:(id)arg1 {
+    if (dd_voice_fav_enabled() && dd_is_fav_voice_item(arg1)) dd_append_voice_msg(arg1, self);
+    %orig;
 }
 %end
 
