@@ -976,7 +976,7 @@ static void dd_send_file_to_chat(NSString *usr, NSString *filePath, NSString *fi
          "<filename>%@</filename></appattach></appmsg></msg>", fileName, fsize, ext, fileName]];
 
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-    [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
+    [mgr AddAppMsg:usr MsgWrap:wrap DataPath:filePath Scene:0];
     [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
 }
 // 语音消息 → 文件消息：直接把微信语音原始文件（.aud，容器内是 SILK v3）拷出去发。
