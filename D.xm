@@ -168,6 +168,9 @@
 @interface MMMenuItem : NSObject
 @property (nonatomic, retain) id userInfo;
 - (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
+// 菜单项 ID。用 initWithTitle: 创建的项默认是 0，必须设成唯一值，
+// 否则会和其他插件注入的项撞车，被微信当成重复项去掉，菜单里只剩一个
+- (void)setMenuType:(long long)type;
 @end
 
 @interface VoiceMessageCellView : UIView
@@ -1257,6 +1260,9 @@ static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL ena
                                                                 svgName:@"icons_filled_voice"
                                                                  target:cell
                                                                  action:@selector(ddvp_importVoice:)];
+    // 微信按 menuType 给菜单项去重，本项要设一个别处不会用到的值（内置项都是几十以内的小值），
+    // 不设的话默认 0，会和 DD语音助手等插件注入的项撞车，菜单里只显示其中一个
+    [item setMenuType:10001];
     item.userInfo = kDDVoicePackImportMenuToken;
 
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
