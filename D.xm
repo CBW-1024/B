@@ -1,5 +1,5 @@
 //
-//  DD语音包.xm
+//  DDVoice.xm
 //  微信语音包插件
 //
 //  功能：
@@ -168,12 +168,6 @@
 @interface MMMenuItem : NSObject
 @property (nonatomic, retain) id userInfo;
 - (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
-// menuType 是微信给菜单项分配的身份 ID：内置项各有其值（forwardMenuItem、deleteMenuItem…
-// 乃至后来加的「问小魏」「元宝」都是 initWithType:target:action: 造的），
-// 而 initWithTitle:... 造出来的自定义项恒为 0。两个 tweak 各注入一项就会 type 撞车，
-// 被 BaseMessageCellView 的 uniqMenuItems: 判成重复项砍掉一个 —— 这就是「不能同时显示」的根因。
-// 设一个微信内部不会用到的大值（内置都是几十以内的小枚举）即可让各自身份独立。
-- (void)setMenuType:(long long)type;
 @end
 
 @interface VoiceMessageCellView : UIView
@@ -1263,9 +1257,6 @@ static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL ena
                                                                 svgName:@"icons_filled_voice"
                                                                  target:cell
                                                                  action:@selector(ddvp_importVoice:)];
-    // 关键一行：给个不撞车的 menuType，否则会和同样注入自定义菜单项的其他 tweak
-    // （如 DD语音助手的「转文件」）一起被 uniqMenuItems: 判成重复项，只剩一个能显示
-    [item setMenuType:10001];
     item.userInfo = kDDVoicePackImportMenuToken;
 
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
