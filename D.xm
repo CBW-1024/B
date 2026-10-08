@@ -151,8 +151,9 @@
 @end
 
 @interface FavForwardLogicController : NSObject
-// 8.0.79 起加了 fileSource 参数，单参版 addMsgFromItem: 已被移除
-- (void)addMsgFromItem:(id)arg1 fileSource:(int)arg2;
+// 8.0.79：由收藏项构造"待转发消息列表"，返回值会被加入待转发列表。
+// 走这个方法就不需要碰 m_messageWrapList 那个 ivar，也不用 KVC
+- (id)preparedMessageWrapsFromFavItem:(id)arg1 fileSource:(int)arg2;
 @end
 
 @interface ForwardMessageLogicController : NSObject
@@ -660,17 +661,13 @@ static id dd_msg_wrap_from_fav_data(id favData, id favItem) {
     }
     return wrap;
 }
-static void dd_append_voice_msg(id favItem, id controller) {
+// 由收藏项构造待转发消息列表。语音收藏项微信自己构造不出来（canBeForward 为 NO），
+// 这里直接返回我们自己造的语音 wrap，替换掉原返回值
+static NSMutableArray *dd_wraps_from_fav_item(id favItem) {
     NSArray *list = ((FavoritesItem *)favItem).dataList;
-    if ([list count] == 0) return;
+    if ([list count] == 0) return nil;
     id wrap = dd_msg_wrap_from_fav_data([list firstObject], favItem);
-    Class ctrlCls = objc_getClass("FavForwardLogicController");
-    if (ctrlCls && ![[controller class] isSubclassOfClass:ctrlCls]) return;
-    Ivar iv = class_getInstanceVariable([controller class], "m_messageWrapList");
-    if (!iv) return;
-    id store = object_getIvar(controller, iv);
-    if (![store isKindOfClass:[NSMutableArray class]]) return;
-    [(NSMutableArray *)store addObject:wrap];
+    return wrap ? [NSMutableArray arrayWithObject:wrap] : nil;
 }
 
 #pragma mark - 语音转换：路径解析
@@ -1108,10 +1105,14 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 #pragma mark - Hook：收藏语音做成待转发消息
 
 %hook FavForwardLogicController
-// 8.0.79：单参的 addMsgFromItem: 已改成下面这个双参版，hook 旧的那个不会被调用
-- (void)addMsgFromItem:(id)arg1 fileSource:(int)arg2 {
-    if (dd_voice_fav_enabled() && dd_is_fav_voice_item(arg1)) dd_append_voice_msg(arg1, self);
-    %orig;
+// 8.0.79 新入口：收藏项 -> 待转发消息列表。返回值会被微信加进待转发列表，
+// 所以直接在这里把语音 wrap 塞进返回值，不碰 m_messageWrapList，也不用 KVC
+- (id)preparedMessageWrapsFromFavItem:(id)arg1 fileSource:(int)arg2 {
+    if (dd_voice_fav_enabled() && dd_is_fav_voice_item(arg1)) {
+        NSMutableArray *wraps = dd_wraps_from_fav_item(arg1);
+        if (wraps) return wraps;
+    }
+    return %orig;
 }
 %end
 
