@@ -76,6 +76,7 @@
 - (void)setM_bForward:(BOOL)arg1;
 - (id)getVoicePath;
 - (void)setM_nsVoicePath:(NSString *)arg1;
+- (unsigned int)getVoiceFormat;   // 诊断用，定位后删
 @end
 
 @interface CExtendInfoOfVoiceMsg : NSObject
@@ -477,6 +478,26 @@ static void dd_hub_finish(void) {
                          // 淡出期间可能又起了新任务，此时卡片还在用，不能摘掉。
                          if (dd_hub_count == 0) [dd_hub_card removeFromSuperview];
                      }];
+}
+// 诊断用：失败原因显示在浮卡上，停留 4 秒再收起（定位后删）
+static void dd_hub_fail(NSString *reason) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ dd_hub_fail(reason); });
+        return;
+    }
+    dd_hub_title.text = reason;
+    [dd_hub_slider.layer removeAllAnimations];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ dd_hub_finish(); });
+}
+// 诊断用：取语音格式 + 长度 + 前 8 字节（定位后删）
+static NSString *dd_voice_probe(NSData *d, CMessageWrap *msg) {
+    NSMutableString *hex = [NSMutableString string];
+    const unsigned char *b = (const unsigned char *)d.bytes;
+    NSUInteger n = d.length < 8 ? d.length : 8;
+    for (NSUInteger i = 0; i < n; i++) [hex appendFormat:@"%02X", b[i]];
+    return [NSString stringWithFormat:@"f=%u n=%lu h=%@",
+            [msg getVoiceFormat], (unsigned long)d.length, hex];
 }
 
 #pragma mark - 语音扩展信息（dd_voice_extend_info）
@@ -1021,11 +1042,11 @@ static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
 
     dispatch_async(dd_convert_queue, ^{
         NSString *p = dd_voice_path_of_msg(msg);
-        if (!dd_file_exists(p)) { dd_hub_finish(); return; }
+        if (!dd_file_exists(p)) { dd_hub_fail(@"①路径无效"); return; }
         NSData *silk = [NSData dataWithContentsOfFile:p];
-        if (silk.length < 12) { dd_hub_finish(); return; }
+        if (silk.length < 12) { dd_hub_fail(@"②文件过小"); return; }
         NSString *m4a = dd_decode_silk_to_audio(silk);
-        if (!m4a.length) { dd_hub_finish(); return; }
+        if (!m4a.length) { dd_hub_fail([@"③解码失败 " stringByAppendingString:dd_voice_probe(silk, msg)]); return; }
 
         dispatch_async(dispatch_get_main_queue(), ^{
             dd_send_file_to_chat(usr, m4a, fn);
