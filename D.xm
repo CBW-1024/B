@@ -782,20 +782,24 @@ static BOOL dd_silk_has_magic10(NSData *d) {
     return d.length >= 10 && ((const unsigned char *)d.bytes)[0] == 0x02
            && memcmp((const unsigned char *)d.bytes + 1, "#!SILK_V3", 9) == 0;
 }
-// 帧链校验：容器后为「[2字节小端帧长][帧数据]」重复序列。
-static BOOL dd_silk_frames_valid(NSData *d) {
-    if (!dd_silk_has_magic10(d) && !dd_silk_has_magic9(d)) return NO;
+// 帧链扫描：返回有效数据长度，撞上非法帧长即停；0 表示完全无效。
+// 8.0.79 收到的语音走 VoiceMsgDownloader 的 CDN 分片下载，落盘文件按 VoiceTime
+// 预分配，真实数据之后残留 0x00 填充，所以不能要求帧链铺满整个文件。
+static NSUInteger dd_silk_scan_frames(NSData *d) {
+    if (!dd_silk_has_magic10(d) && !dd_silk_has_magic9(d)) return 0;
     const unsigned char *b = (const unsigned char *)d.bytes;
-    NSUInteger len = d.length, pos = dd_silk_has_magic10(d) ? 10 : 9;
+    NSUInteger len = d.length, head = dd_silk_has_magic10(d) ? 10 : 9;
+    NSUInteger pos = head;
     while (pos + 2 <= len) {
         NSUInteger frameLen = (NSUInteger)b[pos] | ((NSUInteger)b[pos + 1] << 8);
+        if (frameLen == 0 || frameLen > 0x1000) break;   // 尾部填充，停
         pos += 2;
-        if (frameLen == 0 || frameLen > 0x1000 || pos + frameLen > len) return NO;
+        if (pos + frameLen > len) break;                  // 末帧不完整，停
         pos += frameLen;
-        if (pos == len) return YES;
     }
-    return NO;
+    return pos > head ? pos : 0;
 }
+static BOOL dd_silk_frames_valid(NSData *d) { return dd_silk_scan_frames(d) > 0; }
 static NSData *dd_silk_normalize(NSData *d) {
     if (dd_silk_has_magic10(d)) return d;
     if (dd_silk_has_magic9(d)) {
@@ -820,8 +824,12 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     if (fileData.length < 12) return nil;
     if (!dd_silk_has_magic10(fileData)) return nil;
-    if (!dd_silk_frames_valid(fileData)) return nil;
-    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:fileData];
+    // 只把有效帧链那一段喂给解码器，丢掉尾部填充
+    NSUInteger valid = dd_silk_scan_frames(fileData);
+    if (valid == 0) return nil;
+    NSData *in = (valid == fileData.length) ? fileData
+               : [fileData subdataWithRange:NSMakeRange(0, valid)];
+    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:in];
     return pcm.length ? pcm : nil;
 }
 
