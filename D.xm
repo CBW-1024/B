@@ -104,7 +104,8 @@
 @end
 
 @interface FavForwardLogicController : NSObject
-- (void)addMsgFromItem:(id)arg1;
+// 8.0.79 起加了 fileSource 参数，单参版 addMsgFromItem: 已被移除
+- (void)addMsgFromItem:(id)arg1 fileSource:(int)arg2;
 @end
 
 @interface ForwardMessageLogicController : NSObject
@@ -449,7 +450,8 @@ static void dd_appendVoiceMsg(id favItem, id controller) {
 #pragma mark - 把收藏语音做成待转发消息
 
 %hook FavForwardLogicController
-- (void)addMsgFromItem:(id)arg1 {
+// 8.0.79：单参的 addMsgFromItem: 已改成下面这个双参版，hook 旧的那个不会被调用
+- (void)addMsgFromItem:(id)arg1 fileSource:(int)arg2 {
     if (ddFavVoiceEnabled() && dd_isFavVoiceItem(arg1)) {
         dd_appendVoiceMsg(arg1, self);
     }
