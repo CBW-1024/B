@@ -1260,9 +1260,9 @@ static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL ena
                                                                 svgName:@"icons_filled_voice"
                                                                  target:cell
                                                                  action:@selector(ddvp_importVoice:)];
-    // 微信按 menuType 给菜单项去重，本项要设一个别处不会用到的值（内置项都是几十以内的小值），
-    // 不设的话默认 0，会和 DD语音助手等插件注入的项撞车，菜单里只显示其中一个
-    [item setMenuType:10001];
+    // 微信按 menuType 给菜单项去重，本项要设一个别处不会用到的值
+    // 不设的话默认 0，会和其他插件注入的项撞车，菜单里只显示其中一个
+    [item setMenuType:1];
     item.userInfo = kDDVoicePackImportMenuToken;
 
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
