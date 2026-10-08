@@ -490,14 +490,18 @@ static void dd_hub_fail(NSString *reason) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ dd_hub_finish(); });
 }
-// 诊断用：取语音格式 + 长度 + 前 8 字节（定位后删）
+// 诊断用：语音格式 + 首帧长度两种端序读法 + 容器尾部 4 字节（定位后删）
 static NSString *dd_voice_probe(NSData *d, CMessageWrap *msg) {
-    NSMutableString *hex = [NSMutableString string];
     const unsigned char *b = (const unsigned char *)d.bytes;
-    NSUInteger n = d.length < 8 ? d.length : 8;
-    for (NSUInteger i = 0; i < n; i++) [hex appendFormat:@"%02X", b[i]];
-    return [NSString stringWithFormat:@"f=%u n=%lu h=%@",
-            [msg getVoiceFormat], (unsigned long)d.length, hex];
+    NSUInteger le = 0, be = 0;
+    NSString *h = @"";
+    if (d.length >= 12) {
+        le = (NSUInteger)b[10] | ((NSUInteger)b[11] << 8);
+        be = ((NSUInteger)b[10] << 8) | (NSUInteger)b[11];
+        h = [NSString stringWithFormat:@"%02X%02X%02X%02X", b[8], b[9], b[10], b[11]];
+    }
+    return [NSString stringWithFormat:@"f%u le%lu be%lu h%@",
+            [msg getVoiceFormat], (unsigned long)le, (unsigned long)be, h];
 }
 
 #pragma mark - 语音扩展信息（dd_voice_extend_info）
@@ -820,15 +824,13 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (!dd_silk_frames_valid(silk)) return nil;
     return silk;
 }
-// SILK → PCM。校验帧链后喂解码器。
+// SILK → PCM。
+// 8.0.79 收到的语音在帧长/端序上可能与旧版不同，插件自己按「2字节小端」扫帧链会误杀，
+// 这里只保证是 SILK 容器（必要时补 0x02 前导），其余交给微信自己的 MJSilkCodec 判断。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     if (fileData.length < 12) return nil;
-    if (!dd_silk_has_magic10(fileData)) return nil;
-    // 只把有效帧链那一段喂给解码器，丢掉尾部填充
-    NSUInteger valid = dd_silk_scan_frames(fileData);
-    if (valid == 0) return nil;
-    NSData *in = (valid == fileData.length) ? fileData
-               : [fileData subdataWithRange:NSMakeRange(0, valid)];
+    NSData *in = dd_silk_normalize(fileData);
+    if (!in) return nil;
     NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:in];
     return pcm.length ? pcm : nil;
 }
