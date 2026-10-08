@@ -168,13 +168,11 @@
 @interface MMMenuItem : NSObject
 @property (nonatomic, retain) id userInfo;
 - (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
-// 不带 target 的版本：微信头文件里确实存在（MMMenuItem.h 第 17 行），WCRefine 用的就是它。
-// 不传 target 时点击走 UIResponder 响应者链派发，而不是直接发给 target。
-- (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName action:(SEL)action;
-// menuType 是微信给菜单项分配的「身份 ID」，内置项各有其值；
-// 用 initWithTitle:... 创建的自定义项默认为 0，两个 tweak 都注入时 type 撞车，
-// 会被 BaseMessageCellView 的 uniqMenuItems: 判为重复项砍掉一个。
-- (long long)menuType;
+// menuType 是微信给菜单项分配的身份 ID：内置项各有其值（forwardMenuItem、deleteMenuItem…
+// 乃至后来加的「问小魏」「元宝」都是 initWithType:target:action: 造的），
+// 而 initWithTitle:... 造出来的自定义项恒为 0。两个 tweak 各注入一项就会 type 撞车，
+// 被 BaseMessageCellView 的 uniqMenuItems: 判成重复项砍掉一个 —— 这就是「不能同时显示」的根因。
+// 设一个微信内部不会用到的大值（内置都是几十以内的小枚举）即可让各自身份独立。
 - (void)setMenuType:(long long)type;
 @end
 
@@ -1261,64 +1259,14 @@ static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL ena
         if ([[item userInfo] isEqual:kDDVoicePackImportMenuToken]) return original;
     }
 
-    // 实验 A+B：不传 target + 显式 setMenuType。
-    // A（无 target）：与 WCRefine 一致，规避「按 target 去重/过滤」那条线。
-    //   不传 target 时点击走响应者链派发，菜单弹出时 cell 已是 firstResponder，
-    //   action 会派发到 cell 上的 ddvp_importVoice:。
-    // B（setMenuType）：微信的内置菜单项各有唯一 menuType（forwardMenuItem、
-    //   deleteMenuItem … 乃至后来加的「问小魏」「元宝」都是 WithType:target:action:），
-    //   而 initWithTitle:... 造出来的自定义项 menuType 恒为 0。语音包与助手各注入一项时
-    //   两个 type 都是 0，被 BaseMessageCellView 的 uniqMenuItems: 判成重复项砍掉一个，
-    //   这就是「不能同时显示」的根因。给个微信内部不会用到的大值即可各自身份独立。
-    // 10001 远离微信内置枚举（内置都是几十以内的小值），也不会跟助手的项撞。
     MMMenuItem *item = [[objc_getClass("MMMenuItem") alloc] initWithTitle:@"纳入"
                                                                 svgName:@"icons_filled_voice"
+                                                                 target:cell
                                                                  action:@selector(ddvp_importVoice:)];
+    // 关键一行：给个不撞车的 menuType，否则会和同样注入自定义菜单项的其他 tweak
+    // （如 DD语音助手的「转文件」）一起被 uniqMenuItems: 判成重复项，只剩一个能显示
     [item setMenuType:10001];
     item.userInfo = kDDVoicePackImportMenuToken;
-
-    NSMutableArray *items = [NSMutableArray arrayWithArray:original];
-    [items addObject:item];
-    return items;
-}
-
-// ========== 与 DD语音助手协作：兜底它的「转文件」菜单项 ==========
-
-// 助手注入时给 MMMenuItem 打的 userInfo 记号，格式是 @"ddvc:" + selector 名
-static NSString * const kDDVoicePackVoiceToFileToken = @"ddvc:dd_voiceToFile:";
-// 助手「转文件」开关写在 standardUserDefaults 的这个 key（与助手 DDVoiceConvertConfig 同一份，默认 NO）
-static NSString * const kDDVoicePackVoiceToFileKey = @"kDDVCVoiceToFile";
-
-// 用 NSSelectorFromString 而不是 @selector(dd_voiceToFile:)：本文件没有该方法的声明，
-// 直接写字面量会触发默认开启的 -Wundeclared-selector，在 -Werror 下会升级成编译错误。
-// selector 名在 runtime 是唯一注册的，取到的 SEL 与助手那边的字面量完全等价
-static SEL DDVoicePackVoiceToFileSelector(void) {
-    return NSSelectorFromString(@"dd_voiceToFile:");
-}
-
-// 助手是否可用且开了「转文件」：方法存在说明助手 dylib 已加载（%new 挂上了），
-// 开关读它自己的 key 保证语义一致。任一不满足就不动，避免注入点了没反应的幽灵菜单项
-static BOOL DDVoicePackVoiceToFileUsable(id cell) {
-    if (![cell respondsToSelector:DDVoicePackVoiceToFileSelector()]) return NO;
-    return [[NSUserDefaults standardUserDefaults] boolForKey:kDDVoicePackVoiceToFileKey];
-}
-
-// 助手的 operationMenuItems 若没挂上（或它的 action 被钩链判否），这里替它把项补进数组。
-// 已注入过（userInfo 记号命中）则原样返回，不会重复
-static NSArray *DDVoicePackEnsureVoiceToFileItem(id cell, NSArray *original) {
-    if (!original || !DDVoicePackVoiceToFileUsable(cell)) return original;
-
-    for (MMMenuItem *item in original) {
-        if ([[item userInfo] isEqual:kDDVoicePackVoiceToFileToken]) return original;
-    }
-
-    MMMenuItem *item = [[objc_getClass("MMMenuItem") alloc] initWithTitle:@"转文件"
-                                                                svgName:@"icon_filled_record_voice"
-                                                                 target:cell
-                                                                 action:DDVoicePackVoiceToFileSelector()];
-    if (!item) return original;
-    [item setMenuType:10002];   // 与「纳入」的 10001 错开，避免两个兜底项之间再撞 type
-    item.userInfo = kDDVoicePackVoiceToFileToken;
 
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
     [items addObject:item];
@@ -1334,8 +1282,6 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 - (NSArray *)operationMenuItems {
     NSArray *items = %orig;
-    // 先补助手的「转文件」（若它自己没注入），再追加「纳入」，保持原有的先后视觉顺序
-    items = DDVoicePackEnsureVoiceToFileItem(self, items);
     return DDVoicePackAppendImportItem(self, items,
                                        [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]));
 }
@@ -1343,10 +1289,6 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (action == @selector(ddvp_importVoice:)) {
         return [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]);
-    }
-    // 协作放行：不再依赖助手自己的 hook 是否在钩链上，这里直接给出结论
-    if (action == DDVoicePackVoiceToFileSelector()) {
-        return DDVoicePackVoiceToFileUsable(self);
     }
     // %orig 单独一行：Logos 对行尾内容的处理不牢靠，与其他语句同行容易编译失败
     BOOL origResult = %orig;
