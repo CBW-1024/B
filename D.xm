@@ -749,6 +749,22 @@ static BOOL dd_silk_frames_valid(NSData *d) {
     }
     return NO;
 }
+// 截到最后一帧完整边界：丢弃尾部残缺帧，使解码器拿到自洽帧链。
+// 适用于被 300KB 等上限截断的语音文件（framesValid=0 但前段帧数据完整）。
+static NSData *dd_silk_trim_valid(NSData *d) {
+    if (!dd_silk_has_magic10(d) && !dd_silk_has_magic9(d)) return nil;
+    NSUInteger hlen = dd_silk_has_magic10(d) ? 10 : 9;
+    const unsigned char *b = (const unsigned char *)d.bytes;
+    NSUInteger len = d.length, pos = hlen;
+    while (pos + 2 <= len) {
+        NSUInteger frameLen = (NSUInteger)b[pos] | ((NSUInteger)b[pos + 1] << 8);
+        if (frameLen == 0 || frameLen > 0x1000) break;          // 非法帧长，停止
+        if (pos + 2 + frameLen > len) break;                     // 尾部残缺帧，停止
+        pos += 2 + frameLen;
+    }
+    if (pos <= hlen) return nil;                                 // 一帧都没有，放弃
+    return [d subdataWithRange:NSMakeRange(0, pos)];
+}
 static NSData *dd_silk_normalize(NSData *d) {
     if (dd_silk_has_magic10(d)) return d;
     if (dd_silk_has_magic9(d)) {
@@ -769,11 +785,13 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (!dd_silk_frames_valid(silk)) return nil;
     return silk;
 }
-// SILK → PCM。直接把整个 magic10 文件喂解码器（不严格对帧，容错交由 MJSilkCodec，与微信播放器行为一致）。
+// SILK → PCM。被截断（framesValid=0）时裁到最后一帧完整边界再喂解码器，
+// 丢掉尾部残缺帧，保留前段可解码音频（与微信播放器容错行为一致）。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     if (fileData.length < 12) return nil;
-    if (!dd_silk_has_magic10(fileData)) return nil;
-    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:fileData];
+    if (!dd_silk_has_magic10(fileData) && !dd_silk_has_magic9(fileData)) return nil;
+    NSData *data = dd_silk_trim_valid(fileData) ?: fileData;   // 截断则裁到完整帧
+    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:data];
     return pcm.length ? pcm : nil;
 }
 
@@ -1039,9 +1057,12 @@ static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
         BOOL magic10 = dd_silk_has_magic10(silk);
         BOOL magic9  = dd_silk_has_magic9(silk);
         BOOL frames  = dd_silk_frames_valid(silk);
-        dd_log(@"[语音转文件] 判定 magic10=%d magic9=%d framesValid=%d localID=%u", magic10, magic9, frames, lid);
+        NSData *trimmed = dd_silk_trim_valid(silk);
+        dd_log(@"[语音转文件] 判定 magic10=%d magic9=%d framesValid=%d 可解码帧区=%lu字节 localID=%u",
+               magic10, magic9, frames, (unsigned long)(trimmed ? trimmed.length : 0), lid);
         NSString *m4a = dd_decode_silk_to_audio(silk);
-        if (!m4a.length) { dd_log(@"[语音转文件] 失败: 解码/导出 m4a 为空 localID=%u (magic10=%d magic9=%d framesValid=%d)", lid, magic10, magic9, frames); dd_hub_finish(); return; }
+        if (!m4a.length) { dd_log(@"[语音转文件] 失败: 解码/导出 m4a 为空 localID=%u (magic10=%d magic9=%d framesValid=%d 帧区=%lu)",
+                                  lid, magic10, magic9, frames, (unsigned long)(trimmed ? trimmed.length : 0)); dd_hub_finish(); return; }
         dd_log(@"[语音转文件] 成功: m4a=%lu 字节 localID=%u", (unsigned long)[[NSData dataWithContentsOfFile:m4a] length], lid);
         dispatch_async(dispatch_get_main_queue(), ^{
             dd_send_file_to_chat(usr, m4a, fn, @"m4a");
