@@ -769,11 +769,10 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (!dd_silk_frames_valid(silk)) return nil;
     return silk;
 }
-// SILK → PCM。校验帧链后喂解码器。
+// SILK → PCM。直接把整个 magic10 文件喂解码器（不严格对帧，容错交由 MJSilkCodec，与微信播放器行为一致）。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     if (fileData.length < 12) return nil;
     if (!dd_silk_has_magic10(fileData)) return nil;
-    if (!dd_silk_frames_valid(fileData)) return nil;
     NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:fileData];
     return pcm.length ? pcm : nil;
 }
