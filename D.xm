@@ -557,8 +557,7 @@ static unsigned int dd_new_voice_local_id(void) {
     return kDDVoiceLocalIDBase + (unsigned int)arc4random_uniform(kDDVoiceLocalIDRange);
 }
 // 发送语音到会话：AddLocalMsg 分配 localID → 写 SILK 到规范路径 → SaveMesVoice → ResendVoiceMsg。
-// 8.0.79 的语音路径由 localID 经 CUtility.GetPathOfMesAudio 推算（getVoicePath 同款），
-// 只需把文件落到该规范路径即可，无需显式设置 m_nsVoicePath（该 ivar/setter 在 8.0.79 已不存在）。
+// 语音路径由 localID 经 CUtility.GetPathOfMesAudio 推算，把文件落到该规范路径即可。
 // SaveMesVoice 首参传 nil（声明两参，传 NSData 会被当成路径）。
 static void dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     NSData *data = [NSData dataWithContentsOfFile:audPath];
@@ -749,8 +748,7 @@ static BOOL dd_silk_frames_valid(NSData *d) {
     }
     return NO;
 }
-// 截到最后一帧完整边界：丢弃尾部残缺帧，使解码器拿到自洽帧链。
-// 适用于被 300KB 等上限截断的语音文件（framesValid=0 但前段帧数据完整）。
+// 截到最后一帧的完整边界返回：尾部残缺帧不入解码，避免解整段失败。
 static NSData *dd_silk_trim_valid(NSData *d) {
     if (!dd_silk_has_magic10(d) && !dd_silk_has_magic9(d)) return nil;
     NSUInteger hlen = dd_silk_has_magic10(d) ? 10 : 9;
@@ -785,8 +783,7 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (!dd_silk_frames_valid(silk)) return nil;
     return silk;
 }
-// SILK → PCM。被截断（framesValid=0）时裁到最后一帧完整边界再喂解码器，
-// 丢掉尾部残缺帧，保留前段可解码音频（与微信播放器容错行为一致）。
+// SILK → PCM：先按帧边界裁掉尾部残缺帧再送入解码，尽量保留可解码的前段音频。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     if (fileData.length < 12) return nil;
     NSData *data = dd_silk_trim_valid(fileData) ?: fileData;   // 截断则裁到完整帧
