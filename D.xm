@@ -1245,26 +1245,23 @@ static const void *kDDVoicePackLongPressKey = &kDDVoicePackLongPressKey;
 
 // ========== Hook 语音消息菜单「纳入」 ==========
 
-// 菜单项去重标记：MMMenuItem 没有 title / action 的 getter，只能用 userInfo 做记号
-static NSString * const kDDVoicePackImportMenuToken = @"ddvp:import";
-
-// 往菜单末尾追加「纳入」（开关关闭 / 已注入过则原样返回）
-static NSArray *DDVoicePackAppendImportItem(id cell, NSArray *original, BOOL enabled) {
-    if (!enabled || !original) return original;
-
-    for (MMMenuItem *item in original) {
-        if ([[item userInfo] isEqual:kDDVoicePackImportMenuToken]) return original;
+// 注入菜单项（svg 图标 + 标题，一级平铺项）。已注入则跳过。
+// 去重标记用 action 派生的 userInfo：MMMenuItem 没有 title/action 的 getter，只能用 userInfo 做记号。
+static NSArray *ddvp_inject_item(id cell, NSArray *original, BOOL enabled, NSString *title, SEL action, long long menuType) {
+    if (!enabled) return original;
+    NSString *token = [@"ddvp:" stringByAppendingString:NSStringFromSelector(action)];
+    for (MMMenuItem *it in original) {
+        id ui = [it userInfo];
+        if ([ui isKindOfClass:[NSString class]] && [(NSString *)ui isEqualToString:token]) return original;
     }
-
-    MMMenuItem *item = [[objc_getClass("MMMenuItem") alloc] initWithTitle:@"纳入"
-                                                                svgName:@"icons_filled_voice"
-                                                                 target:cell
-                                                                 action:@selector(ddvp_importVoice:)];
-    // 微信按 menuType 给菜单项去重，本项要设一个别处不会用到的值
-    // 不设的话默认 0，会和其他插件注入的项撞车，菜单里只显示其中一个
-    [item setMenuType:1];
-    item.userInfo = kDDVoicePackImportMenuToken;
-
+    Class cls = objc_getClass("MMMenuItem");
+    MMMenuItem *item = [[cls alloc] initWithTitle:title
+                                          svgName:@"icons_filled_voice"
+                                           target:cell
+                                           action:action];
+    if (!item) return original;
+    [item setUserInfo:token];
+    [item setMenuType:menuType];
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
     [items addObject:item];
     return items;
@@ -1279,8 +1276,9 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 - (NSArray *)operationMenuItems {
     NSArray *items = %orig;
-    return DDVoicePackAppendImportItem(self, items,
-                                       [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]));
+    return ddvp_inject_item(self, items,
+                            [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]),
+                            @"纳入", @selector(ddvp_importVoice:), 10001); // 如果按钮冲突可改此处值
 }
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
