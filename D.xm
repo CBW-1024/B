@@ -941,21 +941,21 @@ static NSString *dd_decode_silk_to_audio(NSData *fileData) {
     if (pcm.length == 0) return nil;
     return dd_write_m4a(pcm);
 }
-// 拷入微信持久沙盒再发送（临时目录会被系统清空，指向死路径 → 消息打不开）。
-static NSString *dd_persist_copy(NSString *src) {
+// 拷入微信持久沙盒再发送（临时目录会被系统清空，指向死路径 → 消息打不开）。ext 为扩展名。
+static NSString *dd_persist_copy(NSString *src, NSString *ext) {
     if (!dd_file_exists(src)) return nil;
     NSString *dir = (NSString *)[objc_getClass("CUtility") GetDocPath];
     if (![dir isKindOfClass:[NSString class]] || dir.length == 0) return nil;
     NSString *dst = [dir stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"ddvc_voice_%@.m4a", [[NSUUID UUID] UUIDString]]];
+        [NSString stringWithFormat:@"ddvc_%@.%@", [[NSUUID UUID] UUIDString], ext]];
     return [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
 }
-// 发送 m4a 文件消息：AddAppMsg 本地落库 → StartUploadAppMsg 触发上传。
-static void dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName) {
-    NSString *persistPath = dd_persist_copy(m4aPath);
-    if (persistPath.length) m4aPath = persistPath;
-    if (!dd_file_exists(m4aPath) || !usr.length) return;
-    NSData *fdata = [NSData dataWithContentsOfFile:m4aPath];
+// 发送文件消息：AddAppMsg 本地落库 → StartUploadAppMsg 触发上传。ext 为扩展名（m4a / txt 等）。
+static void dd_send_file_to_chat(NSString *usr, NSString *filePath, NSString *fileName, NSString *ext) {
+    NSString *persistPath = dd_persist_copy(filePath, ext);
+    if (persistPath.length) filePath = persistPath;
+    if (!dd_file_exists(filePath) || !usr.length) return;
+    NSData *fdata = [NSData dataWithContentsOfFile:filePath];
     if (fdata.length == 0) return;
 
     unsigned long long fsize = fdata.length;
@@ -970,7 +970,7 @@ static void dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     CExtendInfoOfAPP *app = [[objc_getClass("CExtendInfoOfAPP") alloc] init];
     [app setM_uiAppMsgInnerType:kDDVCAppInnerFile];
     [app setM_nsAppFileName:fileName];
-    [app setM_nsAppFileExt:@"m4a"];
+    [app setM_nsAppFileExt:ext];
     [app setM_uiAppDataSize:fsize];
     [app setM_nsTitle:fileName];
     [app setM_bAppAttachExistInSvr:YES];
@@ -980,12 +980,47 @@ static void dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fil
     [wrap setM_nsContent:[NSString stringWithFormat:
         @"<msg><appmsg appid=\"\" sdkver=\"0\"><title>%@</title><des></des><type>6</type>"
          "<appattach><totallen>%llu</totallen><attachid></attachid><fileext>%@</fileext>"
-         "<filename>%@</filename></appattach></appmsg></msg>", fileName, fsize, @"m4a", fileName]];
+         "<filename>%@</filename></appattach></appmsg></msg>", fileName, fsize, ext, fileName]];
 
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-    [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
+    [mgr AddAppMsg:usr MsgWrap:wrap DataPath:filePath Scene:0];
     [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
 }
+#pragma mark - 日志（落文件，设置界面可导出/清空；证书注入无控制台时用于定位转换问题）
+
+static NSString *dd_log_path(void) {
+    NSString *dir = (NSString *)[objc_getClass("CUtility") GetDocPath];
+    if (![dir isKindOfClass:[NSString class]] || dir.length == 0) return nil;
+    return [dir stringByAppendingPathComponent:@"ddvc_log.txt"];
+}
+// 追加一行时间戳日志到文件（同时进 NSLog 方便有控制台的人）。
+static void dd_log(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+    f.dateFormat = @"MM-dd HH:mm:ss";
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [f stringFromDate:[NSDate date]], msg];
+    NSString *path = dd_log_path();
+    if (path) {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) { [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil]; fh = [NSFileHandle fileHandleForWritingAtPath:path]; }
+        if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    }
+    NSLog(@"[DDVC] %@", msg);
+}
+// 导出日志：返回日志文件 URL，由系统分享面板分享到任意 App（不碰发送链，避免影响文件发送功能）。
+static NSURL *dd_export_log(void) {
+    NSString *path = dd_log_path();
+    if (!path || !dd_file_exists(path)) return nil;
+    return [NSURL fileURLWithPath:path];
+}
+// 清空日志文件。
+static void dd_clear_log(void) {
+    NSString *path = dd_log_path();
+    if (path) [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+}
+
 // 语音消息 → 文件消息：解 SILK 导出 m4a 发出。提示从菜单点击起，发起发送即收起。
 static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
     if (!msg) return;
@@ -994,15 +1029,23 @@ static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
     dd_hub_begin(win);
 
     dispatch_async(dd_convert_queue, ^{
+        unsigned int lid = msg.m_uiMesLocalID;
         NSString *p = dd_voice_path_of_msg(msg);
-        if (!dd_file_exists(p)) { dd_hub_finish(); return; }
+        dd_log(@"[语音转文件] 开始 localID=%u usr=%@ path=%@", lid, usr, p);
+        if (!dd_file_exists(p)) { dd_log(@"[语音转文件] 失败: 文件不存在 localID=%u path=%@", lid, p); dd_hub_finish(); return; }
         NSData *silk = [NSData dataWithContentsOfFile:p];
-        if (silk.length < 12) { dd_hub_finish(); return; }
+        dd_log(@"[语音转文件] 文件大小=%lu 前10字节=%@", (unsigned long)silk.length,
+               [silk subdataWithRange:NSMakeRange(0, silk.length > 10 ? 10 : silk.length)]);
+        if (silk.length < 12) { dd_log(@"[语音转文件] 失败: 数据过短(<12字节) localID=%u", lid); dd_hub_finish(); return; }
+        BOOL magic10 = dd_silk_has_magic10(silk);
+        BOOL magic9  = dd_silk_has_magic9(silk);
+        BOOL frames  = dd_silk_frames_valid(silk);
+        dd_log(@"[语音转文件] 判定 magic10=%d magic9=%d framesValid=%d localID=%u", magic10, magic9, frames, lid);
         NSString *m4a = dd_decode_silk_to_audio(silk);
-        if (!m4a.length) { dd_hub_finish(); return; }
-
+        if (!m4a.length) { dd_log(@"[语音转文件] 失败: 解码/导出 m4a 为空 localID=%u (magic10=%d magic9=%d framesValid=%d)", lid, magic10, magic9, frames); dd_hub_finish(); return; }
+        dd_log(@"[语音转文件] 成功: m4a=%lu 字节 localID=%u", (unsigned long)[[NSData dataWithContentsOfFile:m4a] length], lid);
         dispatch_async(dispatch_get_main_queue(), ^{
-            dd_send_file_to_chat(usr, m4a, fn);
+            dd_send_file_to_chat(usr, m4a, fn, @"m4a");
             // 消息已入库并出现在会话里，提示到此收起，不等上传结果。
             dd_hub_finish();
         });
@@ -1300,6 +1343,16 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
         [_tableViewManager addSection:sec2];
     }
 
+    // 分组三：调试（证书注入无控制台时，导出日志定位转换问题）
+    WCTableViewSectionManager *sec3 = [secMgr sectionWithHeader:@"调试"];
+    if (sec3) {
+        [sec3 addCell:[cellMgr normalCellForSel:nil target:nil title:@"导出日志"
+                                      rightView:[self debugButtonWithTitle:@"导出" action:@selector(onExportLog)]]];
+        [sec3 addCell:[cellMgr normalCellForSel:nil target:nil title:@"清空日志"
+                                      rightView:[self debugButtonWithTitle:@"清空" action:@selector(onClearLog)]]];
+        [_tableViewManager addSection:sec3];
+    }
+
     [_tableViewManager reloadTableView];
 }
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1364,6 +1417,30 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     [container addSubview:btn];
     return container;
 }
+// 调试按钮（与「确认」按钮同款样式），用于触发导出/清空日志。
+- (UIButton *)debugButtonWithTitle:(NSString *)title action:(SEL)action {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = CGRectMake(0, 0, 60, 34);
+    [btn setTitle:title forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor systemGray5Color];
+    btn.layer.cornerRadius = 6.0;
+    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return btn;
+}
+- (void)onExportLog {
+    NSURL *url = dd_export_log();
+    if (!url) return;
+    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    // iPad 必须给 popover 锚点，否则崩溃；iPhone 忽略即可。
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        avc.popoverPresentationController.sourceView = self.view;
+        avc.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height / 2.0, 0, 0);
+    }
+    [self presentViewController:avc animated:YES completion:nil];
+}
+- (void)onClearLog { dd_clear_log(); }
 @end
 
 #pragma mark - 注册入口
