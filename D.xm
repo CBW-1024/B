@@ -72,7 +72,6 @@
 - (void)setM_uiDownloadStatus:(unsigned int)arg1;
 - (void)setM_bForward:(BOOL)arg1;
 - (id)getVoicePath;
-- (void)setM_nsVoicePath:(NSString *)arg1;
 @end
 
 @interface CExtendInfoOfVoiceMsg : NSObject
@@ -558,7 +557,8 @@ static unsigned int dd_new_voice_local_id(void) {
     return kDDVoiceLocalIDBase + (unsigned int)arc4random_uniform(kDDVoiceLocalIDRange);
 }
 // 发送语音到会话：AddLocalMsg 分配 localID → 写 SILK 到规范路径 → SaveMesVoice → ResendVoiceMsg。
-// 必须显式 setM_nsVoicePath，否则 ResendVoiceMsg 会按 localID 重算路径、读坏文件。
+// 8.0.79 的语音路径由 localID 经 CUtility.GetPathOfMesAudio 推算（getVoicePath 同款），
+// 只需把文件落到该规范路径即可，无需显式设置 m_nsVoicePath（该 ivar/setter 在 8.0.79 已不存在）。
 // SaveMesVoice 首参传 nil（声明两参，传 NSData 会被当成路径）。
 static void dd_send_voice(NSString *usr, NSString *audPath, unsigned int duration) {
     NSData *data = [NSData dataWithContentsOfFile:audPath];
@@ -579,8 +579,7 @@ static void dd_send_voice(NSString *usr, NSString *audPath, unsigned int duratio
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
     [mgr AddLocalMsg:usr MsgWrap:wrap];
 
-    NSString *voicePath = dd_install_audio_file(wrap, audPath);
-    if (voicePath.length) [wrap setM_nsVoicePath:voicePath];
+    dd_install_audio_file(wrap, audPath);
 
     [mgr SaveMesVoice:nil MsgWrap:wrap];
     [sender ResendVoiceMsg:usr MsgWrap:wrap];
