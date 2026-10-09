@@ -4,7 +4,7 @@
 //    1. 语音转发：收藏语音 / 语音消息可直接转发，长按菜单补「转发」入口
 //    2. 自定义语音秒数：上行语音时长改写为 1~60s 内指定值
 //    3. 媒体转换：视频 / 文件 →「转语音」（抽音轨编 SILK 发送）
-//                 语音 →「转文件」（解码 SILK→PCM→封装 m4a，发可播放文件消息，对齐 WCR）
+//                 语音 →「转文件」（解 SILK 导出 m4a 发送）
 //
 //  媒体尚未下载时先触发微信原生下载，落盘后再转换；转换期间在聊天主窗口顶部
 //  显示「正在转换中」浮卡，消息发起发送即收起。
@@ -58,9 +58,6 @@
 @interface CMessageWrap : NSObject
 + (BOOL)isSenderFromMsgWrap:(id)arg1;
 + (id)GetPathOfAppData:(id)msgWrap;
-// 微信自己发文件用的工厂方法：一次把 m_nsContent / CExtendInfoOfAPP / 附件字段填好。
-// （WCRefine 的语音转文件就是走这个；8.0.79 CMessageWrap.h:46 确认存在）
-+ (id)genFileAppMsgWithFileName:(id)arg1 filePath:(id)arg2 fileData:(id)arg3;
 - (id)initWithMsgType:(long long)arg1;
 - (BOOL)IsVoiceMsg;
 - (BOOL)IsVideoMsg;
@@ -185,7 +182,6 @@
 
 @interface CMessageMgr : NSObject
 - (void)StartDownloadVideo:(id)a0 MsgWrap:(id)a1 Priority:(BOOL)a2 Silent:(BOOL)a3;
-- (void)AddMsg:(id)a0 MsgWrap:(id)a1;
 - (void)AddAppMsg:(id)a0 MsgWrap:(id)a1 DataPath:(id)a2 Scene:(unsigned int)a3;
 - (void)StartUploadAppMsg:(id)a0 MsgWrap:(id)a1 Scene:(unsigned int)a2;
 - (void)AddLocalMsg:(id)a0 MsgWrap:(id)a1;
@@ -482,17 +478,6 @@ static void dd_hub_finish(void) {
                          if (dd_hub_count == 0) [dd_hub_card removeFromSuperview];
                      }];
 }
-// 诊断用：失败原因显示在浮卡上，停留 4 秒再收起（定位后删）
-static void dd_hub_fail(NSString *reason) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ dd_hub_fail(reason); });
-        return;
-    }
-    dd_hub_title.text = reason;
-    [dd_hub_slider.layer removeAllAnimations];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ dd_hub_finish(); });
-}
 
 #pragma mark - 语音扩展信息（dd_voice_extend_info）
 
@@ -776,24 +761,20 @@ static BOOL dd_silk_has_magic10(NSData *d) {
     return d.length >= 10 && ((const unsigned char *)d.bytes)[0] == 0x02
            && memcmp((const unsigned char *)d.bytes + 1, "#!SILK_V3", 9) == 0;
 }
-// 帧链扫描：返回有效数据长度，撞上非法帧长即停；0 表示完全无效。
-// 8.0.79 收到的语音走 VoiceMsgDownloader 的 CDN 分片下载，落盘文件按 VoiceTime
-// 预分配，真实数据之后残留 0x00 填充，所以不能要求帧链铺满整个文件。
-static NSUInteger dd_silk_scan_frames(NSData *d) {
-    if (!dd_silk_has_magic10(d) && !dd_silk_has_magic9(d)) return 0;
+// 帧链校验：容器后为「[2字节小端帧长][帧数据]」重复序列。
+static BOOL dd_silk_frames_valid(NSData *d) {
+    if (!dd_silk_has_magic10(d) && !dd_silk_has_magic9(d)) return NO;
     const unsigned char *b = (const unsigned char *)d.bytes;
-    NSUInteger len = d.length, head = dd_silk_has_magic10(d) ? 10 : 9;
-    NSUInteger pos = head;
+    NSUInteger len = d.length, pos = dd_silk_has_magic10(d) ? 10 : 9;
     while (pos + 2 <= len) {
         NSUInteger frameLen = (NSUInteger)b[pos] | ((NSUInteger)b[pos + 1] << 8);
-        if (frameLen == 0 || frameLen > 0x1000) break;   // 尾部填充，停
         pos += 2;
-        if (pos + frameLen > len) break;                  // 末帧不完整，停
+        if (frameLen == 0 || frameLen > 0x1000 || pos + frameLen > len) return NO;
         pos += frameLen;
+        if (pos == len) return YES;
     }
-    return pos > head ? pos : 0;
+    return NO;
 }
-static BOOL dd_silk_frames_valid(NSData *d) { return dd_silk_scan_frames(d) > 0; }
 static NSData *dd_silk_normalize(NSData *d) {
     if (dd_silk_has_magic10(d)) return d;
     if (dd_silk_has_magic9(d)) {
@@ -814,21 +795,12 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (!dd_silk_frames_valid(silk)) return nil;
     return silk;
 }
-// SILK → PCM。
-// 8.0.79 收到的语音在帧长/端序上可能与旧版不同，插件自己按「2字节小端」扫帧链会误杀，
-// 这里只保证是 SILK 容器（必要时补 0x02 前导），其余交给微信自己的 MJSilkCodec 判断。
-// 治本：WeChat 语音 .aud 落盘按 VoiceTime 预分配，尾部常带 0x00 填充；个别导出还会把最后一帧
-// 截掉（缺 0xFFFF 终止符 + 残缺尾帧）。这两种情况若整段喂给 MJSilkCodec，都会因越界/残缺尾帧
-// 解码失败、出不来 PCM、进而 m4a 封装失败。先按帧链扫出「有效长度」并裁掉尾部填充/残缺帧，
-// 只把干净帧链交给解码器。
+// SILK → PCM。校验帧链后喂解码器。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     if (fileData.length < 12) return nil;
-    NSData *in = dd_silk_normalize(fileData);
-    if (!in) return nil;
-    NSUInteger valid = dd_silk_scan_frames(in);
-    if (valid < 12) return nil;   // 帧链完全无效
-    NSData *clean = (valid == in.length) ? in : [in subdataWithRange:NSMakeRange(0, valid)];
-    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:clean];
+    if (!dd_silk_has_magic10(fileData)) return nil;
+    if (!dd_silk_frames_valid(fileData)) return nil;
+    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:fileData];
     return pcm.length ? pcm : nil;
 }
 
@@ -945,140 +917,120 @@ static void dd_media_to_voice(CMessageWrap *msg, NSString *(^pathBlock)(void), v
 
 #pragma mark - 语音转换：语音 → 文件
 
+// PCM → WAV（44 字节 RIFF 头，16bit / 单声道 / 16000Hz）。
+static NSData *dd_wav_of_pcm(NSData *pcm) {
+    if (pcm.length == 0) return nil;
+    const uint32_t sampleRate = (uint32_t)kDDVCVoiceSampleRate;
+    const uint16_t channels = 1, bits = 16;
+    unsigned char hdr[44] = {0};
+    uint32_t riffSize = (uint32_t)(36 + pcm.length);
+    uint32_t fmtSize = 16, byteRate = sampleRate * channels * bits / 8;
+    uint16_t audioFmt = 1, blockAlign = channels * bits / 8, bitsVal = bits;
+    uint32_t dataSize = (uint32_t)pcm.length;
+    memcpy(hdr + 0,  "RIFF", 4);  memcpy(hdr + 4,  &riffSize, 4);
+    memcpy(hdr + 8,  "WAVE", 4);  memcpy(hdr + 12, "fmt ", 4);
+    memcpy(hdr + 16, &fmtSize, 4); memcpy(hdr + 20, &audioFmt, 2);
+    memcpy(hdr + 22, &channels, 2); memcpy(hdr + 24, &sampleRate, 4);
+    memcpy(hdr + 28, &byteRate, 4); memcpy(hdr + 32, &blockAlign, 2);
+    memcpy(hdr + 34, &bitsVal, 2);  memcpy(hdr + 36, "data", 4);
+    memcpy(hdr + 40, &dataSize, 4);
+    NSMutableData *wav = [NSMutableData dataWithCapacity:pcm.length + 44];
+    [wav appendBytes:hdr length:44];
+    [wav appendData:pcm];
+    return wav;
+}
+// PCM → m4a：先转 WAV，再经 AVAssetExportSession 导出 AppleM4A。
+static NSString *dd_write_m4a(NSData *pcm) {
+    if (pcm.length == 0) return nil;
+    NSString *wavPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"wav"]];
+    if (![dd_wav_of_pcm(pcm) writeToFile:wavPath atomically:YES]) return nil;
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                      [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"m4a"]];
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:wavPath] options:nil];
+    AVAssetExportSession *ex = [AVAssetExportSession exportSessionWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+    if (!ex) return nil;
+    ex.outputFileType = AVFileTypeAppleM4A;
+    ex.outputURL = [NSURL fileURLWithPath:path];
+    __block BOOL done = NO;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [ex exportAsynchronouslyWithCompletionHandler:^{ done = YES; dispatch_semaphore_signal(sem); }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
+    [[NSFileManager defaultManager] removeItemAtPath:wavPath error:nil];
+    BOOL ok = done && dd_file_exists(path) && ex.status == AVAssetExportSessionStatusCompleted;
+    return ok ? path : nil;
+}
+// SILK → m4a 文件。
+static NSString *dd_decode_silk_to_audio(NSData *fileData) {
+    NSData *pcm = dd_decode_silk_to_pcm(fileData);
+    if (pcm.length == 0) return nil;
+    return dd_write_m4a(pcm);
+}
 // 拷入微信持久沙盒再发送（临时目录会被系统清空，指向死路径 → 消息打不开）。
-static NSString *dd_persist_copy(NSString *src, NSString *ext) {
+static NSString *dd_persist_copy(NSString *src) {
     if (!dd_file_exists(src)) return nil;
     NSString *dir = (NSString *)[objc_getClass("CUtility") GetDocPath];
     if (![dir isKindOfClass:[NSString class]] || dir.length == 0) return nil;
     NSString *dst = [dir stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"ddvc_voice_%@.%@", [[NSUUID UUID] UUIDString], ext]];
+        [NSString stringWithFormat:@"ddvc_voice_%@.m4a", [[NSUUID UUID] UUIDString]]];
     return [[NSFileManager defaultManager] copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
 }
-// 发送语音原始文件消息（WCRefine 同款做法）：
-// [CMessageWrap genFileAppMsgWithFileName:filePath:fileData:] 是微信自己发文件用的类方法，
-// 内部一次把 m_nsContent / CExtendInfoOfAPP / 附件字段填对，不用手拼 appmsg XML。
-// 再用 AddMsg:MsgWrap: 入库（WCR 走的就是这条，没有 StartUploadAppMsg）。
-static BOOL dd_send_file_to_chat(NSString *usr, NSString *filePath, NSString *fileName, NSString *ext) {
-    NSString *persistPath = dd_persist_copy(filePath, ext);
-    if (persistPath.length) filePath = persistPath;
-    if (!dd_file_exists(filePath) || !usr.length) return NO;
-    NSData *fdata = [NSData dataWithContentsOfFile:filePath];
-    if (fdata.length == 0) return NO;
+// 发送 m4a 文件消息：AddAppMsg 本地落库 → StartUploadAppMsg 触发上传。
+static void dd_send_file_to_chat(NSString *usr, NSString *m4aPath, NSString *fileName) {
+    NSString *persistPath = dd_persist_copy(m4aPath);
+    if (persistPath.length) m4aPath = persistPath;
+    if (!dd_file_exists(m4aPath) || !usr.length) return;
+    NSData *fdata = [NSData dataWithContentsOfFile:m4aPath];
+    if (fdata.length == 0) return;
 
-    Class cls = (Class)objc_getClass("CMessageWrap");
-    if (![cls respondsToSelector:@selector(genFileAppMsgWithFileName:filePath:fileData:)]) return NO;
+    unsigned long long fsize = fdata.length;
 
-    CMessageWrap *wrap = [cls genFileAppMsgWithFileName:fileName filePath:filePath fileData:fdata];
+    CMessageWrap *wrap = [[objc_getClass("CMessageWrap") alloc] initWithMsgType:kDDVCAppMsgType];
+    [wrap setM_uiMessageType:kDDVCAppMsgType];
     [wrap setM_nsFromUsr:dd_current_usr_name()];
     [wrap setM_nsToUsr:usr];
     [wrap setM_uiCreateTime:[(MMNewSessionMgr *)dd_mm_service(@"MMNewSessionMgr") GenSendMsgTime]];
     [wrap setM_uiStatus:kDDMsgStatusSending];
 
+    CExtendInfoOfAPP *app = [[objc_getClass("CExtendInfoOfAPP") alloc] init];
+    [app setM_uiAppMsgInnerType:kDDVCAppInnerFile];
+    [app setM_nsAppFileName:fileName];
+    [app setM_nsAppFileExt:@"m4a"];
+    [app setM_uiAppDataSize:fsize];
+    [app setM_nsTitle:fileName];
+    [app setM_bAppAttachExistInSvr:YES];
+    [wrap setM_extendInfoWithMsgType:app];
+
+    // 消息正文 appmsg XML（type=6 文件）。不写则微信重启重建消息时正文为空 → 判不出文件名/附件。
+    [wrap setM_nsContent:[NSString stringWithFormat:
+        @"<msg><appmsg appid=\"\" sdkver=\"0\"><title>%@</title><des></des><type>6</type>"
+         "<appattach><totallen>%llu</totallen><attachid></attachid><fileext>%@</fileext>"
+         "<filename>%@</filename></appattach></appmsg></msg>", fileName, fsize, @"m4a", fileName]];
+
     CMessageMgr *mgr = (CMessageMgr *)dd_mm_service(@"CMessageMgr");
-    [mgr AddMsg:usr MsgWrap:wrap];
-    return YES;
+    [mgr AddAppMsg:usr MsgWrap:wrap DataPath:m4aPath Scene:0];
+    [mgr StartUploadAppMsg:usr MsgWrap:wrap Scene:0];
 }
-// PCM(16bit 单声道 小端) → m4a(AAC)。对齐 WCR：语音转文件要把裸 SILK 解码后重新封装成
-// 可播放容器，WCR 默认/偏好就是 m4a（嗅探到 RIFF→wav / ID3,0xFFFB,0xFFF3→mp3 / ftyp→m4a）。
-// 这里直接封 m4a，接收方微信必能播。采样率沿用插件对微信语音的约定 kDDVCVoiceSampleRate(16000)。
-static CMAudioFormatDescriptionRef dd_pcm_asbd_desc(void) {
-    AudioStreamBasicDescription asbd = {0};
-    asbd.mFormatID         = kAudioFormatLinearPCM;
-    asbd.mFormatFlags      = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-    asbd.mSampleRate       = kDDVCVoiceSampleRate;
-    asbd.mChannelsPerFrame = 1;
-    asbd.mBitsPerChannel   = 16;
-    asbd.mFramesPerPacket  = 1;
-    asbd.mBytesPerFrame    = 2;
-    asbd.mBytesPerPacket   = 2;
-    CMAudioFormatDescriptionRef desc = NULL;
-    CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &desc);
-    return desc;
-}
-
-// 把解码出的 PCM 编码为 m4a，落临时文件并返回路径；失败返回 nil。
-static NSString *dd_pcm_to_m4a_path(NSData *pcm) {
-    if (pcm.length < 2) return nil;
-    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-        [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"m4a"]];
-    NSError *err = nil;
-    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:tmp]
-                                                      fileType:AVFileTypeAppleM4A error:&err];
-    if (!writer) { [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil]; return nil; }
-    NSDictionary *settings = @{
-        AVFormatIDKey:         @(kAudioFormatMPEG4AAC),
-        AVSampleRateKey:       @(kDDVCVoiceSampleRate),
-        AVNumberOfChannelsKey: @1,
-        AVEncoderBitRateKey:   @(24000),
-    };
-    AVAssetWriterInput *input = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio
-                                                             outputSettings:settings];
-    input.expectsMediaDataInRealTime = NO;
-    [writer addInput:input];
-    if (![writer startWriting]) { [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil]; return nil; }
-    [writer startSessionAtSourceTime:kCMTimeZero];
-
-    CMAudioFormatDescriptionRef desc = dd_pcm_asbd_desc();
-    const char *base = (const char *)pcm.bytes;
-    NSUInteger totalSamples = pcm.length / 2;
-    NSUInteger offset = 0;
-    const int kSamplesPerBuf = 1024;
-    while (offset < totalSamples) {
-        NSUInteger n = MIN((NSUInteger)kSamplesPerBuf, totalSamples - offset);
-        size_t bytes = n * 2;
-        CMBlockBufferRef block = NULL;
-        CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault,
-                                          (void *)(base + offset * 2), bytes,
-                                          kCFAllocatorNull, NULL, 0, bytes, 0, &block);
-        if (!block) break;
-        CMSampleTimingInfo timing = { CMTimeMake(1, kDDVCVoiceSampleRate),
-                                     CMTimeMake(offset, kDDVCVoiceSampleRate), kCMTimeInvalid };
-        CMSampleBufferRef sb = NULL;
-        CMSampleBufferCreateReady(kCFAllocatorDefault, block, (CMFormatDescriptionRef)desc,
-                                 (CMItemCount)n, 1, &timing, 0, NULL, &sb);
-        CFRelease(block);
-        if (sb) {
-            if (input.readyForMoreMediaData) [input appendSampleBuffer:sb];
-            CFRelease(sb);
-        }
-        offset += n;
-    }
-    if (desc) CFRelease(desc);
-    [input markAsFinished];
-
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-
-    if (writer.status == AVAssetWriterStatusCompleted && dd_file_exists(tmp)) return tmp;
-    [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-    return nil;
-}
-
-// 语音消息 → 文件消息（对齐 WCR）：解码 SILK → PCM → 封装 m4a，发可播放容器而非 silk。
-// 这样既跟 WCR 实际行为一致，接收方也能直接播放，不会卡在"silk 文件打不开"。
+// 语音消息 → 文件消息：解 SILK 导出 m4a 发出。提示从菜单点击起，发起发送即收起。
 static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
+    NSString *fn  = [NSString stringWithFormat:@"语音_%u.m4a", (unsigned int)time(NULL)];
     dd_hub_begin(win);
 
     dispatch_async(dd_convert_queue, ^{
         NSString *p = dd_voice_path_of_msg(msg);
-        if (!dd_file_exists(p)) { dd_hub_fail(@"①语音路径无效"); return; }
-
+        if (!dd_file_exists(p)) { dd_hub_finish(); return; }
         NSData *silk = [NSData dataWithContentsOfFile:p];
-        if (!dd_silk_frames_valid(silk)) { dd_hub_fail(@"①语音非合法 SILK"); return; }
-        NSData *pcm = dd_decode_silk_to_pcm(silk);
-        if (pcm.length == 0) { dd_hub_fail(@"②SILK 解码失败"); return; }
-        NSString *m4a = dd_pcm_to_m4a_path(pcm);
-        if (!m4a) { dd_hub_fail(@"③PCM→m4a 封装失败"); return; }
+        if (silk.length < 12) { dd_hub_finish(); return; }
+        NSString *m4a = dd_decode_silk_to_audio(silk);
+        if (!m4a.length) { dd_hub_finish(); return; }
 
-        NSString *fn = [NSString stringWithFormat:@"语音_%u.m4a", (unsigned int)time(NULL)];
         dispatch_async(dispatch_get_main_queue(), ^{
-            BOOL ok = dd_send_file_to_chat(usr, m4a, fn, @"m4a");
-            [[NSFileManager defaultManager] removeItemAtPath:m4a error:nil];
-            if (ok) dd_hub_finish();
-            else dd_hub_fail(@"④文件消息生成失败");
+            dd_send_file_to_chat(usr, m4a, fn);
+            // 消息已入库并出现在会话里，提示到此收起，不等上传结果。
+            dd_hub_finish();
         });
     });
 }
