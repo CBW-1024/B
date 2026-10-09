@@ -1014,7 +1014,6 @@ static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
         NSString *p = dd_voice_path_of_msg(msg);
         if (!dd_file_exists(p)) { dd_hub_finish(); return; }
         NSData *silk = [NSData dataWithContentsOfFile:p];
-        if (silk.length < 12) { dd_hub_finish(); return; }
         NSString *m4a = dd_decode_silk_to_audio(silk);
         if (!m4a.length) { dd_hub_finish(); return; }
         dispatch_async(dispatch_get_main_queue(), ^{
