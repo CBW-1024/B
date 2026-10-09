@@ -45,6 +45,7 @@
 - (id)initWithTitle:(id)a0 svgName:(id)a1 target:(id)a2 action:(SEL)a3;
 - (id)userInfo;
 - (void)setUserInfo:(id)a0;
+- (void)setMenuType:(long long)arg1;
 @end
 
 @interface FavoritesItemDataField : NSObject
@@ -147,7 +148,7 @@
 @end
 
 @interface FavForwardLogicController : NSObject
-// 8.0.79 起加了 fileSource 参数，单参版 addMsgFromItem: 已被移除
+// 仅此双参版可用（单参版 addMsgFromItem: 已废弃）
 - (void)addMsgFromItem:(id)arg1 fileSource:(int)arg2;
 @end
 
@@ -1039,7 +1040,9 @@ static NSString *dd_menu_token(SEL action) {
     return [@"ddvc:" stringByAppendingString:NSStringFromSelector(action)];
 }
 // 注入菜单项（svg 图标 + 标题，一级平铺项）。已注入则跳过。
-static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSString *title, SEL action) {
+// menuType 交给微信做菜单项去重：与 DD语音包「纳入」(menuType=1) 取值不同即可互不撞车；
+// 取 0 即默认槽位，若另有插件也用默认 0 仍可能撞，按需改成别的唯一值。
+static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSString *title, SEL action, long long menuType) {
     if (!enabled) return original;
     NSString *token = dd_menu_token(action);
     for (MMMenuItem *it in original) {
@@ -1053,6 +1056,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
                                            action:action];
     if (!item) return original;
     [item setUserInfo:token];
+    [item setMenuType:menuType];
     NSMutableArray *items = [NSMutableArray arrayWithArray:original];
     [items addObject:item];
     return items;
@@ -1095,7 +1099,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 #pragma mark - Hook：收藏语音做成待转发消息
 
 %hook FavForwardLogicController
-// 8.0.79：单参的 addMsgFromItem: 已改成下面这个双参版，hook 旧的那个不会被调用
+// 仅 hook 双参版（单参版已废弃，不会被调用）
 - (void)addMsgFromItem:(id)arg1 fileSource:(int)arg2 {
     if (dd_voice_fav_enabled() && dd_is_fav_voice_item(arg1)) dd_append_voice_msg(arg1, self);
     %orig;
@@ -1167,7 +1171,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 - (NSArray *)operationMenuItems {
     NSArray *items = %orig;
     return dd_inject_items(self, items, [DDVoiceConvertConfig shared].videoToVoiceEnabled,
-                           @"转语音", @selector(dd_mediaToVoice:));
+                           @"转语音", @selector(dd_mediaToVoice:), 0);
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (action == @selector(dd_mediaToVoice:) && [DDVoiceConvertConfig shared].videoToVoiceEnabled) return YES;
@@ -1190,7 +1194,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     if (!dd_file_has_audio(dd_msg_of_cell(self))) return %orig;
     NSArray *items = %orig;
     return dd_inject_items(self, items, [DDVoiceConvertConfig shared].fileToVoiceEnabled,
-                           @"转语音", @selector(dd_mediaToVoice:));
+                           @"转语音", @selector(dd_mediaToVoice:), 0);
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (action == @selector(dd_mediaToVoice:))
@@ -1211,7 +1215,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 - (NSArray *)operationMenuItems {
     NSArray *origItems = %orig;
     NSArray *items = dd_inject_items(self, origItems, [DDVoiceConvertConfig shared].voiceToFileEnabled,
-                                     @"转文件", @selector(dd_voiceToFile:));
+                                     @"转文件", @selector(dd_voiceToFile:), 0);
     if (!dd_voice_msg_enabled()) return items;
     // 转发开关打开时，把微信自带的转发项插到首位。
     NSMutableArray *merged = [NSMutableArray arrayWithArray:items];
