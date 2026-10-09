@@ -168,24 +168,9 @@
 + (id)encodeToSilkFromPCMData:(id)a0;
 @end
 
-// 微信流式 SILK 解码器。逐帧 appendData:，末帧 lastSlice=YES 触发 flush，
-// 对截断 / 尾部填充比 MJSilkCodec 一次性解码更耐造。输出经 getDecodeData: 拉取。
-@interface StreamSilkAudioCodec : NSObject
-+ (instancetype)alloc;
-- (instancetype)initWithSampleRate:(double)sampleRate;
-- (void)appendData:(NSData *)data decodeNow:(BOOL)decodeNow lastSlice:(BOOL)lastSlice;
-- (void)getDecodeData:(void *)buffer playedFrames:(unsigned int)playedFrames frames:(unsigned int *)frames;
-- (void)getDecodeData:(void *)buffer time:(unsigned int)time frames:(unsigned int *)frames;
-@end
-
 // 微信原生文件下载任务（AppFileMessageCellView 的「下载」同款）。需在主线程发起，filePath 为落盘路径。
 @interface MsgFileTransferTask : NSObject
 + (id)taskFromMessageWrap:(id)msgWrap;
-- (id)filePath;
-- (BOOL)isFileExist;
-- (BOOL)isCompleted;
-- (unsigned long long)state;
-- (int)progress;
 - (void)startTransfer;
 - (void)stopTransfer;
 @end
@@ -805,61 +790,13 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (!dd_silk_frames_valid(silk)) return nil;
     return silk;
 }
-// 把 WeChat .aud（0x02 + #!SILK_V3 + 帧链）拆成「裸帧数组」。
-// 流式解码只吃裸帧，不吃 0x02 包装与 magic；同时天然跳过尾部 0x00 填充与残缺末帧
-//（截断文件喂一次性解码器会崩，这里遇到非法帧长 / 越界就停，不收残帧）。
-// 至少含 1 帧才返回；任何一步非法返回 nil。
-static NSMutableArray<NSData *> *dd_silk_split_frames(NSData *d) {
-    if (d.length < 12) return nil;
-    const unsigned char *b = (const unsigned char *)d.bytes;
-    NSUInteger len = d.length, head = 0;
-    if (len >= 10 && b[0] == 0x02 && memcmp(b + 1, "#!SILK_V3", 9) == 0) head = 10; // magic10
-    else if (len >= 9 && memcmp(b, "#!SILK_V3", 9) == 0) head = 9;                   // magic9
-    else return nil;
-    NSMutableArray<NSData *> *frames = [NSMutableArray array];
-    NSUInteger pos = head;
-    while (pos + 2 <= len) {
-        NSUInteger fl = (NSUInteger)b[pos] | ((NSUInteger)b[pos + 1] << 8);
-        if (fl == 0 || fl > 0x1000) break;       // 尾部 0x00 填充 / 非法帧长，停
-        pos += 2;
-        if (pos + fl > len) break;                 // 末帧残缺，停（不收这帧）
-        [frames addObject:[d subdataWithRange:NSMakeRange(pos, fl)]];
-        pos += fl;
-    }
-    return frames.count ? frames : nil;
-}
-// SILK → PCM：流式解码（StreamSilkAudioCodec）。
-// 逐帧 appendData:，最后一帧 lastSlice=YES 让解码器 flush，比 MJSilkCodec 一次性解码更耐截断。
-// 每帧 SILK → 20ms PCM（16000Hz / 单声道 / 16bit）= 640 字节，据此一次性拉取整段 PCM。
+// SILK → PCM。校验帧链后喂解码器。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     if (fileData.length < 12) return nil;
-    NSMutableArray<NSData *> *frames = dd_silk_split_frames(fileData);
-    if (!frames) return nil;
-    Class cls = objc_getClass("StreamSilkAudioCodec");
-    if (!cls) return nil;
-    id codec = [[cls alloc] initWithSampleRate:(double)kDDVCVoiceSampleRate];
-    if (!codec) return nil;
-
-    NSUInteger n = frames.count;
-    for (NSUInteger i = 0; i < n; i++) {
-        BOOL last = (i == n - 1);
-        // 末帧 decodeNow=YES + lastSlice=YES：收尾 flush，把缓冲帧全部解出（截断尾帧被忽略）。
-        [codec appendData:frames[i] decodeNow:last lastSlice:last];
-    }
-
-    const NSUInteger bytesPerFrame = (NSUInteger)(kDDVCVoiceSampleRate * 2 * 0.02); // 640
-    unsigned int got = (unsigned int)n;                       // 请求全部
-    NSMutableData *pcm = [NSMutableData dataWithLength:(NSUInteger)n * bytesPerFrame];
-    if ([codec respondsToSelector:@selector(getDecodeData:playedFrames:frames:)])
-        [codec getDecodeData:pcm.mutableBytes playedFrames:0 frames:&got];
-    else if ([codec respondsToSelector:@selector(getDecodeData:time:frames:)])
-        [codec getDecodeData:pcm.mutableBytes time:0 frames:&got];
-
-    if (got > 0) {
-        pcm.length = (NSUInteger)got * bytesPerFrame;
-        if (pcm.length) return pcm;
-    }
-    return nil;
+    if (!dd_silk_has_magic10(fileData)) return nil;
+    if (!dd_silk_frames_valid(fileData)) return nil;
+    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:fileData];
+    return pcm.length ? pcm : nil;
 }
 
 #pragma mark - 语音转换：语音构造与发送
