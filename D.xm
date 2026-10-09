@@ -1378,11 +1378,11 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     @autoreleasepool {
         dd_convert_queue = dispatch_queue_create("com.ddvc.convert", DISPATCH_QUEUE_SERIAL);
 
-        id mgr = objc_getClass("WCPluginsMgr");
-        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD语音助手"
-                                                      version:@"1.0.0"
-                                                   controller:@"DDSettingsViewController"];
+        Class mgrCls = objc_getClass("WCPluginsMgr");
+        if (mgrCls) {
+            [[mgrCls sharedInstance] registerControllerWithTitle:@"DD语音助手"
+                                                         version:@"1.0.0"
+                                                      controller:@"DDSettingsViewController"];
         }
     }
 }
