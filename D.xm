@@ -4,7 +4,7 @@
 //    1. 语音转发：收藏语音 / 语音消息可直接转发，长按菜单补「转发」入口
 //    2. 自定义语音秒数：上行语音时长改写为 1~60s 内指定值
 //    3. 媒体转换：视频 / 文件 →「转语音」（抽音轨编 SILK 发送）
-//                 语音 →「转文件」（原始 SILK 容器直接发文件消息）
+//                 语音 →「转文件」（解码 SILK→PCM→封装 m4a，发可播放文件消息，对齐 WCR）
 //
 //  媒体尚未下载时先触发微信原生下载，落盘后再转换；转换期间在聊天主窗口顶部
 //  显示「正在转换中」浮卡，消息发起发送即收起。
@@ -817,11 +817,18 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
 // SILK → PCM。
 // 8.0.79 收到的语音在帧长/端序上可能与旧版不同，插件自己按「2字节小端」扫帧链会误杀，
 // 这里只保证是 SILK 容器（必要时补 0x02 前导），其余交给微信自己的 MJSilkCodec 判断。
+// 治本：WeChat 语音 .aud 落盘按 VoiceTime 预分配，尾部常带 0x00 填充；个别导出还会把最后一帧
+// 截掉（缺 0xFFFF 终止符 + 残缺尾帧）。这两种情况若整段喂给 MJSilkCodec，都会因越界/残缺尾帧
+// 解码失败、出不来 PCM、进而 m4a 封装失败。先按帧链扫出「有效长度」并裁掉尾部填充/残缺帧，
+// 只把干净帧链交给解码器。
 static NSData *dd_decode_silk_to_pcm(NSData *fileData) {
     if (fileData.length < 12) return nil;
     NSData *in = dd_silk_normalize(fileData);
     if (!in) return nil;
-    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:in];
+    NSUInteger valid = dd_silk_scan_frames(in);
+    if (valid < 12) return nil;   // 帧链完全无效
+    NSData *clean = (valid == in.length) ? in : [in subdataWithRange:NSMakeRange(0, valid)];
+    NSData *pcm = [objc_getClass("MJSilkCodec") decodeToPCMFromSilkData:clean];
     return pcm.length ? pcm : nil;
 }
 
@@ -971,9 +978,85 @@ static BOOL dd_send_file_to_chat(NSString *usr, NSString *filePath, NSString *fi
     [mgr AddMsg:usr MsgWrap:wrap];
     return YES;
 }
-// 语音消息 → 文件消息：直接把微信语音原始文件（.aud，容器内就是 SILK v3）拷出去发。
-// 不做 SILK → PCM → m4a 转换，绕开解码环节，也就不会受帧长 / 端序 / 尾部填充影响。
-// 扩展名给 silk：WCRefine 的 supportedAudioExtensions 白名单第一项就是 silk。
+// PCM(16bit 单声道 小端) → m4a(AAC)。对齐 WCR：语音转文件要把裸 SILK 解码后重新封装成
+// 可播放容器，WCR 默认/偏好就是 m4a（嗅探到 RIFF→wav / ID3,0xFFFB,0xFFF3→mp3 / ftyp→m4a）。
+// 这里直接封 m4a，接收方微信必能播。采样率沿用插件对微信语音的约定 kDDVCVoiceSampleRate(16000)。
+static CMAudioFormatDescriptionRef dd_pcm_asbd_desc(void) {
+    AudioStreamBasicDescription asbd = {0};
+    asbd.mFormatID         = kAudioFormatLinearPCM;
+    asbd.mFormatFlags      = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    asbd.mSampleRate       = kDDVCVoiceSampleRate;
+    asbd.mChannelsPerFrame = 1;
+    asbd.mBitsPerChannel   = 16;
+    asbd.mFramesPerPacket  = 1;
+    asbd.mBytesPerFrame    = 2;
+    asbd.mBytesPerPacket   = 2;
+    CMAudioFormatDescriptionRef desc = NULL;
+    CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, 0, NULL, 0, NULL, NULL, &desc);
+    return desc;
+}
+
+// 把解码出的 PCM 编码为 m4a，落临时文件并返回路径；失败返回 nil。
+static NSString *dd_pcm_to_m4a_path(NSData *pcm) {
+    if (pcm.length < 2) return nil;
+    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [[[NSUUID UUID] UUIDString] stringByAppendingPathExtension:@"m4a"]];
+    NSError *err = nil;
+    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:tmp]
+                                                      fileType:AVFileTypeAppleM4A error:&err];
+    if (!writer) { [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil]; return nil; }
+    NSDictionary *settings = @{
+        AVFormatIDKey:         @(kAudioFormatMPEG4AAC),
+        AVSampleRateKey:       @(kDDVCVoiceSampleRate),
+        AVNumberOfChannelsKey: @1,
+        AVEncoderBitRateKey:   @(24000),
+    };
+    AVAssetWriterInput *input = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio
+                                                             outputSettings:settings];
+    input.expectsMediaDataInRealTime = NO;
+    [writer addInput:input];
+    if (![writer startWriting]) { [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil]; return nil; }
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    CMAudioFormatDescriptionRef desc = dd_pcm_asbd_desc();
+    const char *base = (const char *)pcm.bytes;
+    NSUInteger totalSamples = pcm.length / 2;
+    NSUInteger offset = 0;
+    const int kSamplesPerBuf = 1024;
+    while (offset < totalSamples) {
+        NSUInteger n = MIN((NSUInteger)kSamplesPerBuf, totalSamples - offset);
+        size_t bytes = n * 2;
+        CMBlockBufferRef block = NULL;
+        CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault,
+                                          (void *)(base + offset * 2), bytes,
+                                          kCFAllocatorNull, NULL, 0, bytes, 0, &block);
+        if (!block) break;
+        CMSampleTimingInfo timing = { CMTimeMake(1, kDDVCVoiceSampleRate),
+                                     CMTimeMake(offset, kDDVCVoiceSampleRate), kCMTimeInvalid };
+        CMSampleBufferRef sb = NULL;
+        CMSampleBufferCreateReady(kCFAllocatorDefault, block, (CMFormatDescriptionRef)desc,
+                                 (CMItemCount)n, 1, &timing, 0, NULL, &sb);
+        CFRelease(block);
+        if (sb) {
+            if (input.readyForMoreMediaData) [input appendSampleBuffer:sb];
+            CFRelease(sb);
+        }
+        offset += n;
+    }
+    if (desc) CFRelease(desc);
+    [input markAsFinished];
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+
+    if (writer.status == AVAssetWriterStatusCompleted && dd_file_exists(tmp)) return tmp;
+    [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+    return nil;
+}
+
+// 语音消息 → 文件消息（对齐 WCR）：解码 SILK → PCM → 封装 m4a，发可播放容器而非 silk。
+// 这样既跟 WCR 实际行为一致，接收方也能直接播放，不会卡在"silk 文件打不开"。
 static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
     if (!msg) return;
     NSString *usr = dd_chat_usr_of_msg(msg);
@@ -982,11 +1065,20 @@ static void dd_voice_to_file(CMessageWrap *msg, UIWindow *win) {
     dispatch_async(dd_convert_queue, ^{
         NSString *p = dd_voice_path_of_msg(msg);
         if (!dd_file_exists(p)) { dd_hub_fail(@"①语音路径无效"); return; }
-        NSString *fn = [NSString stringWithFormat:@"语音_%u.silk", (unsigned int)time(NULL)];
 
+        NSData *silk = [NSData dataWithContentsOfFile:p];
+        if (!dd_silk_frames_valid(silk)) { dd_hub_fail(@"①语音非合法 SILK"); return; }
+        NSData *pcm = dd_decode_silk_to_pcm(silk);
+        if (pcm.length == 0) { dd_hub_fail(@"②SILK 解码失败"); return; }
+        NSString *m4a = dd_pcm_to_m4a_path(pcm);
+        if (!m4a) { dd_hub_fail(@"③PCM→m4a 封装失败"); return; }
+
+        NSString *fn = [NSString stringWithFormat:@"语音_%u.m4a", (unsigned int)time(NULL)];
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (dd_send_file_to_chat(usr, p, fn, @"silk")) dd_hub_finish();
-            else dd_hub_fail(@"②文件消息生成失败");
+            BOOL ok = dd_send_file_to_chat(usr, m4a, fn, @"m4a");
+            [[NSFileManager defaultManager] removeItemAtPath:m4a error:nil];
+            if (ok) dd_hub_finish();
+            else dd_hub_fail(@"④文件消息生成失败");
         });
     });
 }
