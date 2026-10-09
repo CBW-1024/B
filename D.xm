@@ -1171,7 +1171,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 - (NSArray *)operationMenuItems {
     NSArray *items = %orig;
     return dd_inject_items(self, items, [DDVoiceConvertConfig shared].videoToVoiceEnabled,
-                           @"转语音", @selector(dd_mediaToVoice:), 0);
+                           @"转语音", @selector(dd_mediaToVoice:), 0); // 如果按钮冲突可改此处值
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (action == @selector(dd_mediaToVoice:) && [DDVoiceConvertConfig shared].videoToVoiceEnabled) return YES;
@@ -1194,7 +1194,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
     if (!dd_file_has_audio(dd_msg_of_cell(self))) return %orig;
     NSArray *items = %orig;
     return dd_inject_items(self, items, [DDVoiceConvertConfig shared].fileToVoiceEnabled,
-                           @"转语音", @selector(dd_mediaToVoice:), 0);
+                           @"转语音", @selector(dd_mediaToVoice:), 0); // 如果按钮冲突可改此处值
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (action == @selector(dd_mediaToVoice:))
@@ -1215,7 +1215,7 @@ static NSArray *dd_inject_items(id cell, NSArray *original, BOOL enabled, NSStri
 - (NSArray *)operationMenuItems {
     NSArray *origItems = %orig;
     NSArray *items = dd_inject_items(self, origItems, [DDVoiceConvertConfig shared].voiceToFileEnabled,
-                                     @"转文件", @selector(dd_voiceToFile:), 0);
+                                     @"转文件", @selector(dd_voiceToFile:), 0); // 如果按钮冲突可改此处值
     if (!dd_voice_msg_enabled()) return items;
     // 转发开关打开时，把微信自带的转发项插到首位。
     NSMutableArray *merged = [NSMutableArray arrayWithArray:items];
