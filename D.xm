@@ -32,7 +32,6 @@
 @end
 
 @interface WCTableViewSectionManager : NSObject
-+ (id)defaultSection;
 + (id)sectionWithHeader:(id)arg1;
 - (void)addCell:(id)arg1;
 @end
@@ -40,8 +39,6 @@
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 on:(_Bool)arg4;
 + (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 rightView:(id)a4;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3;
-+ (id)normalCellForSel:(SEL)arg1 target:(id)arg2 title:(id)a3 rightValue:(id)a4;
 @end
 
 @interface MMMenuItem : NSObject
@@ -126,7 +123,6 @@
 
 @interface AudioSender : NSObject
 - (void)ResendVoiceMsg:(id)arg1 MsgWrap:(id)arg2;
-- (_Bool)addMessageToDB:(id)arg1;
 - (id)getAudioFileName:(id)arg1 LocalID:(unsigned int)arg2;
 @end
 
@@ -172,7 +168,6 @@
 @interface MsgFileTransferTask : NSObject
 + (id)taskFromMessageWrap:(id)msgWrap;
 - (void)startTransfer;
-- (void)stopTransfer;
 @end
 
 @interface CMessageMgr : NSObject
