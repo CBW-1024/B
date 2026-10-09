@@ -1379,6 +1379,13 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
 
 - (void)onEnabledSwitchChanged:(UISwitch *)sender {
     [DDVoicePackConfig setEnabled:sender.isOn];
+    if (sender.isOn) {
+        // 开启即建好语音包根目录，保证后续「纳入」拷贝的目标目录一定存在（首次安装未导入语音包也不会因此失败）
+        [[NSFileManager defaultManager] createDirectoryAtPath:DDVoicePackRootPath()
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:nil];
+    }
     [self buildTable];
 }
 
