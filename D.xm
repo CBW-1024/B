@@ -168,7 +168,7 @@
 + (id)encodeToSilkFromPCMData:(id)a0;
 @end
 
-// 微信原生文件下载任务（AppFileMessageCellView 的「下载」同款）。需在主线程发起，filePath 为落盘路径。
+// 微信原生文件下载任务（AppFileMessageCellView 的「下载」同款）。需在主线程发起。
 @interface MsgFileTransferTask : NSObject
 + (id)taskFromMessageWrap:(id)msgWrap;
 - (void)startTransfer;
@@ -242,21 +242,12 @@ static const void *kDDVoiceFavSourceKey = &kDDVoiceFavSourceKey;
     dispatch_once(&once, ^{ c = [DDVoiceConfig new]; });
     return c;
 }
-+ (void)initialize {
-    if (self != [DDVoiceConfig class]) return;
-    [NSUserDefaults.standardUserDefaults registerDefaults:@{
-        kDDVoiceEnableFav: @NO,
-        kDDVoiceEnableMsg: @NO,
-        kDDVoiceSecondsEnabled: @NO,
-        kDDVoiceSeconds: @"",
-    }];
-}
 - (instancetype)init {
     if (self = [super init]) {
         _favEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceEnableFav];
         _msgEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceEnableMsg];
         _voiceSecondsEnabled = [NSUserDefaults.standardUserDefaults boolForKey:kDDVoiceSecondsEnabled];
-        _voiceSeconds = [[NSUserDefaults.standardUserDefaults stringForKey:kDDVoiceSeconds] copy] ?: @"";
+        _voiceSeconds = [[NSUserDefaults.standardUserDefaults stringForKey:kDDVoiceSeconds] copy];
     }
     return self;
 }
@@ -297,12 +288,6 @@ static BOOL dd_voice_forward_enabled(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ c = [DDVoiceConvertConfig new]; });
     return c;
-}
-+ (void)initialize {
-    if (self != [DDVoiceConvertConfig class]) return;
-    [NSUserDefaults.standardUserDefaults registerDefaults:@{
-        kDDVCVideoToVoice: @NO, kDDVCFileToVoice: @NO, kDDVCVoiceToFile: @NO,
-    }];
 }
 - (instancetype)init {
     if (self = [super init]) {
@@ -786,7 +771,7 @@ static NSData *dd_encode_pcm_to_silk(NSData *pcm) {
     if (pcm.length == 0) return nil;
     NSData *raw = [objc_getClass("MJSilkCodec") encodeToSilkFromPCMData:pcm];
     if (raw.length == 0) return nil;
-    NSData *silk = dd_silk_normalize(raw) ?: raw;
+    NSData *silk = dd_silk_normalize(raw);
     if (!dd_silk_frames_valid(silk)) return nil;
     return silk;
 }
