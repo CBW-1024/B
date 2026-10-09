@@ -1278,7 +1278,7 @@ static BOOL DDVoicePackIsVoiceMessageWrap(id wrap) {
     NSArray *items = %orig;
     return ddvp_inject_item(self, items,
                             [DDVoicePackConfig enabled] && DDVoicePackIsVoiceMessageWrap([self getMediaWrap]),
-                            @"纳入", @selector(ddvp_importVoice:), 10001); // 如果按钮冲突可改此处值
+                            @"纳入", @selector(ddvp_importVoice:), 1); // 如果按钮冲突可改此处值
 }
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
