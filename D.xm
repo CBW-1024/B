@@ -94,37 +94,17 @@ static inline BOOL momentsEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].moments;
 }
 
+// 广告数据管不起来，后面的取数、落盘、展示整条链路都不存在。
 %hook WCAdvertiseDataHelper
-// 兜住本地残留：插件安装前 / 开关关闭期间已落盘的广告，不再加载。
-- (void)tryLoadAdvertiseData {
-    if (momentsEnabled()) return;
-    %orig;
-}
-- (BOOL)isAdPreviewExpired:(id)arg1 {
-    if (momentsEnabled()) return YES;
-    return %orig;
-}
-// 取广告数据：一律返回空，朋友圈就凑不出广告条目。
-- (id)getAdvertiseDataByCurMinTime:(unsigned int)arg1 MaxTime:(unsigned int)arg2 checkDataValid:(BOOL)arg3 {
-    if (momentsEnabled()) return [NSMutableArray array];
-    return %orig;
-}
-- (id)getTopAdvertiseDataByTopNumber:(unsigned int)arg1 {
-    if (momentsEnabled()) return [NSMutableArray array];
+- (id)init {
+    if (momentsEnabled()) return nil;
     return %orig;
 }
 %end
 
-%hook WCTimelineMgr
-- (id)getAdvertiseDataByCurMinTime:(unsigned int)arg1 MaxTime:(unsigned int)arg2 {
-    if (momentsEnabled()) return [NSMutableArray array];
-    return %orig;
-}
-- (void)onAdPullWithAdDatas:(id)arg1 {
-    if (momentsEnabled()) return;
-    %orig;
-}
-- (void)tryToProcessWithNewAdList:(id)arg1 {
+// 广告数据不写进本地存储。
+%hook WCAdvertiseStorage
+- (void)setOAdvertiseData:(id)arg1 {
     if (momentsEnabled()) return;
     %orig;
 }
@@ -136,35 +116,57 @@ static inline BOOL brandEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].brand;
 }
 
-// 文章内的广告位是页面 DOM，原生侧拦不到，只能靠注入脚本隐藏。
-// 广告容器常嵌在 li / div 里，只藏自身会留下空白，所以顺带把父节点也收掉。
-static NSString *DDAdBlockHideCSS(void) {
-    return @".iframe_ad_container,.iframe_adv_ad_container,.comment-ad-container,"
-           @"li.cidad_comment_constant_key,#cidad_comment_constant_key,"
-           @".adv_keyword_search,.ad_control-tips"
-           @"{display:none!important;height:0!important;min-height:0!important;"
-           @"margin:0!important;padding:0!important;overflow:hidden!important;}";
+// 文章内广告位的容器：底部 / 顶部 / 文中 CPC / 评论区广告、iframe 广告。
+static NSString *DDAdBlockAdSelector(void) {
+    return @"#js_bottom_ad_area,#js_top_ad_area,#js_tail_video_ad_area,"
+           @"#js_ad_area,#js_cpc_area,#js_cpc_container,#js_ad_container,"
+           @"#cidad_comment_constant_key,.comment-ad-container,"
+           @".recommend_friend_content_wrap,.ad_control-tips,"
+           @".js_bottom_ad_area,.js_ad_area,.js_ad_link,.js_cpc_area,"
+           @"[id^=\"js_ad_\"],[class*=\"js_ad_\"],"
+           @"iframe.iframe_ad_container,iframe.iframe_adv_ad_container,"
+           @"iframe[src*=\"/mp/advertisement\"],iframe[src*=\"/mp/ad_\"]";
 }
 
-// 只做两次清扫（首屏 + 1 秒后兜住异步插入的广告），不挂常驻监听，避免长文章里的性能开销。
+// 只对公众号文章页生效；写入隐藏样式，再扫两遍兜住异步插入的广告。
+// 不挂常驻监听，避免长文章里的性能开销。
 static NSString *DDAdBlockInjectJS(void) {
     return [NSString stringWithFormat:
         @"(function(){"
-        @"if(window.__dd_injected)return;"
-        @"window.__dd_injected=1;"
+        @"var host=(window.location&&window.location.hostname||'').toLowerCase();"
+        @"if(host!=='mp.weixin.qq.com'&&!host.endsWith('.mp.weixin.qq.com'))return 0;"
+        @"if(window.__ddAdBlocked){"
+        @"if(typeof window.__ddHideAds==='function')return window.__ddHideAds();return 0;}"
+        @"window.__ddAdBlocked=1;"
+        @"var sel='%@';"
+        @"try{var s=document.createElement('style');s.id='__dd_adblock';"
+        @"s.textContent=sel+'{display:none!important;height:0!important;min-height:0!important;"
+        @"margin:0!important;padding:0!important;overflow:hidden!important;}';"
+        @"(document.head||document.documentElement).appendChild(s);}catch(e){}"
+        @"function hideNode(n){"
+        @"if(!n||n.nodeType!==1)return 0;"
+        @"var c=0;"
         @"try{"
-        @"var s=document.createElement('style');s.id='__dd_adblock';"
-        @"s.textContent='%@';"
-        @"(document.head||document.documentElement).appendChild(s);"
-        @"var sweep=function(){try{Array.prototype.forEach.call("
-        @"document.querySelectorAll('.iframe_ad_container,.comment-ad-container'),"
-        @"function(e){var p=e.parentElement,n=0;"
-        @"while(p&&n<3){if(p.tagName==='LI'||(p.className&&/comment-ad|discuss_media/.test(p.className))){"
-        @"p.style.setProperty('display','none','important');break;}p=p.parentElement;n++;}});}catch(e){}};"
-        @"setTimeout(sweep,0);"
-        @"setTimeout(sweep,1000);"
-        @"}catch(e){}})();",
-        DDAdBlockHideCSS()];
+        @"if(n.matches&&n.matches(sel)&&n.getAttribute('data-dd-ad-hidden')!=='1'){"
+        @"n.setAttribute('data-dd-ad-hidden','1');"
+        @"n.style.setProperty('display','none','important');"
+        @"n.style.setProperty('height','0','important');"
+        @"n.style.setProperty('min-height','0','important');"
+        @"n.style.setProperty('margin','0','important');"
+        @"n.style.setProperty('padding','0','important');"
+        @"n.style.setProperty('overflow','hidden','important');"
+        @"c++;}"
+        @"var sub=n.querySelectorAll(sel);"
+        @"for(var i=0;i<sub.length;i++)c+=hideNode(sub[i]);"
+        @"}catch(e){}"
+        @"return c;}"
+        @"window.__ddHideAds=function(){try{return hideNode(document.documentElement);}catch(e){return 0;}};"
+        @"window.__ddHideAds();"
+        @"setTimeout(window.__ddHideAds,0);"
+        @"setTimeout(window.__ddHideAds,1000);"
+        @"document.addEventListener('DOMContentLoaded',window.__ddHideAds,{once:true});"
+        @"return 0;})();",
+        DDAdBlockAdSelector()];
 }
 
 // 列表：原生数据层拦截
@@ -187,6 +189,30 @@ static NSString *DDAdBlockInjectJS(void) {
 - (void)handleBizAdNotifyNewXml:(id)arg1 {
     if (brandEnabled()) return;
     %orig;
+}
+%end
+
+// 订阅号消息流里的广告卡片：数据段建不起来，卡片就不会出现。
+%hook BTCanvasMsgSectionData
+- (id)initWithMsgWrap:(id)arg1 sectionWidth:(double)arg2 displayMode:(unsigned int)arg3 delegate:(id)arg4 {
+    if (brandEnabled()) return nil;
+    return %orig;
+}
+%end
+
+// 订阅号消息流里的推荐卡片：推荐关注 / 推荐视频号，数据建不出来就不展示。
+// 这两个类头文件里没声明 init，走的是 NSObject 的实现，hook 继承方法同样生效。
+%hook BTRecommendMsgData
+- (id)init {
+    if (brandEnabled()) return nil;
+    return %orig;
+}
+%end
+
+%hook BTRecommendFinderData
+- (id)init {
+    if (brandEnabled()) return nil;
+    return %orig;
 }
 %end
 
