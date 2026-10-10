@@ -116,7 +116,8 @@ static inline BOOL brandEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].brand;
 }
 
-// 文章内广告位的容器：底部 / 顶部 / 文中 CPC / 评论区广告、iframe 广告。
+// 文章内广告位的容器：底部 / 顶部 / 文中 CPC·CPS（商品·短剧·小游戏）/ 评论区广告、iframe 广告。
+// 文中 CPS 广告为动态注入，渲染后节点带 data-adtype / data-templateid="card"，一并纳入。
 static NSString *DDAdBlockAdSelector(void) {
     return @"#js_bottom_ad_area,#js_top_ad_area,#js_tail_video_ad_area,"
            @"#js_ad_area,#js_cpc_area,#js_cpc_container,#js_ad_container,"
@@ -125,7 +126,8 @@ static NSString *DDAdBlockAdSelector(void) {
            @".js_bottom_ad_area,.js_ad_area,.js_ad_link,.js_cpc_area,"
            @"[id^=\"js_ad_\"],[class*=\"js_ad_\"],"
            @"iframe.iframe_ad_container,iframe.iframe_adv_ad_container,"
-           @"iframe[src*=\"/mp/advertisement\"],iframe[src*=\"/mp/ad_\"]";
+           @"iframe[src*=\"/mp/advertisement\"],iframe[src*=\"/mp/ad_\"],"
+           @"[data-adtype],div[data-templateid=\"card\"]";
 }
 
 // 只对公众号文章页生效；写入隐藏样式，再扫两遍兜住异步插入的广告。
@@ -320,16 +322,18 @@ static inline BOOL rewardedEnabled(void) {
 // 这是 Swift 类（类名带点），用 Logos 的 hook 指令会生成含点的变量名导致编译失败，
 // 所以这里用 runtime 直接换 IMP。
 @interface NSObject (DDPlayableAd)
-- (void)onCreated;
+- (void)onMainScriptInjected:(id)arg1;
 - (void)notifyMiniProgramPlayableStatusWithIsEnd:(BOOL)arg1;
 @end
 
-static void (*ddOrigOnCreated)(id, SEL);
+static void (*ddOrigMainScriptInjected)(id, SEL, id);
 static void (*ddOrigNotifyEnd)(id, SEL, BOOL);
 
-// 试玩一创建就通知"已结束"，跳过等待。
-static void ddPlayableOnCreated(id self, SEL _cmd) {
-    if (ddOrigOnCreated) ddOrigOnCreated(self, _cmd);
+// 试玩的等待时长由注入的 JS 控制，原生侧没有可归零的入口，
+// 只能在脚本注入完成后直接通知"已结束"，跳过中间那段等待。
+// 不在 onCreated 里通知：那时 JS 还没注入完，小程序状态对不上。
+static void ddPlayableMainScriptInjected(id self, SEL _cmd, id arg1) {
+    if (ddOrigMainScriptInjected) ddOrigMainScriptInjected(self, _cmd, arg1);
     if (rewardedEnabled() && ddOrigNotifyEnd) {
         ddOrigNotifyEnd(self, @selector(notifyMiniProgramPlayableStatusWithIsEnd:), YES);
     }
@@ -343,11 +347,11 @@ static void ddPlayableNotifyEnd(id self, SEL _cmd, BOOL isEnd) {
 static void ddInstallPlayableHook(void) {
     Class cls = objc_getClass("WeChat.MagicNewPlayableService");
     if (!cls) return;
-    Method mCreated = class_getInstanceMethod(cls, @selector(onCreated));
-    Method mNotify  = class_getInstanceMethod(cls, @selector(notifyMiniProgramPlayableStatusWithIsEnd:));
-    if (mCreated) {
-        ddOrigOnCreated = (void (*)(id, SEL))method_getImplementation(mCreated);
-        method_setImplementation(mCreated, (IMP)ddPlayableOnCreated);
+    Method mScript = class_getInstanceMethod(cls, @selector(onMainScriptInjected:));
+    Method mNotify = class_getInstanceMethod(cls, @selector(notifyMiniProgramPlayableStatusWithIsEnd:));
+    if (mScript) {
+        ddOrigMainScriptInjected = (void (*)(id, SEL, id))method_getImplementation(mScript);
+        method_setImplementation(mScript, (IMP)ddPlayableMainScriptInjected);
     }
     if (mNotify) {
         ddOrigNotifyEnd = (void (*)(id, SEL, BOOL))method_getImplementation(mNotify);
