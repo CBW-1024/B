@@ -12,6 +12,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 
 #pragma mark - 微信类前向声明
@@ -135,6 +136,37 @@ static inline BOOL brandEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].brand;
 }
 
+// 文章内的广告位是页面 DOM，原生侧拦不到，只能靠注入脚本隐藏。
+// 广告容器常嵌在 li / div 里，只藏自身会留下空白，所以顺带把父节点也收掉。
+static NSString *DDAdBlockHideCSS(void) {
+    return @".iframe_ad_container,.iframe_adv_ad_container,.comment-ad-container,"
+           @"li.cidad_comment_constant_key,#cidad_comment_constant_key,"
+           @".adv_keyword_search,.ad_control-tips"
+           @"{display:none!important;height:0!important;min-height:0!important;"
+           @"margin:0!important;padding:0!important;overflow:hidden!important;}";
+}
+
+// 只做两次清扫（首屏 + 1 秒后兜住异步插入的广告），不挂常驻监听，避免长文章里的性能开销。
+static NSString *DDAdBlockInjectJS(void) {
+    return [NSString stringWithFormat:
+        @"(function(){"
+        @"if(window.__dd_injected)return;"
+        @"window.__dd_injected=1;"
+        @"try{"
+        @"var s=document.createElement('style');s.id='__dd_adblock';"
+        @"s.textContent='%@';"
+        @"(document.head||document.documentElement).appendChild(s);"
+        @"var sweep=function(){try{Array.prototype.forEach.call("
+        @"document.querySelectorAll('.iframe_ad_container,.comment-ad-container'),"
+        @"function(e){var p=e.parentElement,n=0;"
+        @"while(p&&n<3){if(p.tagName==='LI'||(p.className&&/comment-ad|discuss_media/.test(p.className))){"
+        @"p.style.setProperty('display','none','important');break;}p=p.parentElement;n++;}});}catch(e){}};"
+        @"setTimeout(sweep,0);"
+        @"setTimeout(sweep,1000);"
+        @"}catch(e){}})();",
+        DDAdBlockHideCSS()];
+}
+
 // 列表：原生数据层拦截
 %hook BrandTLExptConfig
 - (BOOL)isExptNotShowAd {
@@ -177,8 +209,20 @@ static inline BOOL brandEnabled(void) {
 }
 %end
 
-// 文章页：拦广告票据，页面拿不到票据就不渲染广告
+// 文章页：注入隐藏脚本 + 拦广告票据
 %hook MMWebViewController
+- (id)webViewUserScriptsForConfiguration {
+    id scripts = %orig;
+    if (!brandEnabled()) return scripts;
+    NSMutableArray *arr = [scripts isKindOfClass:[NSArray class]]
+        ? [(NSArray *)scripts mutableCopy]
+        : [NSMutableArray array];
+    WKUserScript *us = [[WKUserScript alloc] initWithSource:DDAdBlockInjectJS()
+                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                           forMainFrameOnly:NO];
+    [arr addObject:us];
+    return arr;
+}
 // completion 按最少参数声明：多出来的参数由调用方写寄存器，block 不用就不读，避免读到脏值。
 - (void)getTokenWithAdUrl:(id)arg1 posId:(id)arg2 completion:(id)arg3 {
     if (brandEnabled()) {
@@ -186,22 +230,6 @@ static inline BOOL brandEnabled(void) {
         if (completion) completion(nil);
         return;
     }
-    %orig;
-}
-%end
-
-// 文章页的广告位（iframe 广告 / 文末卡片 / 评论区广告）都由这两个 JSAPI 驱动：
-// 一个配广告属性，一个取广告 ID。拦住后 H5 拿不到配置与标识，广告位渲染不出来。
-%hook WebviewJSEventHandler_configMpAdAttrs
-- (void)handleJSEvent:(id)arg1 HandlerFacade:(id)arg2 ExtraData:(id)arg3 {
-    if (brandEnabled()) return;
-    %orig;
-}
-%end
-
-%hook WebviewJSEventHandler_getAdIdInfo
-- (void)handleJSEvent:(id)arg1 HandlerFacade:(id)arg2 ExtraData:(id)arg3 {
-    if (brandEnabled()) return;
     %orig;
 }
 %end
