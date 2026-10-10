@@ -4,7 +4,7 @@
 //    1. 朋友圈广告：拦广告数据的落地与拉取
 //    2. 公众号广告：拦原生数据层，并在文章页注入 CSS / JS 隐藏广告位
 //    3. 视频号广告：拦视频流与评论区广告的数据、曝光与上报
-//    4. 小程序广告：拦开屏与 MagicAd 系列服务，并在小程序页注入 CSS / JS 隐藏广告位
+//    4. 小程序广告：拦开屏与 MagicAd 系列服务（纯原生，不注入 JS）
 //    5. 激励广告：页面一出现即关闭，跳过倒计时
 //
 //  总开关关闭时全部放行；分项开关在总开关开启后才展开。
@@ -230,11 +230,11 @@ static BOOL ddURLIsAd(NSString *url) {
 %end
 
 %hook BrandTLCanvasCardMgr
-- (BOOL)isAdCardOpen {
++ (BOOL)isAdCardOpen {
     if (brandEnabled()) return NO;
     return %orig;
 }
-- (BOOL)isAdRequestOpen {
++ (BOOL)isAdRequestOpen {
     if (brandEnabled()) return NO;
     return %orig;
 }
@@ -426,43 +426,21 @@ static inline BOOL miniProgramEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].miniProgram;
 }
 
-static NSString *DDAdBlockMiniAppHideCSS(void) {
-    return @"wx-ad,wx-ad-custom,ad,ad-custom,.wx-ad,.wx-ad-custom"
-           @"{display:none!important;height:0!important;min-height:0!important;"
-           @"max-height:0!important;margin:0!important;padding:0!important;"
-           @"overflow:hidden!important;}";
-}
-
-static NSString *DDAdBlockMiniAppInjectJS(void) {
-    return [NSString stringWithFormat:
-        @"(function(){"
-        @"if(window.__dd_injected_wa)return;"
-        @"window.__dd_injected_wa=true;"
-        @"if(window.__dd_ob_wa){window.__dd_ob_wa.disconnect();delete window.__dd_ob_wa;}"
-        @"if(window.__dd_timer_wa){clearTimeout(window.__dd_timer_wa);delete window.__dd_timer_wa;}"
-        @"try{"
-        @"var s=document.createElement('style');s.id='__dd_adblock_wa';"
-        @"s.textContent='%@';"
-        @"(document.head||document.documentElement).appendChild(s);"
-        @"var sweep=function(){try{Array.prototype.forEach.call("
-        @"document.querySelectorAll('wx-ad,wx-ad-custom,.wx-ad,.wx-ad-custom'),"
-        @"function(e){e.style.setProperty('display','none','important');"
-        @"e.style.setProperty('height','0','important');"
-        @"e.style.setProperty('max-height','0','important');});}catch(e){}};"
-        @"sweep();"
-        @"if(window.MutationObserver){"
-        @"var timer=null;"
-        @"window.__dd_ob_wa=new MutationObserver(function(){"
-        @"if(timer)return;timer=setTimeout(function(){timer=null;sweep();},300);});"
-        @"window.__dd_ob_wa.observe(document.documentElement,{childList:true,subtree:true});"
-        @"window.__dd_timer_wa=timer;"
-        @"}"
-        @"}catch(e){}})();",
-        DDAdBlockMiniAppHideCSS()];
-}
-
 // 原生层拦截
 %hook WAAppTaskSplashADConfig
+// 开屏广告三处原生开关：都判否，微信自己就不走展示流程。
+- (BOOL)canShowSplashADWindow {
+    if (miniProgramEnabled()) return NO;
+    return %orig;
+}
+- (BOOL)canHotStartShowSplashAD {
+    if (miniProgramEnabled()) return NO;
+    return %orig;
+}
+- (BOOL)splashADHasContent {
+    if (miniProgramEnabled()) return NO;
+    return %orig;
+}
 - (void)handleShowSplashAdCalled:(BOOL)arg1 {
     if (miniProgramEnabled()) return;
     %orig;
@@ -491,6 +469,26 @@ static NSString *DDAdBlockMiniAppInjectJS(void) {
 %end
 
 %hook MagicAdCommonService
+// 客户端拦截：命中即不取广告。
+- (BOOL)shouldClientInterceptPosId:(id)arg1 reasonOut:(unsigned char *)arg2 {
+    if (miniProgramEnabled()) return YES;
+    return %orig;
+}
+// 判为已过期，广告不再展示。
+- (BOOL)checkAdHasExpiredWithPosId:(id)arg1 {
+    if (miniProgramEnabled()) return YES;
+    return %orig;
+}
+// 无兜底广告可补位。
+- (id)buildFallbackAdInfoForPosId:(id)arg1 {
+    if (miniProgramEnabled()) return nil;
+    return %orig;
+}
+// 不预加载广告数据，省掉一轮请求。
+- (void)preloadAdWithPosId:(id)arg1 {
+    if (miniProgramEnabled()) return;
+    %orig;
+}
 - (id)getAdInfoWithPosId:(id)arg1 {
     if (miniProgramEnabled()) return nil;
     return %orig;
@@ -535,31 +533,6 @@ static NSString *DDAdBlockMiniAppInjectJS(void) {
 - (void)handlePushMsg:(id)arg1 {
     if (miniProgramEnabled()) return;
     %orig;
-}
-%end
-
-// WebView：注入脚本 + 拦截广告 URL
-%hook WAWebViewController
-- (void)webViewDidFinishLoad:(id)arg1 navigation:(id)arg2 {
-    %orig;
-    if (!miniProgramEnabled()) return;
-    id wv = nil;
-    // webView 未对外暴露，走 KVC 取；取不到就不注入。
-    @try {
-        wv = [(id)self valueForKey:@"webView"];
-    } @catch (__unused NSException *e) {}
-    if (![wv respondsToSelector:@selector(evaluateJavaScript:completionHandler:)]) return;
-    [wv evaluateJavaScript:DDAdBlockMiniAppInjectJS() completionHandler:nil];
-}
-
-- (BOOL)webView:(id)arg1 shouldStartLoadWithRequest:(id)arg2 navigationType:(long long)arg3 isMainFrame:(BOOL)arg4 navigationAction:(id)arg5 {
-    if (miniProgramEnabled() && !arg4) {
-        NSString *u = [[(NSURLRequest *)arg2 URL] absoluteString];
-        if (ddURLIsAd(u)) {
-            return NO;
-        }
-    }
-    return %orig;
 }
 %end
 
