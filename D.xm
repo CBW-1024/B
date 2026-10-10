@@ -235,20 +235,31 @@ static NSString *DDAdBlockInjectJS(void) {
 }
 %end
 
-// 文章页：注入隐藏脚本 + 拦广告票据
-%hook MMWebViewController
-- (id)webViewUserScriptsForConfiguration {
-    id scripts = %orig;
-    if (!brandEnabled()) return scripts;
-    NSMutableArray *arr = [scripts isKindOfClass:[NSArray class]]
-        ? [(NSArray *)scripts mutableCopy]
-        : [NSMutableArray array];
-    WKUserScript *us = [[WKUserScript alloc] initWithSource:DDAdBlockInjectJS()
-                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                                           forMainFrameOnly:NO];
-    [arr addObject:us];
-    return arr;
+// 注入点选在系统类的初始化方法：任何 WKWebView 创建都必然经过，
+// 不依赖微信自己是否调用 webViewUserScriptsForConfiguration。
+// 脚本内部限定 mp.weixin.qq.com，不会波及其它页面。
+%hook WKWebView
+- (id)initWithFrame:(CGRect)arg1 configuration:(id)arg2 {
+    id webView = %orig;
+    if (!brandEnabled()) return webView;
+
+    WKWebViewConfiguration *cfg = (WKWebViewConfiguration *)arg2;
+    if (!cfg) cfg = [(WKWebView *)webView configuration];
+    WKUserContentController *ucc = [cfg userContentController];
+    if (!ucc) {
+        ucc = [WKUserContentController new];
+        [cfg setUserContentController:ucc];
+    }
+    WKUserScript *script = [[WKUserScript alloc] initWithSource:DDAdBlockInjectJS()
+                                                  injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                               forMainFrameOnly:NO];
+    [ucc addUserScript:script];
+    return webView;
 }
+%end
+
+// 文章页：拦广告票据，页面拿不到票据就不渲染广告
+%hook MMWebViewController
 // completion 按最少参数声明：多出来的参数由调用方写寄存器，block 不用就不读，避免读到脏值。
 - (void)getTokenWithAdUrl:(id)arg1 posId:(id)arg2 completion:(id)arg3 {
     if (brandEnabled()) {
