@@ -1,9 +1,13 @@
+//  DD广告拦截 —— 单文件越狱插件（Theos/Logos）
 //
-//  DDAdBlock.xm
-//  DD广告拦截
-//  版本: 1.0.0
-//  功能: 屏蔽微信广告（朋友圈、公众号、视频号、小程序）
-//        激励广告快速跳过
+//  屏蔽微信广告，按场景分五个模块：
+//    1. 朋友圈广告：拦广告数据的落地与拉取
+//    2. 公众号广告：拦原生数据层，并在文章页注入 CSS / JS 隐藏广告位
+//    3. 视频号广告：拦视频流与评论区广告的数据、曝光与上报
+//    4. 小程序广告：拦开屏与 MagicAd 系列服务，并在小程序页注入 CSS / JS 隐藏广告位
+//    5. 激励广告：页面一出现即关闭，跳过倒计时
+//
+//  总开关关闭时全部放行；分项开关在总开关开启后才展开。
 //
 
 #import <UIKit/UIKit.h>
@@ -11,9 +15,7 @@
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 
-// ============================================================================
-//  私有类声明（供设置界面及插件注册使用）
-// ============================================================================
+#pragma mark - 微信类前向声明
 
 @interface WCTableViewManager : NSObject
 - (UITableView *)getTableView;
@@ -39,9 +41,9 @@
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controllerName;
 @end
 
-// ============================================================================
-//  配置类（总开关 + 5 个分项，默认全关，持久化到 NSUserDefaults）
-// ============================================================================
+#pragma mark - 配置：广告屏蔽开关（DDAdBlockConfig）
+
+// 总开关 + 5 个分项，默认全关，持久化到 NSUserDefaults。
 
 static NSString * const kMaster           = @"DDAdBlock_Master";
 static NSString * const kMoments          = @"DDAdBlock_Moments";
@@ -86,9 +88,7 @@ static NSString * const kRewardedFastPass = @"DDAdBlock_RewardedFastPass";
 - (void)setRewardedFastPass:(BOOL)v { _rewardedFastPass = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kRewardedFastPass]; }
 @end
 
-// ============================================================================
-//  模块 1：朋友圈广告
-// ============================================================================
+#pragma mark - Hook：朋友圈广告
 
 static inline BOOL momentsEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].moments;
@@ -140,15 +140,13 @@ static inline BOOL momentsEnabled(void) {
 }
 %end
 
-// ============================================================================
-//  模块 2：公众号广告
-// ============================================================================
+#pragma mark - Hook：公众号广告
 
 static inline BOOL brandEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].brand;
 }
 
-// CSS 隐藏规则
+// 隐藏广告容器及其父节点：容器常嵌在 li / div 内，只藏自身会留下空白。
 static NSString *DDAdBlockMPHideCSS(void) {
     return @".iframe_ad_container,.iframe_adv_ad_container,.comment-ad-container,"
            @"li.cidad_comment_constant_key,#cidad_comment_constant_key,"
@@ -162,7 +160,7 @@ static NSString *DDAdBlockMPHideParentCSS(void) {
            @"{display:none!important;height:0!important;}";
 }
 
-// 注入 JS：写入隐藏样式，并监听 DOM 变化持续清理广告节点
+// 注入 JS：写入隐藏样式，并用 MutationObserver 兜住之后异步插入的广告节点。
 static NSString *DDAdBlockInjectJS(void) {
     return [NSString stringWithFormat:
         @"(function(){"
@@ -191,7 +189,7 @@ static NSString *DDAdBlockInjectJS(void) {
         DDAdBlockMPHideCSS(), DDAdBlockMPHideParentCSS()];
 }
 
-// URL 黑名单
+// 广告 URL 特征串，命中即拦。公众号与小程序共用。
 static NSArray<NSString *> *DDAdBlockURLBlocklist(void) {
     static NSArray *list;
     static dispatch_once_t once;
@@ -289,9 +287,7 @@ static BOOL ddURLIsAd(NSString *url) {
 }
 %end
 
-// ============================================================================
-//  模块 3：视频号广告
-// ============================================================================
+#pragma mark - Hook：视频号广告
 
 static inline BOOL finderEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].finder;
@@ -424,9 +420,7 @@ static inline BOOL finderEnabled(void) {
 }
 %end
 
-// ============================================================================
-//  模块 4：小程序广告
-// ============================================================================
+#pragma mark - Hook：小程序广告
 
 static inline BOOL miniProgramEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].miniProgram;
@@ -550,6 +544,7 @@ static NSString *DDAdBlockMiniAppInjectJS(void) {
     %orig;
     if (!miniProgramEnabled()) return;
     id wv = nil;
+    // webView 未对外暴露，走 KVC 取；取不到就不注入。
     @try {
         wv = [(id)self valueForKey:@"webView"];
     } @catch (__unused NSException *e) {}
@@ -568,15 +563,14 @@ static NSString *DDAdBlockMiniAppInjectJS(void) {
 }
 %end
 
-// ============================================================================
-//  模块 5：激励广告快速跳过
-// ============================================================================
+#pragma mark - Hook：激励广告快速跳过
 
 static inline BOOL rewardedEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].rewardedFastPass;
 }
 
 %hook WCFinderRewardAdViewController
+// 页面一出现即关闭，跳过倒计时等待。
 - (void)viewDidAppear:(BOOL)arg1 {
     if (rewardedEnabled()) {
         [(id)self dismissViewControllerAnimated:YES completion:nil];
@@ -586,9 +580,7 @@ static inline BOOL rewardedEnabled(void) {
 }
 %end
 
-// ============================================================================
-//  设置界面
-// ============================================================================
+#pragma mark - 设置界面（唯一入口：DDAdBlockSettingsViewController）
 
 @interface DDAdBlockSettingsViewController : UIViewController
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
@@ -629,7 +621,7 @@ static inline BOOL rewardedEnabled(void) {
     WCTableViewSectionManager *secMain = [sectionCls defaultSection];
     secMain.headerTitle = @"广告屏蔽开关";
     [secMain addCell:[self switchCellWithTitle:@"启用广告拦截" on:cfg.master action:@selector(onMasterSwitch:)]];
-    // 总开关关闭时折叠分项，开启才展开
+    // 总开关关闭时折叠分项，开启才展开。
     if (cfg.master) {
         [secMain addCell:[self switchCellWithTitle:@"屏蔽朋友圈广告" on:cfg.moments action:@selector(onMomentsSwitch:)]];
         [secMain addCell:[self switchCellWithTitle:@"屏蔽公众号广告" on:cfg.brand action:@selector(onBrandSwitch:)]];
@@ -654,7 +646,7 @@ static inline BOOL rewardedEnabled(void) {
     return [cellCls switchCellForSel:action target:self title:title on:on];
 }
 
-// 总开关翻转会折叠/展开分项，需重建表格
+// 开关切换即重建表格（总开关开启则展开分项）
 - (void)onMasterSwitch:(UISwitch *)s       { [DDAdBlockConfig sharedConfig].master = s.isOn; [self buildSections]; }
 - (void)onMomentsSwitch:(UISwitch *)s      { [DDAdBlockConfig sharedConfig].moments = s.isOn; }
 - (void)onBrandSwitch:(UISwitch *)s        { [DDAdBlockConfig sharedConfig].brand = s.isOn; }
@@ -664,9 +656,7 @@ static inline BOOL rewardedEnabled(void) {
 
 @end
 
-// ============================================================================
-//  插件注册
-// ============================================================================
+#pragma mark - 注册入口
 
 %ctor {
     @autoreleasepool {
