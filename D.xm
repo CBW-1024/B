@@ -189,16 +189,13 @@ static NSString *DDAdBlockInjectJS(void) {
         DDAdBlockMPHideCSS(), DDAdBlockMPHideParentCSS()];
 }
 
-// 广告 URL 特征串，命中即拦。公众号与小程序共用。
+// 广告 URL 特征串，命中即拦。用于公众号文章页的子帧请求。
 static NSArray<NSString *> *DDAdBlockURLBlocklist(void) {
     static NSArray *list;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         list = @[
-            @"wxa.wxs.qq.com/tmpl/px/",
-            @"wxa.wxs.qq.com/tmpl/lite/",
             @"support.weixin.qq.com/cgi-bin/mmsupport-bin/",
-            @"wxapp.tc.qq.com/ad/",
             @"cpro.baidu.com",
             @"pos.baidu.com",
             @"go.mobile.qq.com/ad",
