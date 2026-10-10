@@ -190,6 +190,22 @@ static inline BOOL brandEnabled(void) {
 }
 %end
 
+// 文章页的广告位（iframe 广告 / 文末卡片 / 评论区广告）都由这两个 JSAPI 驱动：
+// 一个配广告属性，一个取广告 ID。拦住后 H5 拿不到配置与标识，广告位渲染不出来。
+%hook WebviewJSEventHandler_configMpAdAttrs
+- (void)handleJSEvent:(id)arg1 HandlerFacade:(id)arg2 ExtraData:(id)arg3 {
+    if (brandEnabled()) return;
+    %orig;
+}
+%end
+
+%hook WebviewJSEventHandler_getAdIdInfo
+- (void)handleJSEvent:(id)arg1 HandlerFacade:(id)arg2 ExtraData:(id)arg3 {
+    if (brandEnabled()) return;
+    %orig;
+}
+%end
+
 #pragma mark - Hook：视频号广告
 
 static inline BOOL finderEnabled(void) {
