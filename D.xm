@@ -258,24 +258,13 @@ static inline BOOL finderEnabled(void) {
 }
 %end
 
-// 视频流广告：数据项里由服务端填充的独立字段，逐个置空，广告组件就挂不上。
+// 视频流广告：让广告条目不成立，刷的时候就不会出现。
 // isHardAdFeed / isHardAdLiveFeed 没拦：它们没有 setter，是由 adFlag 算出来的派生属性，
 // adFlag 归零后它们自然为 NO。
+// 跳转卡片、广告直播封面也没拦：那些是广告已经出现在流里之后才挂的组件，广告不出现就用不上。
 %hook WCFinderDataItem
 - (BOOL)isFromAdsStream {
     if (finderEnabled()) return NO;
-    return %orig;
-}
-- (id)jumpInfoContainer {
-    if (finderEnabled()) return nil;
-    return %orig;
-}
-- (id)postJumpInfoContainer {
-    if (finderEnabled()) return nil;
-    return %orig;
-}
-- (id)adLiveCoverUrl {
-    if (finderEnabled()) return nil;
     return %orig;
 }
 - (id)adsParams {
