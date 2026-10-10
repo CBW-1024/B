@@ -258,37 +258,20 @@ static inline BOOL finderEnabled(void) {
     if (finderEnabled()) return 0.0;
     return %orig;
 }
-// 媒体区高度置 0，卡片不占位。
-- (double)heightForMediaWithRatio:(double)arg1 maxHeightPercentage:(long long)arg2 minArea:(unsigned long long)arg3 {
-    if (finderEnabled()) return 0.0;
-    return %orig;
-}
+// 媒体区高度没拦：行高已经归零，整个 cell 不占位置，媒体区多高无所谓。
 - (void)updateWithModel:(id)arg1 width:(double)arg2 {
     %orig;
     if (finderEnabled()) [(UIView *)self setHidden:YES];
 }
 %end
 
-// 视频流广告
+// 视频流广告：数据项里由服务端填充的独立字段，逐个置空，广告组件就挂不上。
+// isHardAdFeed / isHardAdLiveFeed 没拦：它们没有 setter，是由 adFlag 算出来的派生属性，
+// adFlag 归零后它们自然为 NO。
 %hook WCFinderDataItem
-- (BOOL)isHardAdFeed {
-    if (finderEnabled()) return NO;
-    return %orig;
-}
-- (BOOL)isHardAdLiveFeed {
-    if (finderEnabled()) return NO;
-    return %orig;
-}
 - (BOOL)isFromAdsStream {
     if (finderEnabled()) return NO;
     return %orig;
-}
-- (void)setIsFromAdsStream:(BOOL)arg1 {
-    if (finderEnabled()) {
-        %orig(NO);
-        return;
-    }
-    %orig;
 }
 - (id)jumpInfoContainer {
     if (finderEnabled()) return nil;
