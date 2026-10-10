@@ -2,7 +2,7 @@
 //  DDAdBlock.xm
 //  DD广告拦截
 //  版本: 1.0.0
-//  功能: 屏蔽微信广告（朋友圈、公众号、视频号、直播、搜索、小程序）
+//  功能: 屏蔽微信广告（朋友圈、公众号、视频号、小程序）
 //        激励广告快速跳过
 //
 
@@ -40,16 +40,14 @@
 @end
 
 // ============================================================================
-//  配置类（8 个开关，默认全关，持久化到 NSUserDefaults）
+//  配置类（总开关 + 5 个分项，默认全关，持久化到 NSUserDefaults）
 // ============================================================================
 
 static NSString * const kMaster           = @"DDAdBlock_Master";
 static NSString * const kMoments          = @"DDAdBlock_Moments";
 static NSString * const kBrand            = @"DDAdBlock_Brand";
 static NSString * const kFinder           = @"DDAdBlock_Finder";
-static NSString * const kLive             = @"DDAdBlock_Live";
 static NSString * const kMiniProgram      = @"DDAdBlock_MiniProgram";
-static NSString * const kSearch           = @"DDAdBlock_Search";
 static NSString * const kRewardedFastPass = @"DDAdBlock_RewardedFastPass";
 
 @interface DDAdBlockConfig : NSObject
@@ -58,9 +56,7 @@ static NSString * const kRewardedFastPass = @"DDAdBlock_RewardedFastPass";
 @property (assign, nonatomic) BOOL moments;
 @property (assign, nonatomic) BOOL brand;
 @property (assign, nonatomic) BOOL finder;
-@property (assign, nonatomic) BOOL live;
 @property (assign, nonatomic) BOOL miniProgram;
-@property (assign, nonatomic) BOOL search;
 @property (assign, nonatomic) BOOL rewardedFastPass;
 @end
 
@@ -77,9 +73,7 @@ static NSString * const kRewardedFastPass = @"DDAdBlock_RewardedFastPass";
         _moments          = [NSUserDefaults.standardUserDefaults boolForKey:kMoments];
         _brand            = [NSUserDefaults.standardUserDefaults boolForKey:kBrand];
         _finder           = [NSUserDefaults.standardUserDefaults boolForKey:kFinder];
-        _live             = [NSUserDefaults.standardUserDefaults boolForKey:kLive];
         _miniProgram      = [NSUserDefaults.standardUserDefaults boolForKey:kMiniProgram];
-        _search           = [NSUserDefaults.standardUserDefaults boolForKey:kSearch];
         _rewardedFastPass = [NSUserDefaults.standardUserDefaults boolForKey:kRewardedFastPass];
     }
     return self;
@@ -88,9 +82,7 @@ static NSString * const kRewardedFastPass = @"DDAdBlock_RewardedFastPass";
 - (void)setMoments:(BOOL)v          { _moments = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kMoments]; }
 - (void)setBrand:(BOOL)v            { _brand = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kBrand]; }
 - (void)setFinder:(BOOL)v           { _finder = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kFinder]; }
-- (void)setLive:(BOOL)v             { _live = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kLive]; }
 - (void)setMiniProgram:(BOOL)v      { _miniProgram = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kMiniProgram]; }
-- (void)setSearch:(BOOL)v           { _search = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kSearch]; }
 - (void)setRewardedFastPass:(BOOL)v { _rewardedFastPass = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kRewardedFastPass]; }
 @end
 
@@ -149,7 +141,7 @@ static inline BOOL momentsEnabled(void) {
 %end
 
 // ============================================================================
-//  模块 2：公众号广告（WKUserScript 单次注入，无重复执行）
+//  模块 2：公众号广告
 // ============================================================================
 
 static inline BOOL brandEnabled(void) {
@@ -170,7 +162,7 @@ static NSString *DDAdBlockMPHideParentCSS(void) {
            @"{display:none!important;height:0!important;}";
 }
 
-// 注入 JS（防重复注入 + Observer 防抖）
+// 注入 JS：写入隐藏样式，并监听 DOM 变化持续清理广告节点
 static NSString *DDAdBlockInjectJS(void) {
     return [NSString stringWithFormat:
         @"(function(){"
@@ -273,7 +265,7 @@ static BOOL ddURLIsAd(NSString *url) {
 }
 %end
 
-// WebView 拦截（仅 WKUserScript 注入，无 webViewDidFinishLoad 重复）
+// WebView：注入脚本 + 拦截广告 URL
 %hook MMWebViewController
 - (id)webViewUserScriptsForConfiguration {
     id scripts = %orig;
@@ -291,12 +283,7 @@ static BOOL ddURLIsAd(NSString *url) {
 - (BOOL)webView:(id)arg1 shouldStartLoadWithRequest:(id)arg2 navigationType:(long long)arg3 isMainFrame:(BOOL)arg4 navigationAction:(id)arg5 {
     if (brandEnabled() && !arg4) {
         NSString *u = [[(NSURLRequest *)arg2 URL] absoluteString];
-        if ([u containsString:@"wxa.wxs.qq.com"] && [u containsString:@"/tmpl/px/"]) {
-            return NO;
-        }
-        if (ddURLIsAd(u)) {
-            return NO;
-        }
+        if (ddURLIsAd(u)) return NO;
     }
     return %orig;
 }
@@ -308,15 +295,6 @@ static BOOL ddURLIsAd(NSString *url) {
 
 static inline BOOL finderEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].finder;
-}
-
-static void ddViewSetHidden(id view, BOOL hidden) {
-    if (!view) return;
-    SEL sel = @selector(setHidden:);
-    if (class_respondsToSelector([(id)view class], sel)) {
-        void (*imp)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))[(id)view methodForSelector:sel];
-        if (imp) imp((id)view, sel, hidden);
-    }
 }
 
 // 评论区广告
@@ -351,12 +329,8 @@ static void ddViewSetHidden(id view, BOOL hidden) {
 
 %hook WCFinderCommentAdTableViewCell
 - (void)updateWithModel:(id)arg1 width:(double)arg2 {
-    if (finderEnabled()) {
-        %orig;
-        ddViewSetHidden((id)self, YES);
-        return;
-    }
     %orig;
+    if (finderEnabled()) [(UIView *)self setHidden:YES];
 }
 - (double)heightForMediaWithRatio:(double)arg1 maxHeightPercentage:(long long)arg2 minArea:(unsigned long long)arg3 {
     if (finderEnabled()) return 0.0;
@@ -451,60 +425,7 @@ static void ddViewSetHidden(id view, BOOL hidden) {
 %end
 
 // ============================================================================
-//  模块 4：直播广告
-// ============================================================================
-
-static inline BOOL liveEnabled(void) {
-    return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].live;
-}
-
-%hook WCFinderAdCountdownBannerView
-- (void)setupSubviews {
-    if (liveEnabled()) return;
-    %orig;
-}
-- (void)startCountdown {
-    if (liveEnabled()) return;
-    %orig;
-}
-- (void)updateUIWithTime:(long long)arg1 {
-    if (liveEnabled()) return;
-    %orig;
-}
-- (BOOL)adHasPlayOver {
-    if (liveEnabled()) return YES;
-    return %orig;
-}
-%end
-
-%hook WCFinderLiveHomePageViewController
-- (void)onAdSectionView:(id)arg1 selectElementVM:(id)arg2 {
-    if (liveEnabled()) return;
-    %orig;
-}
-%end
-
-// ============================================================================
-//  模块 5：搜索广告
-// ============================================================================
-
-static inline BOOL searchEnabled(void) {
-    return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].search;
-}
-
-%hook WCAdSearchH5Info
-- (BOOL)isValid {
-    if (searchEnabled()) return NO;
-    return %orig;
-}
-+ (id)fromXML:(struct XmlReaderNode_t *)arg1 {
-    if (searchEnabled()) return nil;
-    return %orig;
-}
-%end
-
-// ============================================================================
-//  模块 6：小程序广告（JS 防重复注入 + Observer 防抖 + URL 拦截）
+//  模块 4：小程序广告
 // ============================================================================
 
 static inline BOOL miniProgramEnabled(void) {
@@ -623,7 +544,7 @@ static NSString *DDAdBlockMiniAppInjectJS(void) {
 }
 %end
 
-// WebView 拦截（仅在 webViewDidFinishLoad 注入一次，JS 内部防重复）
+// WebView：注入脚本 + 拦截广告 URL
 %hook WAWebViewController
 - (void)webViewDidFinishLoad:(id)arg1 navigation:(id)arg2 {
     %orig;
@@ -648,7 +569,7 @@ static NSString *DDAdBlockMiniAppInjectJS(void) {
 %end
 
 // ============================================================================
-//  模块 7：激励广告快速跳过
+//  模块 5：激励广告快速跳过
 // ============================================================================
 
 static inline BOOL rewardedEnabled(void) {
@@ -708,19 +629,22 @@ static inline BOOL rewardedEnabled(void) {
     WCTableViewSectionManager *secMain = [sectionCls defaultSection];
     secMain.headerTitle = @"广告屏蔽开关";
     [secMain addCell:[self switchCellWithTitle:@"启用广告拦截" on:cfg.master action:@selector(onMasterSwitch:)]];
-    [secMain addCell:[self switchCellWithTitle:@"屏蔽朋友圈广告" on:cfg.moments action:@selector(onMomentsSwitch:)]];
-    [secMain addCell:[self switchCellWithTitle:@"屏蔽公众号广告" on:cfg.brand action:@selector(onBrandSwitch:)]];
-    [secMain addCell:[self switchCellWithTitle:@"屏蔽视频号广告" on:cfg.finder action:@selector(onFinderSwitch:)]];
-    [secMain addCell:[self switchCellWithTitle:@"屏蔽直播广告" on:cfg.live action:@selector(onLiveSwitch:)]];
-    [secMain addCell:[self switchCellWithTitle:@"屏蔽搜索广告" on:cfg.search action:@selector(onSearchSwitch:)]];
-    [secMain addCell:[self switchCellWithTitle:@"屏蔽小程序广告" on:cfg.miniProgram action:@selector(onMiniProgramSwitch:)]];
+    // 总开关关闭时折叠分项，开启才展开
+    if (cfg.master) {
+        [secMain addCell:[self switchCellWithTitle:@"屏蔽朋友圈广告" on:cfg.moments action:@selector(onMomentsSwitch:)]];
+        [secMain addCell:[self switchCellWithTitle:@"屏蔽公众号广告" on:cfg.brand action:@selector(onBrandSwitch:)]];
+        [secMain addCell:[self switchCellWithTitle:@"屏蔽视频号广告" on:cfg.finder action:@selector(onFinderSwitch:)]];
+        [secMain addCell:[self switchCellWithTitle:@"屏蔽小程序广告" on:cfg.miniProgram action:@selector(onMiniProgramSwitch:)]];
+    }
     [_tableViewManager addSection:secMain];
 
-    WCTableViewSectionManager *secAdv = [sectionCls defaultSection];
-    secAdv.headerTitle = @"进阶拦截";
-    secAdv.footerTitle = @"开启后，激励广告将自动快速跳过（无需等待）";
-    [secAdv addCell:[self switchCellWithTitle:@"激励广告快速跳过" on:cfg.rewardedFastPass action:@selector(onRewardedSwitch:)]];
-    [_tableViewManager addSection:secAdv];
+    if (cfg.master) {
+        WCTableViewSectionManager *secAdv = [sectionCls defaultSection];
+        secAdv.headerTitle = @"进阶拦截";
+        secAdv.footerTitle = @"开启后，激励广告将自动快速跳过（无需等待）";
+        [secAdv addCell:[self switchCellWithTitle:@"激励广告快速跳过" on:cfg.rewardedFastPass action:@selector(onRewardedSwitch:)]];
+        [_tableViewManager addSection:secAdv];
+    }
 
     [_tableViewManager reloadTableView];
 }
@@ -730,12 +654,11 @@ static inline BOOL rewardedEnabled(void) {
     return [cellCls switchCellForSel:action target:self title:title on:on];
 }
 
-- (void)onMasterSwitch:(UISwitch *)s       { [DDAdBlockConfig sharedConfig].master = s.isOn; }
+// 总开关翻转会折叠/展开分项，需重建表格
+- (void)onMasterSwitch:(UISwitch *)s       { [DDAdBlockConfig sharedConfig].master = s.isOn; [self buildSections]; }
 - (void)onMomentsSwitch:(UISwitch *)s      { [DDAdBlockConfig sharedConfig].moments = s.isOn; }
 - (void)onBrandSwitch:(UISwitch *)s        { [DDAdBlockConfig sharedConfig].brand = s.isOn; }
 - (void)onFinderSwitch:(UISwitch *)s       { [DDAdBlockConfig sharedConfig].finder = s.isOn; }
-- (void)onLiveSwitch:(UISwitch *)s         { [DDAdBlockConfig sharedConfig].live = s.isOn; }
-- (void)onSearchSwitch:(UISwitch *)s       { [DDAdBlockConfig sharedConfig].search = s.isOn; }
 - (void)onMiniProgramSwitch:(UISwitch *)s  { [DDAdBlockConfig sharedConfig].miniProgram = s.isOn; }
 - (void)onRewardedSwitch:(UISwitch *)s     { [DDAdBlockConfig sharedConfig].rewardedFastPass = s.isOn; }
 
