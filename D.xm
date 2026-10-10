@@ -300,14 +300,18 @@ static inline BOOL rewardedEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].rewardedFastPass;
 }
 
+// 倒计时归零 + 判为已播完：微信直接走奖励发放流程，不用干等。
+// 这里不能用 dismiss 关页面——那在微信眼里是"中途退出"，广告没播完，奖励反而不发。
+// 试玩型（Playable）激励广告不在这一类：它跑在小程序 canvas 里、由 JS 驱动，
+// 没有原生页面，原生 hook 碰不到。
 %hook WCFinderRewardAdViewController
-// 页面一出现即关闭，跳过倒计时等待。
-- (void)viewDidAppear:(BOOL)arg1 {
-    if (rewardedEnabled()) {
-        [(id)self dismissViewControllerAnimated:YES completion:nil];
-        return;
-    }
-    %orig;
+- (long long)adFeedsCountdownCount {
+    if (rewardedEnabled()) return 0;
+    return %orig;
+}
+- (BOOL)adHasPlayOver {
+    if (rewardedEnabled()) return YES;
+    return %orig;
 }
 %end
 
