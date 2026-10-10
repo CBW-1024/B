@@ -314,7 +314,7 @@ static inline BOOL miniProgramEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].miniProgram;
 }
 
-// 开屏广告：三处判断都判否，微信自己就不走展示流程。
+// 开屏广告：冷启动、热启动两个判断都判否，微信自己就不走展示流程。
 // 只拦这种"纯查询、无副作用"的方法：拦住后微信直接不展示，不会有流程卡住。
 // 不要拦 handleShowSplashAdCalled: 这类推进状态机的方法，也不要拦 JS 事件处理器
 // （不回调会让小程序的 wx.showSplashAd() 一直等结果，整个小程序的 JS 链会卡住）。
@@ -324,10 +324,6 @@ static inline BOOL miniProgramEnabled(void) {
     return %orig;
 }
 - (BOOL)canHotStartShowSplashAD {
-    if (miniProgramEnabled()) return NO;
-    return %orig;
-}
-- (BOOL)splashADHasContent {
     if (miniProgramEnabled()) return NO;
     return %orig;
 }
