@@ -169,26 +169,19 @@ static NSString *DDAdBlockInjectJS(void) {
         DDAdBlockAdSelector()];
 }
 
-// 订阅号消息流里的广告卡片：数据段建不起来，卡片就不会出现。
+// 订阅号消息流的两类卡片：广告 canvas 卡片、推荐卡片（推荐关注 / 推荐视频号）。
+// 拦"能否创建 section"这个类判断：卡片 section 压根不建，比让数据类 init 返回 nil 更干净
+// （不产生空对象，也就不会有把 nil 塞进数组的风险）。
 %hook BTCanvasMsgSectionData
-- (id)initWithMsgWrap:(id)arg1 sectionWidth:(double)arg2 displayMode:(unsigned int)arg3 delegate:(id)arg4 {
-    if (brandEnabled()) return nil;
++ (BOOL)canCreateSectionDataWithMsgWrap:(id)arg1 {
+    if (brandEnabled()) return NO;
     return %orig;
 }
 %end
 
-// 订阅号消息流里的推荐卡片：推荐关注 / 推荐视频号，数据建不出来就不展示。
-// 这两个类头文件里没声明 init，走的是 NSObject 的实现，hook 继承方法同样生效。
-%hook BTRecommendMsgData
-- (id)init {
-    if (brandEnabled()) return nil;
-    return %orig;
-}
-%end
-
-%hook BTRecommendFinderData
-- (id)init {
-    if (brandEnabled()) return nil;
+%hook BTRecommendSectionData
++ (BOOL)canCreateSectionDataWithMsgWrap:(id)arg1 {
+    if (brandEnabled()) return NO;
     return %orig;
 }
 %end
