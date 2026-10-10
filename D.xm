@@ -64,91 +64,34 @@ static NSString * const kRewardedFastPass = @"DDAdBlock_RewardedFastPass";
 @property (assign, nonatomic) BOOL rewardedFastPass;
 @end
 
-@implementation DDAdBlockConfig {
-    BOOL _master;
-    BOOL _moments;
-    BOOL _brand;
-    BOOL _finder;
-    BOOL _live;
-    BOOL _miniProgram;
-    BOOL _search;
-    BOOL _rewardedFastPass;
-}
-
+@implementation DDAdBlockConfig
 + (instancetype)sharedConfig {
-    static DDAdBlockConfig *config = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        config = [[DDAdBlockConfig alloc] init];
-    });
-    return config;
+    static DDAdBlockConfig *c = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ c = [DDAdBlockConfig new]; });
+    return c;
 }
-
 - (instancetype)init {
-    self = [super init];
-    if (self) {
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        _master           = [ud boolForKey:kMaster];
-        _moments          = [ud boolForKey:kMoments];
-        _brand            = [ud boolForKey:kBrand];
-        _finder           = [ud boolForKey:kFinder];
-        _live             = [ud boolForKey:kLive];
-        _miniProgram      = [ud boolForKey:kMiniProgram];
-        _search           = [ud boolForKey:kSearch];
-        _rewardedFastPass = [ud boolForKey:kRewardedFastPass];
+    if (self = [super init]) {
+        _master           = [NSUserDefaults.standardUserDefaults boolForKey:kMaster];
+        _moments          = [NSUserDefaults.standardUserDefaults boolForKey:kMoments];
+        _brand            = [NSUserDefaults.standardUserDefaults boolForKey:kBrand];
+        _finder           = [NSUserDefaults.standardUserDefaults boolForKey:kFinder];
+        _live             = [NSUserDefaults.standardUserDefaults boolForKey:kLive];
+        _miniProgram      = [NSUserDefaults.standardUserDefaults boolForKey:kMiniProgram];
+        _search           = [NSUserDefaults.standardUserDefaults boolForKey:kSearch];
+        _rewardedFastPass = [NSUserDefaults.standardUserDefaults boolForKey:kRewardedFastPass];
     }
     return self;
 }
-
-- (void)setMaster:(BOOL)value {
-    _master = value;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:value forKey:kMaster];
-    [ud synchronize];
-}
-- (void)setMoments:(BOOL)value {
-    _moments = value;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:value forKey:kMoments];
-    [ud synchronize];
-}
-- (void)setBrand:(BOOL)value {
-    _brand = value;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:value forKey:kBrand];
-    [ud synchronize];
-}
-- (void)setFinder:(BOOL)value {
-    _finder = value;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:value forKey:kFinder];
-    [ud synchronize];
-}
-- (void)setLive:(BOOL)value {
-    _live = value;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:value forKey:kLive];
-    [ud synchronize];
-}
-- (void)setMiniProgram:(BOOL)value {
-    _miniProgram = value;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:value forKey:kMiniProgram];
-    [ud synchronize];
-}
-- (void)setSearch:(BOOL)value {
-    _search = value;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:value forKey:kSearch];
-    [ud synchronize];
-}
-- (void)setRewardedFastPass:(BOOL)value {
-    _rewardedFastPass = value;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:value forKey:kRewardedFastPass];
-    [ud synchronize];
-}
-
+- (void)setMaster:(BOOL)v           { _master = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kMaster]; }
+- (void)setMoments:(BOOL)v          { _moments = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kMoments]; }
+- (void)setBrand:(BOOL)v            { _brand = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kBrand]; }
+- (void)setFinder:(BOOL)v           { _finder = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kFinder]; }
+- (void)setLive:(BOOL)v             { _live = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kLive]; }
+- (void)setMiniProgram:(BOOL)v      { _miniProgram = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kMiniProgram]; }
+- (void)setSearch:(BOOL)v           { _search = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kSearch]; }
+- (void)setRewardedFastPass:(BOOL)v { _rewardedFastPass = v; [NSUserDefaults.standardUserDefaults setBool:v forKey:kRewardedFastPass]; }
 @end
 
 // ============================================================================
@@ -736,7 +679,7 @@ static inline BOOL rewardedEnabled(void) {
     [super viewDidLoad];
     self.title = @"DD广告拦截";
     // 导航栏外观交给微信原生渲染；视图整屏延伸，由 viewDidLayoutSubviews 把表格推到导航栏底边。
-    Class mgrCls = NSClassFromString(@"WCTableViewManager");
+    Class mgrCls = objc_getClass("WCTableViewManager");
     _tableViewManager = [[mgrCls alloc] initWithFrame:self.view.bounds
                                                 style:UITableViewStyleInsetGrouped];
     UITableView *tableView = [_tableViewManager getTableView];
@@ -757,7 +700,7 @@ static inline BOOL rewardedEnabled(void) {
 }
 
 - (void)buildSections {
-    Class sectionCls = NSClassFromString(@"WCTableViewSectionManager");
+    Class sectionCls = objc_getClass("WCTableViewSectionManager");
     DDAdBlockConfig *cfg = [DDAdBlockConfig sharedConfig];
 
     [_tableViewManager clearAllSection];
@@ -783,7 +726,7 @@ static inline BOOL rewardedEnabled(void) {
 }
 
 - (id)switchCellWithTitle:(NSString *)title on:(BOOL)on action:(SEL)action {
-    Class cellCls = NSClassFromString(@"WCTableViewCellManager");
+    Class cellCls = objc_getClass("WCTableViewCellManager");
     return [cellCls switchCellForSel:action target:self title:title on:on];
 }
 
