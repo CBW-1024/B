@@ -735,18 +735,25 @@ static inline BOOL rewardedEnabled(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"DD广告拦截";
-    self.view.backgroundColor = [UIColor systemBackgroundColor];
-
+    // 导航栏外观交给微信原生渲染；视图整屏延伸，由 viewDidLayoutSubviews 把表格推到导航栏底边。
     Class mgrCls = NSClassFromString(@"WCTableViewManager");
     _tableViewManager = [[mgrCls alloc] initWithFrame:self.view.bounds
                                                 style:UITableViewStyleInsetGrouped];
     UITableView *tableView = [_tableViewManager getTableView];
-    tableView.frame = self.view.bounds;
-    tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
+    self.view.backgroundColor = tableView.backgroundColor;
+    tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     [self.view addSubview:tableView];
 
     [self buildSections];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGFloat top = self.view.safeAreaInsets.top;
+    UITableView *tableView = [_tableViewManager getTableView];
+    CGFloat w = self.view.bounds.size.width;
+    CGFloat h = self.view.bounds.size.height;
+    tableView.frame = CGRectMake(0, top, w, h - top);
 }
 
 - (void)buildSections {
