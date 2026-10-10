@@ -2,7 +2,7 @@
 //
 //  屏蔽微信广告，按场景分五个模块：
 //    1. 朋友圈广告：拦广告数据的落地与拉取
-//    2. 公众号广告：拦原生数据层，并在文章页注入 CSS / JS 隐藏广告位
+//    2. 公众号广告：拦列表的原生数据层，文章页拦广告票据与广告请求
 //    3. 视频号广告：拦视频流与评论区广告的数据、曝光与上报
 //    4. 小程序启动广告：拦开屏广告（冷启动 / 热启动）
 //    5. 激励广告：页面一出现即关闭，跳过倒计时
@@ -12,7 +12,6 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 
 #pragma mark - 微信类前向声明
@@ -136,79 +135,7 @@ static inline BOOL brandEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].brand;
 }
 
-// 隐藏广告容器及其父节点：容器常嵌在 li / div 内，只藏自身会留下空白。
-static NSString *DDAdBlockMPHideCSS(void) {
-    return @".iframe_ad_container,.iframe_adv_ad_container,.comment-ad-container,"
-           @"li.cidad_comment_constant_key,#cidad_comment_constant_key,"
-           @".adv_keyword_search,.ad_control-tips"
-           @"{display:none!important;height:0!important;min-height:0!important;"
-           @"margin:0!important;padding:0!important;overflow:hidden!important;}";
-}
-
-static NSString *DDAdBlockMPHideParentCSS(void) {
-    return @"div:has(> .iframe_ad_container),li:has(> .comment-ad-container)"
-           @"{display:none!important;height:0!important;}";
-}
-
-// 注入 JS：写入隐藏样式，并用 MutationObserver 兜住之后异步插入的广告节点。
-static NSString *DDAdBlockInjectJS(void) {
-    return [NSString stringWithFormat:
-        @"(function(){"
-        @"if(window.__dd_injected)return;"
-        @"window.__dd_injected=true;"
-        @"if(window.__dd_ob){window.__dd_ob.disconnect();delete window.__dd_ob;}"
-        @"if(window.__dd_timer){clearTimeout(window.__dd_timer);delete window.__dd_timer;}"
-        @"try{"
-        @"var s=document.createElement('style');s.id='__dd_adblock';"
-        @"s.textContent='%@'+'%@';"
-        @"(document.head||document.documentElement).appendChild(s);"
-        @"var sweep=function(){try{Array.prototype.forEach.call("
-        @"document.querySelectorAll('.iframe_ad_container,.comment-ad-container'),"
-        @"function(e){var p=e.parentElement,n=0;"
-        @"while(p&&n<3){if(p.tagName==='LI'||(p.className&&/comment-ad|discuss_media/.test(p.className))){"
-        @"p.style.setProperty('display','none','important');break;}p=p.parentElement;n++;}});}catch(e){}};"
-        @"sweep();"
-        @"if(window.MutationObserver){"
-        @"var timer=null;"
-        @"window.__dd_ob=new MutationObserver(function(){"
-        @"if(timer)return;timer=setTimeout(function(){timer=null;sweep();},300);});"
-        @"window.__dd_ob.observe(document.documentElement,{childList:true,subtree:true});"
-        @"window.__dd_timer=timer;"
-        @"}"
-        @"}catch(e){}})();",
-        DDAdBlockMPHideCSS(), DDAdBlockMPHideParentCSS()];
-}
-
-// 广告 URL 特征串，命中即拦。用于公众号文章页的子帧请求。
-static NSArray<NSString *> *DDAdBlockURLBlocklist(void) {
-    static NSArray *list;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        list = @[
-            @"support.weixin.qq.com/cgi-bin/mmsupport-bin/",
-            @"cpro.baidu.com",
-            @"pos.baidu.com",
-            @"go.mobile.qq.com/ad",
-            @"/cgi-bin/mmbiz-bin/ad",
-            @"ad.weixin.qq.com",
-            @"wxad",
-            @"adunit-",
-            @"_ad_",
-            @"&adpos=",
-        ];
-    });
-    return list;
-}
-
-static BOOL ddURLIsAd(NSString *url) {
-    if (url.length == 0) return NO;
-    for (NSString *sub in DDAdBlockURLBlocklist()) {
-        if ([url containsString:sub]) return YES;
-    }
-    return NO;
-}
-
-// 原生数据层拦截
+// 列表：原生数据层拦截
 %hook BrandTLExptConfig
 - (BOOL)isExptNotShowAd {
     if (brandEnabled()) return YES;
@@ -250,27 +177,16 @@ static BOOL ddURLIsAd(NSString *url) {
 }
 %end
 
-// WebView：注入脚本 + 拦截广告 URL
+// 文章页：拦广告票据，页面拿不到票据就不渲染广告
 %hook MMWebViewController
-- (id)webViewUserScriptsForConfiguration {
-    id scripts = %orig;
-    if (!brandEnabled()) return scripts;
-    NSMutableArray *arr = [scripts isKindOfClass:[NSArray class]]
-        ? [(NSArray *)scripts mutableCopy]
-        : [NSMutableArray array];
-    WKUserScript *us = [[WKUserScript alloc] initWithSource:DDAdBlockInjectJS()
-                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                                           forMainFrameOnly:NO];
-    [arr addObject:us];
-    return arr;
-}
-
-- (BOOL)webView:(id)arg1 shouldStartLoadWithRequest:(id)arg2 navigationType:(long long)arg3 isMainFrame:(BOOL)arg4 navigationAction:(id)arg5 {
-    if (brandEnabled() && !arg4) {
-        NSString *u = [[(NSURLRequest *)arg2 URL] absoluteString];
-        if (ddURLIsAd(u)) return NO;
+// completion 按最少参数声明：多出来的参数由调用方写寄存器，block 不用就不读，避免读到脏值。
+- (void)getTokenWithAdUrl:(id)arg1 posId:(id)arg2 completion:(id)arg3 {
+    if (brandEnabled()) {
+        void (^completion)(id) = arg3;
+        if (completion) completion(nil);
+        return;
     }
-    return %orig;
+    %orig;
 }
 %end
 
