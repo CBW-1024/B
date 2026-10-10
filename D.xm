@@ -302,8 +302,6 @@ static inline BOOL rewardedEnabled(void) {
 
 // 倒计时归零 + 判为已播完：微信直接走奖励发放流程，不用干等。
 // 这里不能用 dismiss 关页面——那在微信眼里是"中途退出"，广告没播完，奖励反而不发。
-// 试玩型（Playable）激励广告不在这一类：它跑在小程序 canvas 里、由 JS 驱动，
-// 没有原生页面，原生 hook 碰不到。
 %hook WCFinderRewardAdViewController
 - (long long)adFeedsCountdownCount {
     if (rewardedEnabled()) return 0;
@@ -314,6 +312,48 @@ static inline BOOL rewardedEnabled(void) {
     return %orig;
 }
 %end
+
+#pragma mark - Hook：试玩广告秒过（实验性）
+
+// 试玩型（Playable）广告跑在小程序 canvas 里，没有原生页面，唯一的原生入口是
+// WeChat.MagicNewPlayableService 的"通知试玩结束"。
+// 这是 Swift 类（类名带点），用 Logos 的 hook 指令会生成含点的变量名导致编译失败，
+// 所以这里用 runtime 直接换 IMP。
+@interface NSObject (DDPlayableAd)
+- (void)onCreated;
+- (void)notifyMiniProgramPlayableStatusWithIsEnd:(BOOL)arg1;
+@end
+
+static void (*ddOrigOnCreated)(id, SEL);
+static void (*ddOrigNotifyEnd)(id, SEL, BOOL);
+
+// 试玩一创建就通知"已结束"，跳过等待。
+static void ddPlayableOnCreated(id self, SEL _cmd) {
+    if (ddOrigOnCreated) ddOrigOnCreated(self, _cmd);
+    if (rewardedEnabled() && ddOrigNotifyEnd) {
+        ddOrigNotifyEnd(self, @selector(notifyMiniProgramPlayableStatusWithIsEnd:), YES);
+    }
+}
+
+// 其它地方发起的通知也一并改成"已结束"，避免被中途的 NO 覆盖。
+static void ddPlayableNotifyEnd(id self, SEL _cmd, BOOL isEnd) {
+    if (ddOrigNotifyEnd) ddOrigNotifyEnd(self, _cmd, rewardedEnabled() ? YES : isEnd);
+}
+
+static void ddInstallPlayableHook(void) {
+    Class cls = objc_getClass("WeChat.MagicNewPlayableService");
+    if (!cls) return;
+    Method mCreated = class_getInstanceMethod(cls, @selector(onCreated));
+    Method mNotify  = class_getInstanceMethod(cls, @selector(notifyMiniProgramPlayableStatusWithIsEnd:));
+    if (mCreated) {
+        ddOrigOnCreated = (void (*)(id, SEL))method_getImplementation(mCreated);
+        method_setImplementation(mCreated, (IMP)ddPlayableOnCreated);
+    }
+    if (mNotify) {
+        ddOrigNotifyEnd = (void (*)(id, SEL, BOOL))method_getImplementation(mNotify);
+        method_setImplementation(mNotify, (IMP)ddPlayableNotifyEnd);
+    }
+}
 
 #pragma mark - 设置界面（唯一入口：DDAdBlockSettingsViewController）
 
@@ -401,5 +441,6 @@ static inline BOOL rewardedEnabled(void) {
                                                          version:@"1.0.0"
                                                       controller:@"DDAdBlockSettingsViewController"];
         }
+        ddInstallPlayableHook();
     }
 }
