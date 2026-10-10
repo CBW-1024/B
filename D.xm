@@ -319,53 +319,6 @@ static inline BOOL finderEnabled(void) {
     if (finderEnabled()) return 0.0;
     return %orig;
 }
-- (void)updatePlayerViewWithCommentInfo:(id)arg1 videoInfo:(id)arg2 {
-    if (finderEnabled()) return;
-    %orig;
-}
-- (void)updateImageViewWithCommentImageInfo:(id)arg1 imgInfo:(id)arg2 {
-    if (finderEnabled()) return;
-    %orig;
-}
-- (void)clickADContentActionWithArea:(NSInteger)arg1 {
-    if (finderEnabled()) return;
-    %orig;
-}
-- (id)commentAdReportDictWithReportScene:(NSInteger)arg1 {
-    if (finderEnabled()) return nil;
-    return %orig;
-}
-- (BOOL)canReportWithReportScene:(NSInteger)arg1 {
-    if (finderEnabled()) return NO;
-    return %orig;
-}
-%end
-
-%hook WCFinderCommentDetailViewController
-- (void)checkCommentAdPlayerExposeStateIfNeeded {
-    if (finderEnabled()) return;
-    %orig;
-}
-- (void)reportCommentAd:(id)arg1 withReportScene:(NSInteger)arg2 {
-    if (finderEnabled()) return;
-    %orig;
-}
-- (void)reportCommentAdIfNeededWithReportScene:(NSInteger)arg2 {
-    if (finderEnabled()) return;
-    %orig;
-}
-- (void)_configADCellReportBehavior:(id)arg1 comment:(id)arg2 {
-    if (finderEnabled()) return;
-    %orig;
-}
-- (void)commentAdCell:(id)arg1 clickFeedbackButton:(id)arg2 atSection:(NSInteger)arg3 {
-    if (finderEnabled()) return;
-    %orig;
-}
-- (void)commentAdCell:(id)arg1 longPressAtSection:(NSInteger)arg3 {
-    if (finderEnabled()) return;
-    %orig;
-}
 %end
 
 // 视频流广告
