@@ -4,7 +4,7 @@
 //    1. 朋友圈广告：拦广告数据的落地与拉取
 //    2. 公众号广告：拦原生数据层，并在文章页注入 CSS / JS 隐藏广告位
 //    3. 视频号广告：拦视频流与评论区广告的数据、曝光与上报
-//    4. 小程序广告：拦开屏与 MagicAd 系列服务（纯原生，不注入 JS）
+//    4. 小程序启动广告：拦开屏广告（冷启动 / 热启动）
 //    5. 激励广告：页面一出现即关闭，跳过倒计时
 //
 //  总开关关闭时全部放行；分项开关在总开关开启后才展开。
@@ -311,13 +311,19 @@ static inline BOOL finderEnabled(void) {
 %end
 
 %hook WCFinderCommentAdTableViewCell
-- (void)updateWithModel:(id)arg1 width:(double)arg2 {
-    %orig;
-    if (finderEnabled()) [(UIView *)self setHidden:YES];
+// 行高置 0：广告被拦掉后，评论区不会再空出一块留白。
++ (double)sectionHeightWith:(id)arg1 width:(double)arg2 halfScreenHeight:(double)arg3 {
+    if (finderEnabled()) return 0.0;
+    return %orig;
 }
+// 媒体区高度置 0，卡片不占位。
 - (double)heightForMediaWithRatio:(double)arg1 maxHeightPercentage:(long long)arg2 minArea:(unsigned long long)arg3 {
     if (finderEnabled()) return 0.0;
     return %orig;
+}
+- (void)updateWithModel:(id)arg1 width:(double)arg2 {
+    %orig;
+    if (finderEnabled()) [(UIView *)self setHidden:YES];
 }
 %end
 
@@ -360,15 +366,14 @@ static inline BOOL finderEnabled(void) {
 }
 %end
 
-#pragma mark - Hook：小程序广告
+#pragma mark - Hook：小程序启动广告
 
 static inline BOOL miniProgramEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].miniProgram;
 }
 
-// 原生层拦截
+// 开屏广告：三处原生开关都判否，微信自己就不走展示流程。
 %hook WAAppTaskSplashADConfig
-// 开屏广告三处原生开关：都判否，微信自己就不走展示流程。
 - (BOOL)canShowSplashADWindow {
     if (miniProgramEnabled()) return NO;
     return %orig;
@@ -387,6 +392,7 @@ static inline BOOL miniProgramEnabled(void) {
 }
 %end
 
+// JS 侧触发开屏的入口，一并挡掉。
 %hook WAJSEventHandler_showSplashAd
 - (void)handleJSEvent:(id)arg1 {
     if (miniProgramEnabled()) return;
@@ -396,81 +402,6 @@ static inline BOOL miniProgramEnabled(void) {
 
 %hook WAJSEventHandler_showSplashAdMenu
 - (void)handleJSEvent:(id)arg1 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-%end
-
-%hook WAJSEventHandler_adOperateWXData
-- (void)handleJSEvent:(id)arg1 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-%end
-
-%hook MagicAdCommonService
-// 客户端拦截：命中即不取广告。
-- (BOOL)shouldClientInterceptPosId:(id)arg1 reasonOut:(unsigned char *)arg2 {
-    if (miniProgramEnabled()) return YES;
-    return %orig;
-}
-// 判为已过期，广告不再展示。
-- (BOOL)checkAdHasExpiredWithPosId:(id)arg1 {
-    if (miniProgramEnabled()) return YES;
-    return %orig;
-}
-// 无兜底广告可补位。
-- (id)buildFallbackAdInfoForPosId:(id)arg1 {
-    if (miniProgramEnabled()) return nil;
-    return %orig;
-}
-// 不预加载广告数据，省掉一轮请求。
-- (void)preloadAdWithPosId:(id)arg1 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-- (id)getAdInfoWithPosId:(id)arg1 {
-    if (miniProgramEnabled()) return nil;
-    return %orig;
-}
-- (id)getCachedAdInfoForPosId:(id)arg1 {
-    if (miniProgramEnabled()) return nil;
-    return %orig;
-}
-- (void)getAdInfoAsyncWithPosId:(id)arg1 completion:(id)arg2 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-- (void)getAdInfoAsyncWithPosId:(id)arg1 timeoutMs:(long long)arg2 completion:(id)arg3 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-- (void)triggerUpdateAdWithPosId:(id)arg1 pullType:(unsigned char)arg2 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-- (void)updateAdInfoByCGIInstantlyWithPosId:(id)arg1 pullType:(unsigned char)arg2 isDelayPull:(BOOL)arg3 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-%end
-
-%hook MagicAdCGIMgr
-+ (void)getAdsCGIWithPosIds:(id)arg1 successBlock:(id)arg2 failBlock:(id)arg3 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-%end
-
-%hook MagicAdPushMgrService
-- (void)handleAdMsg:(id)arg1 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-%end
-
-%hook WCAdvertisePushService
-- (void)handlePushMsg:(id)arg1 {
     if (miniProgramEnabled()) return;
     %orig;
 }
@@ -539,7 +470,7 @@ static inline BOOL rewardedEnabled(void) {
         [secMain addCell:[self switchCellWithTitle:@"屏蔽朋友圈广告" on:cfg.moments action:@selector(onMomentsSwitch:)]];
         [secMain addCell:[self switchCellWithTitle:@"屏蔽公众号广告" on:cfg.brand action:@selector(onBrandSwitch:)]];
         [secMain addCell:[self switchCellWithTitle:@"屏蔽视频号广告" on:cfg.finder action:@selector(onFinderSwitch:)]];
-        [secMain addCell:[self switchCellWithTitle:@"屏蔽小程序广告" on:cfg.miniProgram action:@selector(onMiniProgramSwitch:)]];
+        [secMain addCell:[self switchCellWithTitle:@"屏蔽小程序启动广告" on:cfg.miniProgram action:@selector(onMiniProgramSwitch:)]];
     }
     [_tableViewManager addSection:secMain];
 
