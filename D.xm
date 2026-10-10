@@ -95,22 +95,7 @@ static inline BOOL momentsEnabled(void) {
 }
 
 %hook WCAdvertiseDataHelper
-- (void)saveAdPullCompareInfo:(id)arg1 {
-    if (momentsEnabled()) return;
-    %orig;
-}
-- (void)saveAdvertiseMsgXmlDatas {
-    if (momentsEnabled()) return;
-    %orig;
-}
-- (void)addAdvertiseDataList:(id)arg1 {
-    if (momentsEnabled()) return;
-    %orig;
-}
-- (void)saveAdvertiseDatas {
-    if (momentsEnabled()) return;
-    %orig;
-}
+// 兜住本地残留：插件安装前 / 开关关闭期间已落盘的广告，不再加载。
 - (void)tryLoadAdvertiseData {
     if (momentsEnabled()) return;
     %orig;
@@ -119,13 +104,18 @@ static inline BOOL momentsEnabled(void) {
     if (momentsEnabled()) return YES;
     return %orig;
 }
-%end
-
-%hook WCTimelineMgr
+// 取广告数据：一律返回空，朋友圈就凑不出广告条目。
 - (id)getAdvertiseDataByCurMinTime:(unsigned int)arg1 MaxTime:(unsigned int)arg2 checkDataValid:(BOOL)arg3 {
     if (momentsEnabled()) return [NSMutableArray array];
     return %orig;
 }
+- (id)getTopAdvertiseDataByTopNumber:(unsigned int)arg1 {
+    if (momentsEnabled()) return [NSMutableArray array];
+    return %orig;
+}
+%end
+
+%hook WCTimelineMgr
 - (id)getAdvertiseDataByCurMinTime:(unsigned int)arg1 MaxTime:(unsigned int)arg2 {
     if (momentsEnabled()) return [NSMutableArray array];
     return %orig;
