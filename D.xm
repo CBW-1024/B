@@ -2,7 +2,7 @@
 //
 //  屏蔽微信广告，按场景分五个模块：
 //    1. 朋友圈广告：广告数据管理器不初始化，广告也不落盘
-//    2. 公众号广告：订阅号消息流拦原生数据层，文章页注入脚本隐藏广告位
+//    2. 公众号广告：消息流里的广告与推荐卡片不初始化，文章页注入脚本隐藏广告位
 //    3. 视频号广告：拦视频流与评论区广告的数据和展示
 //    4. 小程序启动广告：拦开屏广告（冷启动 / 热启动）
 //    5. 激励广告：页面一出现即关闭，跳过倒计时
@@ -169,29 +169,6 @@ static NSString *DDAdBlockInjectJS(void) {
         DDAdBlockAdSelector()];
 }
 
-// 列表：原生数据层拦截
-%hook BrandTLExptConfig
-- (BOOL)isExptNotShowAd {
-    if (brandEnabled()) return YES;
-    return %orig;
-}
-%end
-
-%hook BrandTLCanvasCardMgr
-+ (BOOL)isAdCardOpen {
-    if (brandEnabled()) return NO;
-    return %orig;
-}
-+ (BOOL)isAdRequestOpen {
-    if (brandEnabled()) return NO;
-    return %orig;
-}
-- (void)handleBizAdNotifyNewXml:(id)arg1 {
-    if (brandEnabled()) return;
-    %orig;
-}
-%end
-
 // 订阅号消息流里的广告卡片：数据段建不起来，卡片就不会出现。
 %hook BTCanvasMsgSectionData
 - (id)initWithMsgWrap:(id)arg1 sectionWidth:(double)arg2 displayMode:(unsigned int)arg3 delegate:(id)arg4 {
@@ -211,25 +188,6 @@ static NSString *DDAdBlockInjectJS(void) {
 
 %hook BTRecommendFinderData
 - (id)init {
-    if (brandEnabled()) return nil;
-    return %orig;
-}
-%end
-
-%hook BrandAdDataParser
-+ (id)adDataItemForContent:(id)arg1 {
-    if (brandEnabled()) return nil;
-    return %orig;
-}
-+ (id)adDataItemForMsgWrap:(id)arg1 {
-    if (brandEnabled()) return nil;
-    return %orig;
-}
-+ (id)adInfoDicForContent:(id)arg1 {
-    if (brandEnabled()) return nil;
-    return %orig;
-}
-+ (id)adInfoDicForMsgWrap:(id)arg1 {
     if (brandEnabled()) return nil;
     return %orig;
 }
@@ -255,19 +213,6 @@ static NSString *DDAdBlockInjectJS(void) {
                                                forMainFrameOnly:NO];
     [ucc addUserScript:script];
     return webView;
-}
-%end
-
-// 文章页：拦广告票据，页面拿不到票据就不渲染广告
-%hook MMWebViewController
-// completion 按最少参数声明：多出来的参数由调用方写寄存器，block 不用就不读，避免读到脏值。
-- (void)getTokenWithAdUrl:(id)arg1 posId:(id)arg2 completion:(id)arg3 {
-    if (brandEnabled()) {
-        void (^completion)(id) = arg3;
-        if (completion) completion(nil);
-        return;
-    }
-    %orig;
 }
 %end
 
@@ -369,7 +314,10 @@ static inline BOOL miniProgramEnabled(void) {
     return [DDAdBlockConfig sharedConfig].master && [DDAdBlockConfig sharedConfig].miniProgram;
 }
 
-// 开屏广告：三处原生开关都判否，微信自己就不走展示流程。
+// 开屏广告：三处判断都判否，微信自己就不走展示流程。
+// 只拦这种"纯查询、无副作用"的方法：拦住后微信直接不展示，不会有流程卡住。
+// 不要拦 handleShowSplashAdCalled: 这类推进状态机的方法，也不要拦 JS 事件处理器
+// （不回调会让小程序的 wx.showSplashAd() 一直等结果，整个小程序的 JS 链会卡住）。
 %hook WAAppTaskSplashADConfig
 - (BOOL)canShowSplashADWindow {
     if (miniProgramEnabled()) return NO;
@@ -382,25 +330,6 @@ static inline BOOL miniProgramEnabled(void) {
 - (BOOL)splashADHasContent {
     if (miniProgramEnabled()) return NO;
     return %orig;
-}
-- (void)handleShowSplashAdCalled:(BOOL)arg1 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-%end
-
-// JS 侧触发开屏的入口，一并挡掉。
-%hook WAJSEventHandler_showSplashAd
-- (void)handleJSEvent:(id)arg1 {
-    if (miniProgramEnabled()) return;
-    %orig;
-}
-%end
-
-%hook WAJSEventHandler_showSplashAdMenu
-- (void)handleJSEvent:(id)arg1 {
-    if (miniProgramEnabled()) return;
-    %orig;
 }
 %end
 
